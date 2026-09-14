@@ -3543,10 +3543,29 @@
                     default = 10;
                     description = ''
                       Pool priority for the controller's `pack` balancer
-                      (`--priority`). LOWER numbers fill first, so give the
-                      on-prem pools a lower priority than this cloud pool and AWS
-                      becomes the SPILL tier — provisioned only once the local
-                      fleet is saturated. Larger == later == cloud-last.
+                      (`--priority`). GARM sorts matching pools in DESCENDING
+                      priority order, so HIGHER numbers are tried FIRST — give the
+                      on-prem pools a HIGHER priority than this cloud pool and AWS
+                      becomes the SPILL tier, provisioned only once the local
+                      fleet is saturated. Smaller == later == cloud-last, which is
+                      why the default (10) sits below the RB3 `basePriority`
+                      default (100).
+
+                      (This description used to say the opposite — "LOWER numbers
+                      fill first". The VALUES were right and the prose was
+                      inverted, so following it would have made the cloud tier
+                      fill BEFORE the free on-prem fleet. GARM's own source is
+                      unambiguous: `params/params.go` — "the higher the number,
+                      the higher the priority … sorted in descending order of
+                      priority" — backed by `Order("priority desc")` in
+                      `database/sql/pools.go` and `sort.Slice(… Priority > …)` in
+                      `runner/pool/cache.go`.)
+
+                      Priority orders POOLS, never JOBS, and only takes full
+                      effect under the `pack` balancer — which GARM sets per ORG
+                      (`garm-cli organization update --pool-balancer-type pack`),
+                      defaults to `roundrobin`, and this module does NOT configure.
+                      See modules/garm/README.md, "What `priority` is".
                     '';
                   };
                   jobAgeBackoff = mkOption {
@@ -3819,6 +3838,13 @@
                       `capabilityPools` balancer sets this automatically across
                       equivalent hosts; for a hand-declared pool leave it 0 unless
                       you want a specific host preferred.
+
+                      It orders POOLS, not JOBS — it decides where a new runner is
+                      CREATED, never which queued job is served first, and it
+                      cannot reserve capacity. If you are reaching for it to keep
+                      a latency-critical job off the back of the queue, you want
+                      `runnerGroup` instead. See modules/garm/README.md, "What
+                      `priority` is — and, more importantly, what it is not".
                     '';
                   };
                   runnerBootstrapTimeout = mkOption {
@@ -3829,7 +3855,34 @@
                   runnerGroup = mkOption {
                     type = types.str;
                     default = "";
-                    description = "Optional GitHub runner group (`--runner-group`); empty leaves it in `Default`.";
+                    description = ''
+                      Optional GitHub runner group (`--runner-group`); empty
+                      leaves the pool's runners in `Default`.
+
+                      THIS IS THE ONLY WAY TO RESERVE CAPACITY. A runner group
+                      with `restricted_to_workflows` refuses its runners to any
+                      job whose workflow is not on the group's admission list,
+                      whatever that job asks for in `runs-on` — the one admission
+                      control in the system that is not label-based. Labels cannot
+                      do it: `runs-on` matches by SUBSET, so a pool on the same
+                      hardware advertises a superset of what ordinary jobs request
+                      and is eligible for them, and it cannot advertise less
+                      because GitHub attaches `self-hosted`, the OS and the arch
+                      to every self-hosted runner itself. `priority` cannot do it
+                      either — it orders pools, not jobs.
+
+                      Pair it with `minIdleRunners >= 1`. Admission control alone
+                      reserves nothing under saturation: with no idle runner the
+                      admitted job queues for a slot like everyone else. The WARM
+                      runner is the reservation; the group is what stops anything
+                      else draining it.
+
+                      The group must already exist in the org — GARM does not
+                      create it, and `garm-cli pool add --runner-group` fails if
+                      it does not. Its admission list is GitHub-side state
+                      (`selected_workflows`), governed separately; the
+                      `terraform/github/governance.nix` engine renders it.
+                    '';
                   };
                   enabled = mkOption {
                     type = types.bool;

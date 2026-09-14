@@ -361,6 +361,45 @@ than a generic pool so a specialised job prefers a specialised host. Both gates
 are hermetic module checks: `t_garm_pools_labels` (RC2) and
 `t_garm_capability_placement` (RB3).
 
+#### What `priority` is — and, more importantly, what it is not
+
+Read this before reaching for `priority` to make anything go **first**.
+
+`priority` orders **pools**, never **jobs**. When several pools match a job's
+labels, GARM sorts them **descending** by priority (`Order("priority desc")` in
+`database/sql/pools.go`; `sort.Slice(… Priority > …)` in
+`runner/pool/cache.go`) and walks that list to decide where to **create a
+runner** — the sort is applied _inside_ a loop over jobs, at
+`runner/pool/pool.go`. **Higher is tried first.** GARM has no job-priority
+concept at any layer: the job iteration order is a `range` over the
+`map[int64]params.Job` in `runner/pool/util.go`, i.e. randomised.
+
+Two consequences worth stating plainly:
+
+- **`priority` cannot make a job jump a queue.** GARM creates runners; **GitHub**
+  decides which queued job lands on an idle one, and GARM's own code treats its
+  choice being overridden as a normal outcome (it breaks the lock on the job
+  that triggered the runner when GitHub gives that runner to a different job).
+- **`priority` cannot reserve capacity.** Nor can a label: `runs-on` matches by
+  **subset**, so a "reserved" pool on the same hardware advertises a superset of
+  what ordinary jobs request and is eligible for them; and you cannot advertise
+  _less_, because GitHub attaches `self-hosted`, the OS and the arch to every
+  self-hosted runner itself. The only admission control that is not label-based
+  is a **GitHub runner group** with `restricted_to_workflows` — set it with
+  `pools.<name>.runnerGroup` / `capabilityPools.<name>.runnerGroup`, pair it with
+  `minIdleRunners >= 1` so the reserved runner is actually there when wanted, and
+  govern the group's admission list on the GitHub side (the
+  `terraform/github/governance.nix` engine renders `selected_workflows`).
+
+> [!IMPORTANT]
+> Priority is only **fully** effective under the `pack` pool balancer, which
+> GARM sets **per entity (org)**, not per pool — `garm-cli organization update
+--pool-balancer-type pack`. GARM's default is `roundrobin`, and its round-robin
+> cursor is not reset between jobs, so priority only fixes the starting point
+> once. **This module does not configure the balancer type**, so on a default
+> controller the `pack`-style spill described for `burstPools` below is not in
+> force. Set it with `garm-cli` on the org, or treat priority as advisory.
+
 **RC5 — cutover completion: alias classes + scale-set retirement.** The
 migration off scale sets is phased class-by-class (no flag day), bridged by
 `services.garm.pools.<name>.aliasClasses` — a list of **legacy scale-set class

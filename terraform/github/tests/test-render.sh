@@ -107,6 +107,38 @@ if nix eval --json --impure --expr "$bad_expr" >/dev/null 2>&1; then
   fail=1
 fi
 
+# ---------------------------------------------------------------------------
+# Runner groups, and in particular the WORKFLOW-RESTRICTED shape.
+#
+# `restricted_to_workflows` was emitted for a long time while `selected_workflows`
+# was not, and that pairing is not merely incomplete — GitHub reads a true
+# restriction with an empty list as "admit NOTHING", so a group emitted that way
+# takes its runners offline for every workflow in the org. These assertions are
+# what keep the two fields from drifting apart again.
+rg='.resource.github_actions_runner_group'
+n_rg="$(jq "$rg | length" <<<"$json")"
+[[ "$n_rg" == "2" ]] || { echo "FAIL: expected 2 runner groups, rendered $n_rg — the assertions below would be vacuous"; fail=1; }
+
+# The unrestricted group carries no admission list at all: a group that does not
+# restrict must not emit `selected_workflows`, or the attribute is asserted to a
+# default the provider then diffs against.
+unrestricted="$(jq -r "$rg | to_entries[] | select(.value.restricted_to_workflows == false) | .key" <<<"$json")"
+[[ -n "$unrestricted" ]] || { echo "FAIL: no unrestricted runner group rendered"; fail=1; }
+[[ "$(jq "${rg}[\"$unrestricted\"] | has(\"selected_workflows\") | not" <<<"$json")" == "true" ]] \
+  || { echo "FAIL: an unrestricted runner group emitted selected_workflows"; fail=1; }
+
+# The restricted group carries a NON-EMPTY list, and each entry is fully
+# qualified — GitHub accepts no wildcards, and an entry it cannot parse does not
+# error, it simply never matches, so the reservation silently shrinks.
+restricted="$(jq -r "$rg | to_entries[] | select(.value.restricted_to_workflows == true) | .key" <<<"$json")"
+[[ -n "$restricted" ]] || { echo "FAIL: no workflow-restricted runner group rendered"; fail=1; }
+n_wf="$(jq "${rg}[\"$restricted\"].selected_workflows | length" <<<"$json")"
+[[ "${n_wf:-0}" -ge 1 ]] \
+  || { echo "FAIL: a restricted runner group rendered $n_wf selected_workflows — GitHub reads that as admitting NOTHING"; fail=1; }
+bad_wf="$(jq -r "(${rg}[\"$restricted\"].selected_workflows // [])[] | select(test(\"^[^/]+/[^/]+/\\\\.github/workflows/[^@]+@(refs/(heads|tags)/.+|[0-9a-f]{40})$\") | not)" <<<"$json")"
+[[ -z "$bad_wf" ]] \
+  || { echo "FAIL: selected_workflows entries are not OWNER/REPO/.github/workflows/FILE@<fully-qualified-ref>: $bad_wf"; fail=1; }
+
 # No company literals leak from the example.
 # The example must render only placeholder identifiers — flag any 12-digit AWS
 # account id other than the 000000000000 placeholder (no real value embedded here).

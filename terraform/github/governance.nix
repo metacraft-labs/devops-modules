@@ -543,6 +543,22 @@ let
         // optionalAttrs (rg ? restrictedToWorkflows) {
           restricted_to_workflows = rg.restrictedToWorkflows;
         }
+        # `selected_workflows` is the ONLY admission control GitHub offers that
+        # is not label-based, and without it `restrictedToWorkflows = true` is
+        # not merely incomplete — it is an OUTAGE: GitHub reads a true
+        # restriction with an empty list as "admit nothing", so the group's
+        # runners become unusable by every workflow in the org. Emitting one
+        # without the other was therefore never a safe state to leave expressible.
+        #
+        # Format, per GitHub: `OWNER/REPO/.github/workflows/FILE@REF`, with the
+        # ref fully qualified (`refs/heads/…`, `refs/tags/…`, or a 40-hex SHA).
+        # NO WILDCARDS — a tag-glob release trigger cannot be expressed. And
+        # "only jobs DIRECTLY DEFINED within the selected workflows will have
+        # access", so for a caller -> reusable-workflow pair it is the CALLED
+        # file, where the job carrying `runs-on` lives, that must be listed.
+        // optionalAttrs (rg ? selectedWorkflows) {
+          selected_workflows = rg.selectedWorkflows;
+        }
       );
 
   customRoleResources =
