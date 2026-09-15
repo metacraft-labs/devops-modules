@@ -16,7 +16,7 @@ jobs:
       ATTIC_SUBSTITUTER: https://cache.metacraft-labs.com/metacraft-private-infrastructure
       ATTIC_TRUSTED_PUBLIC_KEY: metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE=
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
 
       # No netbird-cache-probe-url: the private cache returns 401 without a
       # token, and the probe uses `curl -fsS` (fails on 4xx). Connectivity is
