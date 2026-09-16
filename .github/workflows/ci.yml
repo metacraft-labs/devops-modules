@@ -96,12 +96,30 @@ jobs:
           substituters: ${{ vars.SUBSTITUTERS }}
           devshell: default
 
+      - name: Assert the Actions Node runtime has the host loader environment
+        uses: actions/github-script@v8
+        with:
+          script: |
+            if (process.env.LD_LIBRARY_PATH) {
+              core.setFailed(`Actions Node inherited LD_LIBRARY_PATH=${process.env.LD_LIBRARY_PATH}`)
+            }
+
       - name: Assert the working devShell was exported to PATH
         run: |
           if ! command -v hello >/dev/null; then
             echo "::error::'hello' from the devShell is not on PATH; the environment was not exported to GITHUB_ENV."
             exit 1
           fi
+          if [[ "$LD_LIBRARY_PATH" != *setup-nix-loader-fixture* ]]; then
+            echo "::error::Bash did not recover the devShell LD_LIBRARY_PATH through BASH_ENV."
+            exit 1
+          fi
+          AH_DISABLE_DEVSHELL_LD_LIBRARY_PATH=1 bash -c '
+            if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+              echo "::error::The per-step host-loader opt-out did not clear LD_LIBRARY_PATH."
+              exit 1
+            fi
+          '
           echo "OK: devShell environment exported; hello resolved to $(command -v hello)."
 
   # Regression test for the OTHER way a Nix setup step lies: reporting success
