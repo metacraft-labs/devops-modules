@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zahary Karadjov <zahary@metacraft-labs.com>
+Date: Wed, 16 Sep 2026 12:00:00 +0300
+Subject: [PATCH] Allow macOS pools, matching what scale sets already accept
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`CreateScaleSetParams.Validate()` does not constrain `OSType` at all, so a
+macOS runner scale set is accepted today and works end to end with an
+external provider. The pool path does constrain it:
+
+    // runner/types.go
+    supportedOSType map[params.OSType]struct{} = map[params.OSType]struct{}{
+        params.Linux:   {},
+        params.Windows: {},
+    }
+
+and `appendTagsToCreatePoolParams()` — the sole caller of
+`IsSupportedOSType()` — rejects anything outside that map, so the same
+declaration expressed as a pool fails with
+
+    error fetching pool params: invalid OS type macos
+
+There is nothing behind the allow-list that actually requires Linux or
+Windows for an external provider. `OSType` on a pool is stored, exported
+as the `os_type` metrics label, used for template selection, and handed to
+the provider verbatim in `BootstrapInstance` — the provider decides what
+that means. JIT config generation and runner registration never look at it.
+
+Add `params.MacOS` to the map, so pools and scale sets agree on which
+operating systems a provider may be asked to serve.
+
+Depends on `MacOS` existing in cloudbase/garm-provider-common — see the
+companion patch in this directory (provider-common-fix.patch) and PR.md.
+
+Signed-off-by: Zahary Karadjov <zahary@metacraft-labs.com>
+---
+ runner/types.go | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/runner/types.go b/runner/types.go
+index ee41188..73644ef 100644
+--- a/runner/types.go
++++ b/runner/types.go
+@@ -29,6 +29,7 @@ var (
+ 	supportedOSType map[params.OSType]struct{} = map[params.OSType]struct{}{
+ 		params.Linux:   {},
+ 		params.Windows: {},
++		params.MacOS:   {},
+ 	}
+
+ 	// These are the architectures that Github supports.
+--
+2.51.0

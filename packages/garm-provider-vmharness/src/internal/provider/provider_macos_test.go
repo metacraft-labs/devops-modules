@@ -529,6 +529,34 @@ func TestMacOSPickToolsAndBootstrap(t *testing.T) {
 	if strings.Contains(text, "systemctl") || strings.Contains(text, "svc.sh") {
 		t.Fatalf("macOS bootstrap must not use Linux/Windows service managers:\n%s", text)
 	}
+	// Runner-Fleet-M3-ARM-Wave MA11 — THE macOS POOL'S ONE REMAINING LANDMINE,
+	// pinned here so it stays defused. GARM's vendored
+	// garm-provider-common `util.GetTools()` rejects any OSType that is not
+	// Linux or Windows, and `githubOSTypeMap` has no `osx` entry, so the two
+	// metadata endpoints that call it — `/metadata/runner-metadata/` and
+	// `/metadata/install-script/` — return 500 for a macOS instance. Admitting
+	// macOS to the POOL path (packages/garm/patches/allow-macos-pools.patch)
+	// is only safe because THIS provider never sends a macOS guest to either:
+	// it picks the `osx` tarball itself via pickTools and renders the
+	// bootstrap itself via renderMacOSRunnerInstallScript, and the guest only
+	// ever fetches `credentials/*` and `runner-registration-token/`.
+	//
+	// That is the whole safety argument, and until now it held only by
+	// inspection. Note the wrapper GARM injects into
+	// ExtraSpecs["runner_install_template"] DOES curl
+	// `$METADATA_URL/install-script/` — it is inert purely because the macOS
+	// branch short-circuits before any extra-spec consumption. So if someone
+	// ever routes macOS through the generic cloudconfig path, this assertion
+	// is what says so, instead of a 500 at first boot on a live runner.
+	// The Windows-ARM tests above carry the identical guard.
+	for _, forbidden := range []string{
+		"/metadata/install-script/",
+		"/metadata/runner-metadata/",
+	} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("macOS bootstrap reaches %q, an endpoint util.GetTools() 500s on for macOS:\n%s", forbidden, text)
+		}
+	}
 }
 
 func TestLinuxBootstrapCreatesRunnerHomeBeforeDownload(t *testing.T) {

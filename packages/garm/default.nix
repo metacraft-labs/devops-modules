@@ -36,6 +36,41 @@ buildGo126Module rec {
 
   patches = [
     ./patches/allow-macos-runner-install-templates.patch
+    # Upstream cloudbase/garm gap, the POOL half of the one above. macOS works
+    # end to end in SCALE SETS today — m3 has run macOS Tart scale sets in
+    # production for months — because that path never consults an OS allow-list.
+    # The POOL path does: `runner/types.go` declares
+    #   supportedOSType = { params.Linux: {}, params.Windows: {} }
+    # and `appendTagsToCreatePoolParams` (runner/runner.go) rejects anything
+    # outside it, which is the ONLY caller of IsSupportedOSType in the whole
+    # tree. So `garm-cli pool add --os-type macos` 400s with
+    #   error fetching pool params: invalid OS type macos
+    # (runner/organizations.go:215 wraps it) while the identical scale set is
+    # accepted. Observed live on high-mem-server 2026-09-16: the central GARM's
+    # reconcile created `metacraft-labs-linux-arm64`, then died on
+    # `metacraft-labs-macos-arm64` and restart-looped past 65 attempts, taking
+    # the fleet's whole control-plane reconcile with it.
+    #
+    # This is the capability-pool model's blocker: the fleet is migrating from
+    # scale sets (targeted by one precise NAME) to POOLS of classic runners
+    # carrying capability labels, so a class that cannot be a pool cannot be
+    # reached by `runs-on: [self-hosted, macos, arm64]` at all.
+    #
+    # For an EXTERNAL provider — which is what this fleet uses — OSType on a
+    # pool is close to a passthrough label: it is stored, exported as a metrics
+    # label, forwarded to the provider as GARM_POOL_OS_TYPE/the bootstrap
+    # params, and used to pick the runner-install template, which the sibling
+    # patch above already taught about macOS (and which m3's macOS template is
+    # deliberately a stub of — garm-provider-vmharness renders the real
+    # bootstrap inside the Tart guest).
+    #
+    # DEPENDS ON the sibling patch above for `params.MacOS`: the OSType
+    # constants live in cloudbase/garm-provider-common, which has only
+    # Windows/Linux/Unknown, and that patch adds `MacOS OSType = "macos"` to the
+    # vendored copy. Keep it FIRST in this list.
+    # See upstream-patches/garm-allow-macos-pools/ and the gate
+    # t_garm_macos_pools_supported.
+    ./patches/allow-macos-pools.patch
     # Upstream cloudbase/garm bug: the v0.1.1 external-provider ListInstances
     # path guards garmExec.Exec with an INVERTED `if err == nil` (every other
     # command path uses `if err != nil`). On a SUCCESSFUL provider run it took

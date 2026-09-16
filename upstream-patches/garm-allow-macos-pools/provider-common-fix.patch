@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zahary Karadjov <zahary@metacraft-labs.com>
+Date: Wed, 16 Sep 2026 12:00:00 +0300
+Subject: [PATCH] Add a MacOS OSType constant
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+`OSType` has constants for Windows and Linux only, so every caller that
+wants to talk about a macOS guest has to spell `params.OSType("macos")`
+inline. External providers already do exactly that — a provider driving
+Apple Virtualization guests has no other way to say what it is running —
+and the string is what garm stores, what it exports as the `os_type`
+metrics label, and what it hands back in `BootstrapInstance`.
+
+Name it once, so that garm and the providers agree on the spelling and so
+that the OS allow-lists in garm can refer to it by constant.
+
+This adds a name; it does not make any existing code path treat macOS
+differently. In particular `util.GetTools()` and `cloudconfig` still
+accept only Linux and Windows — a provider that renders its own runner
+bootstrap (as the Apple-silicon ones do) does not reach them, and
+widening them is a separate change with its own testing story.
+
+Signed-off-by: Zahary Karadjov <zahary@metacraft-labs.com>
+---
+ params/params.go | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/params/params.go b/params/params.go
+index a4e5529..83e40b6 100644
+--- a/params/params.go
++++ b/params/params.go
+@@ -30,6 +30,7 @@ type (
+ const (
+ 	Windows OSType = "windows"
+ 	Linux   OSType = "linux"
++	MacOS   OSType = "macos"
+ 	Unknown OSType = "unknown"
+ )
+ 
+--
+2.51.0

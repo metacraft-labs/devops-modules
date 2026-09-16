@@ -749,6 +749,20 @@
         }
       );
 
+      # The macOS runner-install template body the reconcile registers when a
+      # macOS pool is declared. See `ensure_macos_install_template` for why this
+      # is a stub rather than a real bootstrap. It must parse as a Go
+      # text/template (GARM runs `templates.ValidateTemplate` on create) — plain
+      # shell with no `{{ }}` does.
+      macosInstallTemplate = pkgs.writeText "garm-macos-compat-install-template.sh" ''
+        #!/bin/sh
+        set -eu
+
+        echo "This GARM macOS install template is a compatibility stub for the external vm-harness provider." >&2
+        echo "garm-provider-vmharness renders and executes the real macOS runner bootstrap inside the Tart guest." >&2
+        exit 1
+      '';
+
       reconcileScript = pkgs.writeShellApplication {
         name = "garm-reconcile";
         runtimeInputs = [
@@ -1036,6 +1050,48 @@
           # Names we (re)applied THIS run — the prune boundary for pools.
           applied_pools="$(mktemp)"
 
+          # ---- POOL-FAILURE ISOLATION -----------------------------------------
+          # ONE BAD POOL MUST NOT TAKE THE CONTROL PLANE WITH IT. Before this,
+          # every pool op ran under the script's `set -e` with its exit status
+          # unchecked, so the FIRST pool GARM refused aborted the whole run: the
+          # remaining pools were never created, the prune never ran, no summary
+          # was printed, and systemd's Restart=on-failure re-ran the identical
+          # doomed reconcile for ever. Observed live on high-mem-server
+          # 2026-09-16: a `macos` pool hit GARM's pool-path OS allow-list
+          # (`invalid OS type macos`, the gap packages/garm/patches/
+          # allow-macos-pools.patch closes) and the reconcile restart-looped
+          # past 65 attempts with the *-win-arm64/-linux/-gpu work behind it
+          # never attempted.
+          #
+          # Now each pool is applied independently. A failure is recorded here —
+          # with the forge's own message — and the run CONTINUES; the ledger is
+          # re-printed as a loud, named summary at the end and decides the exit
+          # code (see the epilogue).
+          #
+          # A FILE, not a variable: each pool loop below is the right-hand side
+          # of a pipe and therefore runs in a SUBSHELL, so a counter would be
+          # lost on every iteration. `applied_pools` already works this way.
+          failed_pools="$(mktemp)"
+
+          # pool_failed LNAME STAGE DETAIL — record one non-converged pool.
+          #
+          # It also marks the pool APPLIED. That is deliberate and is a prune
+          # safety property, not bookkeeping: `pruneUnmanaged` deletes every
+          # pool in the id-map that was not applied this run, so without this a
+          # pool that merely FAILED TO UPDATE (its host briefly unreachable,
+          # say) would be destroyed by the same run that failed to converge it.
+          # A pool is pruned when its DECLARATION goes away, never because an
+          # attempt to reconcile it errored.
+          pool_failed() {
+            local lname="$1" stage="$2" detail="$3"
+            grep -qxF "$lname" "$applied_pools" 2>/dev/null || echo "$lname" >> "$applied_pools"
+            # Flatten: the ledger is one line per failure.
+            printf '%s\t%s\t%s\n' "$lname" "$stage" "$(printf '%s' "$detail" | tr '\n' ' ')" \
+              >> "$failed_pools"
+            log "ERROR: pool '$lname' NOT converged at stage '$stage': $detail"
+            log "ERROR: pool '$lname' skipped — continuing with the remaining declarations"
+          }
+
           # derive_tags MANIFEST_FILE DECLARED_CSV POLICY_CSV
           #   Compute a pool's classic-runner tag set. With a manifest: derive the
           #   proven hardware labels (RA6→RC1), LINT any declared set (advertised
@@ -1078,34 +1134,115 @@
             return 0
           }
 
+          # ---- macOS runner-install template (the SECOND macOS pool gate) -----
+          # Created ON DEMAND — only when a declared pool is actually macOS — so
+          # a controller that never places macOS work keeps a 4-row template
+          # table. Idempotent: create once, then update in place, keyed on the
+          # name. Its BODY is a deliberate stub, and the same stub the m3
+          # per-host GARM has served its macOS Tart scale sets with in
+          # production (infra services/ephemeral-runner-host/darwin.nix):
+          # garm-provider-vmharness renders the real macOS bootstrap INSIDE the
+          # Tart guest (its own renderMacOSRunnerInstallScript + `osx` tool
+          # mapping) and never reads this template, so anything else here would
+          # be fiction. If some future macOS provider DOES consult it, exiting 1
+          # with a named message is a loud failure rather than a silent wrong
+          # boot — the campaign's fail-loud pattern.
+          macos_template_name="garm-macos-compat"
+          macos_template_file="${macosInstallTemplate}"
+          ensure_macos_install_template() {
+            local tid errf
+            tid="$(gcli template list --forge-type github --os-type macos \
+              --name "$macos_template_name" 2>/dev/null \
+              | jq -r --arg n "$macos_template_name" \
+                  'first(.[]? | select(.name==$n) | .id) // empty')"
+            errf="$(mktemp)"
+            if [ -z "$tid" ]; then
+              if ! garm-cli template create --name "$macos_template_name" \
+                --os-type macos --forge-type github \
+                --description "Compatibility macOS runner-install template (the real bootstrap is rendered in-guest by the external provider)" \
+                --path "$macos_template_file" >/dev/null 2>"$errf"; then
+                log "ERROR: could not create the macOS runner-install template: $(cat "$errf")"
+                log "ERROR: GARM only accepts os_type=macos on templates WITH packages/garm/patches/allow-macos-runner-install-templates.patch — check the deployed garm carries it"
+                rm -f "$errf"
+                return 1
+              fi
+              log "macOS runner-install template '$macos_template_name' created"
+            else
+              if ! garm-cli template update "$tid" --name "$macos_template_name" \
+                --path "$macos_template_file" >/dev/null 2>"$errf"; then
+                log "ERROR: could not update the macOS runner-install template (id=$tid): $(cat "$errf")"
+                rm -f "$errf"
+                return 1
+              fi
+              log "macOS runner-install template '$macos_template_name' (id=$tid) converged"
+            fi
+            rm -f "$errf"
+            return 0
+          }
+
           # pool_apply LNAME OID PROVIDER TAGS IMAGE FLAVOR OSTYPE OSARCH MIN MAX PRIO BOOT ENABLED GROUP EXTRAS
           pool_apply() {
             local lname="$1" oid="$2" prov="$3" tags="$4" image="$5" flavor="$6"
             local ostype="$7" osarch="$8" minr="$9" maxr="''${10}" prio="''${11}"
             local boot="''${12}" enabled="''${13}" group="''${14}" extras="''${15}"
-            local group_flag="" enabled_flag extras_flag="" pid out tmp
+            local group_flag="" enabled_flag extras_flag="" tpl_flag="" pid out tmp errf
             [ -n "$group" ] && [ "$group" != "null" ] && group_flag="--runner-group=$group"
             if [ "$enabled" = "true" ]; then enabled_flag="--enabled=true"; else enabled_flag="--enabled=false"; fi
             [ -n "$extras" ] && [ "$extras" != "{}" ] && extras_flag="--extra-specs=$extras"
+            # macOS needs an EXPLICIT runner-install template; nothing else does.
+            # GARM seeds exactly four system templates (linux/windows ×
+            # github/gitea, database/sql/sql.go `ensureTemplates`), and pool
+            # creation resolves the default by requiring
+            # `OSType == pool.OSType && Owner == SystemUser` (runner/
+            # repositories.go `findTemplate`). With no macOS row the org-pool
+            # create fails `400 failed to find suitable template: no template ID
+            # supplied and no default template can be found` — the SECOND macOS
+            # pool gate, immediately behind the `invalid OS type macos` one that
+            # packages/garm/patches/allow-macos-pools.patch closes. Passing the
+            # id explicitly is the documented way out of the SystemUser rule.
+            if [ "$ostype" = "macos" ]; then
+              if ! ensure_macos_install_template; then
+                pool_failed "$lname" "template" "could not ensure the macOS runner-install template '$macos_template_name'"
+                return 1
+              fi
+              tpl_flag="--runner-install-template=$macos_template_name"
+            fi
             echo "$lname" >> "$applied_pools"
             pid="$(jq -r --arg n "$lname" '.[$n] // ""' "$pool_state")"
+            # garm-cli prints the forge/API refusal on STDERR ("Error: [POST
+            # /organizations/{orgID}/pools][400] … invalid OS type macos"), and
+            # that message is the ONLY thing that says WHY a pool was refused.
+            # Capture it so pool_failed can name the reason instead of logging
+            # an opaque exit status.
+            errf="$(mktemp)"
             if [ -n "$pid" ] && gcli pool show "$pid" >/dev/null 2>&1; then
               # shellcheck disable=SC2086
-              garm-cli pool update "$pid" --image "$image" --flavor "$flavor" \
+              if ! garm-cli pool update "$pid" --image "$image" --flavor "$flavor" \
                 --tags "$tags" $enabled_flag --min-idle-runners "$minr" \
                 --max-runners "$maxr" --priority "$prio" \
-                --runner-bootstrap-timeout "$boot" $group_flag $extras_flag >/dev/null
+                --runner-bootstrap-timeout "$boot" $group_flag $extras_flag $tpl_flag \
+                >/dev/null 2>"$errf"; then
+                pool_failed "$lname" "update" "$(cat "$errf")"
+                rm -f "$errf"
+                return 1
+              fi
+              rm -f "$errf"
               log "pool '$lname' (id=$pid) reconciled (provider=$prov tags=[$tags] prio=$prio max=$maxr min=$minr)"
             else
               # shellcheck disable=SC2086
-              out="$(garm-cli --format json pool add --org "$oid" --provider-name "$prov" \
+              if ! out="$(garm-cli --format json pool add --org "$oid" --provider-name "$prov" \
                 --image "$image" --flavor "$flavor" --tags "$tags" $enabled_flag \
                 --min-idle-runners "$minr" --max-runners "$maxr" --priority "$prio" \
                 --os-type "$ostype" --os-arch "$osarch" \
-                --runner-bootstrap-timeout "$boot" $group_flag $extras_flag)"
+                --runner-bootstrap-timeout "$boot" $group_flag $extras_flag $tpl_flag 2>"$errf")"; then
+                pool_failed "$lname" "add" "$(cat "$errf")"
+                rm -f "$errf"
+                return 1
+              fi
+              rm -f "$errf"
               pid="$(echo "$out" | jq -r '.id // empty')"
               if [ -z "$pid" ]; then
-                log "ERROR: pool '$lname' add returned no id"
+                pool_failed "$lname" "add" "the add succeeded but returned no pool id"
                 return 1
               fi
               tmp="$(mktemp)"
@@ -1120,14 +1257,14 @@
             plorg="$(echo "$pl" | jq -r '.org')"
             oid="$(org_id_for "$plorg")"
             if [ -z "$oid" ]; then
-              log "WARNING: pool '$plname' org '$plorg' has no id; skipping"
+              pool_failed "$plname" "org" "org '$plorg' has no id in this controller"
               continue
             fi
             mf="$(echo "$pl" | jq -r '.manifestFile // ""')"
             declared="$(echo "$pl" | jq -r '.labels | join(",")')"
             policy="$(echo "$pl" | jq -r '.policyLabels | join(",")')"
             if ! tags="$(derive_tags "$mf" "$declared" "$policy")"; then
-              log "ERROR: pool '$plname' label derivation failed — skipping (fail-closed)"
+              pool_failed "$plname" "labels" "label derivation/lint failed against manifest '$mf' (fail-closed)"
               continue
             fi
             # RC5: append legacy alias class names verbatim (NOT linted — a name,
@@ -1137,6 +1274,9 @@
             # queued — the deliberate end of the cutover bridge.
             aliases="$(echo "$pl" | jq -r '.aliasClasses | join(",")')"
             [ -n "$aliases" ] && tags="$tags,$aliases"
+            # `|| true`: pool_apply has already recorded the failure through
+            # pool_failed and named the pool. The run continues — see the
+            # POOL-FAILURE ISOLATION note above.
             pool_apply "$plname" "$oid" \
               "$(echo "$pl" | jq -r '.provider')" "$tags" \
               "$(echo "$pl" | jq -r '.image')" "$(echo "$pl" | jq -r '.flavor')" \
@@ -1144,7 +1284,7 @@
               "$(echo "$pl" | jq -r '.minIdleRunners')" "$(echo "$pl" | jq -r '.maxRunners')" \
               "$(echo "$pl" | jq -r '.priority')" "$(echo "$pl" | jq -r '.runnerBootstrapTimeout')" \
               "$(echo "$pl" | jq -r '.enabled')" "$(echo "$pl" | jq -r '.runnerGroup // ""')" \
-              "$(echo "$pl" | jq -r '.extraSpecs // "{}"')"
+              "$(echo "$pl" | jq -r '.extraSpecs // "{}"')" || true
           done
 
           # (ii) capability pools (RB3): EXPAND per qualifying host + balance.
@@ -1153,7 +1293,7 @@
             cporg="$(echo "$cp" | jq -r '.org')"
             oid="$(org_id_for "$cporg")"
             if [ -z "$oid" ]; then
-              log "WARNING: capabilityPool '$cpname' org '$cporg' has no id; skipping"
+              pool_failed "$cpname" "org" "org '$cporg' has no id in this controller"
               continue
             fi
             req="$(echo "$cp" | jq -r '.requires | join(",")')"
@@ -1166,13 +1306,17 @@
               prov="$(echo "$cand" | jq -r '.provider')"
               mf="$(echo "$cand" | jq -r '.manifestFile // ""')"
               if ! qualifies "$mf" "$req"; then
+                # NOT a failure: a host that does not prove the required
+                # capabilities is simply not a placement for this pool, and if
+                # it used to be one, prune SHOULD remove that expansion. So this
+                # path deliberately does not go through pool_failed.
                 log "capabilityPool '$cpname': provider '$prov' does NOT prove [$req] — skipped"
                 continue
               fi
               # tags = the host's FULL derived set (+ policy) — a qualifying host
               # advertises everything it proves, so narrower jobs match too.
               if ! tags="$(derive_tags "$mf" "" "$policy")"; then
-                log "capabilityPool '$cpname': provider '$prov' derive failed — skipped"
+                pool_failed "$cpname@$prov" "labels" "derive failed on manifest '$mf' for a provider that DID qualify"
                 continue
               fi
               # RC5 transitional bridge: append legacy alias class names verbatim
@@ -1193,7 +1337,7 @@
                 "$(echo "$cp" | jq -r '.minIdleRunners')" "$(echo "$cp" | jq -r '.maxRunners')" \
                 "$prio" "$(echo "$cp" | jq -r '.runnerBootstrapTimeout')" \
                 "$(echo "$cp" | jq -r '.enabled')" "$(echo "$cp" | jq -r '.runnerGroup // ""')" \
-                "{}"
+                "{}" || true
               idx=$(( idx + 1 ))
             done
           done
@@ -1204,7 +1348,7 @@
             bporg="$(echo "$bp" | jq -r '.org')"
             oid="$(org_id_for "$bporg")"
             if [ -z "$oid" ]; then
-              log "WARNING: burst pool '$bpname' org '$bporg' has no id; skipping"
+              pool_failed "$bpname" "org" "org '$bporg' has no id in this controller"
               continue
             fi
             tags="$(echo "$bp" | jq -r '.labels | join(",")')"
@@ -1215,7 +1359,7 @@
               "$(echo "$bp" | jq -r '.minIdleRunners')" "$(echo "$bp" | jq -r '.maxRunners')" \
               "$(echo "$bp" | jq -r '.priority')" "$(echo "$bp" | jq -r '.runnerBootstrapTimeout')" \
               "$(echo "$bp" | jq -r '.enabled')" "" \
-              "$(echo "$bp" | jq -c '.extraSpecs // "{}"' | jq -r 'if type=="string" then . else tojson end')"
+              "$(echo "$bp" | jq -c '.extraSpecs // "{}"' | jq -r 'if type=="string" then . else tojson end')" || true
           done
 
           # ---- (5) Prune (GUARDED, opt-in) ------------------------------------
@@ -1281,6 +1425,58 @@
             done
           else
             log "prune disabled (default) — undeclared entries left untouched"
+          fi
+
+          # ---- (6) EPILOGUE: the pool-failure ledger decides the exit code -----
+          # Reached unconditionally now — before the failure-isolation change
+          # the FIRST refused pool exited here-minus-everything, so this line
+          # (and the prune above) never ran on a controller with one bad
+          # declaration.
+          #
+          # THREE exit codes, and the distinction is what stops the restart
+          # loop that motivated this:
+          #
+          #   0  everything converged.
+          #   3  every pool that failed did so for a reason RE-RUNNING CANNOT
+          #      FIX — the forge/controller returned a 4xx-class refusal of the
+          #      DECLARATION itself. garm-reconcile.service pairs this with
+          #      RestartPreventExitStatus=3, so systemd leaves the unit FAILED
+          #      (loud: `systemctl --failed`, the deploy, any unit-state alert)
+          #      and does NOT re-run it. Everything else on the controller is
+          #      already converged, so a retry would only re-fail identically —
+          #      which is exactly what 65 restarts on high-mem-server bought.
+          #   1  at least one failure could plausibly be transient (5xx, a
+          #      refused connection, a timeout, an unreadable manifest). Restart
+          #      =on-failure retries, bounded by StartLimitBurst as before.
+          #
+          # UNSURE ⇒ TRANSIENT. Misreading a permanent error as transient costs
+          # a bounded handful of retries; the other direction would silently
+          # stop retrying something a retry would have fixed.
+          if [ -s "$failed_pools" ]; then
+            nfail="$(wc -l < "$failed_pools" | tr -d ' ')"
+            permanent=1
+            log "ERROR: ============================================================"
+            log "ERROR: RECONCILE FINISHED WITH $nfail POOL(S) NOT CONVERGED."
+            log "ERROR: Every OTHER declared entity WAS reconciled — a bad pool no"
+            log "ERROR: longer aborts the run. Each failure, with the reason:"
+            while IFS="$(printf '\t')" read -r f_name f_stage f_detail; do
+              log "ERROR:   * $f_name [$f_stage]: $f_detail"
+              case "$f_detail" in
+                *"[400]"* | *"[404]"* | *"[409]"* | *"[422]"* \
+                  | *"Bad Request"* | *"invalid OS type"* | *"invalid OS architecture"* \
+                  | *"no such provider"* | *"no default template can be found"*) ;;
+                *) permanent=0 ;;
+              esac
+            done < "$failed_pools"
+            log "ERROR: ============================================================"
+            if [ "$permanent" = 1 ]; then
+              log "ERROR: every failure above is a DECLARATION error (4xx-class): re-running"
+              log "ERROR: this reconcile cannot fix it, so systemd is told NOT to retry"
+              log "ERROR: (exit 3 + RestartPreventExitStatus). Fix the declaration and deploy."
+              exit 3
+            fi
+            log "ERROR: at least one failure may be transient — exiting 1 so systemd retries."
+            exit 1
           fi
 
           log "reconcile complete"
@@ -4422,6 +4618,16 @@
               # Retry a few times if garm is still coming up.
               Restart = "on-failure";
               RestartSec = "5s";
+              # …but NEVER retry a DECLARATION error. Exit 3 is the reconcile's
+              # "I converged everything I could; the pools listed in the ERROR
+              # summary were refused by the controller for a reason a retry
+              # cannot change" (see the script's epilogue). Without this the
+              # unit re-runs the identical doomed reconcile until the start
+              # limit trips — measured on high-mem-server 2026-09-16 at 65
+              # restarts over ~40 minutes for ONE mis-declared macOS pool. The
+              # unit still ends in `failed`, so the condition stays loud; it
+              # just stops costing a full forge-hitting reconcile every 5s.
+              RestartPreventExitStatus = [ 3 ];
             };
             unitConfig = {
               StartLimitIntervalSec = "120";
