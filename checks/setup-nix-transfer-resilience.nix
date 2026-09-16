@@ -22,5 +22,21 @@
             PY
             touch "$out"
           '';
+
+      checks.setup-nix-hosted-disk-reclamation =
+        pkgs.runCommand "setup-nix-hosted-disk-reclamation"
+          {
+            nativeBuildInputs = [
+              pkgs.bash
+              pkgs.coreutils
+              pkgs.gawk
+              pkgs.python3
+            ];
+          }
+          ''
+            cd ${../.}
+            python3 scripts/tests/test_setup_nix_hosted_disk.py
+            touch "$out"
+          '';
     };
 }

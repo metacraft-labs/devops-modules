@@ -101,6 +101,27 @@
   runners—including macOS ARM64—remain required operational evidence; no
   Darwin execution result is claimed by this local checkpoint.
 
+* Opt-in GitHub-hosted Nix disk reclamation
+
+  Setup Nix and the reusable Terraform workflow expose
+  =reclaim_hosted_runner_disk= as a disabled-by-default boolean. When enabled,
+  it runs before any Nix installation or realization, accepts only GitHub's
+  immutable =runner.environment= classification =github-hosted= together with
+  Linux, and removes exactly the reviewed Android, .NET, GHC, ghcup, and CodeQL
+  image paths. Deletion uses non-interactive sudo, is confined to each named
+  filesystem, and cannot ignore errors. The helper then fails unless at least
+  20 GiB is available on the root filesystem.
+
+  The reusable workflow forwards the same option to offline, plan, apply, and
+  drift jobs; its self-hosted runner default and the Setup Nix default remain
+  unchanged. =test_setup_nix_hosted_disk.py= verifies the positive helper path,
+  rejects self-hosted, non-Linux, out-of-Actions, failed-cleanup, malformed
+  measurement, and insufficient-space executions, and carries hostile source
+  mutations for default enablement, broadened deletion, weakened runner checks,
+  ignored errors, removed postconditions, and incomplete workflow propagation.
+  This source checkpoint claims no hosted-runner execution evidence; consumers
+  must observe the opt-in on their actual runner image.
+
 * Terraform provider and backend credential composition
 
   Terraform-root metadata models provider and backend authentication as
