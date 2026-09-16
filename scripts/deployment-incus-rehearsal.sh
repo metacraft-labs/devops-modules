@@ -16,6 +16,11 @@ topology_file="${MCL_DEPLOYMENT_INCUS_TOPOLOGY:-$repo_root/tests/deployment/incu
 topology_prefix="${MCL_DEPLOYMENT_INCUS_PREFIX:-mcl-deployment-${USER:-user}}"
 topology_artifact_dir="${MCL_DEPLOYMENT_INCUS_ARTIFACT_DIR:-}"
 topology_keep="${MCL_DEPLOYMENT_INCUS_KEEP:-}"
+if [[ "${MCL_DEPLOYMENT_INCUS_SITE_GROUP+x}" == x ]]; then
+  topology_site_group="$MCL_DEPLOYMENT_INCUS_SITE_GROUP"
+else
+  topology_site_group="example-site"
+fi
 detect_nix_system() {
   if [[ -n "${MCL_DEPLOYMENT_INCUS_SYSTEM:-}" ]]; then
     echo "$MCL_DEPLOYMENT_INCUS_SYSTEM"
@@ -55,6 +60,10 @@ Modes:
 
 Environment:
   MCL_DEPLOYMENT_INCUS_TOPOLOGY       JSON topology inventory for topology scenarios.
+  MCL_DEPLOYMENT_INCUS_SITE_GROUP     Home-lab site target group. Defaults to the
+                                      neutral public fixture group "example-site"
+                                      when unset. If set, it must be non-empty and
+                                      name an existing, distinct topology group.
   MCL_DEPLOYMENT_INCUS_PREFIX         Prefix for runtime container and network names.
   MCL_DEPLOYMENT_INCUS_IMAGE_ATTR     Generic NixOS LXC image attribute.
   MCL_DEPLOYMENT_INCUS_RUNTIME_PROBE_TIMEOUT
@@ -105,7 +114,17 @@ check_port() {
 
 validate_topology() {
   [[ -f "$topology_file" ]] || die "missing topology inventory: $topology_file"
-  jq -e --arg scenario "$scenario" '
+  [[ -n "$topology_site_group" ]] || die "MCL_DEPLOYMENT_INCUS_SITE_GROUP must be non-empty when set"
+  case "$topology_site_group" in
+    home-lab-gpu | hetzner | workstation)
+      die "MCL_DEPLOYMENT_INCUS_SITE_GROUP must name a distinct site group"
+      ;;
+  esac
+  jq -e --arg siteGroup "$topology_site_group" '
+    any((.targetGroups // [])[]; .name == $siteGroup)
+    and any((.roles // [])[]; .role == "target" and .targetGroup == $siteGroup)
+  ' "$topology_file" >/dev/null || die "MCL_DEPLOYMENT_INCUS_SITE_GROUP does not name an existing target group with a target role"
+  jq -e --arg scenario "$scenario" --arg siteGroup "$topology_site_group" '
     (.networks | map(.name)) as $networkNames
     | (.targetGroups | map(.name)) as $targetGroupNames
     | def controlsText($name):
@@ -120,14 +139,15 @@ validate_topology() {
     and any(.roles[]; .role == "attic-cache")
     and any(.roles[]; .role == "monitoring")
     and any(.roles[]; .targetGroup == "home-lab-gpu" and .avahi == true)
-    and any(.roles[]; .targetGroup == "example-site" and .avahi == true)
+    and any(.roles[]; .targetGroup == $siteGroup and .avahi == true)
     and any(.roles[]; .targetGroup == "hetzner" and .avahi == false)
     and any(.roles[]; .targetGroup == "workstation" and .avahi == false)
     and all(.roles[]; . as $role | (.networks | type == "array" and length > 0 and all(. as $network | $networkNames | index($network))))
     and all(.roles[]; . as $role | ((has("targetGroup") | not) or ($targetGroupNames | index($role.targetGroup))))
-    and all(.roles[] | select(.targetGroup == "home-lab-gpu" or .targetGroup == "example-site"); (.networks | index("home-lab")))
-    and all(.roles[] | select(.targetGroup == "hetzner"); (.networks | index("hetzner")))
-    and all(.roles[] | select(.targetGroup == "workstation"); (.networks | index("workstation")))
+    and ($targetGroupNames | index($siteGroup))
+    and all(.roles[] | select(.targetGroup == "home-lab-gpu" or .targetGroup == $siteGroup); .avahi == true and (.networks | index("home-lab")))
+    and all(.roles[] | select(.targetGroup == "hetzner"); .avahi == false and (.networks | index("hetzner")))
+    and all(.roles[] | select(.targetGroup == "workstation"); .avahi == false and (.networks | index("workstation")))
     and (controlsText("full-topology") | contains("runner") and contains("attic") and contains("monitoring") and contains("hetzner") and contains("workstation") and contains("deploy"))
     and (controlsText("full-topology-failures") | contains("partition") and contains("missing cache") and contains("invalid") and contains("signature") and contains("switch failure") and contains("health-check failure") and contains("rollback") and contains("lock contention"))
     and (controlsText("offline-latest-only") | contains("deployment 41") and contains("deployment 42") and contains("offline") and contains("only deployment 42 applies"))
@@ -196,6 +216,7 @@ dry_run_topology() {
   client="$(runtime_cmd || echo incus)"
   echo "deployment-incus-rehearsal: scenario=${scenario}"
   echo "deployment-incus-rehearsal: topology=${topology_file}"
+  echo "deployment-incus-rehearsal: site-group=${topology_site_group}"
   echo "deployment-incus-rehearsal: image-attr=${topology_image_attr}"
   echo "deployment-incus-rehearsal: runtime client=${client}"
   jq -r --arg scenario "$scenario" --arg prefix "$topology_prefix" '
@@ -661,18 +682,23 @@ topology_write_runtime_scripts() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-meta=/etc/mcl-deployment-rehearsal/runtime.json
+meta="${MCL_DEPLOYMENT_INCUS_RUNTIME_META:-/etc/mcl-deployment-rehearsal/runtime.json}"
 test -s "$meta"
 
 role_name="$(jq -r '.role.name' "$meta")"
 role_kind="$(jq -r '.role.role' "$meta")"
 target_group="$(jq -r '.role.targetGroup // ""' "$meta")"
 avahi="$(jq -r '.role.avahi // false' "$meta")"
+site_group="$(jq -r '.siteGroup // ""' "$meta")"
 
-jq -e '.schemaVersion == 1 and (.role.name | length > 0) and (.role.role | length > 0)' "$meta" >/dev/null
+[[ -n "$site_group" ]] || {
+  echo "runtime metadata has no configured site group" >&2
+  exit 1
+}
+jq -e --arg siteGroup "$site_group" '.schemaVersion == 1 and .siteGroup == $siteGroup and (.role.name | length > 0) and (.role.role | length > 0)' "$meta" >/dev/null
 
 case "$target_group" in
-  home-lab-gpu | example-site)
+  home-lab-gpu | "$site_group")
     [[ "$avahi" == "true" ]] || {
       echo "expected Avahi enabled for target group $target_group" >&2
       exit 1
@@ -726,6 +752,7 @@ import time
 scenario = sys.argv[1]
 topology_path = pathlib.Path(sys.argv[2])
 out_dir = pathlib.Path(sys.argv[3])
+site_group = sys.argv[4]
 topology = json.loads(topology_path.read_text())
 out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -736,6 +763,12 @@ commands_path = out_dir / "runtime-commands.log"
 roles = topology["roles"]
 target_groups = [group["name"] for group in topology["targetGroups"]]
 targets = [role for role in roles if role["role"] == "target"]
+if not site_group:
+    raise SystemExit("configured site group is empty")
+if site_group not in target_groups:
+    raise SystemExit("configured site group is missing from topology")
+if not any(role.get("targetGroup") == site_group for role in targets):
+    raise SystemExit("configured site group has no runtime target")
 
 events = []
 
@@ -795,9 +828,9 @@ elif scenario == "full-topology-failures":
     event("cache-missing-object", cache="attic", storePath="/nix/store/synthetic-missing", exitCode=evidence["missingCacheObject"]["exitCode"])
     event("manifest-rejected", reason="invalid-signature", deploymentId=42, exitCode=evidence["invalidSignature"]["exitCode"])
     event("switch-failed", targetGroup="hetzner", deploymentId=43, exitCode=evidence["switchFailure"]["exitCode"])
-    event("healthcheck-failed", targetGroup="example-site", deploymentId=44, exitCode=evidence["healthCheckFailure"]["exitCode"])
-    event("rollback-started", targetGroup="example-site", fromDeploymentId=44)
-    event("rollback-complete", targetGroup="example-site", restoredDeploymentId=evidence["rollback"]["restoredDeploymentId"])
+    event("healthcheck-failed", targetGroup=site_group, deploymentId=44, exitCode=evidence["healthCheckFailure"]["exitCode"])
+    event("rollback-started", targetGroup=site_group, fromDeploymentId=44)
+    event("rollback-complete", targetGroup=site_group, restoredDeploymentId=evidence["rollback"]["restoredDeploymentId"])
     event("stale-desired-state-rejected", rejectedDeploymentId=evidence["staleDesiredState"]["rejectedDeploymentId"], currentDeploymentId=evidence["staleDesiredState"]["currentDeploymentId"])
     event("lock-contention", lock="controller", contender="second-reconciler", exitCode=evidence["lockContention"]["exitCode"])
     final = {
@@ -936,6 +969,7 @@ final.update(
         "cachixDeployUsed": False,
         "productionCommandsUsed": [],
         "roles": sorted({role["role"] for role in roles}),
+        "siteGroup": site_group,
     }
 )
 state_path.write_text(json.dumps(final, indent=2, sort_keys=True) + "\n")
@@ -1110,6 +1144,7 @@ topology_inject_role_metadata() {
     --arg prefix "$topology_safe_prefix" \
     --arg container "$container" \
     --arg artifactDir "$topology_artifact_dir" \
+    --arg siteGroup "$topology_site_group" \
     '
       . as $topology
       | ($topology.roles[] | select(.name == $roleName)) as $role
@@ -1119,6 +1154,7 @@ topology_inject_role_metadata() {
           prefix: $prefix,
           container: $container,
           artifactDir: $artifactDir,
+          siteGroup: $siteGroup,
           role: $role,
           declaredNetworks: $role.networks,
           credentials: $topology.credentials,
@@ -1520,7 +1556,7 @@ topology_run_scenario_driver() {
   local runner_role runner_container
   runner_role="$(topology_role_by_kind orchestrator)"
   runner_container="$(topology_role_container "$runner_role")"
-  container_exec "$runner_container" "python3 /tmp/mcl-rehearsal/scenario-driver.py '$scenario' /tmp/mcl-rehearsal/topology.json /tmp/mcl-rehearsal"
+  container_exec "$runner_container" "site_group=\$(jq -r '.siteGroup // empty' /etc/mcl-deployment-rehearsal/runtime.json); test -n \"\$site_group\"; python3 /tmp/mcl-rehearsal/scenario-driver.py '$scenario' /tmp/mcl-rehearsal/topology.json /tmp/mcl-rehearsal \"\$site_group\""
 }
 
 topology_capture_artifacts() {
