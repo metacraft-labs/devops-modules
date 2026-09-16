@@ -142,6 +142,37 @@ import ./governance.nix {
         description = "Touches Layer-0 or secrets.";
       }
     ];
+    # Two runner groups, chosen to exercise BOTH shapes of the emitter: an
+    # ordinary unrestricted group, and one that reserves capacity by refusing
+    # every workflow not on its admission list.
+    #
+    # The restricted shape is the load-bearing one. Under GitHub's capability
+    # matching you cannot reserve runners with a label — `runs-on` matches by
+    # SUBSET, so a reserved pool on the same hardware advertises a superset of
+    # what ordinary jobs ask for and is eligible for them — and you cannot
+    # advertise less, because GitHub attaches `self-hosted`/OS/arch to every
+    # self-hosted runner itself. `restricted_to_workflows` + `selected_workflows`
+    # is the only admission control in the system that is not label-based, which
+    # makes it the only way to express a reserved release lane.
+    runnerGroups = [
+      {
+        name = "example-shared";
+        visibility = "all";
+        allowsPublicRepositories = true;
+        restrictedToWorkflows = false;
+      }
+      {
+        name = "example-release-lane";
+        visibility = "all";
+        allowsPublicRepositories = true;
+        restrictedToWorkflows = true;
+        # Fully-qualified refs, no wildcards, and the CALLED workflow for a
+        # reusable pair — see the emitter's note in governance.nix.
+        selectedWorkflows = [
+          "example-org/infra/.github/workflows/release.yml@refs/heads/live"
+        ];
+      }
+    ];
     deferredResources = [ ];
   };
 
