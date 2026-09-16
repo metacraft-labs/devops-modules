@@ -73,6 +73,13 @@ inputs:
     required: false
     default: |
       nix-${{ runner.os }}-
+  reclaim_hosted_runner_disk:
+    description: >-
+      Reclaim space from a fixed allowlist of preinstalled toolchains before
+      Nix setup. This opt-in is accepted only on GitHub-hosted Linux runners.
+    type: boolean
+    required: false
+    default: false
   netbird-setup-key:
     description: Optional NetBird setup key. When set on a Linux GitHub-hosted runner, the action joins NetBird before configuring Nix substituters.
     required: false
@@ -97,6 +104,14 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    - name: Reclaim GitHub-hosted runner disk for Nix
+      if: ${{ fromJSON(inputs.reclaim_hosted_runner_disk || 'false') }}
+      shell: bash
+      env:
+        SETUP_NIX_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        SETUP_NIX_RUNNER_OS: ${{ runner.os }}
+      run: bash "${{ github.action_path }}/reclaim-hosted-runner-disk.sh"
+
     - name: Log GH API rate limits
       env:
         GH_TOKEN: ${{ github.token }}

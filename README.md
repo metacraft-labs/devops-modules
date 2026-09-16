@@ -111,6 +111,12 @@ jobs:
       working_directory: cloudflare
 ```
 
+Large Nix closures can opt into `reclaim_hosted_runner_disk: true` when the
+selected runner is standard GitHub-hosted Linux. Before installing or invoking
+Nix, Setup Nix removes only its fixed preinstalled-tool allowlist and fails if
+the runner identity is different or less than 20 GiB remains. The input
+defaults to `false`; do not enable it for self-hosted or non-Linux runners.
+
 #### [`reusable-update-flake-lock.yml`](.github/workflows/reusable-update-flake-lock.yml)
 
 Updates `flake.lock` and creates a PR. Supports GPG-signed commits.

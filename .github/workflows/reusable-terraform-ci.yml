@@ -37,6 +37,14 @@ on:
         required: false
         default: '["self-hosted", "Linux", "x86-64-v2"]'
 
+      reclaim_hosted_runner_disk:
+        description: >-
+          Reclaim a fixed allowlist of GitHub-hosted Linux image toolchains
+          before Nix setup. Fails closed on every other runner class.
+        type: boolean
+        required: false
+        default: false
+
       provider_allowlist:
         description: 'Comma-separated list of allowed provider source prefixes for denylist check (e.g. "cloudflare,google")'
         type: string
@@ -237,6 +245,7 @@ jobs:
         uses: ./.mcl/reusable-terraform-ci/.github/setup-nix
         with:
           push-to-cache: false
+          reclaim_hosted_runner_disk: ${{ inputs.reclaim_hosted_runner_disk }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
@@ -455,6 +464,7 @@ jobs:
         uses: ./.mcl/reusable-terraform-ci/.github/setup-nix
         with:
           push-to-cache: false
+          reclaim_hosted_runner_disk: ${{ inputs.reclaim_hosted_runner_disk }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
@@ -989,6 +999,7 @@ jobs:
         uses: ./.mcl/reusable-terraform-ci/.github/setup-nix
         with:
           push-to-cache: false
+          reclaim_hosted_runner_disk: ${{ inputs.reclaim_hosted_runner_disk }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
@@ -1260,6 +1271,7 @@ jobs:
         uses: ./.mcl/reusable-terraform-ci/.github/setup-nix
         with:
           push-to-cache: false
+          reclaim_hosted_runner_disk: ${{ inputs.reclaim_hosted_runner_disk }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
