@@ -12,8 +12,9 @@
 #     BundlePricing / SkuPricing budget types.
 #
 # A single org-scoped budget is included alongside to assert the two scopes do
-# not bleed into each other (org keeps path=/organizations/… and
-# budget_entity_name="" by default).
+# not bleed into each other (org keeps path=/organizations/… and, since the
+# engine pins BOTH scopes to the entity GitHub stores, budget_entity_name = its
+# own login — never the enterprise slug).
 #
 # No credentials, no network; the engine is pure builtins so `nix eval --json`
 # renders it directly. useS3Backend = false keeps the render backend-less.
@@ -33,7 +34,8 @@ import ../../actions-budgets.nix {
     };
   };
   # An org-scoped budget rendered in the SAME call: it must stay organization
-  # scoped with an empty entity_name, proving the enterprise axis is isolated.
+  # scoped with its OWN login as entity_name (not the enterprise slug), proving
+  # the enterprise axis is isolated.
   budgets = {
     "example-org" = {
       id = "852e9d35-0000-0000-0000-000000000000";
