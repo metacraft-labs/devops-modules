@@ -64,10 +64,40 @@
 #       "git_lfs_storage"                         # bare string == { sku = …; }
 #     ];
 #
-# `budgetType` is inferred (git_lfs* → SkuPricing, else ProductPricing) but can
-# be set explicitly per entry. Omitting `productSkus` keeps the legacy
-# single-SKU shape (`{ id; amount?; productSku? }`) and renders byte-for-byte as
-# before: one org-named resource on the "actions" product.
+# `budgetType` is inferred (git_lfs* → SkuPricing, ai_credits → BundlePricing,
+# else ProductPricing) but can be set explicitly per entry. Omitting
+# `productSkus` keeps the legacy single-SKU shape (`{ id; amount?; productSku? }`)
+# and renders byte-for-byte as before: one org-named resource on the "actions"
+# product.
+#
+# ENTERPRISE SCOPE. Some GitHub billing lives on an ENTERPRISE, not an org: two
+# enterprise-plan orgs that share one enterprise pool their spend, so an
+# org-scoped cap is not the authoritative ceiling — the enterprise budget is.
+# Pass `enterprises` (same value shape as `budgets`, keyed by enterprise slug) to
+# emit enterprise-scoped budgets:
+#
+#   * `budget_scope       = "enterprise"`,
+#   * `path               = /enterprises/{slug}/settings/billing/budgets`,
+#   * `budget_entity_name = {slug}` — pinned to the slug GitHub stores.
+#
+# `budget_entity_name` is IMMUTABLE on GitHub's side: a PATCH that CHANGES it
+# 400s, and magodo/restful sends the whole body on every PATCH. So enterprise
+# budgets ALWAYS carry the slug (never ""), and org budgets can opt into pinning
+# their login via `pinOrgEntityName = true`. The default stays "" so existing
+# org callers (e.g. metacraft-prod, which pins the login itself in a post-pass)
+# render byte-for-byte as before.
+#
+# The full $0-everywhere shape for an enterprise (all five capped SKUs):
+#
+#   enterprises."schelling-point-labs" = {
+#     productSkus = [
+#       "actions"          # minutes + actions storage/cache   (ProductPricing)
+#       "packages"         # Packages storage + bandwidth       (ProductPricing)
+#       "codespaces"       # Codespaces compute + storage       (ProductPricing)
+#       "ai_credits"       # Copilot / Models metered credits   (BundlePricing)
+#       "git_lfs_storage"  # Git LFS storage, a leaf SKU        (SkuPricing)
+#     ];
+#   };
 #
 # The token reaches the provider through a terraform variable (default
 # `github_billing_token`). Point the root's metadata.json at an agenix token
@@ -87,7 +117,17 @@
   #         amount ? 0; preventFurtherUsage ? true; }
   #     where amount/preventFurtherUsage act as per-org defaults each SKU entry
   #     may override. See the header comment for the valid SKU strings.
-  budgets,
+  budgets ? { },
+  # attrset: enterpriseSlug -> the SAME value shape as a `budgets` entry (legacy
+  # single-SKU or multi-SKU `productSkus`). Each yields ENTERPRISE-scoped budget
+  # resources: budget_scope="enterprise", path=/enterprises/<slug>/…, and
+  # budget_entity_name pinned to <slug> (the immutable value GitHub stores).
+  enterprises ? { },
+  # Opt-in: pin an ORGANIZATION budget's budget_entity_name to its org login
+  # (matching what GitHub stores for an org-scoped budget) instead of the "" the
+  # engine has always emitted. Off by default so existing org callers render
+  # byte-for-byte as before; enterprise budgets ALWAYS pin (see header).
+  pinOrgEntityName ? false,
   # Terraform variable name carrying the billing-scoped token. The concrete
   # root's metadata.json must set credentials_env_name = "TF_VAR_<this>".
   tokenVar ? "github_billing_token",
@@ -110,9 +150,17 @@ let
   # A ProductPricing budget caps every child SKU of a product, but Git LFS is
   # billed only through the leaf SKUs git_lfs_storage / git_lfs_bandwidth, which
   # belong to NO product — so an LFS entry has to be a single-SKU (SkuPricing)
-  # budget. Everything else defaults to the product-wide ProductPricing budget.
+  # budget. `ai_credits` is a metered BUNDLE (Copilot / Models credits), billed
+  # as BundlePricing rather than a product. Everything else defaults to the
+  # product-wide ProductPricing budget.
   inferBudgetType =
-    sku: if builtins.match "git_lfs.*" sku != null then "SkuPricing" else "ProductPricing";
+    sku:
+    if builtins.match "git_lfs.*" sku != null then
+      "SkuPricing"
+    else if sku == "ai_credits" then
+      "BundlePricing"
+    else
+      "ProductPricing";
 
   # Normalize one SKU entry (bare string == { sku = <string>; }) against the
   # org-level amount / preventFurtherUsage defaults.
@@ -129,11 +177,15 @@ let
       preventFurtherUsage = e.preventFurtherUsage or (cfg.preventFurtherUsage or true);
     };
 
-  # Per-org effective settings with defaults. Yields a LIST of budget entries:
+  # Per-entity effective settings with defaults. Yields a LIST of budget entries:
   # the multi-SKU shape maps `productSkus`; the legacy shape yields exactly one
-  # actions/ProductPricing entry named after the org, byte-for-byte as before.
+  # actions/ProductPricing entry named after the entity, byte-for-byte as before.
+  # `scope` ("organization" | "enterprise") and `entity` (org login | enterprise
+  # slug) travel on each entry so budgetResource can render the right path/scope/
+  # entity_name. For an ORGANIZATION entity this is identical to the pre-change
+  # behavior; the only new axis is the scope tag.
   norm =
-    org: cfg:
+    scope: entity: cfg:
     let
       legacy = !(cfg ? productSkus);
       skuEntries =
@@ -154,62 +206,87 @@ let
       e:
       e
       // {
-        inherit org;
-        # Legacy callers keep the bare org-named resource; multi-SKU callers get a
-        # unique <org>_<sku> label per (org, SKU).
-        name = sanitize (if legacy then org else "${org}_${e.sku}");
+        inherit scope entity;
+        # Legacy callers keep the bare entity-named resource; multi-SKU callers get
+        # a unique <entity>_<sku> label per (entity, SKU).
+        name = sanitize (if legacy then entity else "${entity}_${e.sku}");
       }
     ) skuEntries;
 
-  entries = builtins.concatLists (builtins.attrValues (builtins.mapAttrs norm budgets));
+  mkEntries =
+    scope: set: builtins.concatLists (builtins.attrValues (builtins.mapAttrs (norm scope) set));
 
-  # One restful_resource per org. `path` is the org's budgets collection; a POST
-  # creates the budget and returns its `id`; `read_path` then GETs the single
-  # budget by that id. The resource's terraform `id` (used for `terraform
-  # import`) is exactly that resolved read path — i.e.
-  #   /organizations/<org>/settings/billing/budgets/<budget-uuid>
-  # which is why the import commands below use the full path, not the bare uuid.
-  budgetResource = e: {
-    name = e.name;
-    value = {
-      path = "/organizations/${e.org}/settings/billing/budgets";
+  entries = (mkEntries "organization" budgets) ++ (mkEntries "enterprise" enterprises);
 
-      create_method = "POST";
-      update_method = "PATCH";
-      # Read a single budget by the id returned from the create response.
-      read_path = "$(path)/$(body.id)";
+  # One restful_resource per (entity, SKU). `path` is the entity's budgets
+  # collection — org- or enterprise-scoped; a POST creates the budget and returns
+  # its `id`; `read_path` then GETs the single budget by that id. The resource's
+  # terraform `id` (used for `terraform import`) is exactly that resolved read
+  # path — i.e.
+  #   /organizations/<org>/settings/billing/budgets/<budget-uuid>            (org)
+  #   /enterprises/<slug>/settings/billing/budgets/<budget-uuid>      (enterprise)
+  # which is why the import ids use the full path, not the bare uuid.
+  budgetResource =
+    e:
+    let
+      enterprise = e.scope == "enterprise";
+      collectionPath =
+        if enterprise then
+          "/enterprises/${e.entity}/settings/billing/budgets"
+        else
+          "/organizations/${e.entity}/settings/billing/budgets";
+      # Enterprise budgets ALWAYS pin the slug (immutable field, whole-body PATCH).
+      # Org budgets keep "" unless the caller opts into pinning the login.
+      entityName =
+        if enterprise then
+          e.entity
+        else if pinOrgEntityName then
+          e.entity
+        else
+          "";
+    in
+    {
+      name = e.name;
+      value = {
+        path = collectionPath;
 
-      # The declarative budget. `budget_type=ProductPricing` on a product SKU
-      # (e.g. actions/packages) caps every child SKU of that product; a leaf SKU
-      # (e.g. git_lfs_storage) uses `budget_type=SkuPricing`. `budget_amount=0` +
-      # `prevent_further_usage` is the hard-stop $0 cap (GitHub refuses to START
-      # further paid usage).
-      body = {
-        budget_amount = e.amount;
-        prevent_further_usage = e.preventFurtherUsage;
-        budget_scope = "organization";
-        budget_entity_name = "";
-        budget_type = e.budgetType;
-        budget_product_sku = e.sku;
-        budget_alerting = {
-          will_alert = false;
-          alert_recipients = [ ];
+        create_method = "POST";
+        update_method = "PATCH";
+        # Read a single budget by the id returned from the create response.
+        read_path = "$(path)/$(body.id)";
+
+        # The declarative budget. `budget_type=ProductPricing` on a product SKU
+        # (e.g. actions/packages) caps every child SKU of that product; a leaf SKU
+        # (e.g. git_lfs_storage) uses `budget_type=SkuPricing`; a metered bundle
+        # (ai_credits) uses `budget_type=BundlePricing`. `budget_amount=0` +
+        # `prevent_further_usage` is the hard-stop $0 cap (GitHub refuses to START
+        # further paid usage).
+        body = {
+          budget_amount = e.amount;
+          prevent_further_usage = e.preventFurtherUsage;
+          budget_scope = if enterprise then "enterprise" else "organization";
+          budget_entity_name = entityName;
+          budget_type = e.budgetType;
+          budget_product_sku = e.sku;
+          budget_alerting = {
+            will_alert = false;
+            alert_recipients = [ ];
+          };
         };
-      };
 
-      # These are sent on create/update but NOT tracked for drift: GitHub's GET
-      # representation of the budget metadata (entity name / alerting envelope)
-      # is not guaranteed to echo the write shape byte-for-byte, and we only
-      # care that scope/type/sku/amount/prevent_further_usage stay pinned. This
-      # keeps the post-import plan clean. If a real import shows drift on a
-      # tracked field (e.g. GitHub returns a capitalized scope), move that field
-      # here too and re-plan.
-      write_only_attrs = [
-        "budget_entity_name"
-        "budget_alerting"
-      ];
+        # These are sent on create/update but NOT tracked for drift: GitHub's GET
+        # representation of the budget metadata (entity name / alerting envelope)
+        # is not guaranteed to echo the write shape byte-for-byte, and we only
+        # care that scope/type/sku/amount/prevent_further_usage stay pinned. This
+        # keeps the post-import plan clean. If a real import shows drift on a
+        # tracked field (e.g. GitHub returns a capitalized scope), move that field
+        # here too and re-plan.
+        write_only_attrs = [
+          "budget_entity_name"
+          "budget_alerting"
+        ];
+      };
     };
-  };
 in
 {
   terraform = {
