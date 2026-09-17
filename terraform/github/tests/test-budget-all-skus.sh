@@ -55,8 +55,14 @@ check_budget example_multi_git_lfs_storage git_lfs_storage SkuPricing   # LFS le
 distinct="$(jq -r '.resource.restful_resource | to_entries[] | select(.key|startswith("example_multi_")) | .value.body.budget_product_sku' <<<"$json" | sort -u | wc -l | tr -d ' ')"
 [[ "$distinct" == "3" ]] || err "the three multi-SKU budgets must carry distinct budget_product_sku values"
 
-# --- (3) backward-compat: the legacy shape renders ONE actions budget, and it
-# is byte-for-byte identical to the pre-B2 engine (git HEAD) --------------------
+# --- (3) legacy shape renders ONE actions budget; the ONLY deltas from the
+# pre-fix engine (git HEAD) are the two intended bug fixes -----------------------
+# Bug 1: the create-response envelope selector  read_path $(body.id) -> $(body.budget.id).
+# Bug 2: an org budget now pins budget_entity_name to its login (was "") so the
+#        immutable-field PATCH no longer 400s.
+# We still hold the render to a byte-for-byte comparison against HEAD — but HEAD
+# is transformed by exactly those two documented changes first, so any OTHER
+# drift in the legacy render still fails the gate (the check is not weakened).
 [[ "$(jq -r '.resource.restful_resource | has("example_legacy")' <<<"$json")" == "true" ]] \
   || err "legacy caller must emit the org-named resource 'example_legacy' (no _<sku> suffix)"
 [[ "$(jq -r '.resource.restful_resource.example_legacy.body.budget_product_sku' <<<"$json")" == "actions" ]] \
@@ -65,18 +71,31 @@ distinct="$(jq -r '.resource.restful_resource | to_entries[] | select(.key|start
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 legacy_expr='{ useS3Backend = false; budgets = { "example-legacy" = { id = "852e9d35-0000-0000-0000-000000000000"; }; }; }'
 new_render="$(nix eval --json --impure --expr "(import ${engine} ${legacy_expr}).resource.restful_resource")"
+
+# Bug 1 (positive): the create-path config carries the nested selector so the
+# enveloped {budget:{id}} create response resolves $(body.budget.id).
+[[ "$(jq -r '.example_legacy.read_path' <<<"$new_render")" == '$(path)/$(body.budget.id)' ]] \
+  || err "legacy read_path must select the enveloped id via \$(body.budget.id), got $(jq -r '.example_legacy.read_path' <<<"$new_render")"
+# Bug 2 (positive): the org budget pins its login as the immutable entity_name.
+[[ "$(jq -r '.example_legacy.body.budget_entity_name' <<<"$new_render")" == "example-legacy" ]] \
+  || err "legacy org budget must pin budget_entity_name to its login 'example-legacy', got $(jq -r '.example_legacy.body.budget_entity_name' <<<"$new_render")"
+
 if git -C "${here}" show HEAD:terraform/github/actions-budgets.nix > "${work}/old-engine.nix" 2>/dev/null; then
   old_render="$(nix eval --json --impure --expr "(import ${work}/old-engine.nix ${legacy_expr}).resource.restful_resource")"
-  if ! diff <(jq -S . <<<"$old_render") <(jq -S . <<<"$new_render") >/dev/null; then
-    err "legacy single-SKU render drifted from the pre-B2 engine (git HEAD):"
-    diff <(jq -S . <<<"$old_render") <(jq -S . <<<"$new_render") >&2 || true
+  # Apply the two intended fixes to the HEAD render, then require exact equality:
+  # anything else that differs is unintended drift and fails the gate.
+  old_fixed="$(jq -S '.example_legacy.read_path = "$(path)/$(body.budget.id)"
+                    | .example_legacy.body.budget_entity_name = "example-legacy"' <<<"$old_render")"
+  if ! diff <(echo "$old_fixed") <(jq -S . <<<"$new_render") >/dev/null; then
+    err "legacy single-SKU render drifted from the pre-fix engine (git HEAD) beyond the two intended fixes:"
+    diff <(echo "$old_fixed") <(jq -S . <<<"$new_render") >&2 || true
   fi
 else
   echo "WARN[$gate]: could not load HEAD engine for byte-for-byte diff (skipping that sub-check)" >&2
 fi
 
 if [[ "$fail" == "0" ]]; then
-  echo "PASS: $gate (3 multi-SKU budgets: actions+packages+git_lfs_storage; legacy actions budget unchanged)"
+  echo "PASS: $gate (3 multi-SKU budgets: actions+packages+git_lfs_storage; legacy actions budget = HEAD + the two intended fixes)"
 else
   exit 1
 fi

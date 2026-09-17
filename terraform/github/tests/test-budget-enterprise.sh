@@ -8,8 +8,8 @@
 # budget_product_sku / budget_type across all FIVE capped SKUs (actions,
 # packages, codespaces → ProductPricing; ai_credits → BundlePricing;
 # git_lfs_storage → SkuPricing). AND that an org-scoped budget rendered in the
-# same call stays organization-scoped with an empty entity_name — the two axes
-# do not bleed.
+# same call stays organization-scoped with its login as entity_name (the engine
+# pins BOTH scopes to the entity GitHub stores) — the two axes do not bleed.
 #
 # Offline: the engine is pure builtins, so `nix eval --json` renders it with no
 # credentials, network, or provider plugins. Mirrors tests/test-budget-all-skus.sh.
@@ -50,8 +50,8 @@ check_ent() {
   b="$(jq -c '.body' <<<"$r")"
   [[ "$(jq -r '.path' <<<"$r")" == "/enterprises/${slug}/settings/billing/budgets" ]] \
     || err "${name}: path must be the enterprise collection, got $(jq -r '.path' <<<"$r")"
-  [[ "$(jq -r '.read_path' <<<"$r")" == '$(path)/$(body.id)' ]] \
-    || err "${name}: read_path must resolve the single budget under the collection"
+  [[ "$(jq -r '.read_path' <<<"$r")" == '$(path)/$(body.budget.id)' ]] \
+    || err "${name}: read_path must resolve the single budget via the enveloped id \$(body.budget.id) (Bug 1: create response is {budget:{id}})"
   [[ "$(jq -r '.prevent_further_usage' <<<"$b")" == "true" ]] || err "${name}: prevent_further_usage must be true"
   [[ "$(jq -r '.budget_amount' <<<"$b")" == "0" ]] || err "${name}: budget_amount must be 0"
   [[ "$(jq -r '.budget_scope' <<<"$b")" == "enterprise" ]] || err "${name}: budget_scope must be enterprise"
@@ -75,16 +75,18 @@ distinct="$(jq -r ".resource.restful_resource | to_entries[] | select(.key|start
 distinct_types="$(jq -r ".resource.restful_resource | to_entries[] | select(.key|startswith(\"${pfx}\")) | .value.body.budget_type" <<<"$json" | sort -u | wc -l | tr -d ' ')"
 [[ "$distinct_types" == "3" ]] || err "expected 3 distinct budget_type values (ProductPricing/BundlePricing/SkuPricing), got ${distinct_types}"
 
-# --- (3) scope isolation: the org-scoped budget stays organization/"" ----------
+# --- (3) scope isolation: the org-scoped budget stays organization + login -----
+# The engine pins BOTH scopes to the entity GitHub stores (immutable field), so
+# the org budget carries its login — NOT the enterprise slug, proving no bleed.
 o="$(res ".example_org")"
 [[ "$(jq -r '.path' <<<"$o")" == "/organizations/example-org/settings/billing/budgets" ]] \
   || err "org budget must use the /organizations/… collection"
 [[ "$(jq -r '.body.budget_scope' <<<"$o")" == "organization" ]] || err "org budget must stay organization-scoped"
-[[ "$(jq -r '.body.budget_entity_name' <<<"$o")" == "" ]] \
-  || err "org budget budget_entity_name must stay \"\" by default (no bleed from the enterprise pin)"
+[[ "$(jq -r '.body.budget_entity_name' <<<"$o")" == "example-org" ]] \
+  || err "org budget budget_entity_name must be its login 'example-org' (pinned by default; NOT the enterprise slug '${slug}')"
 
 if [[ "$fail" == "0" ]]; then
-  echo "PASS: $gate (5 enterprise budgets on /enterprises/${slug}, entity=slug, types ProductPricing/BundlePricing/SkuPricing; org budget isolated)"
+  echo "PASS: $gate (5 enterprise budgets on /enterprises/${slug}, entity=slug, types ProductPricing/BundlePricing/SkuPricing; org budget isolated, entity=login)"
 else
   exit 1
 fi

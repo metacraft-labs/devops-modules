@@ -81,11 +81,14 @@
 #   * `budget_entity_name = {slug}` — pinned to the slug GitHub stores.
 #
 # `budget_entity_name` is IMMUTABLE on GitHub's side: a PATCH that CHANGES it
-# 400s, and magodo/restful sends the whole body on every PATCH. So enterprise
-# budgets ALWAYS carry the slug (never ""), and org budgets can opt into pinning
-# their login via `pinOrgEntityName = true`. The default stays "" so existing
-# org callers (e.g. metacraft-prod, which pins the login itself in a post-pass)
-# render byte-for-byte as before.
+# 400s, and magodo/restful sends the whole body on every PATCH. GitHub stores
+# the org login for an org-scoped budget (and the slug for an enterprise one),
+# so emitting "" made every post-import reconcile attempt "<login>" -> "" and
+# 400. The engine therefore pins BOTH scopes to the entity GitHub stores:
+# enterprise budgets carry the slug and org budgets carry the org login BY
+# DEFAULT (`pinOrgEntityName = true`). Set `pinOrgEntityName = false` only to
+# reproduce the legacy "" render (which cannot survive a PATCH and exists for
+# backward-compat inspection only).
 #
 # The full $0-everywhere shape for an enterprise (all five capped SKUs):
 #
@@ -123,11 +126,12 @@
   # resources: budget_scope="enterprise", path=/enterprises/<slug>/…, and
   # budget_entity_name pinned to <slug> (the immutable value GitHub stores).
   enterprises ? { },
-  # Opt-in: pin an ORGANIZATION budget's budget_entity_name to its org login
-  # (matching what GitHub stores for an org-scoped budget) instead of the "" the
-  # engine has always emitted. Off by default so existing org callers render
-  # byte-for-byte as before; enterprise budgets ALWAYS pin (see header).
-  pinOrgEntityName ? false,
+  # Pin an ORGANIZATION budget's budget_entity_name to its org login (matching
+  # what GitHub stores for an org-scoped budget). ON by default: GitHub 400s a
+  # PATCH that changes the immutable entity_name, so emitting "" breaks the
+  # post-import reconcile. Set to false ONLY to reproduce the legacy "" render;
+  # enterprise budgets ALWAYS pin their slug regardless (see header).
+  pinOrgEntityName ? true,
   # Terraform variable name carrying the billing-scoped token. The concrete
   # root's metadata.json must set credentials_env_name = "TF_VAR_<this>".
   tokenVar ? "github_billing_token",
@@ -220,9 +224,9 @@ let
 
   # One restful_resource per (entity, SKU). `path` is the entity's budgets
   # collection — org- or enterprise-scoped; a POST creates the budget and returns
-  # its `id`; `read_path` then GETs the single budget by that id. The resource's
-  # terraform `id` (used for `terraform import`) is exactly that resolved read
-  # path — i.e.
+  # its id in a `{budget:{id}}` envelope; `read_path` (`$(body.budget.id)`) then
+  # GETs the single budget by that id. The resource's terraform `id` (used for
+  # `terraform import`) is exactly that resolved read path — i.e.
   #   /organizations/<org>/settings/billing/budgets/<budget-uuid>            (org)
   #   /enterprises/<slug>/settings/billing/budgets/<budget-uuid>      (enterprise)
   # which is why the import ids use the full path, not the bare uuid.
@@ -235,8 +239,10 @@ let
           "/enterprises/${e.entity}/settings/billing/budgets"
         else
           "/organizations/${e.entity}/settings/billing/budgets";
-      # Enterprise budgets ALWAYS pin the slug (immutable field, whole-body PATCH).
-      # Org budgets keep "" unless the caller opts into pinning the login.
+      # budget_entity_name is immutable and magodo sends the whole body on every
+      # PATCH, so it must match what GitHub stores: the slug for an enterprise
+      # budget, the org login for an org budget. Org budgets pin by default;
+      # pinOrgEntityName = false forces the legacy "" (inspection only).
       entityName =
         if enterprise then
           e.entity
@@ -253,7 +259,14 @@ let
         create_method = "POST";
         update_method = "PATCH";
         # Read a single budget by the id returned from the create response.
-        read_path = "$(path)/$(body.id)";
+        # GitHub's budget-CREATE (POST) wraps the created record in an envelope:
+        #   {"message":"Budget successfully created.","budget":{"id":"<uuid>",…}}
+        # so the new id lives at `budget.id`, NOT top-level `id`. magodo/restful
+        # resolves this `$(body.…)` gjson path ONCE, against the create response,
+        # to compute the resource id (the read path); reads/updates then use that
+        # stored id and imports supply it directly — so the nested selector fixes
+        # first-time CREATE while leaving IMPORT/READ/UPDATE untouched.
+        read_path = "$(path)/$(body.budget.id)";
 
         # The declarative budget. `budget_type=ProductPricing` on a product SKU
         # (e.g. actions/packages) caps every child SKU of that product; a leaf SKU
