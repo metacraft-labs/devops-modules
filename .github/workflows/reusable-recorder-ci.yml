@@ -78,7 +78,11 @@ jobs:
         with:
           env-flavor: ${{ inputs.env-flavor }}
           gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-cache: ${{ vars.ATTIC_CACHE }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
 
       - name: Prepare (recorder-specific)
         if: inputs.prepare-recipe != ''
