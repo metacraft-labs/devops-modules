@@ -85,6 +85,21 @@
 
       # Shell-safe token for a name (for sentinels / filenames).
       sanitizeName = name: lib.replaceStrings [ "-" "." "/" " " ":" ] [ "_" "_" "_" "_" "_" ] name;
+      # TOML basic-string escape for a value interpolated into `key = "..."`.
+      # A raw value breaks the file when it contains a backslash or quote: a
+      # Windows golden path such as `D:\storage\g.vhdx` emits `\s`/`\g`, which
+      # the provider binary rejects at startup with
+      #   toml: invalid escape in string '\s'
+      # so every CreateInstance fails before a clone can boot. Escape backslash
+      # and quote (and the control chars TOML mandates). Byte-identical for
+      # values with no special chars, so existing (POSIX-path) configs are
+      # unchanged; use it wherever a value could carry a backslash or quote.
+      tomlStr =
+        s:
+        lib.replaceStrings
+          [ "\\" "\"" "\n" "\r" "\t" ]
+          [ "\\\\" "\\\"" "\\n" "\\r" "\\t" ]
+          s;
       # systemd LoadCredential id + on-disk staged path for a credential's PEM.
       appKeyCredName = name: "app-key-${name}";
       stagedPemPath = name: "${stateDir}/app-key-${sanitizeName name}.pem";
@@ -295,9 +310,9 @@
           lib.mapAttrsToList (image: spec: ''
 
             [images."${image}"]
-            source_image = "${spec.sourceImage}"
-            os_name = "${spec.osName}"
-            os_version = "${spec.osVersion}"
+            source_image = "${tomlStr spec.sourceImage}"
+            os_name = "${tomlStr spec.osName}"
+            os_version = "${tomlStr spec.osVersion}"
           '') p.images
         );
       mkProviderConfigFile =
