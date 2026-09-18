@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7
 
       # What the file MAKES CURL SEND, which is a different claim from what the
       # file contains -- and the only one that can see the defect this guards.
