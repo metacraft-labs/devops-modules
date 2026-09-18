@@ -756,11 +756,20 @@ function Initialize-RunnerToolchain {
 	}
 	Write-Host "runner toolchain verified: $gitVersion"
 	Write-Host "runner toolchain verified: $bashVersion"
-	# git-lfs lives in PortableGit's cmd\ and mingw64\bin\, but the golden put
+	# git-lfs lives in PortableGit's cmd\ and its mingw bin\, but the golden put
 	# only bin\ on PATH -- bin\ has bash/sh/git yet no git-lfs.exe. Because git
 	# pre-exists, Install-RunnerToolchain never ran, so those dirs were never
 	# added. actions/checkout with lfs:true then fails before fetching. Put the
 	# directory that actually holds git-lfs.exe on PATH.
+	#
+	# THE MINGW DIRECTORY IS ARCH-SPECIFIC, and getting it wrong aborts the
+	# instance rather than degrading it -- the check below is fatal. Git for
+	# Windows names the directory after the toolchain that built it: mingw64\ on
+	# x86_64, clangarm64\ on ARM64. Measured in the pinned
+	# PortableGit-2.55.0.4-arm64 archive the Windows-ARM golden is provisioned
+	# from, clangarm64/bin/git-lfs.exe is the only copy and there is no mingw64\
+	# at all, so an x64-only candidate list takes the entire eph-win-arm64 lane
+	# down. Keep both names.
 	if ($null -eq (Get-Command git-lfs -ErrorAction SilentlyContinue)) {
 		$gitSrc = (Get-Command git).Source
 		$gitDir = Split-Path -Parent $gitSrc
@@ -771,8 +780,10 @@ function Initialize-RunnerToolchain {
 		}
 		$candidates = @(
 			(Join-Path $root 'cmd'),
+			(Join-Path $root 'clangarm64\bin'),
 			(Join-Path $root 'mingw64\bin'),
 			(Join-Path $PortableGitInstallDir 'cmd'),
+			(Join-Path $PortableGitInstallDir 'clangarm64\bin'),
 			(Join-Path $PortableGitInstallDir 'mingw64\bin')
 		)
 		foreach ($cand in $candidates) {

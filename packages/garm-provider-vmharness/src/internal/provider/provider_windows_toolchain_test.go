@@ -184,6 +184,65 @@ func TestWindowsBootstrapProvisionsToolchainBeforeRunnerStarts(t *testing.T) {
 	}
 }
 
+// TestWindowsBootstrapFindsGitLfsOnBothArchitectures pins the arch-specific
+// half of the git-lfs retrofit.
+//
+// PortableGit does not ship git-lfs.exe under a stable path. It lives in the
+// directory named after the toolchain Git for Windows was built with, and that
+// name differs per architecture: mingw64\bin on x86_64, clangarm64\bin on
+// ARM64. In the PortableGit-2.55.0.4-arm64 archive the Windows-ARM golden is
+// provisioned from there is no mingw64\ directory at all -- clangarm64/bin is
+// the only place git-lfs.exe exists.
+//
+// This matters more than a missing-PATH-entry bug usually would, because the
+// retrofit ends in Fail-Install: a candidate list that misses the real
+// directory does not degrade the runner, it aborts provisioning outright. An
+// x64-only list is exactly what took eph-win-arm64 down on m3 after its guests
+// started booting successfully -- every instance reached PowerShell and then
+// died on "git-lfs is not on PATH after provisioning".
+//
+// Asserting on both names is what makes this a regression test rather than a
+// restatement: dropping either one silently breaks one architecture's lane
+// while leaving the other green, so neither can be removed as redundant.
+func TestWindowsBootstrapFindsGitLfsOnBothArchitectures(t *testing.T) {
+	text := windowsBootstrapText(t)
+
+	lfsAt := strings.Index(text, "git-lfs")
+	if lfsAt < 0 {
+		t.Fatal("the Windows bootstrap performs no git-lfs provisioning at all; " +
+			"actions/checkout with lfs:true will fail in the guest")
+	}
+
+	for _, dir := range []string{`clangarm64\bin`, `mingw64\bin`} {
+		if !strings.Contains(text, dir) {
+			t.Errorf("the git-lfs search does not consider %s; PortableGit puts "+
+				"git-lfs.exe there on %s, so provisioning Fail-Installs and the "+
+				"whole lane goes down", dir, archForMingwDir(dir))
+		}
+	}
+
+	// The search must run before Fail-Install can fire on it, otherwise the
+	// candidate list is dead code and every guest aborts regardless. Anchor on
+	// the call, not on its message: the message is also quoted in the template's
+	// own comments, and matching those would compare the wrong offsets.
+	failAt := strings.Index(text, `Fail-Install 'git-lfs`)
+	if failAt < 0 {
+		t.Fatal("no Fail-Install guards git-lfs; a golden missing it would " +
+			"produce runners that fail at checkout time instead of at boot")
+	}
+	if candAt := strings.Index(text, `clangarm64\bin`); candAt > failAt {
+		t.Fatalf("the git-lfs candidate search (offset %d) runs after the "+
+			"Fail-Install that checks it (offset %d)", candAt, failAt)
+	}
+}
+
+func archForMingwDir(dir string) string {
+	if strings.HasPrefix(dir, "clangarm64") {
+		return "ARM64"
+	}
+	return "x86_64"
+}
+
 // TestLinuxBootstrapUnaffectedByWindowsToolchain keeps the change scoped: the
 // Linux template must not have grown Windows provisioning.
 func TestLinuxBootstrapUnaffectedByWindowsToolchain(t *testing.T) {
