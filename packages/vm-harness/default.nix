@@ -7,7 +7,7 @@
 }:
 # Runner-Fleet-Capability-Pools-And-Remote-Driving campaign, milestone RA2.
 #
-# The `vm-harness` CLI/daemon binary (public toolkit, metacraft-labs/vm-harness).
+# The `vm-harness` CLI/daemon binary (public toolkit, metacraft-labs/gosti).
 # Its SINGLE binary already includes `vm-harness serve` — the RA1 remoting
 # daemon (PR #25, merged on the `dev` branch) — so nothing separate needs
 # building for the serve deployment; `services.vm-harness-serve` just packages
@@ -28,7 +28,10 @@ stdenv.mkDerivation (finalAttrs: {
 
   src = fetchFromGitHub {
     owner = "metacraft-labs";
-    repo = "vm-harness";
+    # Repo renamed vm-harness -> gosti (GOSTI1); content-addressed hash is
+    # unchanged by the rename. The in-repo vm-harness/vmh CLI brand rename
+    # (pname, binary, share/ paths, serve service) is the GOSTI1b follow-up.
+    repo = "gosti";
     rev = "b5df21a2375446d2929a583a112d70d564085d21";
     hash = "sha256-XKtLJTpM+54EILNVeBOL3tHc1b8b9x0yw28CzkxAq3I=";
   };
@@ -59,7 +62,7 @@ stdenv.mkDerivation (finalAttrs: {
 
   meta = {
     description = "Cross-platform VM lifecycle orchestration (incl. the `vm-harness serve` remoting daemon)";
-    homepage = "https://github.com/metacraft-labs/vm-harness";
+    homepage = "https://github.com/metacraft-labs/gosti";
     license = lib.licenses.mit;
     mainProgram = "vm-harness";
     platforms = [
