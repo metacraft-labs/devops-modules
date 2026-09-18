@@ -43,7 +43,11 @@ Config (env):
   GHA_OUTPUT         path to the .prom textfile to write (required)
   GHA_API            GitHub API base (default https://api.github.com)
   GHA_TOKEN_FILE     file containing a GitHub token (optional; unauth otherwise)
-  GHA_REPOS_JSON     JSON list of {"owner","repo"} to inspect (required)
+  GHA_REPOS_FILE     path to a JSON file listing {"owner","repo"} to inspect
+                     (preferred; a path survives systemd's Environment= quote
+                     parsing intact, whereas inline JSON has its "-quotes eaten)
+  GHA_REPOS_JSON     inline JSON list of {"owner","repo"} (compat fallback when
+                     GHA_REPOS_FILE is unset)
   GHA_LOOKBACK_RUNS  recent completed runs per repo to inspect (default 40)
   GHA_SCAN_LOGS      "1"/"0" — fetch+scan logs of non-success jobs (default 1)
 
@@ -123,6 +127,22 @@ _NON_SUCCESS = {"failure", "cancelled", "timed_out", "stale"}
 def _read_file(path: str) -> str:
     with open(path, "r", encoding="utf-8") as fh:
         return fh.read().strip()
+
+
+def load_repos() -> list:
+    """The watched-repos list, from GHA_REPOS_FILE (a path) or GHA_REPOS_JSON.
+
+    GHA_REPOS_FILE wins: a filesystem path carries no shell-special characters,
+    so it survives systemd's `Environment=` shell-quote parsing unchanged. An
+    inline GHA_REPOS_JSON value, by contrast, has its JSON double-quotes stripped
+    by that same parsing before the process starts, which used to make the very
+    first `json.loads` here fail at runtime. GHA_REPOS_JSON is kept as a
+    compatibility path for ad-hoc invocation and tests.
+    """
+    path = os.environ.get("GHA_REPOS_FILE")
+    if path:
+        return json.loads(_read_file(path))
+    return json.loads(os.environ.get("GHA_REPOS_JSON", "[]"))
 
 
 def _request(url: str, token: str | None, raw: bool = False):
@@ -288,7 +308,7 @@ def main() -> int:
     if token_file and os.path.exists(token_file):
         token = _read_file(token_file)
 
-    repos = json.loads(os.environ.get("GHA_REPOS_JSON", "[]"))
+    repos = load_repos()
     lookback = int(os.environ.get("GHA_LOOKBACK_RUNS", "40"))
     scan_logs = os.environ.get("GHA_SCAN_LOGS", "1") != "0"
 

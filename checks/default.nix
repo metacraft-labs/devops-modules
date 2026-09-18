@@ -26,6 +26,7 @@
     ./fleet-alerting.nix
     ./alertmanager-routing.nix
     ./fit-monitoring.nix
+    ./fit-exporter-repos-env.nix
     ./hybrid-ci-runner.nix
     ./runner-mode-switch.nix
     ./runner-mode-manager.nix

@@ -49,6 +49,15 @@
           inherit (r) owner repo;
         }) cfg.repos
       );
+
+      # The watched-repos list is handed to the exporter as a FILE PATH, not as
+      # an inline JSON env value. systemd's `Environment=` directive parses
+      # shell-style quoting, so an inline `GHA_REPOS_JSON=[{"owner":…}]` has its
+      # double-quotes stripped before the process sees it and `json.loads` then
+      # fails at runtime. A path has no shell-special characters, so it survives
+      # intact — the exporter reads GHA_REPOS_FILE (falling back to the inline
+      # GHA_REPOS_JSON for ad-hoc invocation / tests).
+      reposFile = pkgs.writeText "github-actions-fit-repos.json" reposJson;
     in
     {
       options.services.github-actions-fit-exporter = {
@@ -145,7 +154,7 @@
               [
                 "GHA_OUTPUT=${cfg.textfileDir}/github-actions-fit.prom"
                 "GHA_API=${cfg.apiBase}"
-                "GHA_REPOS_JSON=${reposJson}"
+                "GHA_REPOS_FILE=${reposFile}"
                 "GHA_LOOKBACK_RUNS=${toString cfg.lookbackRuns}"
                 "GHA_SCAN_LOGS=${if cfg.scanLogs then "1" else "0"}"
               ]
