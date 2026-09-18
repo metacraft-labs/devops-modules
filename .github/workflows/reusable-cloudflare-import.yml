@@ -80,8 +80,8 @@ jobs:
   offline:
     runs-on: ${{ fromJSON(inputs.runner) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: metacraft-labs/devops-modules
           ref: ${{ inputs.nixos_modules_ref }}
@@ -135,8 +135,8 @@ jobs:
       || (github.event_name == 'workflow_dispatch' && inputs.mode == 'plan')
     runs-on: ${{ fromJSON(inputs.runner) }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: metacraft-labs/devops-modules
           ref: ${{ inputs.nixos_modules_ref }}
@@ -181,7 +181,7 @@ jobs:
           echo "token_path=$token_file" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials for plan
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           aws-region: ${{ inputs.aws_region }}
           role-to-assume: ${{ github.event_name == 'workflow_dispatch' && vars.AWS_TERRAFORM_DRIFT_ROLE_ARN || vars.AWS_TERRAFORM_PLAN_ROLE_ARN }}
@@ -295,8 +295,8 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runner) }}
     environment: production
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: metacraft-labs/devops-modules
           ref: ${{ inputs.nixos_modules_ref }}
@@ -337,7 +337,7 @@ jobs:
           echo "token_path=$token_file" >> "$GITHUB_OUTPUT"
 
       - name: Configure AWS credentials for apply
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           aws-region: ${{ inputs.aws_region }}
           role-to-assume: ${{ vars.AWS_TERRAFORM_APPLY_ROLE_ARN }}
