@@ -2273,6 +2273,7 @@
                       "hyperv"
                       "tart-macos"
                       "tart-linux-arm"
+                      "qemu-windows-arm"
                       "noop"
                     ];
                     default = "incus";
@@ -2280,6 +2281,13 @@
                       vm-harness backend id the REMOTE host drives (forwarded as
                       the remote `--backend`). `noop` is the sanctioned test
                       backend used by the `t_garm_provider_remote` gate.
+
+                      This is a SUBSET of the local `backend` enum above, and
+                      deliberately so: a backend belongs here only once a remote
+                      `vm-harness serve` is known to drive it. `qemu-windows-arm`
+                      qualified when m3 began serving Windows-ARM guests to the
+                      central controller; `utm-windows-arm` has not, and stays
+                      local-only until something serves it.
                     '';
                   };
                   authTokenFile = mkOption {

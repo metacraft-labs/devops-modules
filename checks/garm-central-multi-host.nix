@@ -206,6 +206,26 @@ top@{ ... }:
                     authTokenFile = "/run/agenix/vm-harness-serve/m3-token";
                   };
                 };
+                # m3 serves a SECOND guest class off the same daemon: Windows
+                # ARM64 under QEMU. Same endpoint and token as m3-tart, a
+                # different target_backend -- the hms-incus/hms-libvirt shape
+                # again, on the one host that is also double-served by its own
+                # per-host GARM.
+                #
+                # This entry is what keeps `qemu-windows-arm` in the
+                # `remote.targetBackend` enum. That enum is a strict subset of
+                # the local `backend` enum, so dropping the value is an EVAL
+                # ERROR here rather than a silent behaviour change -- which is
+                # the point: infra's central-garm.nix declares this exact
+                # provider, and without it m3's Windows-ARM pool cannot exist.
+                m3-qemu-winarm = {
+                  backend = "remote";
+                  remote = {
+                    endpoint = "100.83.174.120:8873";
+                    targetBackend = "qemu-windows-arm";
+                    authTokenFile = "/run/agenix/vm-harness-serve/m3-token";
+                  };
+                };
               };
             };
           }
@@ -386,22 +406,26 @@ top@{ ... }:
             nprov_p = int(controller.succeed(
                 f"grep -c '^\\[\\[provider\\]\\]' {tmpl}"
             ).strip())
-            assert nprov_p == 6, f"prod-shape: expected 6 providers, got {nprov_p}"
-            # LoadCredential: one serve-token per provider (six)
+            assert nprov_p == 7, f"prod-shape: expected 7 providers, got {nprov_p}"
+            # LoadCredential: one serve-token per provider (seven)
             ncred = int(controller.succeed(
                 f"grep -c 'serve-token-' {prod} || true"
             ).strip())
-            assert ncred >= 6, f"prod-shape: expected >=6 serve-token creds, got {ncred}"
+            assert ncred >= 7, f"prod-shape: expected >=7 serve-token creds, got {ncred}"
             # the realistic target backends are all present
             allbodies = controller.succeed(
                 f"for c in $(grep -oE '/nix/store/[a-z0-9]+-garm-provider-[a-z0-9_]+\\.toml' {tmpl} | sort -u); do cat $c; done"
             )
-            for tb in ["incus", "libvirt", "hyperv", "tart-macos"]:
+            for tb in ["incus", "libvirt", "hyperv", "tart-macos", "qemu-windows-arm"]:
                 assert f'target_backend = "{tb}"' in allbodies, \
                     f"prod-shape: missing target_backend {tb}"
             # hms's two providers share ONE endpoint (incus + libvirt on one daemon)
             hms_hits = allbodies.count('endpoint = "100.83.180.254:8873"')
             assert hms_hits == 2, f"prod-shape: hms endpoint should back 2 providers, got {hms_hits}"
+            # m3 does the same thing for a DIFFERENT reason: one macOS guest
+            # class and one Windows guest class off a single serve daemon.
+            m3_hits = allbodies.count('endpoint = "100.83.174.120:8873"')
+            assert m3_hits == 2, f"prod-shape: m3 endpoint should back 2 providers, got {m3_hits}"
 
             print("[t_garm_central_multi_host] PASS")
           '';
