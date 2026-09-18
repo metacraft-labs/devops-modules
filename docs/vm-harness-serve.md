@@ -4,7 +4,7 @@ Campaign: *CI Runner Fleet — vm-harness Remoting, Central GARM, Capability
 Pools* · milestone **RA2** (Linux/incus serve deployment).
 
 `services.vm-harness-serve` runs the RA1 [`vm-harness
-serve`](https://github.com/metacraft-labs/vm-harness/blob/dev/docs/serve.md)
+serve`](https://github.com/metacraft-labs/gosti/blob/dev/docs/serve.md)
 remoting daemon as a hardened systemd service. It is the **uniform network
 access point** that lets ONE central GARM's incus providers drive every Linux
 host's containers remotely (campaign Phase B) — replacing the per-host GARM and
