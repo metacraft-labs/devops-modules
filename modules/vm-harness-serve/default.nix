@@ -32,8 +32,23 @@
   # delivered out of the world-readable store via systemd `LoadCredential`
   # (agenix-provisioned ciphertext in infra).
   #
-  # It is idle-cheap / scale-to-zero-friendly: a single accept loop handling one
-  # connection at a time, no polling, no timers — an idle daemon costs ~nothing.
+  # It is idle-cheap / scale-to-zero-friendly: one acceptor thread plus a small
+  # bounded pool of request handlers, all parked in a blocking wait when idle —
+  # no polling and no busy loop, so an idle daemon costs ~nothing.
+  #
+  # Runner-Fleet-M3-ARM-Wave MA12 — THE HEALTHCHECK WATCHDOG. The daemon has
+  # twice gone silently deaf in production (high-mem-server, gpu-server-001),
+  # each time staying `active` with its port `LISTEN`ing while answering
+  # nothing, once for nineteen hours. `Restart=on-failure` cannot see that: the
+  # process never failed. The vm-harness side now bounds the damage three ways
+  # (a bounded handler pool, a dedicated acceptor that answers 503 rather than
+  # letting connections rot in the backlog, and a per-exec deadline), but none
+  # of those can bound the OUTAGE if the daemon is wedged for a reason nobody
+  # anticipated. So this module also ships the platform's own health
+  # supervision: a periodic timer that PROBES the listener and restarts the unit
+  # after repeated failures, modelled directly on the `services.garm`
+  # FU9 GARM-API-WATCHDOG in this repo, which exists for the same
+  # process-alive-but-API-dead failure.
   flake.modules.nixos.vm-harness-serve =
     {
       config,
@@ -69,6 +84,127 @@
       enrollCredPath = "%d/${enrollCredName}";
       runtimeDir = "vm-harness-serve";
       portFile = "/run/${runtimeDir}/port";
+
+      # ----- MA12 SERVE-LISTENER WATCHDOG ---------------------------------
+      hcfg = cfg.healthcheck;
+
+      # WHAT IS PROBED, and why it is emphatically NOT an authenticated call.
+      #
+      # An UNAUTHENTICATED GET /v1/info is answered 401 by a live daemon. That
+      # 401 is a SUCCESS signal here: producing it requires the accept, the
+      # dispatch to a handler, the request read and the response write — the
+      # entire path that was dead in production — while costing the daemon
+      # nothing, because the auth gate rejects before any dispatch work.
+      #
+      # The authenticated form would be actively harmful as a probe: it
+      # synchronously probes every registered hypervisor backend. MEASURED
+      # 2026-09-18 on an aarch64-darwin host: 16.7s authenticated versus 5ms
+      # unauthenticated. Probing that on a timer would both mistake a slow
+      # answer for a dead one and put a real periodic load on the host.
+      #
+      # It also keeps the watchdog credential-free — it never needs the bearer
+      # token, so no secret is staged into a root-run timer unit.
+      healthProbeURL = "http://${cfg.listenAddress}:${toString cfg.port}/v1/info";
+
+      healthCheckScript = pkgs.writeShellApplication {
+        name = "vm-harness-serve-healthcheck";
+        runtimeInputs = [
+          pkgs.coreutils
+          pkgs.curl
+          pkgs.systemd
+          pkgs.gnused
+        ];
+        text = ''
+          set -euo pipefail
+
+          url="${healthProbeURL}"
+          fail_file="/var/lib/vm-harness-serve-healthcheck/consecutive-failures"
+          last_restart_file="/var/lib/vm-harness-serve-healthcheck/last-restart"
+          threshold=${toString hcfg.failureThreshold}
+
+          log() { echo "vm-harness-serve-healthcheck: $*"; }
+
+          # Probe. `-o /dev/null -w %{http_code}` so the STATUS is inspected, not
+          # merely curl's exit code: a 503 means the daemon is up but has no
+          # free handler, which is a real degradation the watchdog must count as
+          # a failure rather than wave through as "it answered".
+          # `-w %{http_code}` ALREADY prints 000 when curl cannot reach the
+          # listener, so the old `|| echo "000"` appended a SECOND 000 and the
+          # variable became "000000" — which matched neither the `000)` wedge
+          # branch nor `200|401`, so the daemon's most important failure mode
+          # was logged as "unexpected HTTP". It still counted as a failure, so
+          # recovery worked; the diagnosis it printed did not. Keep curl's own
+          # output and only neutralise its exit status.
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+                   --max-time ${toString hcfg.probeTimeout} "$url" </dev/null \
+                 || true)
+          code=''${code:-000}
+
+          case "$code" in
+            401|200)
+              # Healthy: the listener accepted, dispatched and replied.
+              if [ -f "$fail_file" ] && [ "$(cat "$fail_file" 2>/dev/null || echo 0)" != "0" ]; then
+                log "listener healthy again (HTTP $code from $url) — resetting failure counter"
+              fi
+              printf '0' > "$fail_file"
+              exit 0
+              ;;
+            503)
+              log "listener answered 503 — every request handler is busy (saturated)"
+              ;;
+            000)
+              log "listener did not answer within ${toString hcfg.probeTimeout}s (timeout/refused) — the wedge signature"
+              ;;
+            *)
+              log "listener answered unexpected HTTP $code"
+              ;;
+          esac
+
+          # Only act if the unit is actually meant to be up. A stopped or failed
+          # daemon is systemd's job (Restart=on-failure); probing a deliberately
+          # stopped one must not manufacture a "recovery".
+          if [ "$(systemctl is-active vm-harness-serve.service 2>/dev/null || true)" != "active" ]; then
+            log "probe failed but vm-harness-serve.service is not active — leaving it to systemd (no watchdog action)"
+            printf '0' > "$fail_file"
+            exit 0
+          fi
+
+          fails=$(( $(cat "$fail_file" 2>/dev/null || echo 0) + 1 ))
+          printf '%s' "$fails" > "$fail_file"
+          log "probe failed ($url); consecutive failures = $fails/$threshold"
+
+          if [ "$fails" -lt "$threshold" ]; then
+            exit 0
+          fi
+
+          # Rate-limit, so a daemon that is wedged for a systemic reason is not
+          # restart-stormed. `systemd-analyze timespan` normalises any span to a
+          # "μs: <N>" line; fall back to 600s if parsing ever fails, so the
+          # limit is never silently a no-op.
+          now=$(date +%s)
+          min_gap_us=$(systemd-analyze timespan "${hcfg.minRestartInterval}" 2>/dev/null \
+            | sed -n 's/^[^0-9]*μs:[[:space:]]*\([0-9]\+\).*/\1/p' | head -n1)
+          if [ -n "''${min_gap_us:-}" ]; then
+            min_gap_s=$(( min_gap_us / 1000000 ))
+          else
+            min_gap_s=600
+          fi
+
+          if [ -f "$last_restart_file" ]; then
+            last=$(cat "$last_restart_file" 2>/dev/null || echo 0)
+            if [ $(( now - last )) -lt "$min_gap_s" ]; then
+              log "listener dead for $fails probes, but a watchdog restart happened $(( now - last ))s ago (< ''${min_gap_s}s) — RATE-LIMITED, not restarting"
+              exit 0
+            fi
+          fi
+
+          log "listener dead for $fails consecutive probes — restarting vm-harness-serve.service (watchdog recovery)"
+          printf '%s' "$now" > "$last_restart_file"
+          printf '0' > "$fail_file"
+          systemctl restart vm-harness-serve.service
+          log "vm-harness-serve.service restart issued"
+        '';
+      };
     in
     {
       options.services.vm-harness-serve = {
@@ -270,6 +406,103 @@
           '';
         };
 
+        serveThreads = mkOption {
+          type = types.nullOr types.int;
+          default = null;
+          example = 8;
+          description = ''
+            `serve --serve-threads <n>`: how many request-handler threads the
+            daemon runs behind its single acceptor. Null uses the daemon's own
+            auto-size, `max(4, CPU count)` capped at 32.
+
+            This bounds concurrency deliberately. Unbounded thread-per-connection
+            would turn a burst of slow requests into a denial of service of its
+            own; a bounded pool plus the acceptor's 503 turns the same burst into
+            an explicit, retryable answer.
+          '';
+        };
+
+        execDeadlineSec = mkOption {
+          type = types.nullOr types.int;
+          default = null;
+          example = 46800;
+          description = ''
+            `serve --exec-deadline-sec <n>`: wall-clock budget for a single
+            `/v1/exec`, after which the worker process is killed and the client
+            told why. Null uses the daemon default (46800s = 13h).
+
+            Keep this ABOVE the longest legitimate operation. The central GARM
+            provider forwards `--timeout-sec 43200` (12h) on runner creates, so a
+            deadline at or below that would kill live CI runners — a worse
+            failure than the leak it bounds. It is a leak bound, not a latency
+            bound: what bounds an OUTAGE is {option}`healthcheck`.
+          '';
+        };
+
+        # ── MA12 listener watchdog ────────────────────────────────────────────
+        healthcheck = {
+          enable = mkOption {
+            type = types.bool;
+            default = true;
+            description = ''
+              Periodically probe the serve listener and restart the unit when it
+              stops answering — recovering a daemon that is process-alive but
+              request-dead.
+
+              Default TRUE, unlike most `enable` options in this repo, because
+              the failure it recovers has happened twice in production and was
+              invisible to every other mechanism: the process lives, all threads
+              are present, the port listens, and `systemctl is-active` says
+              nothing is wrong. An operator must opt OUT of supervision here,
+              not into it.
+            '';
+          };
+
+          interval = mkOption {
+            type = types.str;
+            default = "1m";
+            description = ''
+              How often to probe (a `systemd.time` span). The probe is a single
+              unauthenticated loopback request that a healthy daemon answers in
+              milliseconds, so a short interval is essentially free.
+            '';
+          };
+
+          probeTimeout = mkOption {
+            type = types.int;
+            default = 5;
+            description = ''
+              Seconds one probe may take before it counts as failed. A healthy
+              daemon answers the unauthenticated probe in milliseconds; this is
+              set well above that so ordinary host load can never be mistaken
+              for a wedge.
+            '';
+          };
+
+          failureThreshold = mkOption {
+            type = types.int;
+            default = 3;
+            description = ''
+              How many CONSECUTIVE failed probes before the unit is restarted. A
+              single failure never acts — with the default {option}`interval`
+              this means the listener has been unresponsive for ~3 minutes,
+              which no healthy state produces and which is three orders of
+              magnitude below the 19-hour outage it exists to prevent.
+            '';
+          };
+
+          minRestartInterval = mkOption {
+            type = types.str;
+            default = "10m";
+            description = ''
+              Minimum wall-clock time between two watchdog-initiated restarts. A
+              daemon wedging for a systemic reason must not be restart-stormed;
+              after this the watchdog keeps logging and leaves the host in a
+              state an operator can inspect.
+            '';
+          };
+        };
+
         overlayInterface = mkOption {
           type = types.nullOr types.str;
           default = "nb-default";
@@ -362,12 +595,15 @@
               ++ optional (cfg.enrollSecretFile != null) "--enroll-secret-file ${enrollCredPath}"
               ++ optional (cfg.identityTtlSec != null) "--identity-ttl-sec ${toString cfg.identityTtlSec}"
               ++ optional (cfg.hostId != null) "--host-id ${cfg.hostId}"
+              # MA12: concurrency bound + per-exec deadline. Both null by
+              # default, leaving the daemon's own documented defaults in force.
+              ++ optional (cfg.serveThreads != null) "--serve-threads ${toString cfg.serveThreads}"
+              ++ optional (cfg.execDeadlineSec != null) "--exec-deadline-sec ${toString cfg.execDeadlineSec}"
             );
-            LoadCredential =
-              [ "${credName}:${toString cfg.authTokenFile}" ]
-              ++ optional (
-                cfg.enrollSecretFile != null
-              ) "${enrollCredName}:${toString cfg.enrollSecretFile}";
+            LoadCredential = [
+              "${credName}:${toString cfg.authTokenFile}"
+            ]
+            ++ optional (cfg.enrollSecretFile != null) "${enrollCredName}:${toString cfg.enrollSecretFile}";
             # Fail fast + loud if the agenix secret is missing at start.
             # (unitConfig below.)
 
@@ -430,6 +666,48 @@
           };
 
           unitConfig.AssertPathExists = [ (toString cfg.authTokenFile) ];
+        };
+
+        # ---- MA12 SERVE-LISTENER WATCHDOG: health-check service + timer ----
+        # A periodic oneshot that probes the listener on the SAME address+port
+        # the daemon binds. It restarts vm-harness-serve.service ONLY after
+        # `failureThreshold` consecutive unanswered/saturated probes, and never
+        # more often than `minRestartInterval`.
+        #
+        # It runs as ROOT (it must `systemctl restart` the unit) but does only a
+        # loopback-ish curl, a counter file under its own state dir, and one
+        # restart. The heavy sandbox the daemon itself carries is unnecessary
+        # here and would block the systemctl D-Bus call, so this is
+        # intentionally light — matching the garm-healthcheck precedent.
+        #
+        # NOTE the state dir is the watchdog's OWN, never the daemon's. Sharing
+        # StateDirectory with the supervised unit is what made garm-healthcheck
+        # re-chown /var/lib/garm to root on every run and break garm's DB
+        # access; that lesson is inherited here rather than relearned.
+        systemd.services.vm-harness-serve-healthcheck = mkIf hcfg.enable {
+          description = "vm-harness serve listener health-check watchdog (auto-recover a process-alive-but-request-dead daemon)";
+          after = [ "vm-harness-serve.service" ];
+          serviceConfig = {
+            Type = "oneshot";
+            ExecStart = lib.getExe healthCheckScript;
+            StateDirectory = "vm-harness-serve-healthcheck";
+            ProtectSystem = "strict";
+            NoNewPrivileges = true;
+            ProtectHome = true;
+            PrivateTmp = true;
+          };
+        };
+
+        systemd.timers.vm-harness-serve-healthcheck = mkIf hcfg.enable {
+          description = "Periodic vm-harness serve listener health-check (MA12 watchdog)";
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            OnBootSec = hcfg.interval;
+            OnUnitActiveSec = hcfg.interval;
+            # If the machine was asleep, do not fire a burst of catch-up runs.
+            AccuracySec = "10s";
+            Unit = "vm-harness-serve-healthcheck.service";
+          };
         };
       };
     };

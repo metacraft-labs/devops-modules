@@ -32,8 +32,21 @@
   # `LoadCredential`, so the daemon reads the decrypted file, which must be
   # readable by {option}`user` (root by default).
   #
-  # It is idle-cheap / scale-to-zero-friendly: a single accept loop handling one
-  # connection at a time, no polling, no timers — an idle daemon costs ~nothing.
+  # It is idle-cheap / scale-to-zero-friendly: one acceptor thread plus a small
+  # bounded pool of request handlers, all parked in a blocking wait when idle —
+  # no polling and no busy loop, so an idle daemon costs ~nothing.
+  #
+  # Runner-Fleet-M3-ARM-Wave MA12 — THE HEALTHCHECK WATCHDOG, and why it is a
+  # SECOND launchd job rather than a unit setting. The daemon has twice gone
+  # silently deaf in production: the process lives, its port listens, and it
+  # answers nothing. launchd's `KeepAlive` cannot see that — it only reacts to
+  # the process EXITING, so a wedged-but-alive daemon is invisible to it, and
+  # launchd has no equivalent of systemd's `WatchdogSec` for a job to prove its
+  # own liveness. The platform's only mechanism for "run this check
+  # periodically" is a job with `StartInterval`, so that is what this is: the
+  # launchd-native analogue of the Linux sibling's systemd timer, doing the
+  # same probe and issuing `launchctl kickstart -k` where the Linux side issues
+  # `systemctl restart`.
   flake.modules.darwin.vm-harness-serve =
     {
       config,
@@ -59,6 +72,118 @@
       );
 
       portFile = "${cfg.stateDir}/port";
+
+      # ----- MA12 SERVE-LISTENER WATCHDOG ---------------------------------
+      hcfg = cfg.healthcheck;
+
+      # WHAT IS PROBED — identical reasoning to the Linux sibling, and it
+      # matters more here, not less. An UNAUTHENTICATED GET /v1/info is answered
+      # 401 by a live daemon; producing that 401 still requires accept →
+      # dispatch → read → respond, the whole path that dies in the wedge, but
+      # costs nothing because auth rejects before any dispatch work.
+      #
+      # The AUTHENTICATED form probes every registered hypervisor backend
+      # synchronously. MEASURED 2026-09-18 on aarch64-darwin: 16.7s
+      # authenticated versus 5ms unauthenticated. On a tart host that sweep also
+      # shells out to `tart`, so probing it on a timer would put real periodic
+      # load on the very host whose CI capacity this campaign is trying to add.
+      #
+      # It also keeps the watchdog credential-free: no bearer token is staged
+      # into a root-run periodic job.
+      healthProbeURL = "http://${cfg.listenAddress}:${toString cfg.port}/v1/info";
+
+      healthCheckScript = pkgs.writeShellApplication {
+        name = "vm-harness-serve-healthcheck";
+        runtimeInputs = [
+          pkgs.coreutils
+          pkgs.curl
+        ];
+        text = ''
+          set -euo pipefail
+
+          url="${healthProbeURL}"
+          state="${cfg.stateDir}/healthcheck"
+          fail_file="$state/consecutive-failures"
+          last_restart_file="$state/last-restart"
+          threshold=${toString hcfg.failureThreshold}
+          min_gap_s=${toString hcfg.minRestartIntervalSec}
+          label=${lib.escapeShellArg cfg.label}
+
+          mkdir -p "$state"
+          log() { echo "vm-harness-serve-healthcheck: $*"; }
+
+          # Inspect the STATUS, not merely curl's exit code: a 503 means the
+          # daemon is up but every request handler is busy, which is a real
+          # degradation the watchdog must count as a failure rather than wave
+          # through as "it answered".
+          # `-w %{http_code}` ALREADY prints 000 when curl cannot reach the
+          # listener, so the old `|| echo "000"` appended a SECOND 000 and the
+          # variable became "000000" — which matched neither the `000)` wedge
+          # branch nor `200|401`, so the daemon's most important failure mode
+          # was logged as "unexpected HTTP". It still counted as a failure, so
+          # recovery worked; the diagnosis it printed did not. Keep curl's own
+          # output and only neutralise its exit status.
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+                   --max-time ${toString hcfg.probeTimeout} "$url" </dev/null \
+                 || true)
+          code=''${code:-000}
+
+          case "$code" in
+            401|200)
+              if [ -f "$fail_file" ] && [ "$(cat "$fail_file" 2>/dev/null || echo 0)" != "0" ]; then
+                log "listener healthy again (HTTP $code from $url) — resetting failure counter"
+              fi
+              printf '0' > "$fail_file"
+              exit 0
+              ;;
+            503)
+              log "listener answered 503 — every request handler is busy (saturated)"
+              ;;
+            000)
+              log "listener did not answer within ${toString hcfg.probeTimeout}s (timeout/refused) — the wedge signature"
+              ;;
+            *)
+              log "listener answered unexpected HTTP $code"
+              ;;
+          esac
+
+          # Only act if launchd believes the job is loaded. `launchctl print`
+          # exits non-zero for an unknown/unloaded label, which is the darwin
+          # analogue of the Linux sibling's `systemctl is-active` guard: a
+          # deliberately unloaded daemon must not be "recovered".
+          if ! /bin/launchctl print "system/$label" >/dev/null 2>&1; then
+            log "probe failed but launchd job $label is not loaded — no watchdog action"
+            printf '0' > "$fail_file"
+            exit 0
+          fi
+
+          fails=$(( $(cat "$fail_file" 2>/dev/null || echo 0) + 1 ))
+          printf '%s' "$fails" > "$fail_file"
+          log "probe failed ($url); consecutive failures = $fails/$threshold"
+
+          if [ "$fails" -lt "$threshold" ]; then
+            exit 0
+          fi
+
+          now=$(date +%s)
+          if [ -f "$last_restart_file" ]; then
+            last=$(cat "$last_restart_file" 2>/dev/null || echo 0)
+            if [ $(( now - last )) -lt "$min_gap_s" ]; then
+              log "listener dead for $fails probes, but a watchdog restart happened $(( now - last ))s ago (< ''${min_gap_s}s) — RATE-LIMITED, not restarting"
+              exit 0
+            fi
+          fi
+
+          log "listener dead for $fails consecutive probes — kickstarting $label (watchdog recovery)"
+          printf '%s' "$now" > "$last_restart_file"
+          printf '0' > "$fail_file"
+          # `kickstart -k` kills the running job and starts it again — the
+          # launchd equivalent of `systemctl restart`. Plain `kickstart` would
+          # be a no-op against a job that is already (uselessly) running.
+          /bin/launchctl kickstart -k "system/$label"
+          log "$label kickstart issued"
+        '';
+      };
     in
     {
       options.services.vm-harness-serve = {
@@ -247,6 +372,140 @@
           default = "org.metacraft-labs.vm-harness-serve";
           description = "launchd job Label.";
         };
+
+        serveThreads = mkOption {
+          type = types.nullOr types.int;
+          default = null;
+          example = 8;
+          description = ''
+            `serve --serve-threads <n>`: how many request-handler threads the
+            daemon runs behind its single acceptor. Null uses the daemon's own
+            auto-size, `max(4, CPU count)` capped at 32.
+
+            Bounded deliberately: unbounded thread-per-connection would turn a
+            burst of slow requests into a denial of service of its own, whereas
+            a bounded pool plus the acceptor's 503 turns the same burst into an
+            explicit, retryable answer.
+          '';
+        };
+
+        execDeadlineSec = mkOption {
+          type = types.nullOr types.int;
+          default = null;
+          example = 46800;
+          description = ''
+            `serve --exec-deadline-sec <n>`: wall-clock budget for a single
+            `/v1/exec`, after which the worker is killed and the client told
+            why. Null uses the daemon default (46800s = 13h).
+
+            Keep it ABOVE the longest legitimate operation — the central GARM
+            provider forwards `--timeout-sec 43200` (12h) on runner creates, so
+            a shorter deadline would kill live CI runners. It bounds a LEAK, not
+            latency; what bounds an OUTAGE is {option}`healthcheck`.
+          '';
+        };
+
+        openFilesLimit = mkOption {
+          type = types.int;
+          default = 8192;
+          example = 16384;
+          description = ''
+            Per-job soft `NumberOfFiles` limit (launchd `SoftResourceLimits`).
+
+            macOS's default soft limit is **256**, and a launchd daemon inherits
+            it — the interactive shell's much larger `ulimit -n` does not apply,
+            because the daemon is not started from a shell. A concurrent serve
+            exceeds 256 easily: every in-flight request holds a client socket
+            plus the spawned worker's stdio pipes, and each `/v1/exec` that
+            carries user-data opens a staging file.
+
+            Measured on m3: the daemon sat at 258 open descriptors against the
+            256 ceiling, and the resulting `EMFILE` surfaced on the CONTROLLER
+            as `failed to start worker: Too many open files` / `failed to stage
+            user-data: Too many open files` — provider errors that name the
+            symptom and not the cause. Every central-GARM pool creation failed
+            while the identical request through the per-host GARM kept working,
+            because that path runs in a shell-descended process.
+
+            8192 is far above any plausible concurrency here (the handler pool
+            is CPU-sized, tens not thousands) and costs nothing when unused —
+            this is a CEILING, not a reservation. The system-wide hard limit is
+            already `unlimited`, so raising the soft one needs no other change.
+          '';
+        };
+
+        # ── MA12 listener watchdog ────────────────────────────────────────────
+        healthcheck = {
+          enable = mkOption {
+            type = types.bool;
+            default = true;
+            description = ''
+              Periodically probe the serve listener and `launchctl kickstart -k`
+              the daemon when it stops answering.
+
+              Default TRUE, unlike most `enable` options here, because the
+              failure it recovers is invisible to everything else on this
+              platform: launchd's `KeepAlive` reacts only to the process
+              exiting, and a wedged daemon does not exit. It has happened twice
+              in production, once for nineteen hours. An operator must opt OUT
+              of supervision, not into it.
+            '';
+          };
+
+          interval = mkOption {
+            type = types.int;
+            default = 60;
+            description = ''
+              Seconds between probes (launchd `StartInterval`, which takes a
+              plain integer — there is no `systemd.time` span syntax here). The
+              probe is a single unauthenticated request a healthy daemon answers
+              in milliseconds, so a short interval is essentially free.
+            '';
+          };
+
+          probeTimeout = mkOption {
+            type = types.int;
+            default = 5;
+            description = ''
+              Seconds one probe may take before it counts as failed. Set well
+              above a healthy daemon's millisecond answer so ordinary host load
+              — and on m3 that means real CI load — can never be mistaken for a
+              wedge.
+            '';
+          };
+
+          failureThreshold = mkOption {
+            type = types.int;
+            default = 3;
+            description = ''
+              How many CONSECUTIVE failed probes before the job is kickstarted.
+              A single failure never acts; with the default {option}`interval`
+              this means ~3 minutes unresponsive, which no healthy state
+              produces.
+            '';
+          };
+
+          minRestartIntervalSec = mkOption {
+            type = types.int;
+            default = 600;
+            description = ''
+              Minimum seconds between two watchdog-initiated kickstarts, so a
+              daemon wedging for a systemic reason is not restart-stormed but
+              left in a state an operator can inspect.
+            '';
+          };
+
+          standardOutLog = mkOption {
+            type = types.str;
+            default = "/var/log/vm-harness-serve/healthcheck.log";
+            description = ''
+              Where the watchdog's own output goes. Deliberately a SEPARATE file
+              from the daemon's: the whole point of this job is to say something
+              when the daemon has gone quiet, and interleaving it with the log
+              that just stopped moving would bury exactly that signal.
+            '';
+          };
+        };
       };
 
       config = mkIf cfg.enable {
@@ -279,7 +538,8 @@
           ${lib.getExe' pkgs.coreutils "install"} -d -m 0750 -o root -g wheel \
             ${lib.escapeShellArg cfg.stateDir} \
             ${lib.escapeShellArg (builtins.dirOf cfg.standardOutLog)} \
-            ${lib.escapeShellArg (builtins.dirOf cfg.standardErrorLog)}
+            ${lib.escapeShellArg (builtins.dirOf cfg.standardErrorLog)} \
+            ${lib.escapeShellArg (builtins.dirOf hcfg.standardOutLog)}
         '';
 
         launchd.daemons.vm-harness-serve = {
@@ -313,6 +573,16 @@
             ++ optionals (cfg.hostId != null) [
               "--host-id"
               cfg.hostId
+            ]
+            # MA12: concurrency bound + per-exec deadline. Both null by default,
+            # leaving the daemon's own documented defaults in force.
+            ++ optionals (cfg.serveThreads != null) [
+              "--serve-threads"
+              (toString cfg.serveThreads)
+            ]
+            ++ optionals (cfg.execDeadlineSec != null) [
+              "--exec-deadline-sec"
+              (toString cfg.execDeadlineSec)
             ];
 
             EnvironmentVariables = {
@@ -329,12 +599,67 @@
             };
             RunAtLoad = true;
             ThrottleInterval = 10;
+
+            # THE macOS DEFAULT IS 256 AND IT IS NOT ENOUGH — measured, not
+            # precautionary. `launchctl limit maxfiles` on m3 reports a SOFT
+            # limit of 256, and a launchd daemon inherits it unless the plist
+            # says otherwise; the shell's own `ulimit -n` of 1048576 is
+            # irrelevant because the daemon is not started from a shell.
+            #
+            # A concurrent serve blows through that. Each in-flight request
+            # holds the client socket plus the spawned worker's stdio pipes,
+            # `--serve-threads` defaults to a pool sized from the CPU count, and
+            # user-data staging opens a file per exec. m3's daemon sat at 258
+            # open fds against the 256 ceiling, and the failure surfaced on the
+            # CONTROLLER as provider errors that name the symptom without the
+            # cause:
+            #
+            #   failed to start worker: Too many open files
+            #   failed to stage user-data: Too many open files
+            #
+            # That is an EMFILE, not a permissions or path problem, and it made
+            # every central-GARM pool creation fail while the identical request
+            # through the per-host GARM kept working — because that path runs in
+            # a shell-descended process with the large soft limit.
+            #
+            # `SoftResourceLimits` is what launchd honours per-job. The hard
+            # limit is already `unlimited` system-wide, so raising the soft one
+            # needs no other change.
+            SoftResourceLimits = {
+              NumberOfFiles = cfg.openFilesLimit;
+            };
+
             StandardOutPath = cfg.standardOutLog;
             StandardErrorPath = cfg.standardErrorLog;
             WorkingDirectory = cfg.stateDir;
           }
           // lib.optionalAttrs (cfg.user != null) { UserName = cfg.user; }
           // lib.optionalAttrs (cfg.group != null) { GroupName = cfg.group; };
+        };
+
+        # ---- MA12 SERVE-LISTENER WATCHDOG (launchd StartInterval job) ------
+        # The launchd-native analogue of the Linux sibling's systemd timer.
+        # `StartInterval` is launchd's only "run this periodically" primitive,
+        # and a separate job is the only way to supervise a daemon that is alive
+        # but unresponsive — `KeepAlive` on the daemon itself cannot observe
+        # that, and launchd has no `WatchdogSec`.
+        #
+        # It runs in the system domain (root) because `launchctl kickstart -k
+        # system/<label>` requires it, and it is deliberately tiny: one curl,
+        # one counter file, one kickstart.
+        launchd.daemons.vm-harness-serve-healthcheck = lib.mkIf hcfg.enable {
+          serviceConfig = {
+            Label = "${cfg.label}-healthcheck";
+            ProgramArguments = [ (lib.getExe healthCheckScript) ];
+            StartInterval = hcfg.interval;
+            # Do NOT RunAtLoad: the first probe should land one interval after
+            # activation, not race the daemon's own startup and count a
+            # not-yet-bound listener as a failure.
+            RunAtLoad = false;
+            StandardOutPath = hcfg.standardOutLog;
+            StandardErrorPath = hcfg.standardOutLog;
+            WorkingDirectory = cfg.stateDir;
+          };
         };
       };
     };

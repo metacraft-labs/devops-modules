@@ -31,8 +31,33 @@ consumes these options.
      (an assertion rejects the wildcard); and
   2. the port is opened on the overlay interface's firewall zone ONLY
      (`networking.firewall.interfaces.<iface>`), never the global firewall.
-- Idle-cheap / scale-to-zero-friendly: a single accept loop, one connection at
-  a time, no timers — an idle daemon costs ~nothing.
+- Idle-cheap / scale-to-zero-friendly: one acceptor thread plus a small bounded
+  pool of request handlers, all parked in a blocking wait when idle — an idle
+  daemon costs ~nothing.
+- **A listener health watchdog (MA12), enabled by default.** A periodic probe
+  restarts the daemon when it stops ANSWERING, which is a state nothing else on
+  either platform can observe: the process is alive, every thread is present,
+  the port is `LISTEN`ing, and `systemctl is-active` reports no problem. That
+  is exactly how the daemon went silently deaf twice in production
+  (high-mem-server, gpu-server-001), once for nineteen hours, with `ss -lnt`
+  showing a full accept backlog (`Recv-Q 4097` against `Send-Q 4096`) and
+  callers timing out rather than being refused.
+
+  On Linux it is a `systemd.timer` + oneshot that `systemctl restart`s the
+  unit; on darwin a launchd `StartInterval` job that `launchctl kickstart -k`s
+  it, because launchd's `KeepAlive` reacts only to the process EXITING and has
+  no `WatchdogSec` equivalent. Both restart only after
+  `healthcheck.failureThreshold` CONSECUTIVE failures and never more often than
+  `healthcheck.minRestartInterval`, so a busy daemon is never restarted and a
+  systemically wedged one is never restart-stormed.
+
+  The probe is an UNAUTHENTICATED `GET /v1/info`, whose healthy answer is
+  `401` — producing it still requires accept → dispatch → read → respond, but
+  costs the daemon nothing, and needs no bearer token in a root-run unit. A
+  `503` (every handler busy) and a timeout both count as failures. Probing the
+  endpoint AUTHENTICATED would be the wrong instrument: it sweeps every
+  registered hypervisor backend synchronously — measured 2026-09-18 at 16.7 s
+  authenticated versus 5 ms unauthenticated.
 
 The daemon's single `vm-harness` binary already contains `serve`; the module
 defaults `package` to this flake's vendored `vm-harness` package
