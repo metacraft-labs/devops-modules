@@ -1,7 +1,7 @@
 # garm-webhook-endpoint
 
 The public front door for the central GARM's `/webhooks` endpoint, added in
-milestone **RC3** of the *Runner-Fleet-Capability-Pools-And-Remote-Driving*
+milestone **RC3** of the _Runner-Fleet-Capability-Pools-And-Remote-Driving_
 campaign (gate `t_garm_webhook_delivery`).
 
 In **scale-set** mode GARM long-polled GitHub outbound, so the fleet needed **no
@@ -31,19 +31,19 @@ exactly these signals.
 
 ## Two transports — Cloudflare Tunnel vs. NetBird relay
 
-| | `cloudflare-tunnel` | `netbird-relay` (**default**) |
-|---|---|---|
-| Inbound firewall hole | **None** (outbound-only tunnel) | One TLS port (443), GitHub-IP-pinned |
-| External dependency | **New Cloudflare account** (a 3rd party in the trust path) | **None new** — reuses NetBird, already deployed |
-| GitHub-IP pinning | Cloudflare edge WAF rule (not NixOS-expressible) | nginx `allow`/`deny` on GitHub's hook CIDRs |
-| TLS termination | Cloudflare edge | nginx (ACME or provided cert) on the relay |
-| Shared SPOF | Cloudflare edge + tunnel process | The relay host |
-| Security posture | **Best** (no inbound at all) | Good (inbound pinned + GARM HMAC) |
+|                       | `cloudflare-tunnel`                                        | `netbird-relay` (**default**)                   |
+| --------------------- | ---------------------------------------------------------- | ----------------------------------------------- |
+| Inbound firewall hole | **None** (outbound-only tunnel)                            | One TLS port (443), GitHub-IP-pinned            |
+| External dependency   | **New Cloudflare account** (a 3rd party in the trust path) | **None new** — reuses NetBird, already deployed |
+| GitHub-IP pinning     | Cloudflare edge WAF rule (not NixOS-expressible)           | nginx `allow`/`deny` on GitHub's hook CIDRs     |
+| TLS termination       | Cloudflare edge                                            | nginx (ACME or provided cert) on the relay      |
+| Shared SPOF           | Cloudflare edge + tunnel process                           | The relay host                                  |
+| Security posture      | **Best** (no inbound at all)                               | Good (inbound pinned + GARM HMAC)               |
 
 ### Recommendation
 
-**Default to `netbird-relay`.** The RC3 directive is to *minimize external
-dependencies*: NetBird is already a fleet dependency, whereas a Cloudflare
+**Default to `netbird-relay`.** The RC3 directive is to _minimize external
+dependencies_: NetBird is already a fleet dependency, whereas a Cloudflare
 account is a brand-new external dependency and adds a third party to the webhook
 trust path. `netbird-relay` reaches parity on the thing that actually matters —
 GitHub's HMAC-SHA256 is the security boundary either way — while keeping the

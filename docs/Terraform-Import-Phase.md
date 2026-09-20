@@ -147,7 +147,7 @@ The only permitted non-import creates are the GitHub governance-app org secrets
 (`GH_GOVERNANCE_APP_*`), bootstrapped separately via
 `just github-governance-app-secrets-apply` — and a consumer that bootstraps them
 through that targeted path, rather than through the governance plan, permits
-*none*, so its allow-set is legitimately empty.
+_none_, so its allow-set is legitimately empty.
 
 **This gate is an M6 fixture, not the steady-state design.** It exists to make
 adoption a provable no-op: state changes, reality does not. It has nothing to
@@ -194,10 +194,10 @@ import blocks.
 
 ## What is shared vs per-repo
 
-| Piece                                                                                                   | Where                                                   |
-| ------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| Inventory tools, GitHub **and** Cloudflare import-block generators, import-only CI harnesses            | shared — `nixos-modules/terraform/{github,cloudflare}/` |
-| This methodology + root-layering                                                                        | shared — `nixos-modules/docs/`                          |
+| Piece                                                                                                                                     | Where                                                   |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| Inventory tools, GitHub **and** Cloudflare import-block generators, import-only CI harnesses                                              | shared — `nixos-modules/terraform/{github,cloudflare}/` |
+| This methodology + root-layering                                                                                                          | shared — `nixos-modules/docs/`                          |
 | `governance.nix` data model, Cloudflare `default.nix` + `import-ids.json`, `inventory.md`, `IMPORTS.md`, secret manifest, `.age` material | per-repo (the org's reviewed reality)                   |
 
 Both providers use the same engine/config split: the import-block generator and

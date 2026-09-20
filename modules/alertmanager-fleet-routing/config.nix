@@ -52,7 +52,9 @@
   groupInterval ? "5m",
   repeatInterval ? "4h",
 
-  global ? { resolve_timeout = "5m"; },
+  global ? {
+    resolve_timeout = "5m";
+  },
 
   # Sane default inhibition:
   #   * a critical alert silences a warning alert with the same

@@ -20,14 +20,14 @@
       ]);
     in
     {
-      packages.garm-fleet-external-checks = pkgs.runCommand "garm-fleet-external-checks"
-        { nativeBuildInputs = [ pkgs.makeWrapper ]; }
-        ''
-          mkdir -p $out/bin $out/share
-          cp ${./github-fleet-checks.py} $out/share/github-fleet-checks.py
-          makeWrapper ${py}/bin/python3 $out/bin/garm-fleet-external-checks \
-            --add-flags $out/share/github-fleet-checks.py
-        '';
+      packages.garm-fleet-external-checks =
+        pkgs.runCommand "garm-fleet-external-checks" { nativeBuildInputs = [ pkgs.makeWrapper ]; }
+          ''
+            mkdir -p $out/bin $out/share
+            cp ${./github-fleet-checks.py} $out/share/github-fleet-checks.py
+            makeWrapper ${py}/bin/python3 $out/bin/garm-fleet-external-checks \
+              --add-flags $out/share/github-fleet-checks.py
+          '';
     };
 
   flake.modules.nixos.garm-fleet-external-checks =
@@ -49,7 +49,8 @@
 
       pkg = mkOption {
         type = types.package;
-        default = pkgs.garm-fleet-external-checks or (throw "set services.garm-fleet-external-checks.package");
+        default =
+          pkgs.garm-fleet-external-checks or (throw "set services.garm-fleet-external-checks.package");
         description = "The exporter package (github-fleet-checks.py wrapped with PyJWT).";
       };
 
@@ -81,11 +82,13 @@
       # FILE rather than JSON-in-Environment: systemd's own quote parsing strips
       # the double-quotes out of a JSON value in `Environment=`, corrupting it.
       # A file is quote-safe for any content.
-      configFile = pkgs.writeText "garm-fleet-external-checks.json" (builtins.toJSON {
-        apps = builtins.fromJSON appsJson;
-        webhooks = builtins.fromJSON webhooksJson;
-        probes = builtins.fromJSON probesJson;
-      });
+      configFile = pkgs.writeText "garm-fleet-external-checks.json" (
+        builtins.toJSON {
+          apps = builtins.fromJSON appsJson;
+          webhooks = builtins.fromJSON webhooksJson;
+          probes = builtins.fromJSON probesJson;
+        }
+      );
     in
     {
       options.services.garm-fleet-external-checks = {

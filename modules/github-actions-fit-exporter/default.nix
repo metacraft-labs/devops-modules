@@ -18,8 +18,7 @@
     { pkgs, ... }:
     {
       packages.github-actions-fit-exporter =
-        pkgs.runCommand "github-actions-fit-exporter"
-          { nativeBuildInputs = [ pkgs.makeWrapper ]; }
+        pkgs.runCommand "github-actions-fit-exporter" { nativeBuildInputs = [ pkgs.makeWrapper ]; }
           ''
             mkdir -p $out/bin $out/share
             cp ${./gh-actions-fit-exporter.py} $out/share/gh-actions-fit-exporter.py
@@ -66,8 +65,7 @@
         package = mkOption {
           type = types.package;
           default =
-            pkgs.github-actions-fit-exporter
-              or (throw "set services.github-actions-fit-exporter.package");
+            pkgs.github-actions-fit-exporter or (throw "set services.github-actions-fit-exporter.package");
           description = "The exporter package (gh-actions-fit-exporter.py, stdlib-only).";
         };
 
@@ -175,15 +173,14 @@
             ProtectHome = true;
             NoNewPrivileges = true;
             ReadWritePaths = [ cfg.textfileDir ];
-            Environment =
-              [
-                "GHA_OUTPUT=${cfg.textfileDir}/github-actions-fit.prom"
-                "GHA_API=${cfg.apiBase}"
-                "GHA_REPOS_FILE=${reposFile}"
-                "GHA_LOOKBACK_RUNS=${toString cfg.lookbackRuns}"
-                "GHA_SCAN_LOGS=${if cfg.scanLogs then "1" else "0"}"
-              ]
-              ++ lib.optional (cfg.tokenFile != null) "GHA_TOKEN_FILE=${cfg.tokenFile}";
+            Environment = [
+              "GHA_OUTPUT=${cfg.textfileDir}/github-actions-fit.prom"
+              "GHA_API=${cfg.apiBase}"
+              "GHA_REPOS_FILE=${reposFile}"
+              "GHA_LOOKBACK_RUNS=${toString cfg.lookbackRuns}"
+              "GHA_SCAN_LOGS=${if cfg.scanLogs then "1" else "0"}"
+            ]
+            ++ lib.optional (cfg.tokenFile != null) "GHA_TOKEN_FILE=${cfg.tokenFile}";
           };
         };
 

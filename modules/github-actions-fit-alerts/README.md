@@ -13,10 +13,10 @@ Delivered for milestone **RD4** of
 
 Over metrics from the companion `github-actions-fit-exporter`:
 
-| Alert                                          | Signal                                                                       | Severity |
-| ---------------------------------------------- | ---------------------------------------------------------------------------- | -------- |
-| `GithubActionsUbuntuLatestDurationRegression`  | hosted public job duration > `regressionFactor`× its trailing baseline        | warning  |
-| `GithubActionsUbuntuLatestResourceLimit`       | hosted public job hit `oom` / `no_space` / `timeout` (from a job-log scan)     | critical |
+| Alert                                         | Signal                                                                     | Severity |
+| --------------------------------------------- | -------------------------------------------------------------------------- | -------- |
+| `GithubActionsUbuntuLatestDurationRegression` | hosted public job duration > `regressionFactor`× its trailing baseline     | warning  |
+| `GithubActionsUbuntuLatestResourceLimit`      | hosted public job hit `oom` / `no_space` / `timeout` (from a job-log scan) | critical |
 
 Plus one recording rule (`github_actions_fit:duration_baseline_seconds`) that is
 the offset trailing average the regression compares against.

@@ -39,7 +39,7 @@ Two corollaries worth stating, because they are easy to get wrong:
   governance root belongs under `terraform/github/<org>-governance-prod` with
   `credential_mode: "github-app"`. The one genuinely Layer-0 slice — the
   Actions secrets holding the CI App credentials and the CI agenix key — is a
-  *separate*, small `bootstrap/` root, so that the pipeline's own credentials
+  _separate_, small `bootstrap/` root, so that the pipeline's own credentials
   are never writable by the pipeline.
 - **A root does not "graduate" out of `bootstrap/` on maturity.** There is no
   probation period. The only reason a root is ever excluded from the

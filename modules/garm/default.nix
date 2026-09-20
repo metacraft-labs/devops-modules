@@ -94,12 +94,7 @@
       # and quote (and the control chars TOML mandates). Byte-identical for
       # values with no special chars, so existing (POSIX-path) configs are
       # unchanged; use it wherever a value could carry a backslash or quote.
-      tomlStr =
-        s:
-        lib.replaceStrings
-          [ "\\" "\"" "\n" "\r" "\t" ]
-          [ "\\\\" "\\\"" "\\n" "\\r" "\\t" ]
-          s;
+      tomlStr = s: lib.replaceStrings [ "\\" "\"" "\n" "\r" "\t" ] [ "\\\\" "\\\"" "\\n" "\\r" "\\t" ] s;
       # systemd LoadCredential id + on-disk staged path for a credential's PEM.
       appKeyCredName = name: "app-key-${name}";
       stagedPemPath = name: "${stateDir}/app-key-${sanitizeName name}.pem";

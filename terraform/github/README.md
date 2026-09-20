@@ -287,7 +287,7 @@ Emits only `github_actions_secret` resources from rendered, GitHub-encrypted
 payloads — no repos, no teams, no org settings. Two distinct uses:
 
 - as a **managed** root (`terraform/github/secrets-<name>-prod`, `credential_mode:
-  github-app`) for ordinary per-repo application secrets, which are
+github-app`) for ordinary per-repo application secrets, which are
   plan-comment-applied like anything else; and
 - as the small **Layer-0** root (`bootstrap/github/<name>-governance-secrets-prod`)
   holding only the chicken-and-egg secrets the pipeline authenticates with.

@@ -53,7 +53,7 @@ tests:
               visibility: public
             exp_annotations:
               summary: 'Workflow slower on ubuntu-latest: metacraft-labs/web CI/build'
-              description: "Job build of workflow CI (metacraft-labs/web) is taking 15m 0s on the github-hosted runner — over 1.5x its recent baseline — for 10m. The workflow may not fit public ubuntu-latest (4 vCPU / 16 GB / 14 GB SSD); compare hosted vs self-hosted on the runner-fit dashboard and consider keeping it on self-hosted."
+              description: 'Job build of workflow CI (metacraft-labs/web) is taking 15m 0s on the github-hosted runner — over 1.5x its recent baseline — for 10m. The workflow may not fit public ubuntu-latest (4 vCPU / 16 GB / 14 GB SSD); compare hosted vs self-hosted on the runner-fit dashboard and consider keeping it on self-hosted.'
 
   # ── GithubActionsUbuntuLatestResourceLimit ─────────────────────────────────
   - interval: 1m
@@ -84,4 +84,4 @@ tests:
               signature: oom
             exp_annotations:
               summary: 'Workflow hit a oom limit on ubuntu-latest: metacraft-labs/web CI/test-oom'
-              description: "Job test-oom of workflow CI (metacraft-labs/web) hit a resource limit (oom: oom = out of RAM, no_space = the ~14 GB SSD full, timeout = job wall-clock) on the github-hosted runner. It does NOT fit public ubuntu-latest — move it back to a self-hosted capability label set or shrink its footprint."
+              description: 'Job test-oom of workflow CI (metacraft-labs/web) hit a resource limit (oom: oom = out of RAM, no_space = the ~14 GB SSD full, timeout = job wall-clock) on the github-hosted runner. It does NOT fit public ubuntu-latest — move it back to a self-hosted capability label set or shrink its footprint.'

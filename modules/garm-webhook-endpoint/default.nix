@@ -80,7 +80,9 @@
           insecure_ssl = "0";
           # secret is supplied by the operator from ${cfg.hmacSecretFile} at
           # registration time; it is intentionally NOT written to the store.
-          secret = "@SECRET_FROM_${lib.toUpper (builtins.replaceStrings [ "/" "." "-" ] [ "_" "_" "_" ] (toString cfg.hmacSecretFile))}@";
+          secret = "@SECRET_FROM_${
+            lib.toUpper (builtins.replaceStrings [ "/" "." "-" ] [ "_" "_" "_" ] (toString cfg.hmacSecretFile))
+          }@";
         };
       };
 
@@ -281,8 +283,7 @@
                   proxy_request_buffering off;
                   proxy_http_version 1.1;
                   ${optionalString cfg.pinToGithubRanges (
-                    (concatStringsSep "\n" (map (c: "allow ${c};") cfg.githubHookCidrs))
-                    + "\ndeny all;"
+                    (concatStringsSep "\n" (map (c: "allow ${c};") cfg.githubHookCidrs)) + "\ndeny all;"
                   )}
                 '';
               };

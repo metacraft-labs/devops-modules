@@ -74,43 +74,62 @@ top@{ ... }:
           gpu ? false,
           hypervisors,
         }:
-        pkgs.writeText "manifest-${host}.json" (builtins.toJSON {
-          identity = {
-            inherit keyId host;
-            issuedAt = 1757440000;
-            notAfter = 1757443600;
-            alg = "hmac-sha256";
-            manifest = {
-              manifestVersion = "1";
-              os = "linux";
-              arch = "x86_64";
-              inherit archLevel gpu;
-              cpuCount = 32;
-              memTotalMb = 128000;
-              nestedVirt = true;
-              docker = true;
-              podman = false;
-              rrHwCounters = true;
-              inherit hypervisors;
+        pkgs.writeText "manifest-${host}.json" (
+          builtins.toJSON {
+            identity = {
+              inherit keyId host;
+              issuedAt = 1757440000;
+              notAfter = 1757443600;
+              alg = "hmac-sha256";
+              manifest = {
+                manifestVersion = "1";
+                os = "linux";
+                arch = "x86_64";
+                inherit archLevel gpu;
+                cpuCount = 32;
+                memTotalMb = 128000;
+                nestedVirt = true;
+                docker = true;
+                podman = false;
+                rrHwCounters = true;
+                inherit hypervisors;
+              };
             };
-          };
-          sig = lib.concatStrings (lib.genList (_: "0") 64);
-        });
+            sig = lib.concatStrings (lib.genList (_: "0") 64);
+          }
+        );
 
       manifestHms = mkManifest {
         host = "high-mem-server";
         keyId = "vmh1-hms";
         gpu = false;
         hypervisors = [
-          { id = "incus"; available = true; guests = [ "linux" ]; }
-          { id = "libvirt"; available = true; guests = [ "windows" "linux" ]; }
+          {
+            id = "incus";
+            available = true;
+            guests = [ "linux" ];
+          }
+          {
+            id = "libvirt";
+            available = true;
+            guests = [
+              "windows"
+              "linux"
+            ];
+          }
         ];
       };
       manifestGpu001 = mkManifest {
         host = "gpu-server-001";
         keyId = "vmh1-gpu001";
         gpu = true;
-        hypervisors = [ { id = "incus"; available = true; guests = [ "linux" ]; } ];
+        hypervisors = [
+          {
+            id = "incus";
+            available = true;
+            guests = [ "linux" ];
+          }
+        ];
       };
 
       dummyProvider = manifest: {

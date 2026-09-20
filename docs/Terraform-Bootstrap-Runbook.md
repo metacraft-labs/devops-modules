@@ -103,7 +103,7 @@ Run **after** the AWS bootstrap (GitHub state lives in the shared S3 backend).
 2. **Governance-secrets root (if present).** The two `GH_GOVERNANCE_APP_*`
    secrets — and the CI agenix key alongside them — are bootstrapped with a
    targeted, confirmation-gated plan so normal governance CI can authenticate
-   with the dedicated GitHub App. This root holds *only* those credentials; the
+   with the dedicated GitHub App. This root holds _only_ those credentials; the
    org governance model itself is a managed root under `terraform/github/` and
    is never applied from here:
 

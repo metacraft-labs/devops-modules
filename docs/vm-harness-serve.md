@@ -1,7 +1,7 @@
 # `services.vm-harness-serve` — declarative `vm-harness serve` deployment
 
-Campaign: *CI Runner Fleet — vm-harness Remoting, Central GARM, Capability
-Pools* · milestone **RA2** (Linux/incus serve deployment).
+Campaign: _CI Runner Fleet — vm-harness Remoting, Central GARM, Capability
+Pools_ · milestone **RA2** (Linux/incus serve deployment).
 
 `services.vm-harness-serve` runs the RA1 [`vm-harness
 serve`](https://github.com/metacraft-labs/gosti/blob/dev/docs/serve.md)

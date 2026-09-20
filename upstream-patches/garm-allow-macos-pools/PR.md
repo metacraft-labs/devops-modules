@@ -127,7 +127,7 @@ against a `Runner` carrying a registered provider, and asserts:
 - `linux` and `windows` are still accepted (the change adds, never replaces);
 - an unknown OS type is still rejected with `invalid OS type`, so the
   allow-list is still an allow-list;
-- an unsupported *architecture* is still rejected, so the neighbouring check
+- an unsupported _architecture_ is still rejected, so the neighbouring check
   was not disturbed;
 - `IsSupportedOSType` agrees with all of the above.
 

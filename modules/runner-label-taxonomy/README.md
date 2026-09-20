@@ -23,18 +23,18 @@ by this linter.
 outside the supported set **fails closed** (no labels) rather than being
 interpreted under the wrong schema.
 
-| Manifest field                      | Derived label(s) |
-|-------------------------------------|------------------|
-| `os`                                | `linux` / `windows` / `macos` |
-| `arch`                              | `x64` (x86_64/amd64) / `arm64` (aarch64) |
-| `archLevel = x86-64-vN`             | `x86-64-v2 … x86-64-vN` — a host proving vN satisfies every lower level; `v1` baseline is not advertised (carries no routing value) |
-| `gpu == true`                       | `gpu` |
-| `nestedVirt == true`                | `nested` |
-| `docker == true`                    | `docker` |
-| `podman == true`                    | `podman` |
-| `rrHwCounters == true`              | `rr-hw-counters` |
-| `hypervisors[].id` where `available`| `incus` / `libvirt` / `hyperv` / `tart` |
-| (structural)                        | `self-hosted` — always, for any serve-host runner |
+| Manifest field                       | Derived label(s)                                                                                                                    |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `os`                                 | `linux` / `windows` / `macos`                                                                                                       |
+| `arch`                               | `x64` (x86_64/amd64) / `arm64` (aarch64)                                                                                            |
+| `archLevel = x86-64-vN`              | `x86-64-v2 … x86-64-vN` — a host proving vN satisfies every lower level; `v1` baseline is not advertised (carries no routing value) |
+| `gpu == true`                        | `gpu`                                                                                                                               |
+| `nestedVirt == true`                 | `nested`                                                                                                                            |
+| `docker == true`                     | `docker`                                                                                                                            |
+| `podman == true`                     | `podman`                                                                                                                            |
+| `rrHwCounters == true`               | `rr-hw-counters`                                                                                                                    |
+| `hypervisors[].id` where `available` | `incus` / `libvirt` / `hyperv` / `tart`                                                                                             |
+| (structural)                         | `self-hosted` — always, for any serve-host runner                                                                                   |
 
 Only a proven `true` (or an `available` hypervisor) yields a label; a missing /
 `false` field yields nothing — "not proven present", never a guess.

@@ -100,7 +100,11 @@ top@{ ... }:
         {
           systemd.tmpfiles.rules = [ "d /etc/garm-central-test 0755 root root -" ];
           environment.etc = lib.mapAttrs' (
-            name: s: lib.nameValuePair "garm-central-test/token-${name}" { text = s.token; mode = "0400"; }
+            name: s:
+            lib.nameValuePair "garm-central-test/token-${name}" {
+              text = s.token;
+              mode = "0400";
+            }
           ) standins;
         };
 
@@ -256,12 +260,14 @@ top@{ ... }:
           testScript = ''
             import json
 
-            standins = ${builtins.toJSON (
-              lib.mapAttrs (name: s: {
-                inherit (s) port token;
-                svc = "vmh-serve-${name}";
-              }) standins
-            )}
+            standins = ${
+              builtins.toJSON (
+                lib.mapAttrs (name: s: {
+                  inherit (s) port token;
+                  svc = "vmh-serve-${name}";
+                }) standins
+              )
+            }
 
             start_all()
 

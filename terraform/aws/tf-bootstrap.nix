@@ -459,174 +459,174 @@ in
     };
 
     aws_iam_policy_document = {
-    state_bucket_tls.statement = [
-      {
-        sid = "DenyInsecureTransport";
-        effect = "Deny";
-        actions = [ "s3:*" ];
-        resources = [
-          "\${aws_s3_bucket.tf_state.arn}"
-          "\${aws_s3_bucket.tf_state.arn}/*"
-        ];
-        principals = [
-          {
-            type = "*";
-            identifiers = [ "*" ];
-          }
-        ];
-        condition = [
-          {
-            test = "Bool";
-            variable = "aws:SecureTransport";
-            values = [ "false" ];
-          }
-        ];
-      }
-    ];
+      state_bucket_tls.statement = [
+        {
+          sid = "DenyInsecureTransport";
+          effect = "Deny";
+          actions = [ "s3:*" ];
+          resources = [
+            "\${aws_s3_bucket.tf_state.arn}"
+            "\${aws_s3_bucket.tf_state.arn}/*"
+          ];
+          principals = [
+            {
+              type = "*";
+              identifiers = [ "*" ];
+            }
+          ];
+          condition = [
+            {
+              test = "Bool";
+              variable = "aws:SecureTransport";
+              values = [ "false" ];
+            }
+          ];
+        }
+      ];
 
-    backend_read_lock.statement = [
-      {
-        sid = "ListStateBucket";
-        effect = "Allow";
-        actions = [ "s3:ListBucket" ];
-        resources = [ "\${aws_s3_bucket.tf_state.arn}" ];
-        condition = [
-          {
-            test = "StringLike";
-            variable = "s3:prefix";
-            values = managedStateListPrefixes;
-          }
-        ];
-      }
-      {
-        sid = "ReadStateObject";
-        effect = "Allow";
-        actions = [ "s3:GetObject" ];
-        resources = managedStateObjectArns;
-      }
-      {
-        sid = "UseStateLock";
-        effect = "Allow";
-        actions = [
-          "dynamodb:DeleteItem"
-          "dynamodb:GetItem"
-          "dynamodb:PutItem"
-          "dynamodb:UpdateItem"
-        ];
-        resources = [ "\${aws_dynamodb_table.tf_locks.arn}" ];
-      }
-    ];
+      backend_read_lock.statement = [
+        {
+          sid = "ListStateBucket";
+          effect = "Allow";
+          actions = [ "s3:ListBucket" ];
+          resources = [ "\${aws_s3_bucket.tf_state.arn}" ];
+          condition = [
+            {
+              test = "StringLike";
+              variable = "s3:prefix";
+              values = managedStateListPrefixes;
+            }
+          ];
+        }
+        {
+          sid = "ReadStateObject";
+          effect = "Allow";
+          actions = [ "s3:GetObject" ];
+          resources = managedStateObjectArns;
+        }
+        {
+          sid = "UseStateLock";
+          effect = "Allow";
+          actions = [
+            "dynamodb:DeleteItem"
+            "dynamodb:GetItem"
+            "dynamodb:PutItem"
+            "dynamodb:UpdateItem"
+          ];
+          resources = [ "\${aws_dynamodb_table.tf_locks.arn}" ];
+        }
+      ];
 
-    backend_read_write_lock.statement = [
-      {
-        sid = "ListStateBucket";
-        effect = "Allow";
-        actions = [ "s3:ListBucket" ];
-        resources = [ "\${aws_s3_bucket.tf_state.arn}" ];
-        condition = [
-          {
-            test = "StringLike";
-            variable = "s3:prefix";
-            values = managedStateListPrefixes;
-          }
-        ];
-      }
-      {
-        sid = "WriteStateObject";
-        effect = "Allow";
-        actions = [
-          "s3:DeleteObject"
-          "s3:GetObject"
-          "s3:PutObject"
-        ];
-        resources = managedStateObjectArns;
-      }
-      {
-        sid = "UseStateLock";
-        effect = "Allow";
-        actions = [
-          "dynamodb:DeleteItem"
-          "dynamodb:GetItem"
-          "dynamodb:PutItem"
-          "dynamodb:UpdateItem"
-        ];
-        resources = [ "\${aws_dynamodb_table.tf_locks.arn}" ];
-      }
-    ];
+      backend_read_write_lock.statement = [
+        {
+          sid = "ListStateBucket";
+          effect = "Allow";
+          actions = [ "s3:ListBucket" ];
+          resources = [ "\${aws_s3_bucket.tf_state.arn}" ];
+          condition = [
+            {
+              test = "StringLike";
+              variable = "s3:prefix";
+              values = managedStateListPrefixes;
+            }
+          ];
+        }
+        {
+          sid = "WriteStateObject";
+          effect = "Allow";
+          actions = [
+            "s3:DeleteObject"
+            "s3:GetObject"
+            "s3:PutObject"
+          ];
+          resources = managedStateObjectArns;
+        }
+        {
+          sid = "UseStateLock";
+          effect = "Allow";
+          actions = [
+            "dynamodb:DeleteItem"
+            "dynamodb:GetItem"
+            "dynamodb:PutItem"
+            "dynamodb:UpdateItem"
+          ];
+          resources = [ "\${aws_dynamodb_table.tf_locks.arn}" ];
+        }
+      ];
 
-    github_plan_assume.statement = [
-      {
-        effect = "Allow";
-        actions = [ "sts:AssumeRoleWithWebIdentity" ];
-        principals = [
-          {
-            type = "Federated";
-            identifiers = [ githubOidcProviderArn ];
-          }
-        ];
-        condition = [
-          {
-            test = "StringEquals";
-            variable = "${githubTokenHost}:aud";
-            values = [ "sts.amazonaws.com" ];
-          }
-          {
-            test = "StringEquals";
-            variable = "${githubTokenHost}:repository";
-            values = [ "\${local.github_repository}" ];
-          }
-          {
-            test = "StringLike";
-            variable = "${githubTokenHost}:sub";
-            values = [ "repo:\${local.github_repository}:pull_request" ];
-          }
-        ];
-      }
-    ];
+      github_plan_assume.statement = [
+        {
+          effect = "Allow";
+          actions = [ "sts:AssumeRoleWithWebIdentity" ];
+          principals = [
+            {
+              type = "Federated";
+              identifiers = [ githubOidcProviderArn ];
+            }
+          ];
+          condition = [
+            {
+              test = "StringEquals";
+              variable = "${githubTokenHost}:aud";
+              values = [ "sts.amazonaws.com" ];
+            }
+            {
+              test = "StringEquals";
+              variable = "${githubTokenHost}:repository";
+              values = [ "\${local.github_repository}" ];
+            }
+            {
+              test = "StringLike";
+              variable = "${githubTokenHost}:sub";
+              values = [ "repo:\${local.github_repository}:pull_request" ];
+            }
+          ];
+        }
+      ];
 
-    github_apply_assume.statement = [
-      {
-        effect = "Allow";
-        actions = [ "sts:AssumeRoleWithWebIdentity" ];
-        principals = [
-          {
-            type = "Federated";
-            identifiers = [ githubOidcProviderArn ];
-          }
-        ];
-        condition = githubApplyAssumeConditions;
-      }
-    ];
+      github_apply_assume.statement = [
+        {
+          effect = "Allow";
+          actions = [ "sts:AssumeRoleWithWebIdentity" ];
+          principals = [
+            {
+              type = "Federated";
+              identifiers = [ githubOidcProviderArn ];
+            }
+          ];
+          condition = githubApplyAssumeConditions;
+        }
+      ];
 
-    github_drift_assume.statement = [
-      {
-        effect = "Allow";
-        actions = [ "sts:AssumeRoleWithWebIdentity" ];
-        principals = [
-          {
-            type = "Federated";
-            identifiers = [ githubOidcProviderArn ];
-          }
-        ];
-        condition = [
-          {
-            test = "StringEquals";
-            variable = "${githubTokenHost}:aud";
-            values = [ "sts.amazonaws.com" ];
-          }
-          {
-            test = "StringEquals";
-            variable = "${githubTokenHost}:repository";
-            values = [ "\${local.github_repository}" ];
-          }
-          {
-            test = "StringLike";
-            variable = "${githubTokenHost}:sub";
-            values = [ "repo:\${local.github_repository}:ref:refs/heads/${githubBranch}" ];
-          }
-        ];
-      }
-    ];
+      github_drift_assume.statement = [
+        {
+          effect = "Allow";
+          actions = [ "sts:AssumeRoleWithWebIdentity" ];
+          principals = [
+            {
+              type = "Federated";
+              identifiers = [ githubOidcProviderArn ];
+            }
+          ];
+          condition = [
+            {
+              test = "StringEquals";
+              variable = "${githubTokenHost}:aud";
+              values = [ "sts.amazonaws.com" ];
+            }
+            {
+              test = "StringEquals";
+              variable = "${githubTokenHost}:repository";
+              values = [ "\${local.github_repository}" ];
+            }
+            {
+              test = "StringLike";
+              variable = "${githubTokenHost}:sub";
+              values = [ "repo:\${local.github_repository}:ref:refs/heads/${githubBranch}" ];
+            }
+          ];
+        }
+      ];
 
     };
   }

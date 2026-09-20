@@ -31,9 +31,9 @@
       # Default-threshold render — convenience + the gate's input. YAML (which
       # amtool parses natively) built from the same pure config.nix the module
       # deploys.
-      packages.fleet-alertmanager-config =
-        (pkgs.formats.yaml { }).generate "alertmanager.yml"
-          (import ./config.nix { inherit lib; });
+      packages.fleet-alertmanager-config = (pkgs.formats.yaml { }).generate "alertmanager.yml" (
+        import ./config.nix { inherit lib; }
+      );
 
       # Dead-man-switch render variant — the gate input proving the Watchdog
       # routes to a dedicated off-host heartbeat receiver (and that enabling it
@@ -41,16 +41,18 @@
       # webhooks, like the default render.
       packages.fleet-alertmanager-config-deadman =
         (pkgs.formats.yaml { }).generate "alertmanager-deadman.yml"
-          (import ./config.nix {
-            inherit lib;
-            deadManReceiver = "deadmanswitch";
-            receivers = {
-              default = { };
-              pager.webhook_configs = [ { url = "http://127.0.0.1:9099/pager"; } ];
-              "ci-ops".webhook_configs = [ { url = "http://127.0.0.1:9099/ci-ops"; } ];
-              deadmanswitch.webhook_configs = [ { url = "http://127.0.0.1:9099/deadman"; } ];
-            };
-          });
+          (
+            import ./config.nix {
+              inherit lib;
+              deadManReceiver = "deadmanswitch";
+              receivers = {
+                default = { };
+                pager.webhook_configs = [ { url = "http://127.0.0.1:9099/pager"; } ];
+                "ci-ops".webhook_configs = [ { url = "http://127.0.0.1:9099/ci-ops"; } ];
+                deadmanswitch.webhook_configs = [ { url = "http://127.0.0.1:9099/deadman"; } ];
+              };
+            }
+          );
     };
 
   flake.modules.nixos.alertmanager-fleet-routing =

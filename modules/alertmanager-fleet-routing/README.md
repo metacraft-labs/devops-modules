@@ -17,11 +17,11 @@ honour them.
 The `garm-fleet-alerts` rules stamp `severity` (`critical` / `warning`) and
 `component: garm-fleet` on every alert. This module routes on exactly those:
 
-| Alert labels                              | Routes to                    |
-| ----------------------------------------- | ---------------------------- |
-| `severity=critical`                       | the **pager** receiver       |
-| `severity=warning`                        | the **CI-ops** receiver      |
-| `component=garm-fleet`                    | grouped together into pages  |
+| Alert labels           | Routes to                   |
+| ---------------------- | --------------------------- |
+| `severity=critical`    | the **pager** receiver      |
+| `severity=warning`     | the **CI-ops** receiver     |
+| `component=garm-fleet` | grouped together into pages |
 
 The `component=garm-fleet` subtree regroups the fleet's alerts (by `component` +
 `severity`) so a burst of runner-chain failures is one page per severity, not one
@@ -71,16 +71,16 @@ secret variants (`routing_key_file`, `api_url_file`, `smtp_auth_password_file`).
 
 ## Options (highlights)
 
-| Option | Default | Purpose |
-| --- | --- | --- |
-| `component` | `garm-fleet` | the label whose alerts group together / are inhibited by controller-down |
-| `criticalReceiver` / `warningReceiver` / `defaultReceiver` | `pager` / `ci-ops` / `default` | which receiver each severity bucket routes to |
-| `receivers` | inert loopback webhooks | pluggable endpoints (override for a real pager) |
-| `fleetGroupBy` | `[component severity]` | how the fleet's alerts are grouped into pages |
-| `severityInhibit` | `true` | critical squelches warning on same `(component, instance)` |
-| `controllerDownInhibit` | `true` | controller-down squelches its dependent `component` alerts (page the cause) |
-| `controllerDownSourceMatchers` | `[alertname="GarmControllerDown"]` | which alert counts as controller-down (overridable) |
-| `listenAddress` / `port` | `127.0.0.1` / `9093` | Alertmanager web/API bind |
+| Option                                                     | Default                            | Purpose                                                                     |
+| ---------------------------------------------------------- | ---------------------------------- | --------------------------------------------------------------------------- |
+| `component`                                                | `garm-fleet`                       | the label whose alerts group together / are inhibited by controller-down    |
+| `criticalReceiver` / `warningReceiver` / `defaultReceiver` | `pager` / `ci-ops` / `default`     | which receiver each severity bucket routes to                               |
+| `receivers`                                                | inert loopback webhooks            | pluggable endpoints (override for a real pager)                             |
+| `fleetGroupBy`                                             | `[component severity]`             | how the fleet's alerts are grouped into pages                               |
+| `severityInhibit`                                          | `true`                             | critical squelches warning on same `(component, instance)`                  |
+| `controllerDownInhibit`                                    | `true`                             | controller-down squelches its dependent `component` alerts (page the cause) |
+| `controllerDownSourceMatchers`                             | `[alertname="GarmControllerDown"]` | which alert counts as controller-down (overridable)                         |
+| `listenAddress` / `port`                                   | `127.0.0.1` / `9093`               | Alertmanager web/API bind                                                   |
 
 ## Dead-man's switch
 
@@ -107,11 +107,11 @@ services.fleet-alert-routing = {
 };
 ```
 
-| Option | Default | Purpose |
-| --- | --- | --- |
-| `deadManReceiver` | `null` | receiver the always-firing `Watchdog` routes to (an off-host Healthchecks ping); `null` disables |
-| `deadManMatchers` | `[alertname="Watchdog"]` | which alert is the heartbeat |
-| `deadManPingInterval` | `1m` | heartbeat cadence (must be < the sink's grace period) |
+| Option                | Default                  | Purpose                                                                                          |
+| --------------------- | ------------------------ | ------------------------------------------------------------------------------------------------ |
+| `deadManReceiver`     | `null`                   | receiver the always-firing `Watchdog` routes to (an off-host Healthchecks ping); `null` disables |
+| `deadManMatchers`     | `[alertname="Watchdog"]` | which alert is the heartbeat                                                                     |
+| `deadManPingInterval` | `1m`                     | heartbeat cadence (must be < the sink's grace period)                                            |
 
 The heartbeat sink **must not live on the monitored host** — it is what detects
 that host dying. Use a hosted Healthchecks tier or a separate box.
