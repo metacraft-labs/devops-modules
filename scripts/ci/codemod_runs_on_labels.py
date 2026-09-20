@@ -35,17 +35,58 @@ from pathlib import Path
 from typing import Iterable
 
 # RC1 migration table — retired class -> minimum capability label set.
+#
+# Each right-hand side is the set the central controller's pool ACTUALLY
+# advertises for that class today (high-mem-server ``central-garm.nix``,
+# ``capabilityPoolsFor`` / ``osPoolsFor`` + their ``aliasClasses``). The codemod
+# may only emit labels a live pool advertises — emitting a label no pool carries
+# turns a job into one that matches NO runner and queues until GitHub culls it
+# (the m3 linux/windows-arm64 regression). So the RHS is deliberately the
+# MINIMUM proven-routable set, never a "descriptive" superset.
+#
+# WHY ``eph-linux-x64-nested`` DOES NOT EMIT ``nested`` (was the RC4-audit bug):
+# central's ``${org}-linux`` pool advertises ``[self-hosted, linux, x64]`` and
+# lists BOTH ``eph-linux-x64`` and ``eph-linux-x64-nested`` as ``aliasClasses``
+# of that same pool — i.e. the controller treats the two classes as equivalent
+# and routes them to one pool that does NOT advertise a ``nested`` tag. Rewriting
+# to ``[self-hosted, linux, x64, nested]`` would over-constrain the job to an
+# empty runner set. The safe, alias-guaranteed migration is the plain triple.
 MIGRATION = {
     "eph-linux-x64": ["self-hosted", "linux", "x64"],
-    "eph-linux-x64-gpu": ["self-hosted", "linux", "x64", "gpu"],
-    "eph-linux-x64-nested": ["self-hosted", "linux", "x64", "nested"],
+    "eph-linux-x64-nested": ["self-hosted", "linux", "x64"],
     "eph-linux-arm64": ["self-hosted", "linux", "arm64"],
     "eph-macos-arm64": ["self-hosted", "macos", "arm64"],
     "eph-win-x64": ["self-hosted", "windows", "x64"],
     "eph-win-arm64": ["self-hosted", "windows", "arm64"],
 }
 
-# Longest class names first so ``eph-linux-x64-gpu`` wins over ``eph-linux-x64``.
+# GPU-host routing aliases we deliberately DO NOT rewrite — this is an operator
+# decision (campaign task #50), NOT a mechanical migration:
+#
+#   * ``eph-linux-x64-g1`` / ``-g2`` are the *general-purpose* scale sets that
+#     happen to live ON the GPU hosts (gpu-server-001/002). Rewriting them to a
+#     plain ``[self-hosted, linux, x64]`` would let those jobs land on ANY linux
+#     host and silently vacate the GPU boxes' reserved general-purpose capacity.
+#   * ``eph-linux-x64-gpu`` / ``-gpu-2`` route to the GPU pool. Whether migrated
+#     jobs should carry a ``gpu`` capability label (and thus stay pinned to the
+#     2-slot GPU fleet) or be re-homed is exactly the #50 decision.
+#
+# Until #50 is decided, the codemod leaves every one of these tokens VERBATIM and
+# WARNS when it sees one, so the choice is made deliberately by a human, not by a
+# silent rewrite. (The word-boundary regex below already refuses to match the
+# ``eph-linux-x64`` PREFIX inside these longer tokens, so "leave verbatim" needs
+# no special case in the rewriter — only this explicit, warned exclusion.)
+NEEDS_DECISION = {
+    "eph-linux-x64-gpu",
+    "eph-linux-x64-gpu-2",
+    "eph-linux-x64-g1",
+    "eph-linux-x64-g2",
+}
+NEEDS_DECISION_RE = re.compile(
+    r"(?<![A-Za-z0-9-])(" + "|".join(map(re.escape, sorted(NEEDS_DECISION, key=len, reverse=True))) + r")(?![A-Za-z0-9-])"
+)
+
+# Longest class names first so ``eph-linux-x64-nested`` wins over ``eph-linux-x64``.
 CLASSES = sorted(MIGRATION, key=len, reverse=True)
 CLASS_RE = re.compile(r"(?<![A-Za-z0-9-])(" + "|".join(map(re.escape, CLASSES)) + r")(?![A-Za-z0-9-])")
 
@@ -101,6 +142,19 @@ def rewrite_text(text: str) -> tuple[str, list[tuple[int, str, str]]]:
     return "".join(out_lines), changes
 
 
+def scan_needs_decision(text: str) -> list[tuple[int, str, str]]:
+    """Find every GPU-host routing alias (task #50) the codemod refuses to touch.
+
+    Returns ``(lineno, token, line)`` for each occurrence so ``main`` can warn.
+    These are left VERBATIM — mapping them mechanically is an operator decision.
+    """
+    hits: list[tuple[int, str, str]] = []
+    for i, line in enumerate(text.splitlines(), 1):
+        for m in NEEDS_DECISION_RE.finditer(line):
+            hits.append((i, m.group(1), line.strip()))
+    return hits
+
+
 def iter_workflows(paths: Iterable[Path]) -> list[Path]:
     out: list[Path] = []
     for p in paths:
@@ -120,21 +174,37 @@ def main(argv: list[str] | None = None) -> int:
 
     workflows = iter_workflows([Path(p) for p in args.paths])
     total = 0
+    flagged = 0
     for wf in workflows:
         text = wf.read_text(encoding="utf-8")
         new, changes = rewrite_text(text)
-        if not changes:
-            continue
-        total += len(changes)
-        print(f"\n{wf}:")
-        for lineno, old, rewritten in changes:
-            print(f"  - {lineno}: {old.strip()}")
-            print(f"  + {lineno}: {rewritten.strip()}")
-        if args.write:
-            wf.write_text(new, encoding="utf-8")
+        needs = scan_needs_decision(text)
+        if changes:
+            total += len(changes)
+            print(f"\n{wf}:")
+            for lineno, old, rewritten in changes:
+                print(f"  - {lineno}: {old.strip()}")
+                print(f"  + {lineno}: {rewritten.strip()}")
+            if args.write:
+                wf.write_text(new, encoding="utf-8")
+        if needs:
+            flagged += len(needs)
+            print(f"\n{wf}: [needs-decision — left UNCHANGED, task #50]")
+            for lineno, token, line in needs:
+                print(f"  ! {lineno}: {token}  ({line})")
+
+    if flagged:
+        print(
+            f"\ncodemod-runs-on-labels: left {flagged} GPU-host routing alias "
+            "reference(s) UNCHANGED (eph-linux-x64-g1/-g2/-gpu*). Mapping these "
+            "is an operator decision (task #50) — the codemod will not rewrite "
+            "them.",
+            file=sys.stderr,
+        )
 
     if total == 0:
-        print("codemod-runs-on-labels: no legacy eph-* classes found.")
+        if flagged == 0:
+            print("codemod-runs-on-labels: no legacy eph-* classes found.")
         return 0
     verb = "rewrote" if args.write else "would rewrite"
     print(f"\ncodemod-runs-on-labels: {verb} {total} legacy class reference(s).", file=sys.stderr)
