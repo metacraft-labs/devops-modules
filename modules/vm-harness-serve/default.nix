@@ -439,6 +439,32 @@
           '';
         };
 
+        openFilesLimit = mkOption {
+          type = types.int;
+          default = 8192;
+          example = 16384;
+          description = ''
+            File-descriptor bound for the daemon, applied to BOTH `LimitNOFILE`
+            and `LimitNOFILESoft`.
+
+            Setting only the hard limit is the trap: systemd's default SOFT
+            limit is 1024 and that is what a process actually hits. Measured on
+            high-mem-server: `LimitNOFILE=524288`, `LimitNOFILESoft=1024`, and
+            the daemon pinned at 1022 open descriptors.
+
+            Every in-flight request holds a client socket plus the spawned
+            worker's stdio pipes, the handler pool is CPU-sized, and each
+            `/v1/exec` carrying user-data opens a staging file — so a busy
+            controller exhausts 1024 without anything being wrong. The failure
+            appears on the CONTROLLER as `Too many open files` while staging
+            user-data, which reads as a remote-driving fault rather than an
+            rlimit.
+
+            8192 is far above any plausible concurrency and costs nothing when
+            unused: this is a CEILING, not a reservation.
+          '';
+        };
+
         # ── MA12 listener watchdog ────────────────────────────────────────────
         healthcheck = {
           enable = mkOption {
@@ -613,6 +639,29 @@
 
             Restart = "on-failure";
             RestartSec = 2;
+
+            # THE SOFT LIMIT IS THE ONE THAT BITES, AND systemd's DEFAULT IS
+            # 1024 — measured, not precautionary. On high-mem-server this unit
+            # showed `LimitNOFILE=524288` (generous) but `LimitNOFILESoft=1024`,
+            # with the daemon pinned at 1022 open descriptors. A concurrent
+            # serve gets there easily: every in-flight request holds a client
+            # socket plus the spawned worker's stdio pipes, the handler pool is
+            # CPU-sized, and each /v1/exec carrying user-data opens a staging
+            # file.
+            #
+            # It surfaces on the CONTROLLER, not here, as a provider error that
+            # names the symptom and not the cause:
+            #
+            #   failed to stage user-data: Too many open files
+            #
+            # so it reads as a remote-driving or permissions fault rather than
+            # an rlimit. Setting BOTH bounds pins the soft limit up to the hard
+            # one; leaving `LimitNOFILE` alone would keep the 1024 soft default
+            # in force. The darwin sibling carries the same fix as
+            # `SoftResourceLimits.NumberOfFiles`, for the same reason — macOS's
+            # default there is 256.
+            LimitNOFILE = cfg.openFilesLimit;
+            LimitNOFILESoft = cfg.openFilesLimit;
 
             RuntimeDirectory = runtimeDir;
             RuntimeDirectoryMode = "0750";

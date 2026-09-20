@@ -175,6 +175,26 @@ top@{ ... }:
                 assert "User=vm-harness-serve" in unit, unit
                 assert "NoNewPrivileges=true" in unit, unit
                 assert "ProtectSystem=strict" in unit, unit
+
+                # THE SOFT LIMIT IS THE ONE A PROCESS ACTUALLY HITS, and
+                # systemd's default is 1024. Measured on high-mem-server:
+                # LimitNOFILE=524288 but LimitNOFILESoft=1024, with the daemon
+                # pinned at 1022 open fds — which surfaced on the CONTROLLER as
+                # "failed to stage user-data: Too many open files" and read as a
+                # remote-driving fault rather than an rlimit. Asserting only the
+                # hard bound would pass against exactly that broken shape, so
+                # pin BOTH.
+                assert "LimitNOFILE=" in unit, unit
+                assert "LimitNOFILESoft=" in unit, unit
+                soft = int(
+                    [l for l in unit.splitlines() if l.startswith("LimitNOFILESoft=")][0]
+                    .split("=", 1)[1]
+                )
+                assert soft > 1024, (
+                    f"LimitNOFILESoft={soft} is not above systemd's 1024 default; "
+                    "a concurrent serve exhausts it and every pool create fails "
+                    "with 'Too many open files'"
+                )
                 # The daemon joins incus-admin (reaches the incus socket) via the
                 # unit's systemd SupplementaryGroups (a runtime grant, so it shows
                 # in the unit, not in static NSS `id` output).
