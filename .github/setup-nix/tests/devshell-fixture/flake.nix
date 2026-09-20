@@ -18,6 +18,9 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          loaderFixture = pkgs.runCommand "setup-nix-loader-fixture" { } ''
+            mkdir -p "$out/lib"
+          '';
         in
         {
           # A devShell whose build always fails. Used to assert that the
@@ -36,6 +39,7 @@
           # success path still exports the environment to $GITHUB_ENV.
           default = pkgs.mkShell {
             packages = [ pkgs.hello ];
+            LD_LIBRARY_PATH = "${loaderFixture}/lib";
           };
         }
       );

@@ -560,6 +560,8 @@ runs:
       if: ${{ fromJSON(inputs.use-direnv || 'false') || inputs.devshell != '' }}
       shell: bash
       run: |
+        set -euo pipefail
+
         direnv() { nix run --inputs-from . nixpkgs#direnv -- "$@"; }
 
         if [ "${{ inputs.devshell }}" != "" ]; then
@@ -579,5 +581,72 @@ runs:
 
         direnv allow .
         echo "::group::Exporting Nix DevShell to GITHUB_ENV"
-        direnv export gha >> "$GITHUB_ENV"
+        export_file="$(mktemp "${RUNNER_TEMP:-/tmp}/nix-devshell-env.XXXXXX")"
+        loader_file="${export_file}.ld-library-path"
+        direnv export gha > "$export_file"
+        : > "$loader_file"
+
+        # direnv's GHA format uses one multiline record per variable. Copy
+        # every record except LD_LIBRARY_PATH verbatim, and capture that value
+        # for Bash run steps below. A line-oriented grep/sed would leave the
+        # value and delimiter behind and corrupt GITHUB_ENV.
+        while IFS= read -r header; do
+          if [[ "$header" != *"<<"* ]]; then
+            echo "Invalid direnv GHA export header: $header" >&2
+            exit 1
+          fi
+          key="${header%%<<*}"
+          delimiter="${header#*<<}"
+          if [[ -z "$key" || -z "$delimiter" ]]; then
+            echo "Invalid direnv GHA export record: $header" >&2
+            exit 1
+          fi
+
+          if [[ "$key" != "LD_LIBRARY_PATH" ]]; then
+            printf '%s\n' "$header" >> "$GITHUB_ENV"
+          fi
+
+          record_complete=false
+          while IFS= read -r line; do
+            if [[ "$line" == "$delimiter" ]]; then
+              if [[ "$key" != "LD_LIBRARY_PATH" ]]; then
+                printf '%s\n' "$line" >> "$GITHUB_ENV"
+              fi
+              record_complete=true
+              break
+            fi
+            if [[ "$key" == "LD_LIBRARY_PATH" ]]; then
+              printf '%s\n' "$line" >> "$loader_file"
+            else
+              printf '%s\n' "$line" >> "$GITHUB_ENV"
+            fi
+          done
+          if [[ "$record_complete" != "true" ]]; then
+            echo "Unterminated direnv GHA export record for $key" >&2
+            exit 1
+          fi
+        done < "$export_file"
+
+        devshell_ld_library_path="$(cat "$loader_file")"
+        previous_bash_env="${BASH_ENV:-}"
+        nix_bash_env="$(mktemp "${RUNNER_TEMP:-/tmp}/nix-devshell-bash-env.XXXXXX")"
+        {
+          if [[ -n "$previous_bash_env" ]]; then
+            printf 'if [[ -f %q ]]; then source %q; fi\n' "$previous_bash_env" "$previous_bash_env"
+          fi
+          printf 'if [[ ${AH_DISABLE_DEVSHELL_LD_LIBRARY_PATH:-0} == 1 ]]; then\n'
+          printf '  unset LD_LIBRARY_PATH\n'
+          printf 'else\n'
+          printf '  export LD_LIBRARY_PATH=%q\n' "$devshell_ld_library_path"
+          printf 'fi\n'
+        } > "$nix_bash_env"
+        chmod 0600 "$nix_bash_env"
+
+        # JavaScript actions (including post actions) execute the runner's host
+        # Node binary. Keep Nix libstdc++ out of that process; GitHub's
+        # noninteractive Bash run steps source BASH_ENV and recover the
+        # devshell loader path. AH_DISABLE_DEVSHELL_LD_LIBRARY_PATH=1 gives an
+        # individual Bash step an explicit host-loader opt-out.
+        printf 'LD_LIBRARY_PATH=\n' >> "$GITHUB_ENV"
+        printf 'BASH_ENV=%s\n' "$nix_bash_env" >> "$GITHUB_ENV"
         echo "::endgroup::"
