@@ -220,12 +220,57 @@ def test_matrix_and_comments() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# 5. Comments and human-readable strings are NEVER rewritten — only the actual
+#    runner-selection value is. (Re-running the codemod on repos whose runs-on
+#    lines carry class-name DOCUMENTATION must not mangle that prose.)
+# ---------------------------------------------------------------------------
+def test_comments_and_strings_left_verbatim() -> None:
+    # trailing comment that names the class is preserved verbatim; the runs-on
+    # value is still migrated.
+    out = rw("    runs-on: eph-win-x64  # CIP-5: DIY-Windows (env.ps1) -> eph-win-x64\n")
+    check(
+        "runs-on migrated, trailing comment eph-win-x64 kept verbatim",
+        out == "    runs-on: [self-hosted, windows, x64]  # CIP-5: DIY-Windows (env.ps1) -> eph-win-x64\n",
+        detail=repr(out),
+    )
+    # a full-line comment is untouched entirely.
+    cline = "  # `eph-linux-x64-g1` is gpu-server-001's scale set; jobs moved off it\n"
+    check(
+        "full-line comment mentioning eph-linux-x64-g1 untouched",
+        rw(cline) == cline,
+        detail=repr(rw(cline)),
+    )
+    # a class named inside a human-readable (multi-word) string literal survives.
+    sline = '        echo "MSVC is part of the eph-win-x64 base image"\n'
+    check(
+        "prose string mentioning eph-win-x64 left verbatim",
+        rw(sline) == sline,
+        detail=repr(rw(sline)),
+    )
+    # description example text that mentions a class is also prose -> untouched.
+    dline = "      description: 'runner class, e.g. the eph-linux-x64 pool'\n"
+    check(
+        "description prose mentioning eph-linux-x64 left verbatim",
+        rw(dline) == dline,
+        detail=repr(rw(dline)),
+    )
+    # but an EXACT-quoted matrix default is still a value -> migrated.
+    check(
+        "exact-quoted matrix default still migrates",
+        rw('        default: "eph-linux-x64"\n')
+        == '        default: ["self-hosted", "linux", "x64"]\n',
+        detail=repr(rw('        default: "eph-linux-x64"\n')),
+    )
+
+
 def main() -> int:
     print("test_codemod_runs_on_labels:")
     test_scalar_forms()
     test_nested_class_drops_nested()
     test_gpu_aliases_migrate()
     test_matrix_and_comments()
+    test_comments_and_strings_left_verbatim()
     print()
     if all(_results):
         print(f"All {len(_results)} checks passed!")

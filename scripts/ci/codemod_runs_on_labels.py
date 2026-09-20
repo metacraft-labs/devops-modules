@@ -83,6 +83,16 @@ MIGRATION = {
 CLASSES = sorted(MIGRATION, key=len, reverse=True)
 CLASS_RE = re.compile(r"(?<![A-Za-z0-9-])(" + "|".join(map(re.escape, CLASSES)) + r")(?![A-Za-z0-9-])")
 
+# An exact-quoted class token, e.g. ``"eph-linux-x64"`` — a JSON/YAML matrix
+# default whose ENTIRE quoted content is the class. Prose that merely MENTIONS a
+# class inside a longer quoted string (``"the eph-win-x64 base image"``) does
+# NOT match this and is therefore left verbatim.
+EXACT_QUOTED_RE = re.compile(r"([\"'])(" + "|".join(map(re.escape, CLASSES)) + r")\1")
+
+# A quoted string span (single- or double-quoted). Bare-token rewriting skips
+# these so a human-readable string that mentions a class is never mangled.
+QUOTED_SPAN_RE = re.compile(r"\"[^\"]*\"|'[^']*'")
+
 
 def _flow(labels: list[str]) -> str:
     return "[" + ", ".join(labels) + "]"
@@ -92,31 +102,52 @@ def _json_arr(labels: list[str]) -> str:
     return "[" + ", ".join(f'"{l}"' for l in labels) + "]"
 
 
+def _split_comment(line: str) -> tuple[str, str]:
+    """Split ``line`` into ``(code, comment)`` at the first ``#`` that is not
+    inside a quoted string. The comment (with its ``#``) is returned verbatim so
+    the rewriter never touches a class name that only appears in a comment."""
+    inq: str | None = None
+    for i, ch in enumerate(line):
+        if inq:
+            if ch == inq:
+                inq = None
+        elif ch in ('"', "'"):
+            inq = ch
+        elif ch == "#":
+            return line[:i], line[i:]
+    return line, ""
+
+
+def _rewrite_bare_outside_quotes(code: str) -> str:
+    """Rewrite bare class tokens to flow arrays, but only in the spans of
+    ``code`` that are NOT inside a quoted string (so prose strings survive)."""
+    out: list[str] = []
+    last = 0
+    for m in QUOTED_SPAN_RE.finditer(code):
+        out.append(CLASS_RE.sub(lambda mm: _flow(MIGRATION[mm.group(1)]), code[last : m.start()]))
+        out.append(m.group(0))  # quoted span left verbatim
+        last = m.end()
+    out.append(CLASS_RE.sub(lambda mm: _flow(MIGRATION[mm.group(1)]), code[last:]))
+    return "".join(out)
+
+
 def rewrite_line(line: str) -> str:
-    """Rewrite any legacy class token on one line to its label set."""
+    """Rewrite legacy class tokens in the CODE portion of one line to their label
+    set, leaving comments and human-readable strings verbatim.
 
-    def repl(m: re.Match) -> str:
-        cls = m.group(1)
-        labels = MIGRATION[cls]
-        start = m.start()
-        before = line[:start]
-        # Inside a JSON/quoted context? Replace the *quoted* token with a JSON
-        # array (strip the surrounding quotes the match does not include).
-        # Detect a quote immediately before the token.
-        if before.rstrip().endswith(('"', "'")):
-            return _json_arr(labels)  # caller strips the trailing quote below
-        return _flow(labels)
-
-    # Handle the quoted-JSON form first: "eph-..." -> ["self-hosted",...]
-    def quoted_repl(m: re.Match) -> str:
-        cls = m.group(2)
-        return _json_arr(MIGRATION[cls])
-
-    quoted = re.compile(r"([\"'])(" + "|".join(map(re.escape, CLASSES)) + r")\1")
-    new = quoted.sub(quoted_repl, line)
-    # Then any remaining bare tokens (runs-on scalar / list item).
-    new = CLASS_RE.sub(lambda m: _flow(MIGRATION[m.group(1)]), new)
-    return new
+    Only two positions are rewritten:
+      * an exact-quoted class token (a matrix ``default: "eph-…"``) -> JSON array;
+      * a bare class token outside any quote (a ``runs-on:`` scalar, a matrix
+        flow-list item, or a ``- eph-…`` list item) -> YAML flow array.
+    A class name inside a trailing/leading comment or embedded in a longer quoted
+    string is left exactly as it was.
+    """
+    code, comment = _split_comment(line)
+    # 1. exact-quoted class token ("eph-…") -> JSON label array.
+    code = EXACT_QUOTED_RE.sub(lambda m: _json_arr(MIGRATION[m.group(2)]), code)
+    # 2. bare class tokens outside any remaining quote -> YAML flow array.
+    code = _rewrite_bare_outside_quotes(code)
+    return code + comment
 
 
 def rewrite_text(text: str) -> tuple[str, list[tuple[int, str, str]]]:
