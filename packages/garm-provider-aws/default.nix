@@ -56,7 +56,7 @@ let
 in
 buildGoModule {
   pname = "garm-provider-aws";
-  version = "0-unstable-2025-09-10-spot";
+  version = "0.1.6";
 
   # `src` is the PATCHED tree (applyPatches above), so it is referenceable by
   # the hermetic gates (`self'.packages.garm-provider-aws.src`) to run the spot
