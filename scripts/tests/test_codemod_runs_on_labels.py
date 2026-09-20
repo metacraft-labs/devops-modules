@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Tests for scripts/ci/codemod_runs_on_labels.py (RC4 runs-on label codemod).
 
-No mock objects: these exercise the real text-rewriting functions
-(``rewrite_text`` / ``scan_needs_decision``) over real workflow snippets. The
-codemod is pure text-in/text-out, so there is no filesystem or process boundary
-worth mocking — the fixtures ARE the contract.
+No mock objects: these exercise the real text-rewriting function
+(``rewrite_text``) over real workflow snippets. The codemod is pure
+text-in/text-out, so there is no filesystem or process boundary worth mocking —
+the fixtures ARE the contract.
 
 The load-bearing case is the RC4-audit regression: a legacy
 ``eph-linux-x64-nested`` class must migrate to ``[self-hosted, linux, x64]`` and
@@ -108,27 +108,61 @@ def test_nested_class_drops_nested() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3. GPU-host routing aliases (task #50) left ALONE + flagged
+# 3. GPU-host routing aliases (task #50, decided 2026-09-20):
+#    g1/g2 -> STANDARD triple (jobs don't need a GPU); gpu/gpu-2 -> keep `gpu`.
 # ---------------------------------------------------------------------------
-def test_gpu_aliases_left_alone() -> None:
-    for tok in ("eph-linux-x64-g1", "eph-linux-x64-g2", "eph-linux-x64-gpu", "eph-linux-x64-gpu-2"):
+def test_gpu_aliases_migrate() -> None:
+    # g1/g2 are general-purpose scale sets on the GPU hosts: they migrate to the
+    # plain standard triple and move OFF the GPU boxes by design.
+    for tok in ("eph-linux-x64-g1", "eph-linux-x64-g2"):
         src = f"runs-on: {tok}\n"
         check(
-            f"{tok} is left verbatim (not rewritten)",
-            rw(src) == src,
+            f"{tok} -> [self-hosted, linux, x64] (standard, no gpu)",
+            rw(src) == "runs-on: [self-hosted, linux, x64]\n",
             detail=repr(rw(src)),
         )
-        hits = cm.scan_needs_decision(src)
         check(
-            f"{tok} is flagged as needs-decision",
-            len(hits) == 1 and hits[0][1] == tok,
-            detail=repr(hits),
+            f"{tok} migration carries no gpu label",
+            "gpu" not in rw(src),
+            detail=repr(rw(src)),
         )
-    # And crucially, none of these are in the auto-migration table.
+    # gpu/gpu-2 route to the GPU pool for jobs that genuinely need a GPU: they
+    # KEEP the `gpu` capability label and stay pinned to the GPU fleet.
+    for tok in ("eph-linux-x64-gpu", "eph-linux-x64-gpu-2"):
+        src = f"runs-on: {tok}\n"
+        check(
+            f"{tok} -> [self-hosted, linux, x64, gpu] (gpu preserved)",
+            rw(src) == "runs-on: [self-hosted, linux, x64, gpu]\n",
+            detail=repr(rw(src)),
+        )
+    # Quoted/JSON form of a gpu alias keeps gpu in the JSON array too.
     check(
-        "no GPU-host alias is in the MIGRATION table",
-        not (set(cm.NEEDS_DECISION) & set(cm.MIGRATION)),
-        detail=repr(set(cm.NEEDS_DECISION) & set(cm.MIGRATION)),
+        "quoted eph-linux-x64-gpu -> JSON array with gpu",
+        rw('runs-on: "eph-linux-x64-gpu"\n')
+        == 'runs-on: ["self-hosted", "linux", "x64", "gpu"]\n',
+        detail=repr(rw('runs-on: "eph-linux-x64-gpu"\n')),
+    )
+    # All four aliases are now in the auto-migration table (no more verbatim).
+    check(
+        "all four GPU-host aliases are in the MIGRATION table",
+        all(
+            tok in cm.MIGRATION
+            for tok in (
+                "eph-linux-x64-g1",
+                "eph-linux-x64-g2",
+                "eph-linux-x64-gpu",
+                "eph-linux-x64-gpu-2",
+            )
+        ),
+        detail=repr(sorted(cm.MIGRATION)),
+    )
+    # `gpu` is emitted ONLY for the genuine gpu aliases, never for g1/g2 or any
+    # other class.
+    gpu_emitters = {c for c, labels in cm.MIGRATION.items() if "gpu" in labels}
+    check(
+        "gpu label emitted only for the genuine gpu aliases",
+        gpu_emitters == {"eph-linux-x64-gpu", "eph-linux-x64-gpu-2"},
+        detail=repr(sorted(gpu_emitters)),
     )
 
 
@@ -190,7 +224,7 @@ def main() -> int:
     print("test_codemod_runs_on_labels:")
     test_scalar_forms()
     test_nested_class_drops_nested()
-    test_gpu_aliases_left_alone()
+    test_gpu_aliases_migrate()
     test_matrix_and_comments()
     print()
     if all(_results):

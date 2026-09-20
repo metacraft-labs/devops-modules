@@ -33,7 +33,8 @@ capability **only if the job genuinely needs it** (see
 | Retired class (`runs-on: <name>`) | Capability label set (`runs-on: [ … ]`) | Notes                                                                                         |
 | --------------------------------- | --------------------------------------- | --------------------------------------------------------------------------------------------- |
 | `eph-linux-x64`                   | `[self-hosted, linux, x64]`             | add `x86-64-v3` only if the job needs AVX2/v3                                                 |
-| `eph-linux-x64-gpu`               | `[self-hosted, linux, x64, gpu]`        |                                                                                               |
+| `eph-linux-x64-gpu` / `-gpu-2`    | `[self-hosted, linux, x64, gpu]`        | genuine GPU jobs keep `gpu` and stay pinned to the 2-slot GPU fleet                           |
+| `eph-linux-x64-g1` / `-g2`        | `[self-hosted, linux, x64]`             | general-purpose scale sets on the GPU hosts; jobs don't need a GPU, so they move off (op #50) |
 | `eph-linux-x64-nested`            | `[self-hosted, linux, x64]`             | container runtimes and nested VMs are universal across the fleet — no extra label (see below) |
 | `eph-linux-arm64`                 | `[self-hosted, linux, arm64]`           |                                                                                               |
 | `eph-macos-arm64`                 | `[self-hosted, macos, arm64]`           |                                                                                               |

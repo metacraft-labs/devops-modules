@@ -51,42 +51,35 @@ from typing import Iterable
 # and routes them to one pool that does NOT advertise a ``nested`` tag. Rewriting
 # to ``[self-hosted, linux, x64, nested]`` would over-constrain the job to an
 # empty runner set. The safe, alias-guaranteed migration is the plain triple.
+#
+# GPU-host routing aliases — the operator decision (campaign task #50) landed
+# 2026-09-20, so these are now mechanical migrations too:
+#
+#   * ``eph-linux-x64-g1`` / ``-g2`` are the *general-purpose* scale sets that
+#     happen to live ON the GPU hosts (gpu-server-001/002). Their jobs do NOT
+#     need a GPU, so by operator decision they migrate to the STANDARD triple
+#     ``[self-hosted, linux, x64]`` and move off the GPU hosts by design — any
+#     linux x64 host may serve them, which is the intended de-pinning.
+#   * ``eph-linux-x64-gpu`` / ``-gpu-2`` route to the GPU pool and their jobs
+#     genuinely need a GPU, so they keep the ``gpu`` capability label and stay
+#     pinned to the 2-slot GPU fleet: ``[self-hosted, linux, x64, gpu]`` (this
+#     is the one alias-set the codemod is permitted to emit ``gpu`` for — the
+#     job was already gpu-pinned by name, so the label adds no new constraint).
 MIGRATION = {
     "eph-linux-x64": ["self-hosted", "linux", "x64"],
     "eph-linux-x64-nested": ["self-hosted", "linux", "x64"],
+    "eph-linux-x64-g1": ["self-hosted", "linux", "x64"],
+    "eph-linux-x64-g2": ["self-hosted", "linux", "x64"],
+    "eph-linux-x64-gpu": ["self-hosted", "linux", "x64", "gpu"],
+    "eph-linux-x64-gpu-2": ["self-hosted", "linux", "x64", "gpu"],
     "eph-linux-arm64": ["self-hosted", "linux", "arm64"],
     "eph-macos-arm64": ["self-hosted", "macos", "arm64"],
     "eph-win-x64": ["self-hosted", "windows", "x64"],
     "eph-win-arm64": ["self-hosted", "windows", "arm64"],
 }
 
-# GPU-host routing aliases we deliberately DO NOT rewrite — this is an operator
-# decision (campaign task #50), NOT a mechanical migration:
-#
-#   * ``eph-linux-x64-g1`` / ``-g2`` are the *general-purpose* scale sets that
-#     happen to live ON the GPU hosts (gpu-server-001/002). Rewriting them to a
-#     plain ``[self-hosted, linux, x64]`` would let those jobs land on ANY linux
-#     host and silently vacate the GPU boxes' reserved general-purpose capacity.
-#   * ``eph-linux-x64-gpu`` / ``-gpu-2`` route to the GPU pool. Whether migrated
-#     jobs should carry a ``gpu`` capability label (and thus stay pinned to the
-#     2-slot GPU fleet) or be re-homed is exactly the #50 decision.
-#
-# Until #50 is decided, the codemod leaves every one of these tokens VERBATIM and
-# WARNS when it sees one, so the choice is made deliberately by a human, not by a
-# silent rewrite. (The word-boundary regex below already refuses to match the
-# ``eph-linux-x64`` PREFIX inside these longer tokens, so "leave verbatim" needs
-# no special case in the rewriter — only this explicit, warned exclusion.)
-NEEDS_DECISION = {
-    "eph-linux-x64-gpu",
-    "eph-linux-x64-gpu-2",
-    "eph-linux-x64-g1",
-    "eph-linux-x64-g2",
-}
-NEEDS_DECISION_RE = re.compile(
-    r"(?<![A-Za-z0-9-])(" + "|".join(map(re.escape, sorted(NEEDS_DECISION, key=len, reverse=True))) + r")(?![A-Za-z0-9-])"
-)
-
-# Longest class names first so ``eph-linux-x64-nested`` wins over ``eph-linux-x64``.
+# Longest class names first so ``eph-linux-x64-nested`` / ``-gpu-2`` win over
+# their ``eph-linux-x64`` / ``eph-linux-x64-gpu`` prefixes.
 CLASSES = sorted(MIGRATION, key=len, reverse=True)
 CLASS_RE = re.compile(r"(?<![A-Za-z0-9-])(" + "|".join(map(re.escape, CLASSES)) + r")(?![A-Za-z0-9-])")
 
@@ -142,19 +135,6 @@ def rewrite_text(text: str) -> tuple[str, list[tuple[int, str, str]]]:
     return "".join(out_lines), changes
 
 
-def scan_needs_decision(text: str) -> list[tuple[int, str, str]]:
-    """Find every GPU-host routing alias (task #50) the codemod refuses to touch.
-
-    Returns ``(lineno, token, line)`` for each occurrence so ``main`` can warn.
-    These are left VERBATIM — mapping them mechanically is an operator decision.
-    """
-    hits: list[tuple[int, str, str]] = []
-    for i, line in enumerate(text.splitlines(), 1):
-        for m in NEEDS_DECISION_RE.finditer(line):
-            hits.append((i, m.group(1), line.strip()))
-    return hits
-
-
 def iter_workflows(paths: Iterable[Path]) -> list[Path]:
     out: list[Path] = []
     for p in paths:
@@ -174,11 +154,9 @@ def main(argv: list[str] | None = None) -> int:
 
     workflows = iter_workflows([Path(p) for p in args.paths])
     total = 0
-    flagged = 0
     for wf in workflows:
         text = wf.read_text(encoding="utf-8")
         new, changes = rewrite_text(text)
-        needs = scan_needs_decision(text)
         if changes:
             total += len(changes)
             print(f"\n{wf}:")
@@ -187,24 +165,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  + {lineno}: {rewritten.strip()}")
             if args.write:
                 wf.write_text(new, encoding="utf-8")
-        if needs:
-            flagged += len(needs)
-            print(f"\n{wf}: [needs-decision — left UNCHANGED, task #50]")
-            for lineno, token, line in needs:
-                print(f"  ! {lineno}: {token}  ({line})")
-
-    if flagged:
-        print(
-            f"\ncodemod-runs-on-labels: left {flagged} GPU-host routing alias "
-            "reference(s) UNCHANGED (eph-linux-x64-g1/-g2/-gpu*). Mapping these "
-            "is an operator decision (task #50) — the codemod will not rewrite "
-            "them.",
-            file=sys.stderr,
-        )
 
     if total == 0:
-        if flagged == 0:
-            print("codemod-runs-on-labels: no legacy eph-* classes found.")
+        print("codemod-runs-on-labels: no legacy eph-* classes found.")
         return 0
     verb = "rewrote" if args.write else "would rewrite"
     print(f"\ncodemod-runs-on-labels: {verb} {total} legacy class reference(s).", file=sys.stderr)
