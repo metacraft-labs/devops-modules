@@ -106,8 +106,16 @@ CAP_JUSTIFY = re.compile(r"#\s*cap-justify:\s*([A-Za-z0-9._:-]+)")
 # The migration table (RC1) — bare class name -> minimum capability label set.
 MIGRATION = {
     "eph-linux-x64": ["self-hosted", "linux", "x64"],
+    # No central pool advertises `nested`; the alias routes to the plain
+    # ${org}-linux pool, so it migrates to the standard linux label set.
+    "eph-linux-x64-nested": ["self-hosted", "linux", "x64"],
+    # g1/g2 GPU-host routing aliases: per operator decision 2026-09-20 these
+    # jobs do NOT need GPUs → standard linux (they move off the GPU hosts).
+    "eph-linux-x64-g1": ["self-hosted", "linux", "x64"],
+    "eph-linux-x64-g2": ["self-hosted", "linux", "x64"],
+    # Genuine GPU aliases keep the gpu capability.
     "eph-linux-x64-gpu": ["self-hosted", "linux", "x64", "gpu"],
-    "eph-linux-x64-nested": ["self-hosted", "linux", "x64", "nested"],
+    "eph-linux-x64-gpu-2": ["self-hosted", "linux", "x64", "gpu"],
     "eph-linux-arm64": ["self-hosted", "linux", "arm64"],
     "eph-macos-arm64": ["self-hosted", "macos", "arm64"],
     "eph-win-x64": ["self-hosted", "windows", "x64"],
