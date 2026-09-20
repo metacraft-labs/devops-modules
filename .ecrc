@@ -1,0 +1,6 @@
+{
+  "//": "editorconfig-checker config. The Indentation check is disabled repo-wide: it enforces leading-space multiples of `indent_size`, which misfires systematically on this codebase's heavy docstrings, embedded YAML/Python inside .nix and .py string literals, and aligned CLI help-text — 20 files of false positives, zero real bugs. Language indentation is already covered elsewhere (nixfmt for .nix, prettier for md/json/yaml, Python's own significant-whitespace at import). The other checks (trailing whitespace, final newline, charset) stay ON.",
+  "Disable": {
+    "Indentation": true
+  }
+}
