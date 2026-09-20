@@ -20,6 +20,16 @@ top@{ ... }:
   # the configured repos — which FAILS on the pre-fix inline-JSON rendering and
   # PASSES on the file-path rendering. It also starts the (oneshot) service and
   # requires it to reach success, reproducing the failed→fixed transition.
+  #
+  # It ALSO gates the SECOND bug found on hms: the exporter's writer could not
+  # create its .prom into the shared, root:root-0755 node-exporter textfile dir.
+  # The pre-fix unit ran as a hardened DynamicUser, which gets EACCES there even
+  # with ReadWritePaths (that lifts systemd's RO mount, not the filesystem DAC
+  # ownership check) → `PermissionError: [Errno 13]`. This gate now builds the
+  # dir with the PROD ownership/mode (root:root 0755, NOT the world-writable 1777
+  # that previously masked it) and requires the oneshot to write the .prom and
+  # exit 0 — which FAILS on the DynamicUser posture and PASSES once the unit runs
+  # as root (mirroring the working sibling win-runner-mem-sampler).
   perSystem =
     {
       config,
@@ -54,12 +64,22 @@ top@{ ... }:
             {
               imports = [ flake.modules.nixos.github-actions-fit-exporter ];
               environment.systemPackages = [ pkgs.python3 ];
-              # The textfile-collector dir is normally provided by
-              # node-exporter; create it so the hardened unit's ReadWritePaths
-              # target exists and the DynamicUser can write its .prom snapshot in
-              # this minimal VM (world-writable sticky dir, node-exporter-style).
+              # PROD-FAITHFUL textfile dir. In production this dir is the shared
+              # node-exporter textfile collector, created `root:root 0755` by the
+              # sibling win-runner-mem-sampler (infra
+              # services/monitoring/win-runner-memory.nix). Model that here — the
+              # dir PRE-EXISTS owned root:root 0755 — so this gate reproduces the
+              # SECOND bug: a hardened DynamicUser writer gets `PermissionError:
+              # [Errno 13]` creating its `.prom` `.tmp` in a root:root 0755 dir
+              # (ReadWritePaths lifts the mount-level RO bind, not the filesystem
+              # DAC ownership check). The prior revision created this dir `1777`
+              # (world-writable) which let ANY uid write and thus MASKED the bug —
+              # the exporter passed in the VM while failing on hms. Do NOT restore
+              # the 1777 shortcut. The fixed module runs the exporter as root and
+              # asserts the same `d … 0755 root root` rule, so this identical rule
+              # is consistent (idempotent) with the module's own.
               systemd.tmpfiles.rules = [
-                "d /var/lib/prometheus-node-exporter/textfile 1777 root root -"
+                "d /var/lib/prometheus-node-exporter/textfile 0755 root root -"
               ];
               services.github-actions-fit-exporter = {
                 enable = true;
@@ -116,15 +136,32 @@ top@{ ... }:
                 got = json.loads(host.succeed("python3 /tmp/roundtrip.py"))
                 assert got == expected, f"exporter loaded {got!r}, expected {expected!r}"
 
-            with subtest("the oneshot service reaches success (not failed, as on the host)"):
+            with subtest("the oneshot writes the .prom into the PROD-permissioned dir and exits 0"):
                 # A clean run: json parse succeeds, per-repo API calls fail-soft
-                # (no network), the .prom is still written and ExecStart exits 0.
+                # (no network), the writer creates its .tmp + renames the .prom
+                # into the root:root 0755 dir, and ExecStart exits 0. On the
+                # pre-fix DynamicUser posture the writer gets EACCES creating the
+                # .tmp here and the unit ends Result=failed — this is the SECOND
+                # bug (the hms `PermissionError: [Errno 13]`).
+                textdir = "/var/lib/prometheus-node-exporter/textfile"
+                prom = f"{textdir}/github-actions-fit.prom"
+
                 host.succeed(f"systemctl start {unit}")
                 result = host.succeed(f"systemctl show -p Result --value {unit}").strip()
                 assert result == "success", f"unit Result={result!r} (expected success)"
-                host.succeed(
-                    "test -s /var/lib/prometheus-node-exporter/textfile/github-actions-fit.prom"
-                )
+                host.succeed(f"test -s {prom}")
+
+                # Faithfulness guard: assert the dir really is prod-permissioned
+                # (root-owned, NOT world-writable). A regression back to a 1777 /
+                # world-writable dir — which would mask this bug again — fails here.
+                mode = host.succeed(f"stat -c '%a' {textdir}").strip()
+                owner = host.succeed(f"stat -c '%U' {textdir}").strip()
+                assert mode == "755", f"textfile dir mode {mode!r} (expected 755, prod-faithful; not a world-writable shortcut)"
+                assert owner == "root", f"textfile dir owner {owner!r} (expected root)"
+
+                # And the writer created it as root (the working sibling's posture).
+                prom_owner = host.succeed(f"stat -c '%U' {prom}").strip()
+                assert prom_owner == "root", f".prom owner {prom_owner!r} (expected root)"
           '';
         };
       };

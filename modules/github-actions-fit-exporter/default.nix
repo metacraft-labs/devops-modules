@@ -137,6 +137,26 @@
       };
 
       config = mkIf cfg.enable {
+        # The textfile-collector output dir must both EXIST before this
+        # strict-mounted unit starts AND be writable by the exporter's writer.
+        # In production it is the SHARED node-exporter textfile-collector dir,
+        # created `root:root 0755` by the sibling win-runner-mem-sampler
+        # (infra services/monitoring/win-runner-memory.nix): node-exporter reads
+        # it (world-readable), and a writer must be root to create files in it.
+        # Declare the identical rule here so the dir also exists when this module
+        # is the first/only writer on a host — two modules asserting the same
+        # `d … 0755 root root` line is idempotent and conflict-free.
+        #
+        # NOTE ON POSTURE: the exporter runs as root (below), mirroring the
+        # sibling sampler that writes this SAME dir successfully. A hardened
+        # DynamicUser could NOT: `ReadWritePaths` only lifts systemd's mount-level
+        # read-only bind, it does not bypass the filesystem's DAC ownership check,
+        # so a transient DynamicUser uid gets EACCES creating its `.prom` `.tmp`
+        # in a `root:root 0755` dir — the `PermissionError: [Errno 13]` observed
+        # on hms. We deliberately match the sibling's `root` + `0755` posture
+        # rather than widen the shared dir to world-writable (`0777`/`1777`).
+        systemd.tmpfiles.rules = [ "d ${cfg.textfileDir} 0755 root root -" ];
+
         systemd.services.github-actions-fit-exporter = {
           description = "GitHub-Actions ubuntu-latest fit exporter (duration + resource-limit signatures)";
           after = [ "network-online.target" ];
@@ -144,8 +164,13 @@
           serviceConfig = {
             Type = "oneshot";
             ExecStart = "${cfg.package}/bin/github-actions-fit-exporter";
-            # Hardened: reads the (agenix) token file and writes the textfile dir.
-            DynamicUser = true;
+            # Root, matching the sibling win-runner-mem-sampler: the shared
+            # node-exporter textfile dir is `root:root 0755`, so the writer that
+            # creates the `.tmp`/`.prom` there must be root. Still hardened — the
+            # service reads only the (agenix) token file and writes only the
+            # textfile dir; ProtectSystem=strict keeps the rest of /var read-only
+            # even for root, so ReadWritePaths is still required for the dir.
+            User = "root";
             ProtectSystem = "strict";
             ProtectHome = true;
             NoNewPrivileges = true;
