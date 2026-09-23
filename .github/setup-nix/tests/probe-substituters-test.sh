@@ -12,8 +12,14 @@
 #                                                        that excludes us)
 #   /portal/      200 + HTML                           (captive portal)
 #   /missing/     404                                  (wrong cache name)
+#   /flaky/       502 twice, then 200                  (a transient blip)
 #
 # plus a closed port for "unreachable".
+#
+# Every probe run gets a PATH holding ONLY bash, curl and the coreutils the
+# script declares (mktemp head tr sleep) — the macOS self-hosted runners have
+# no grep/sed/awk, and an earlier revision died there on `grep: command not
+# found`, misreading cache.nixos.org as unusable.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,6 +39,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 GOOD = "good-token"
 
 class H(BaseHTTPRequestHandler):
+    flaky = 0
     def reply(self, code, body, ctype="text/plain"):
         data = body.encode()
         self.send_response(code)
@@ -54,6 +61,11 @@ class H(BaseHTTPRequestHandler):
             return self.reply(401, '{"code":401,"error":"Unauthorized"}')
         if self.path == "/acl/nix-cache-info":
             return self.reply(403, "<html><head><title>403 Forbidden</title></head><body><center>nginx</center></body></html>", "text/html")
+        if self.path == "/flaky/nix-cache-info":
+            H.flaky += 1
+            if H.flaky <= 2:
+                return self.reply(502, "<html>502 Bad Gateway</html>", "text/html")
+            return self.reply(200, cache_info)
         if self.path == "/portal/nix-cache-info":
             return self.reply(200, "<html>Please log in to the Wi-Fi</html>", "text/html")
         return self.reply(404, "not found")
@@ -75,6 +87,18 @@ base="http://127.0.0.1:$port"
 # A port nothing listens on: bind, record, release.
 closed_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
 
+# The minimal runner PATH (see header).
+minbin="$work/minbin"
+mkdir -p "$minbin"
+for tool in bash curl mktemp head tr sleep; do
+  ln -s "$(command -v "$tool")" "$minbin/$tool"
+done
+nocurlbin="$work/nocurlbin"
+mkdir -p "$nocurlbin"
+for tool in bash mktemp head tr sleep; do
+  ln -s "$(command -v "$tool")" "$nocurlbin/$tool"
+done
+
 pass=0
 fail=0
 
@@ -83,9 +107,10 @@ run() {
   local name="$1" expect="$2"
   shift 2
   local rc=0
-  out="$(env -i PATH="$PATH" HOME="$work" \
+  out="$(env -i PATH="$minbin" HOME="$work" \
     SETUP_NIX_PROBE_UPSTREAM="$base/ok" \
     SETUP_NIX_PROBE_ATTEMPTS=2 \
+    SETUP_NIX_PROBE_BACKOFF=0 \
     SETUP_NIX_PROBE_CONNECT_TIMEOUT=2 \
     SETUP_NIX_PROBE_MAX_TIME=5 \
     "$@" bash "$probe" 2>&1)" || rc=$?
@@ -128,11 +153,13 @@ good_netrc="$work/netrc-good"
 printf 'machine 127.0.0.1\nlogin attic\npassword good-token\n' >"$good_netrc"
 bad_netrc="$work/netrc-bad"
 printf 'machine 127.0.0.1\nlogin attic\npassword revoked-token\n' >"$bad_netrc"
-chmod 600 "$good_netrc" "$bad_netrc"
+github_only_netrc="$work/netrc-github"
+printf 'machine github.com\nlogin x-access-token\npassword gh*token\n' >"$github_only_netrc"
+chmod 600 "$good_netrc" "$bad_netrc" "$github_only_netrc"
 
 # 1. All healthy (trailing slash tolerated).
 run healthy 0 SETUP_NIX_PROBE_SUBSTITUTERS="$base/ok/ $base/private" \
-  SETUP_NIX_PROBE_NETRC="$good_netrc" SETUP_NIX_PROBE_TOKEN_SUPPLIED=true &&
+  SETUP_NIX_PROBE_NETRC="$good_netrc" &&
   expect_in healthy "OK  $base/ok" && expect_in healthy "OK  $base/private" &&
   expect_not_in healthy "::warning" && expect_not_in healthy "::error"
 
@@ -147,13 +174,18 @@ run acl-fail 1 SETUP_NIX_PROBE_MODE=fail SETUP_NIX_PROBE_SUBSTITUTERS="$base/ok 
   expect_in acl-fail "::error title=Binary cache unusable::$base/acl" &&
   expect_in acl-fail "failing now rather than letting Nix build"
 
-# 4. Private cache, no token passed: diagnosis names the missing input.
+# 4. Private cache, no token passed: diagnosis names the missing input —
+#    both with no netrc at all and with a netrc that only covers github.com
+#    (the real shape: write-netrc always files the github credential).
 run no-token 1 SETUP_NIX_PROBE_MODE=fail SETUP_NIX_PROBE_SUBSTITUTERS="$base/private" &&
   expect_in no-token "no attic-token was passed"
+run no-token-gh-netrc 1 SETUP_NIX_PROBE_MODE=fail SETUP_NIX_PROBE_SUBSTITUTERS="$base/private" \
+  SETUP_NIX_PROBE_NETRC="$github_only_netrc" &&
+  expect_in no-token-gh-netrc "has no entry for 127.0.0.1"
 
 # 5. Private cache, token passed but refused.
 run bad-token 1 SETUP_NIX_PROBE_MODE=fail SETUP_NIX_PROBE_SUBSTITUTERS="$base/private" \
-  SETUP_NIX_PROBE_NETRC="$bad_netrc" SETUP_NIX_PROBE_TOKEN_SUPPLIED=true &&
+  SETUP_NIX_PROBE_NETRC="$bad_netrc" &&
   expect_in bad-token "rejected the credential"
 
 # 6. The upstream cache failing is fatal even in warn mode.
@@ -185,12 +217,52 @@ run off 0 SETUP_NIX_PROBE_MODE=off SETUP_NIX_PROBE_SUBSTITUTERS="$base/acl" &&
 run bad-mode 1 SETUP_NIX_PROBE_MODE=sometimes SETUP_NIX_PROBE_SUBSTITUTERS="$base/ok" &&
   expect_in bad-mode "must be one of fail, warn, off"
 
-# 12. Step summary gets a table row per cache.
+# 12. A transient 5xx is retried with backoff and then succeeds.
+run flaky 0 SETUP_NIX_PROBE_ATTEMPTS=5 SETUP_NIX_PROBE_MODE=fail \
+  SETUP_NIX_PROBE_SUBSTITUTERS="$base/flaky" &&
+  expect_in flaky "attempt 1/5: HTTP 502" && expect_in flaky "attempt 2/5: HTTP 502" &&
+  expect_in flaky "OK  $base/flaky"
+
+# 13. Warn mode prunes unusable caches from nix.conf (and only them, only on
+#     the substituters line); fail mode leaves it alone.
+conf="$work/nix.conf"
+write_conf() {
+  printf '%s\n' "  fallback = true" \
+    "  substituters = $base/ok $base/acl/ $base/private" \
+    "  trusted-public-keys = a:1 b:2" \
+    "  netrc-file = /x" >"$conf"
+}
+write_conf
+run prune 0 SETUP_NIX_PROBE_NIX_CONF="$conf" SETUP_NIX_PROBE_NETRC="$good_netrc" \
+  SETUP_NIX_PROBE_SUBSTITUTERS="$base/ok $base/acl/ $base/private" &&
+  expect_in prune "removed from $conf: $base/acl" &&
+  out="$(<"$conf")" &&
+  expect_in prune "  substituters = $base/ok $base/private"$'\n' &&
+  expect_not_in prune "$base/acl" &&
+  expect_in prune "  trusted-public-keys = a:1 b:2" &&
+  expect_in prune "  fallback = true"
+write_conf
+run no-prune-in-fail 1 SETUP_NIX_PROBE_MODE=fail SETUP_NIX_PROBE_NIX_CONF="$conf" \
+  SETUP_NIX_PROBE_SUBSTITUTERS="$base/ok $base/acl/" &&
+  out="$(<"$conf")" && expect_in no-prune-in-fail "$base/acl/"
+
+# 14. Missing curl is reported, not misread as an unusable cache.
+rc=0
+out="$(env -i PATH="$nocurlbin" HOME="$work" SETUP_NIX_PROBE_SUBSTITUTERS="$base/ok" \
+  "$nocurlbin/bash" "$probe" 2>&1)" || rc=$?
+if [[ "$rc" == 1 ]]; then
+  expect_in no-curl "curl is not on this runner's PATH"
+else
+  echo "FAIL [no-curl]: exit $rc"
+  fail=$((fail + 1))
+fi
+
+# 15. Step summary gets a table row per cache.
 summary_file="$work/summary.md"
 run summary 0 GITHUB_STEP_SUMMARY="$summary_file" SETUP_NIX_PROBE_SUBSTITUTERS="$base/ok $base/acl" &&
   out="$(cat "$summary_file")" &&
   expect_in summary "| \`$base/ok\` | OK |" &&
-  expect_in summary "| \`$base/acl\` | WARN — HTTP 403"
+  expect_in summary "| \`$base/acl\` | WARN (removed from substituters) — HTTP 403"
 
 echo "probe-substituters-test: $pass assertion(s) passed, $fail failed"
 [[ "$fail" -eq 0 ]]

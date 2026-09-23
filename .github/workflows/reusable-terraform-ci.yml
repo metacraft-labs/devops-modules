@@ -170,6 +170,15 @@ on:
         required: false
         default: ''
 
+      nix_fallback:
+        description: >-
+          setup-nix `fallback`. Default 'true' (Nix builds from source what a
+          failing substituter could not provide, after disabling it for 60s).
+          'false' makes any substituter error fail the job instead — use it
+          where a silent source build of the devShell is worse than a retry.
+        type: string
+        required: false
+        default: 'true'
       substituter_preflight:
         description: >-
           setup-nix `substituter-preflight` mode: `fail` stops the job when any
@@ -309,6 +318,7 @@ jobs:
           # No attic-cache is set, so nothing is pushed.
           attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           substituter-preflight: ${{ inputs.substituter_preflight }}
+          fallback: ${{ inputs.nix_fallback }}
 
       - name: Lockfile check
         run: |
@@ -532,6 +542,7 @@ jobs:
           # No attic-cache is set, so nothing is pushed.
           attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           substituter-preflight: ${{ inputs.substituter_preflight }}
+          fallback: ${{ inputs.nix_fallback }}
 
       - name: Decrypt provider credentials
         if: inputs.agenix_plan_secret_path != ''
@@ -1071,6 +1082,7 @@ jobs:
           # No attic-cache is set, so nothing is pushed.
           attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           substituter-preflight: ${{ inputs.substituter_preflight }}
+          fallback: ${{ inputs.nix_fallback }}
 
       - name: Lockfile existence gate
         run: |
@@ -1389,6 +1401,7 @@ jobs:
           # No attic-cache is set, so nothing is pushed.
           attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           substituter-preflight: ${{ inputs.substituter_preflight }}
+          fallback: ${{ inputs.nix_fallback }}
 
       - name: Decrypt provider credentials
         if: inputs.agenix_plan_secret_path != ''

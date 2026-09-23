@@ -82,24 +82,29 @@ inputs:
     default: false
   fallback:
     description: >-
-      Value of Nix's `fallback` setting. Default `false`. With `true`, one
-      transient download error makes Nix DISABLE that substituter for 60
-      seconds for the whole process, and every path it would have fetched is
-      scheduled for a source build instead — which is how a `nix develop` that
-      only needed `age` ended up building stdenv and hanging a job for 5 hours.
-      With `false`, a download that keeps failing after `download-attempts`
-      retries fails the job, loudly. Derivations that are in no cache are
-      still built either way; this only governs failed downloads.
+      Value of Nix's `fallback` setting. Default `true` (unchanged behaviour).
+      With `true`: when a substituter errors (anything but "not found" — a
+      5xx, a timeout, a DNS failure that survives `download-attempts`), Nix
+      DISABLES that substituter for 60 seconds for the whole process and
+      builds whatever it could not fetch from source. With `false`: Nix never
+      disables a substituter, but ANY such error is rethrown and fails the
+      command — including while merely querying a substituter about a
+      derivation that is in no cache at all (Nix 2.28/2.31 `SubstitutionGoal`
+      and `querySubstitutablePathInfos` rethrow when fallback is off). So
+      `false` trades "may silently build the world" for "a transient cache
+      error (e.g. an Attic 500 burst) fails the job". Opt in for jobs that
+      must never build a large closure from source (e.g. terraform apply).
     required: false
-    default: 'false'
+    default: 'true'
   substituter-preflight:
     description: >-
       Probe every configured substituter's `nix-cache-info` (with the netrc Nix
       will use) before anything asks Nix to substitute. `fail`: any unusable
       cache fails the job with the diagnosed cause (401 no/bad token, 403
       network ACL, unreachable). `warn` (default): cache.nixos.org must be
-      usable, other caches only produce a warning annotation. `off`: no probe.
-      See probe-substituters.sh.
+      usable; any other unusable cache produces a warning annotation and is
+      removed from this job's nix.conf so no nix command waits on it. `off`:
+      no probe. See probe-substituters.sh.
     required: false
     default: 'warn'
   netbird-setup-key:
@@ -419,9 +424,8 @@ runs:
             ''
           }}
 
-          # See the `fallback` input: `true` turns one transient error into
-          # "substituter disabled for 60s" + a source build of the closure.
-          fallback = ${{ inputs.fallback == 'true' && 'true' || 'false' }}
+          # See the `fallback` input for the exact trade-off in both values.
+          fallback = ${{ inputs.fallback == 'false' && 'false' || 'true' }}
           download-attempts = 5
           # `connect-timeout` is libcurl's CURLOPT_CONNECTTIMEOUT, and libcurl
           # charges the time a transfer spends QUEUED for a free connection
@@ -429,17 +433,24 @@ runs:
           # At 5s with an 8-connection pool, every narinfo/NAR queued behind
           # eight busy NAR downloads failed with "Operation timed out after
           # 5000 milliseconds with 0 bytes received" — no network fault at all
-          # — and with fallback on, that disabled cache.nixos.org. Keep the
-          # pool at Nix's default and give queued transfers real headroom;
-          # genuinely silent transfers are bounded by stalled-download-timeout.
-          connect-timeout = 60
+          # — and with fallback on, that disabled cache.nixos.org.
+          #
+          # 16 connections = Nix's default max-substitution-jobs, so NAR
+          # downloads alone never queue; only narinfo lookups can wait behind
+          # them. It stays below Nix's own default of 25 to keep burst load
+          # on our Attic (which has shown 500 bursts) bounded. 20s (Nix 2.31
+          # ships 15) gives a queued lookup headroom while bounding a truly
+          # unreachable cache to ~20s x download-attempts per nix process;
+          # the "Probe binary caches" step removes caches it finds unusable
+          # from nix.conf so the common case never waits at all.
+          connect-timeout = 20
           # Persistent self-hosted runners have observed a group of multiplexed
           # cache.nixos.org NAR transfers make no progress until the job ceiling.
           # Bound silent transfers and use HTTP/1.1 so Nix can retry an
           # individual object instead of wedging the whole substitution.
           stalled-download-timeout = 30
           http2 = false
-          http-connections = 25
+          http-connections = 16
           narinfo-cache-negative-ttl = 120
           allow-import-from-derivation = true
           experimental-features = ${{ inputs.experimental-features }}
@@ -510,9 +521,9 @@ runs:
       env:
         SETUP_NIX_PROBE_SUBSTITUTERS: https://cache.nixos.org ${{ inputs.substituters }}
         SETUP_NIX_PROBE_MODE: ${{ inputs.substituter-preflight }}
-        SETUP_NIX_PROBE_TOKEN_SUPPLIED: ${{ inputs.attic-token != '' && 'true' || 'false' }}
       run: |
         SETUP_NIX_PROBE_NETRC="$HOME/.config/nix/netrc" \
+        SETUP_NIX_PROBE_NIX_CONF="$HOME/.config/nix/nix.conf" \
           bash "${{ github.action_path }}/probe-substituters.sh"
 
     - name: Start Attic watch-store

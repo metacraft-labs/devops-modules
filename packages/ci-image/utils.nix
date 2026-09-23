@@ -44,9 +44,9 @@ rec {
       cat > $out/etc/nix/nix.conf <<EOF
       trusted-users = ${lib.concatStringsSep " " trustedUsers}
       experimental-features = nix-command flakes
-      fallback = false
+      fallback = true
       download-attempts = 5
-      connect-timeout = 60
+      connect-timeout = 20
       narinfo-cache-negative-ttl = 120
       allow-import-from-derivation = true
       EOF

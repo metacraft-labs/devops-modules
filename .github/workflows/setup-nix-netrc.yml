@@ -71,3 +71,20 @@ jobs:
       - name: Run the binary-cache preflight contract test
         shell: bash
         run: bash .github/setup-nix/tests/probe-substituters-test.sh
+
+  fallback-semantics:
+    # Runs the action itself end to end (install Nix, write nix.conf + netrc,
+    # probe the binary caches), then pins Nix's `fallback` semantics with the
+    # real nix it installed. See tests/fallback-semantics-test.sh.
+    name: setup-nix fallback semantics (real nix)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup Nix (this action, defaults)
+        uses: ./.github/setup-nix
+
+      - name: Run the fallback semantics test
+        shell: bash
+        run: bash .github/setup-nix/tests/fallback-semantics-test.sh
