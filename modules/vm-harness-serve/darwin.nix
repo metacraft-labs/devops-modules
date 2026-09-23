@@ -55,6 +55,9 @@
   #    host itself — under userspace NetBird that never works, so the original
   #    watchdog "recovered" a healthy daemon every 10 minutes. A failed
   #    handshake is now judged by the kernel's accept queue instead.
+  #  * A daemon can keep answering while its request handlers leak one by one
+  #    (each stuck behind a worker it never reaps), so long-dead unreaped
+  #    workers count as a failure too.
   #  * Both jobs start through `/bin/wait4path /nix/store`, and the watchdog
   #    re-bootstraps (rather than kickstarts) a job launchd has stopped
   #    spawning, with every launchctl call time-bounded.
@@ -161,6 +164,9 @@
           launchctl_cmd="''${VMH_HC_LAUNCHCTL:-/bin/launchctl}"
           netstat_cmd="''${VMH_HC_NETSTAT:-/usr/sbin/netstat}"
           launchctl_timeout="''${VMH_HC_LAUNCHCTL_TIMEOUT:-30}"
+          ps_cmd="''${VMH_HC_PS:-/bin/ps}"
+          stuck_threshold=${toString hcfg.stuckWorkerThreshold}
+          stuck_grace_s=${toString hcfg.stuckWorkerGraceSec}
 
           mkdir -p "$state"
           log() { echo "vm-harness-serve-healthcheck: $*"; }
@@ -173,7 +179,43 @@
           # supervises stayed down.
           lctl() { timeout "$launchctl_timeout" "$launchctl_cmd" "$@"; }
 
+          # Workers the daemon has not reaped long after they exited. A
+          # request handler streams its worker's stdout until EOF and only
+          # then wait(2)s it, so a zombie child that is minutes old is a
+          # handler that will never return: something still holds the write
+          # end of that stdout pipe (on m3, 9 such zombies up to 76 minutes
+          # old with the whole handler pool busy — the daemon answered every
+          # request with 503). The listener stays up and its accept queue
+          # drains, so no network-side probe sees it from this host.
+          stuck_workers() {
+            local pid
+            pid="$(grep -Em1 '^[[:space:]]*pid = [0-9]+$' <<<"$job" | awk '{ print $3 }' || true)"
+            if [ -z "$pid" ]; then
+              echo 0
+              return
+            fi
+            "$ps_cmd" -axo ppid=,stat=,etime= 2>/dev/null | awk -v p="$pid" -v g="$stuck_grace_s" '
+              function secs(e,   d, x, a, n, i, s) {
+                d = 0
+                if (index(e, "-")) { split(e, x, "-"); d = x[1]; e = x[2] }
+                n = split(e, a, ":"); s = 0
+                for (i = 1; i <= n; i++) s = s * 60 + a[i]
+                return d * 86400 + s
+              }
+              $1 == p && $2 ~ /^Z/ && secs($3) >= g { c++ }
+              END { print c + 0 }' || echo 0
+          }
+
+          # "Answered" is not enough on its own: a daemon whose handlers are
+          # leaking still answers until the last one is gone. Returns (does
+          # not exit) when stuck handlers make it a failure after all.
           healthy() {
+            local stuck
+            stuck="$(stuck_workers)"
+            if [ "$stuck" -ge "$stuck_threshold" ]; then
+              log "listener answered ($*), but $stuck worker(s) exited more than ''${stuck_grace_s}s ago and were never reaped — that many request handlers are stuck"
+              return 0
+            fi
             if [ -f "$fail_file" ] && [ "$(cat "$fail_file" 2>/dev/null || echo 0)" != "0" ]; then
               log "listener healthy again ($*) — resetting failure counter"
             fi
@@ -599,6 +641,32 @@
               Minimum seconds between two watchdog-initiated kickstarts, so a
               daemon wedging for a systemic reason is not restart-stormed but
               left in a state an operator can inspect.
+            '';
+          };
+
+          stuckWorkerThreshold = mkOption {
+            type = types.int;
+            default = 4;
+            description = ''
+              How many long-dead, never-reaped worker processes (zombies older
+              than {option}`stuckWorkerGraceSec`) make a probe count as failed
+              even though the listener answered. Each one is a request handler
+              that will never return; the daemon keeps answering until the
+              whole pool is gone and then refuses everything with 503.
+
+              Not 1: recovery restarts the daemon, which also kills any
+              legitimate long-running create in flight, so a single leaked
+              handler is tolerated until a few have accumulated.
+            '';
+          };
+
+          stuckWorkerGraceSec = mkOption {
+            type = types.int;
+            default = 600;
+            description = ''
+              Minimum age, in seconds, of an unreaped worker before it counts
+              toward {option}`stuckWorkerThreshold`. A healthy daemon reaps a
+              worker within moments of its exit.
             '';
           };
 
