@@ -21,6 +21,10 @@
 
             ${pkgs.bash}/bin/bash ${../terraform/ci/tests/test-matrix.sh}
             ${pkgs.bash}/bin/bash ${../terraform/ci/tests/test-matrix-mutations.sh}
+
+            export PLAN_DESTROY_GUARD_SCRIPT=${../terraform/ci/plan-destroy-guard}
+            export PLAN_DESTROY_GUARD_PYTHON=${pkgs.python3}/bin/python3
+            ${pkgs.bash}/bin/bash ${../terraform/ci/tests/test-plan-destroy-guard.sh}
             touch "$out"
           '';
     };
