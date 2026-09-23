@@ -24,6 +24,7 @@ TESTS=(
   TestFailedDeleteDoesNotCancelSiblings
   TestFailedCleanupDeleteBacksOff
   TestCreateRetryIsBackedOff
+  TestFailingPoolDoesNotBlockOtherPools
 )
 
 say "0. static: the upstream defects are gone from the patched tree"
@@ -34,6 +35,8 @@ if grep -q 'deleteInstanceFromProvider(errCtx, instance)' "$pool"; then
   fail "retry cleanup deletes still share a cancellable errgroup context"
 fi
 grep -q 'func createRetryBackoff' "$pool" || fail "create retries are not backed off"
+grep -q 'failedPools\[dbInstance.PoolID\] = err' "$pool" ||
+  fail "cleanupOrphanedGithubRunners no longer skips a failing pool per pool"
 grep -q 'InstanceAbsentFromProviderCount.WithLabelValues' "$pool" &&
   grep -q '"absent_from_provider_total"' "$GATE_PATCHED_SRC/metrics/instance.go" &&
   grep -q 'InstanceAbsentFromProviderCount,' "$GATE_PATCHED_SRC/metrics/metrics.go" ||

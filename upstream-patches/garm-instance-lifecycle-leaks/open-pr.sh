@@ -62,8 +62,9 @@ git commit -s -m "Test instance-lifecycle handling in the pool manager
 Drives cleanupOrphanedGithubRunners() and retryFailedInstancesForOnePool()
 against the real SQLite store with a mocked provider and forge: an instance
 absent from ListInstances is routed through DeleteInstance, a failing delete
-neither cancels its siblings nor is retried every tick, and create retries
-are spaced out."
+neither cancels its siblings nor is retried every tick, create retries
+are spaced out, and a pool whose provider cannot be listed does not stop
+the orphan sweep for the others."
 
 #   go test -tags testing ./runner/pool/ -run TestInstanceLifecycleSuite
 git push -u origin "$BRANCH"
