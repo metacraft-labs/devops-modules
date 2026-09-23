@@ -146,20 +146,34 @@ top@{ ... }:
             }
 
             # launchctl shim: `print` reports $SHIM_JOB (running | stuck |
-            # unloaded); every call is appended to work/launchctl.log;
-            # `kickstart` sleeps when SHIM_KICKSTART_HANGS=1, reproducing the
-            # 2026-09-21 hang against a penalty-boxed job.
+            # unloaded | hung) — or, once a bootout/bootstrap has run in this
+            # case, the state launchd would then be in (work/job-state), so a
+            # multi-pass case sees the job it left behind. Every call is
+            # appended to work/launchctl.log. `kickstart` sleeps when
+            # SHIM_KICKSTART_HANGS=1, reproducing the 2026-09-21 hang against a
+            # penalty-boxed job; `hung` makes `print` itself never return;
+            # SHIM_BOOTSTRAP_FAIL=1 makes `bootstrap` fail the way launchd does
+            # right after a bootout (`5: Input/output error`).
             cat > shims/launchctl <<'SH'
             #!/bin/sh
             echo "$*" >> "$SHIM_LOG"
+            job=$(cat "$SHIM_STATE" 2>/dev/null || echo "$SHIM_JOB")
             case "$1" in
               print)
-                case "$SHIM_JOB" in
+                case "$job" in
                   unloaded) exit 113 ;;
+                  hung) exec sleep 30 ;;
                   running) printf 'system/x = {\n\tstate = running\n\tpid = 4242\n\t\tstate = active\n}\n' ;;
                   stuck) printf 'system/x = {\n\tstate = spawn scheduled\n\tlast exit code = 78: EX_CONFIG\n\t\tstate = active\n}\n' ;;
                 esac ;;
-              kickstart) [ "''${SHIM_KICKSTART_HANGS:-0}" = 1 ] && sleep 30 ;;
+              kickstart) [ "''${SHIM_KICKSTART_HANGS:-0}" = 1 ] && exec sleep 30 ;;
+              bootout) echo unloaded > "$SHIM_STATE" ;;
+              bootstrap)
+                if [ "''${SHIM_BOOTSTRAP_FAIL:-0}" = 1 ]; then
+                  echo 'Bootstrap failed: 5: Input/output error' >&2
+                  exit 5
+                fi
+                echo running > "$SHIM_STATE" ;;
             esac
             exit 0
             SH
@@ -171,15 +185,17 @@ top@{ ... }:
             [ -n "''${SHIM_QUEUE:-}" ] && echo "$SHIM_QUEUE        127.0.0.1.${toString fixturePort}"
             exit 0
             SH
-            # ps shim: prints $SHIM_PS verbatim (ppid stat etime rows).
+            # ps shim: prints $SHIM_PS verbatim (ppid stat etime rows), then
+            # exits $SHIM_PS_RC (default 0).
             cat > shims/ps <<'SH'
             #!/bin/sh
             printf '%b' "''${SHIM_PS:-}"
-            exit 0
+            exit "''${SHIM_PS_RC:-0}"
             SH
             chmod +x shims/launchctl shims/netstat shims/ps
 
-            reset_state() { rm -rf "$PWD/state" work/launchctl.log; mkdir -p "$PWD/state/healthcheck"; : > work/launchctl.log; }
+            reset_state() { rm -rf "$PWD/state" work/launchctl.log work/job-state; mkdir -p "$PWD/state/healthcheck"; : > work/launchctl.log; }
+            marker="$PWD/state/healthcheck/rebootstrap-pending"
             counter() { cat "$PWD/state/healthcheck/consecutive-failures" 2>/dev/null || echo missing; }
             actions() { grep -v '^print' work/launchctl.log | tr '\n' ';' || true; }
 
@@ -191,6 +207,8 @@ top@{ ... }:
             probe() {  # $1 = label; runs one watchdog pass with the shims
               set +e
               SHIM_LOG="$PWD/work/launchctl.log" \
+                SHIM_STATE="$PWD/work/job-state" \
+                VMH_HC_BOOTSTRAP_BACKOFF_SEC=0 \
                 VMH_HC_LAUNCHCTL="$PWD/shims/launchctl" \
                 VMH_HC_NETSTAT="$PWD/shims/netstat" \
                 VMH_HC_PS="$PWD/shims/ps" \
@@ -308,6 +326,66 @@ top@{ ... }:
             printf '2' > state/healthcheck/consecutive-failures
             SHIM_JOB=unloaded probe unloaded
             expect unloaded 0 "" "unloaded job -> no action"
+            [ ! -e "$marker" ] || bad "operator unload left a re-bootstrap marker behind"
+
+            # --- a re-bootstrap that fails right after bootout ---------------
+            # Pass 1: threshold on a never-spawned job; bootout succeeds, every
+            # bootstrap attempt fails with launchd's `5: Input/output error`.
+            # The job is now gone, and pass 2 must NOT read that as an
+            # operator unload — it completes the re-bootstrap.
+            reset_state
+            printf '2' > state/healthcheck/consecutive-failures
+            SHIM_JOB=stuck SHIM_BOOTSTRAP_FAIL=1 VMH_HC_BOOTSTRAP_ATTEMPTS=3 probe bsfail1
+            plist=/Library/LaunchDaemons/org.metacraft-labs.vm-harness-serve.plist
+            bs="bootstrap system $plist;"
+            if [ "$(cat work/rc.bsfail1)" = 0 ]; then
+              bad "a pass whose bootstrap never succeeded exited 0: $(cat work/out.bsfail1)"
+            elif [ "$(actions)" != "bootout system/org.metacraft-labs.vm-harness-serve;$bs$bs$bs" ]; then
+              bad "failed bootstrap: actions '$(actions)', expected bootout + 3 bootstrap attempts: $(cat work/out.bsfail1)"
+            elif [ ! -e "$marker" ]; then
+              bad "failed bootstrap left no re-bootstrap marker: $(cat work/out.bsfail1)"
+            else
+              note "ok: a bootstrap failing after bootout is retried, then left marked for the next pass"
+            fi
+            : > work/launchctl.log
+            SHIM_JOB=stuck probe bsfail2
+            expect bsfail2 0 "$bs" "next pass completes an interrupted re-bootstrap instead of treating the unloaded job as operator intent"
+            [ ! -e "$marker" ] || bad "re-bootstrap marker survived a successful bootstrap"
+            [ "$(cat work/job-state)" = running ] || bad "job not loaded after the recovering pass"
+
+            # --- marker + job loaded and serving: marker is cleared ----------
+            reset_state
+            date +%s > "$marker"
+            pid=$(serve_code 200); sleep 1
+            probe marker_ok
+            kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+            expect marker_ok 0 "" "a stale marker on a running job is cleared, no action"
+            [ ! -e "$marker" ] || bad "stale marker not cleared once the job was loaded and running"
+
+            # --- launchd itself hangs on `print` -----------------------------
+            # A timed-out `print` is not "not loaded": it must count toward the
+            # threshold rather than reset the counter.
+            reset_state
+            printf '1' > state/healthcheck/consecutive-failures
+            SHIM_JOB=hung probe print_hang
+            expect print_hang 2 "" "launchctl print timing out counts as a failure (counter not reset)"
+            grep -q 'launchd is unresponsive' work/out.print_hang \
+              || bad "a print timeout was not logged distinctly: $(cat work/out.print_hang)"
+
+            # --- ps fails ------------------------------------------------------
+            # Partial output that already shows stuck workers still counts;
+            # a failing ps with no output is 0 stuck, without a shell error.
+            reset_state
+            SHIM_QUEUE="0/0/128" SHIM_PS_RC=1 \
+              SHIM_PS='4242 Z 01:16:00\n4242 Z 58:50\n4242 Z 1-02:00:00\n4242 Z 12:00\n' \
+              probe ps_partial
+            expect ps_partial 1 "" "stuck workers in the output of a failing ps still count"
+            reset_state
+            SHIM_QUEUE="0/0/128" SHIM_PS_RC=1 SHIM_PS="" probe ps_fail
+            expect ps_fail 0 "" "a failing ps with no output reads as zero stuck workers"
+            if grep -q 'integer expression' work/out.ps_fail work/out.ps_partial; then
+              bad "stuck-worker count is not a single integer when ps fails: $(cat work/out.ps_fail work/out.ps_partial)"
+            fi
 
             if [ "$fail" -eq 0 ]; then
               echo "vmharness-serve-darwin-posture OK"
