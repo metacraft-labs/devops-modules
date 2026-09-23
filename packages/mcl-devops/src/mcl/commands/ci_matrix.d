@@ -1022,7 +1022,14 @@ NixSystem[] getSupportedSystems(string flakeRef = ".")
         flakeRef = flakeRef.absolutePath.buildNormalizedPath;
     }
 
-    return nix.eval!JSONValue(flakeRef ~ `#mcl.shard-matrix.systemsToBuild`)
+    // The leading `.` makes the attribute path absolute. Without it `nix eval`
+    // first tries `packages.<system>.mcl...`, and in a flake whose
+    // `packages.<system>.mcl` throws (this repo's rename tombstone) that throw
+    // is fatal instead of falling through to the top-level `mcl.shard-matrix`
+    // output. The eval then "fails", we fall back to every system, and the
+    // runner lookup for a system the caller never mapped dies with a
+    // RangeError.
+    return nix.eval!JSONValue(flakeRef ~ `#.mcl.shard-matrix.systemsToBuild`)
         .ifThrown(nix.eval!JSONValue(flakeRef ~ `#legacyPackages`, [
             "--apply",
             `builtins.attrNames`

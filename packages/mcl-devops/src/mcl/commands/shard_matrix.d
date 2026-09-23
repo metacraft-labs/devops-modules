@@ -83,7 +83,8 @@ ShardMatrix generateShardMatrix(string flakeRef = ".", Nullable!NixSystem system
     }
 
     const shardCountOutput = nix.eval(
-        "%s#mcl.shard-matrix.result.%s".fmt(
+        // Absolute attribute path (leading `.`): see `getSupportedSystems`.
+        "%s#.mcl.shard-matrix.result.%s".fmt(
             flakeRef,
             system.isNull
                 ? "shardCount"
