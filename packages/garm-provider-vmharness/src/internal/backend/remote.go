@@ -209,10 +209,11 @@ func (b *RemoteBackend) Create(ctx context.Context, args CreateArgs) (Instance, 
 	}, nil
 }
 
-// Delete reclaims the per-job guest on the remote host over RPC. It is
-// idempotent: a transport/auth failure is surfaced, but a non-zero worker exit
-// (the guest is already gone) is treated as success so a repeated Delete of an
-// absent instance still reports success — matching the local backends' contract.
+// Delete reclaims the per-job guest on the remote host over RPC. A transport or
+// auth failure is surfaced, and so is ANY non-zero worker exit: the teardown did
+// not complete and the guest may still exist. Idempotence lives in the worker —
+// `ephemeral-destroy` exits 0 for an instance that is already gone — so a
+// repeated Delete of an absent instance still reports success.
 func (b *RemoteBackend) Delete(ctx context.Context, idOrName string) error {
 	argv := b.recipe().del(b.TargetBackend, idOrName)
 	code, err := b.Client.ExecStream(ctx, argv, logToStderr("delete "+idOrName))
@@ -250,9 +251,15 @@ const (
 	// listTimeout bounds one enumeration round-trip. Enumeration is a couple of
 	// `virsh`/`incus` calls on the daemon host; a minute is generous.
 	listTimeout = 60 * time.Second
-	// usageExitCode is what vm-harness exits with for an unknown verb or flag,
-	// i.e. what a daemon older than `ephemeral-label` answers.
+	// usageExitCode is what vm-harness exits with for ANY usage error: an
+	// unknown verb (a daemon older than `ephemeral-label`), but equally an
+	// unknown flag or a rejected --label value on a current daemon. The exit
+	// code alone therefore cannot identify an old daemon; oldDaemonLabelMarker
+	// does.
 	usageExitCode = 2
+	// oldDaemonLabelMarker is what a vm-harness that predates the verb prints
+	// (`vm-harness: unknown subcommand '<verb>'`, then its help, exit 2).
+	oldDaemonLabelMarker = "unknown subcommand 'ephemeral-label'"
 )
 
 // ErrEnumerationUnavailable marks a failure to enumerate the remote host. It
@@ -268,8 +275,10 @@ var ErrEnumerationUnavailable = errors.New("remote instance enumeration unavaila
 // create (and deletes + retries it, as it does for any create error) than a
 // live runner that the next reconcile pass tears down.
 //
-// The one tolerated failure is a daemon too old to know the verb (usage exit
-// 2): refusing every create during a rolling upgrade would be an outage, and
+// The one tolerated failure is a daemon too old to know the verb — exit 2 AND
+// its "unknown subcommand 'ephemeral-label'" message; any other usage error is
+// a real failure. Refusing every create during a rolling upgrade would be an
+// outage, and
 // such a daemon also cannot answer `ephemeral-list`, so List fails closed for
 // that host anyway and nothing is removed on the strength of an absent label.
 func (b *RemoteBackend) label(ctx context.Context, args CreateArgs) error {
@@ -284,14 +293,21 @@ func (b *RemoteBackend) label(ctx context.Context, args CreateArgs) error {
 		argv = append(argv, "--label", labelController+"="+args.ControllerID)
 	}
 	argv = append(argv, "--log-format", "json")
-	code, err := b.Client.ExecStream(ctx, argv, logToStderr("label "+args.Name))
+	logEv := logToStderr("label " + args.Name)
+	unknownVerb := false
+	code, err := b.Client.ExecStream(ctx, argv, func(ev ExecEvent) {
+		if ev.Kind == "log" && strings.Contains(ev.Line, oldDaemonLabelMarker) {
+			unknownVerb = true
+		}
+		logEv(ev)
+	})
 	if err != nil {
 		return fmt.Errorf("remote Create %s: recording ownership labels: %w", args.Name, err)
 	}
-	switch code {
-	case 0:
+	switch {
+	case code == 0:
 		return nil
-	case usageExitCode:
+	case code == usageExitCode && unknownVerb:
 		fmt.Fprintf(os.Stderr, "remote Create %s: daemon does not support ephemeral-label (exit 2); instance is unattributed until the daemon is upgraded\n", args.Name)
 		return nil
 	default:

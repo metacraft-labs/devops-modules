@@ -109,6 +109,9 @@ func (h *fakeHost) run(argv []string) ([]string, int) {
 		if h.oldDaemon {
 			return []string{"vm-harness: unknown subcommand 'ephemeral-label'"}, 2
 		}
+		if h.labelExit == 2 {
+			return []string{"vm-harness: --label expects key=value, got 'garm-pool'"}, 2
+		}
 		if h.labelExit != 0 {
 			return []string{"cannot write label record"}, h.labelExit
 		}
@@ -387,6 +390,17 @@ func TestRemoteCreateLabelsAndToleratesOnlyAnOldDaemon(t *testing.T) {
 		defer done()
 		if _, err := b.Create(context.Background(), CreateArgs{Name: "garm-o", PoolID: "P"}); err != nil {
 			t.Fatalf("Create against a daemon without ephemeral-label must not fail: %v", err)
+		}
+	})
+	t.Run("a usage error from a CURRENT daemon fails the create", func(t *testing.T) {
+		// Exit 2 is every usage error, not just an unknown verb: only the old
+		// daemon's "unknown subcommand" message may be tolerated.
+		h := newFakeHost()
+		h.labelExit = 2
+		b, done := h.server(t)
+		defer done()
+		if _, err := b.Create(context.Background(), CreateArgs{Name: "garm-u", PoolID: "P"}); err == nil {
+			t.Fatal("a rejected --label (exit 2) was mistaken for an old daemon and the instance left unattributed")
 		}
 	})
 	t.Run("label write failure fails the create", func(t *testing.T) {
