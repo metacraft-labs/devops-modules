@@ -47,6 +47,7 @@
     ./garm-provider-vmharness-windows-toolchain.nix
     ./vmharness-image-is-honoured.nix
     ./vmharness-serve-linux-deploy.nix
+    ./vmharness-serve-inventory-textfile.nix
     ./vmharness-serve-darwin-posture.nix
     ./vmharness-serve-win-libvirt.nix
     ./runner-label-taxonomy.nix
