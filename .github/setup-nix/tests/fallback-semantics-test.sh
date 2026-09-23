@@ -4,8 +4,8 @@
 # setup-nix is documented by evidence rather than by belief.
 #
 # A local HTTP origin plays a binary cache; a trivial derivation that is in NO
-# cache is built into a throwaway chroot store with that cache as its only
-# substituter:
+# cache (its name carries a per-run nonce) is built with that cache as its
+# only substituter:
 #
 #   narinfo answer | fallback=true        | fallback=false
 #   ---------------+----------------------+-------------------------------
@@ -17,7 +17,12 @@
 # The second row is why setup-nix keeps `fallback = true` by default and makes
 # `false` an explicit opt-in: with `false`, an Attic 500 burst fails the job.
 #
-# Needs: nix (any 2.2x+), python3, bash. Runs unprivileged (chroot store).
+# Needs: nix (any 2.2x+), python3, bash, and a user TRUSTED by the nix daemon
+# (setup-nix installs with trust-runner-user), because it overrides
+# substituters / require-sigs / sandbox per invocation. It builds into the
+# real store: a chroot store cannot write outputs without a user-namespace
+# sandbox, which GitHub-hosted Ubuntu restricts. Set
+# FALLBACK_TEST_STORE=local?root=/some/dir to use a chroot store instead.
 set -euo pipefail
 
 command -v nix >/dev/null || {
@@ -82,12 +87,17 @@ start_origin() {
 
 # case <narinfo-status> <fallback> <expected: built|fails>
 case_() {
-  local status="$1" fallback="$2" expect="$3" rc=0 store="$work/store-$1-$2"
+  local status="$1" fallback="$2" expect="$3" rc=0
+  local store_args=()
+  if [[ -n "${FALLBACK_TEST_STORE:-}" ]]; then
+    store_args=(--store "$FALLBACK_TEST_STORE-$1-$2")
+  fi
   start_origin "$status"
-  nix-build "$work/drv.nix" --no-out-link \
-    --store "local?root=$store" \
+  # A fresh derivation per case, so no case sees another's output.
+  sed "s/fallback-semantics-/fallback-semantics-$1-$2-/" "$work/drv.nix" >"$work/drv-$1-$2.nix"
+  nix-build "$work/drv-$1-$2.nix" --no-out-link \
+    ${store_args[@]+"${store_args[@]}"} \
     --option substituters "http://127.0.0.1:$port" \
-    --option trusted-substituters "" \
     --option require-sigs false \
     --option sandbox false \
     --option fallback "$fallback" \

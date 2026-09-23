@@ -44,6 +44,11 @@
             assert "attic-token" not in probe_step
             assert "SETUP_NIX_PROBE_NIX_CONF=" in probe_step
 
+            # nix.conf is written by an UNQUOTED heredoc (it interpolates
+            # $HOME): a backtick or $( in a comment there is executed by bash.
+            heredoc = action.split('cat << EOF > "$HOME/.config/nix/nix.conf"', 1)[1].split("\n        EOF\n", 1)[0]
+            assert "`" not in heredoc and "$(" not in heredoc, "command substitution inside the nix.conf heredoc"
+
             # The binary-cache preflight runs after nix.conf + netrc are
             # written and before anything substitutes.
             assert action.index("/write-netrc.sh") < action.index("name: Probe binary caches")
