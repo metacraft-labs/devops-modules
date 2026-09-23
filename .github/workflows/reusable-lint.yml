@@ -1,5 +1,38 @@
 name: 'Lint'
 
+# Runs a repository's pre-commit / prek hook suite.
+#
+# HOW THE HOOK ENTRY POINT IS FOUND
+#
+# Repositories expose their hooks in several shapes: a dedicated
+# `devShells.<system>.pre-commit` shell carrying prek, a git-hooks.nix
+# `checks.<system>.pre-commit-check` (or `.pre-commit`) derivation, a dev shell
+# whose shellHook writes the (usually gitignored) `.pre-commit-config.yaml`
+# symlink and carries prek or pre-commit, or a plain committed
+# `.pre-commit-config.yaml`. With no inputs set, the first match below wins:
+#
+#   1. devShells.<system>.pre-commit      -> `prek run --all-files` in it
+#                                            (the original behaviour, unchanged)
+#   2. checks.<system>.pre-commit-check   -> `nix build` the check
+#      checks.<system>.pre-commit
+#   3. devShells.<system>.hooks, .lint, .default, in that order -> enter the
+#      shell; if it then provides a `.pre-commit-config.yaml` and prek (or
+#      pre-commit), run it with `--all-files`; otherwise try the next shell
+#   4. a committed `.pre-commit-config.yaml` -> `prek` from nixpkgs
+#
+# If nothing matches, the job FAILS with the list of what was probed — a repo
+# wired to this workflow must never pass by running nothing.
+#
+# Overrides, for repos where discovery needs help:
+#   check:   run only `nix build .#checks.<system>.<check>`
+#   shell:   run only in `devShells.<system>.<shell>` (with `command`, or the
+#            auto hook runner when `command` is empty)
+#   command: a bash command; run inside `shell` when that is set, otherwise
+#            directly in the checkout (it may invoke nix itself)
+#
+# The discovery step is exercised hermetically by
+# checks/ci-workflows.nix (`reusable-lint-hook-discovery`).
+
 on:
   # Allow this workflow to be reused by other workflows:
   workflow_call:
@@ -7,6 +40,21 @@ on:
       runner:
         description: 'JSON-encoded runner label set (RC1 capability labels, e.g. ["self-hosted","linux","x64"])'
         default: '["self-hosted","linux","x64"]'
+        required: false
+        type: string
+      shell:
+        description: 'Dev shell to run the hooks in (devShells.<system>.<shell>); empty = discover'
+        default: ''
+        required: false
+        type: string
+      check:
+        description: 'Flake check to build instead (checks.<system>.<check>), e.g. a git-hooks.nix pre-commit-check; empty = discover'
+        default: ''
+        required: false
+        type: string
+      command:
+        description: 'Bash command to run (inside `shell` if set, else in the checkout); empty = the auto hook runner'
+        default: ''
         required: false
         type: string
 
@@ -38,4 +86,147 @@ jobs:
           substituters: ${{ vars.SUBSTITUTERS }}
 
       - name: Check formatting
-        run: nix develop --accept-flake-config .#pre-commit -c prek run --all-files --show-diff-on-failure --color always
+        env:
+          LINT_SHELL: ${{ inputs.shell }}
+          LINT_CHECK: ${{ inputs.check }}
+          LINT_COMMAND: ${{ inputs.command }}
+        run: |
+          # Actions runs this with `bash -e`; exit codes are handled
+          # explicitly below (NO_ENTRY must not abort the discovery loop).
+          set +e -uo pipefail
+
+          # Exit code the in-shell runner uses for "this shell has no hook
+          # entry point" (as opposed to "the hooks ran and failed").
+          NO_ENTRY=97
+          runner_flags=(run --all-files --show-diff-on-failure --color always)
+          probed=()
+
+          die() {
+            echo "::error title=reusable-lint::$*"
+            exit 1
+          }
+
+          run_logged() {
+            echo "reusable-lint: + $*"
+            "$@"
+          }
+
+          # Runs inside a dev shell, after its shellHook: the shellHook of a
+          # git-hooks.nix shell is what writes the gitignored config symlink.
+          # shellcheck disable=SC2016
+          auto_runner='
+            if [ ! -e .pre-commit-config.yaml ]; then
+              echo "reusable-lint: no .pre-commit-config.yaml after entering the shell" >&2
+              exit 97
+            fi
+            if command -v prek >/dev/null 2>&1; then
+              exec prek "$@"
+            elif command -v pre-commit >/dev/null 2>&1; then
+              exec pre-commit "$@"
+            fi
+            echo "reusable-lint: the shell provides neither prek nor pre-commit" >&2
+            exit 97
+          '
+
+          # attr_names <flake output> -> space-separated attribute names of
+          # <output>.<system>, empty when the output is absent.
+          attr_names() {
+            local out err
+            err=$(mktemp)
+            if out=$(nix eval --raw --accept-flake-config ".#$1.$system" \
+                --apply 'a: builtins.concatStringsSep " " (builtins.attrNames a)' 2>"$err"); then
+              echo "$out"
+            else
+              if ! grep -q 'does not provide attribute' "$err"; then
+                echo "::warning title=reusable-lint::evaluating .#$1.$system failed:" >&2
+                cat "$err" >&2
+              fi
+            fi
+            rm -f "$err"
+          }
+
+          has() { [[ " $1 " == *" $2 "* ]]; }
+
+          run_check() {
+            run_logged nix build -L --no-link --accept-flake-config ".#checks.$system.$1"
+          }
+
+          # run_in_shell <shell> -> runs LINT_COMMAND or the auto runner;
+          # returns NO_ENTRY when the shell carries no hook entry point.
+          run_in_shell() {
+            if [ -n "$LINT_COMMAND" ]; then
+              run_logged nix develop --accept-flake-config ".#$1" -c bash -euo pipefail -c "$LINT_COMMAND"
+            else
+              run_logged nix develop --accept-flake-config ".#$1" -c bash -c "$auto_runner" reusable-lint "${runner_flags[@]}"
+            fi
+          }
+
+          system=$(nix eval --raw --impure --expr builtins.currentSystem) ||
+            die "cannot determine the Nix system"
+
+          # ---- explicit overrides -------------------------------------------
+          if [ -n "$LINT_CHECK" ] && [ -n "$LINT_SHELL" ]; then
+            die "set at most one of the 'check' and 'shell' inputs"
+          fi
+          if [ -n "$LINT_CHECK" ]; then
+            [ -z "$LINT_COMMAND" ] || die "'command' cannot be combined with 'check'"
+            run_check "$LINT_CHECK"
+            exit
+          fi
+          if [ -n "$LINT_SHELL" ]; then
+            run_in_shell "$LINT_SHELL"
+            rc=$?
+            [ "$rc" -ne "$NO_ENTRY" ] || die "devShells.$system.$LINT_SHELL (the 'shell' input) provides no hook entry point: it needs a .pre-commit-config.yaml after its shellHook and prek or pre-commit on PATH — or set 'command'"
+            exit "$rc"
+          fi
+          if [ -n "$LINT_COMMAND" ]; then
+            run_logged bash -euo pipefail -c "$LINT_COMMAND"
+            exit
+          fi
+
+          # ---- discovery ------------------------------------------------------
+          shells=""
+          checks=""
+          if [ -f flake.nix ]; then
+            shells=$(attr_names devShells)
+            checks=$(attr_names checks)
+          else
+            probed+=("no flake.nix")
+          fi
+
+          # 1. The dedicated pre-commit shell (original behaviour).
+          if has "$shells" pre-commit; then
+            run_logged nix develop --accept-flake-config .#pre-commit -c prek "${runner_flags[@]}"
+            exit
+          fi
+          probed+=("devShells.$system.pre-commit")
+
+          # 2. A git-hooks.nix check derivation.
+          for c in pre-commit-check pre-commit; do
+            if has "$checks" "$c"; then
+              run_check "$c"
+              exit
+            fi
+            probed+=("checks.$system.$c")
+          done
+
+          # 3. A dev shell that sets the hooks up.
+          for s in hooks lint default; do
+            if has "$shells" "$s"; then
+              run_in_shell "$s"
+              rc=$?
+              [ "$rc" -eq "$NO_ENTRY" ] || exit "$rc"
+              probed+=("devShells.$system.$s (no hook config/runner inside)")
+            else
+              probed+=("devShells.$system.$s")
+            fi
+          done
+
+          # 4. A committed config, run with prek from nixpkgs.
+          if [ -f .pre-commit-config.yaml ] && git ls-files --error-unmatch .pre-commit-config.yaml >/dev/null 2>&1; then
+            run_logged nix run --accept-flake-config nixpkgs#prek -- "${runner_flags[@]}"
+            exit
+          fi
+          probed+=("committed .pre-commit-config.yaml")
+
+          die "no hook entry point found (probed: $(IFS=';'; echo "${probed[*]}")). Expose devShells.<system>.pre-commit or checks.<system>.pre-commit-check, or set the 'shell' / 'check' / 'command' input."
