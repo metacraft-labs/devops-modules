@@ -32,6 +32,24 @@ check() { # check <description> <condition-exit-code>
   fi
 }
 
+# The harness's own tools must exist before any assertion runs. Several
+# checks are NEGATIVE ("no temporary credential remains") and are written as
+# `[[ -z "$(find ...)" ]]`: with `find` missing, the substitution is empty and
+# the check passes vacuously while the paired positive check fails for a
+# misleading reason. That is exactly what the minimal-PATH m3 service runner
+# produced ("an unremovable temporary credential remains protected at mode
+# 600" failed, every "leaves no temporary credential" check passed). A harness
+# that cannot observe must refuse to report, not report success.
+missing_harness_tools=()
+for harness_tool in awk grep sed cmp find stat cp ln readlink chmod mkdir mktemp mv rm cat wc dirname env; do
+  command -v "$harness_tool" >/dev/null 2>&1 || missing_harness_tools+=("$harness_tool")
+done
+if (( ${#missing_harness_tools[@]} > 0 )); then
+  echo "write-netrc-test: harness tools missing from PATH: ${missing_harness_tools[*]}" >&2
+  echo "write-netrc-test: refusing to run; negative assertions would pass vacuously" >&2
+  exit 2
+fi
+
 file_mode() {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
 }
