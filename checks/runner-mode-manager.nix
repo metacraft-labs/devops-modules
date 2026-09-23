@@ -9,22 +9,42 @@ _top@{ ... }:
   #
   # HERMETIC: the test extracts the REAL `decide` and `metrics` run blocks from
   # the workflow (not copies) and drives them under `env -i` with a stub `gh`
-  # that returns canned billing JSON (and a stub that FAILS, for the fail-safe
-  # case). The only `gh` on PATH is the stub, and `env -i` strips the
-  # environment, so a real network call cannot happen — a regression that
-  # reached the live billing API would fail rather than pass.
+  # (fixtures/billing-usage/gh-stub.sh) that serves the ENHANCED-billing usage
+  # report CAPTURED LIVE for 2026-09 (names anonymized) — one Team org and one
+  # two-org ENTERPRISE pool — and GitHub's real failure shapes (HTTP 410 from the
+  # retired classic endpoint, the old classic body, unreachable API). The only
+  # `gh` on PATH is the stub, and `env -i` strips the environment, so a real
+  # network call cannot happen — a regression that reached the live billing API
+  # would fail rather than pass.
+  #
+  # Mock justification (dev-guidelines): the billing API is a paid, org-private
+  # third-party boundary that cannot be driven into a chosen state (a month
+  # mid-way through its pool, an exhausted pool, a 410) from a Nix sandbox. The
+  # stub replays captured responses verbatim, so the parser runs against the
+  # real wire shape; only the transport is replaced.
   #
   # NON-TAUTOLOGICAL: each case pins the exact CI_RUNNER_MODE + failsafe flag
   # for a distinct billing shape, so the decision logic is load-bearing:
-  #   * remove the fail-safe (case d error -> github-hosted) and (d)/(d2) flip;
-  #   * remove the minutes buffer and (b) flips to github-hosted;
-  #   * remove the budget check and (c) flips to github-hosted.
+  #   * the pool is PRICE-weighted: the enterprise pool through 09-18 still has
+  #     4847 Linux-equivalent minutes (a 1x/2x/10x multiplier model says it is
+  #     exhausted), and the full month is exhausted at -229 (a raw-minutes model
+  #     says 16k remain) — both were confirmed against live job blocking;
+  #   * public-repo usage must be excluded (it is ~10x the private usage in the
+  #     org fixture), else the healthy cases flip to self-hosted;
+  #   * remove the minutes buffer and near-exhaustion flips to github-hosted;
+  #   * remove the budget check and over-budget flips to github-hosted; count
+  #     storage overage as budget and storage-overage-ignored flips;
+  #   * remove any fail-safe (410 / old shape / enterprise plan at org scope /
+  #     repo-listing error / unreachable) and that case flips.
   # The metrics assertions pin the stuck-state dead-man's-switch: a successful
   # run advances last_success; a fail-safe run does not.
   perSystem =
     { pkgs, ... }:
     let
       manageWorkflow = ../.github/workflows/reusable-manage-runner-mode.yml;
+      chooseWorkflow = ../.github/workflows/reusable-choose-runner.yml;
+      syncWorkflow = ../.github/workflows/reusable-sync-hosted-minutes.yml;
+      fixtures = ./fixtures/billing-usage;
       py = pkgs.python3.withPackages (ps: [ ps.pyyaml ]);
     in
     {
@@ -58,6 +78,28 @@ _top@{ ... }:
             assert env.get("GH_TOKEN") == "${"$"}{{ secrets.billing_token }}", env.get("GH_TOKEN")
             assert env.get("MIN_REMAIN") == "${"$"}{{ inputs.min_minutes_remaining }}", env.get("MIN_REMAIN")
             assert env.get("MAX_BILLED") == "${"$"}{{ inputs.max_billed_amount }}", env.get("MAX_BILLED")
+            assert env.get("INCLUDED_MINUTES") == "${"$"}{{ inputs.included_minutes }}", env.get("INCLUDED_MINUTES")
+            assert env.get("BILLING_ENTERPRISE") == "${"$"}{{ inputs.enterprise }}", env.get("BILLING_ENTERPRISE")
+            # The retired classic endpoint (HTTP 410) must not be read anywhere.
+            for wfpath in ("${manageWorkflow}", "${chooseWorkflow}", "${syncWorkflow}"):
+                assert "settings/billing/actions" not in "".join(
+                    l for l in open(wfpath) if not l.lstrip().startswith("#")), wfpath
+            # The billing reader is shared: the three copies must be byte-identical.
+            import re
+            blocks = []
+            for wfpath in ("${manageWorkflow}", "${chooseWorkflow}", "${syncWorkflow}"):
+                txt = open(wfpath).read()
+                m = re.search(r"^( *)# >>> billing-remaining.*?^\1# <<< billing-remaining$", txt, re.S | re.M)
+                assert m, f"{wfpath}: shared billing_remaining block missing"
+                blocks.append("\n".join(l[len(m.group(1)):] for l in m.group(0).splitlines()))
+            assert blocks[0] == blocks[1] == blocks[2], "billing_remaining copies drifted between workflows"
+            # The poll must be able to START when the pool is exhausted: hosted
+            # only for a public caller, else the self-hosted `runner` input.
+            runs_on = wf["jobs"]["manage"]["runs-on"]
+            assert "github.event.repository.visibility == 'public'" in runs_on, runs_on
+            assert "inputs.runner" in runs_on, runs_on
+            on0 = wf.get("on", wf.get(True))
+            assert on0["workflow_call"]["inputs"]["runner"]["default"].startswith('["self-hosted"'), on0
             # The written variable is the S1-authoritative CI_RUNNER_MODE.
             writestep = next(s for s in steps if "Write CI_RUNNER_MODE" in s.get("name", ""))
             assert "gh variable set CI_RUNNER_MODE" in writestep["run"], writestep["run"]
@@ -73,41 +115,10 @@ _top@{ ... }:
             ${pkgs.bash}/bin/bash -n decide.sh  || fail "decide run block is not valid bash"
             ${pkgs.bash}/bin/bash -n metrics.sh || fail "metrics run block is not valid bash"
 
-            # A stub `gh` = the ONLY network boundary. It dispatches on the API
-            # path and returns canned billing JSON from env; MOCK_FAIL / the
-            # per-endpoint MOCK_FAIL_USAGE make a call fail (unreachable), which
-            # the decision must treat as fail-safe self-hosted.
+            # A stub `gh` = the ONLY network boundary (see gh-stub.sh): it serves
+            # the captured usage reports and GitHub's real failure shapes.
             mkdir -p mockbin
-            {
-              printf '#!%s\n' "${pkgs.bash}/bin/bash"
-              cat <<'SH'
-            if [ -n "''${MOCK_FAIL:-}" ]; then
-              echo "gh: simulated billing API failure" >&2
-              exit 1
-            fi
-            case "$*" in
-              *settings/billing/usage*)
-                if [ -n "''${MOCK_FAIL_USAGE:-}" ]; then
-                  echo "gh: simulated usage endpoint failure" >&2
-                  exit 1
-                fi
-                printf '{"usageItems":[{"product":"Actions","sku":"Actions Linux","unitType":"minutes","quantity":%s,"netAmount":%s}]}\n' \
-                  "''${MOCK_USED:-0}" "''${MOCK_BILLED:-0}"
-                ;;
-              *settings/billing/actions*)
-                printf '{"included_minutes":%s,"total_minutes_used":%s}\n' \
-                  "''${MOCK_INCLUDED:-3000}" "''${MOCK_USED:-0}"
-                ;;
-              variable\ set*)
-                : # the write step is not exercised here.
-                ;;
-              *)
-                echo "gh: unexpected call: $*" >&2
-                exit 2
-                ;;
-            esac
-            SH
-            } > mockbin/gh
+            { printf '#!%s\n' "${pkgs.bash}/bin/bash"; cat ${fixtures}/gh-stub.sh; } > mockbin/gh
             chmod +x mockbin/gh
             export PATH="$PWD/mockbin:${pkgs.jq}/bin:${pkgs.gawk}/bin:${pkgs.gnugrep}/bin:${pkgs.coreutils}/bin:$PATH"
 
@@ -118,9 +129,8 @@ _top@{ ... }:
               env -i \
                 PATH="$PATH" \
                 GITHUB_OUTPUT="$out" \
-                ORG="metacraft-labs" \
+                FIXTURES="${fixtures}" \
                 MIN_REMAIN="300" \
-                INCLUDED_DEFAULT="3000" \
                 MAX_BILLED="0" \
                 "$@" \
                 ${pkgs.bash}/bin/bash decide.sh >/dev/null 2>caselog \
@@ -135,31 +145,49 @@ _top@{ ... }:
               echo "[t_runner_mode_manager][ok] $name -> CI_RUNNER_MODE=$got_mode (failsafe=$got_fs)"
             }
 
-            # (a) healthy, plenty remaining, nothing billed -> github-hosted.
-            decide_case "healthy-plenty" "github-hosted" "0" \
-              MOCK_INCLUDED="3000" MOCK_USED="100" MOCK_BILLED="0"
+            ORGCASE=(ORG="example-org" INCLUDED_MINUTES="3000" MOCK_USAGE="org-usage-2026-09.json")
+            ENTCASE=(ORG="example-ent-org-a" BILLING_ENTERPRISE="example-ent" INCLUDED_MINUTES="50000"
+                     MOCK_EXPECT_SCOPE="enterprise" MOCK_USAGE="enterprise-usage-2026-09.json")
 
-            # (b) near exhaustion: remaining (200) below the 300 buffer -> self-hosted.
-            decide_case "near-exhaustion" "self-hosted" "0" \
-              MOCK_INCLUDED="3000" MOCK_USED="2800" MOCK_BILLED="0"
+            # ---- Team org (3000-minute pool = $18 at the Linux price) --------
+            # (a) early month: 2052 Linux-equivalent minutes left -> github-hosted.
+            decide_case "org/healthy" "github-hosted" "0" "''${ORGCASE[@]}" MOCK_UNTIL="2026-09-05"
+            # (a2) 392 left, just above the 300 buffer -> github-hosted.
+            decide_case "org/above-buffer" "github-hosted" "0" "''${ORGCASE[@]}" MOCK_UNTIL="2026-09-11"
+            # (b) 148 left, below the 300 buffer -> self-hosted.
+            decide_case "org/near-exhaustion" "self-hosted" "0" "''${ORGCASE[@]}" MOCK_UNTIL="2026-09-12"
+            # (b2) the real month: the pool ran out on 09-13 (-10) -> self-hosted.
+            decide_case "org/exhausted" "self-hosted" "0" "''${ORGCASE[@]}"
+            # (c) plenty of pool left but a minutes SKU was net-billed (e.g. a
+            #     larger runner, never covered by the pool) -> self-hosted.
+            decide_case "org/over-budget" "self-hosted" "0" "''${ORGCASE[@]}" MOCK_UNTIL="2026-09-05" \
+              MOCK_INJECT_SKU="Actions Linux 4-core" MOCK_INJECT_NET="0.5"
+            # (c2) storage overage is NOT a runner-mode signal (runner choice
+            #      cannot change it; it has its own $0 budget) -> github-hosted.
+            decide_case "org/storage-overage-ignored" "github-hosted" "0" "''${ORGCASE[@]}" MOCK_UNTIL="2026-09-05" \
+              MOCK_INJECT_SKU="Actions storage" MOCK_INJECT_UNIT="GigabyteHours" MOCK_INJECT_NET="0.94"
 
-            # (c) over budget: plenty of minutes but billed 5 USD over the 0 cap
-            #     -> self-hosted (budget dimension, independent of minutes).
-            decide_case "over-budget" "self-hosted" "0" \
-              MOCK_INCLUDED="3000" MOCK_USED="100" MOCK_BILLED="5"
+            # ---- Enterprise pool (50000 minutes = $300, shared by two orgs) --
+            # (e) through 09-18: $270.92 drawn -> 4847 left -> github-hosted.
+            decide_case "enterprise/healthy" "github-hosted" "0" "''${ENTCASE[@]}" MOCK_UNTIL="2026-09-18"
+            # (e2) the real month: exhausted at $301.37 (-229) -> self-hosted.
+            decide_case "enterprise/exhausted" "self-hosted" "0" "''${ENTCASE[@]}"
 
-            # (d) billing API unreachable -> fail-safe self-hosted.
-            decide_case "billing-error" "self-hosted" "1" \
-              MOCK_FAIL="1"
-
-            # (d2) minutes endpoint OK but the enhanced usage endpoint fails ->
-            #      still fail-safe self-hosted (the budget read is load-bearing).
-            decide_case "usage-endpoint-error" "self-hosted" "1" \
-              MOCK_INCLUDED="3000" MOCK_USED="100" MOCK_FAIL_USAGE="1"
-
-            # (e) post-reset: allowance restored (used back to 0) -> github-hosted.
-            decide_case "post-reset-plenty" "github-hosted" "0" \
-              MOCK_INCLUDED="3000" MOCK_USED="0" MOCK_BILLED="0"
+            # ---- Fail-safe: every error path -> self-hosted, failsafe=1 ------
+            # (d) billing API unreachable.
+            decide_case "billing-unreachable" "self-hosted" "1" "''${ORGCASE[@]}" MOCK_FAIL="1"
+            # (d2) the usage endpoint answers HTTP 410 (as billing/actions does now).
+            decide_case "usage-http-410" "self-hosted" "1" "''${ORGCASE[@]}" MOCK_USAGE_410="1"
+            # (d3) a 200 with the OLD classic body (no usageItems) is ambiguous.
+            decide_case "old-response-shape" "self-hosted" "1" "''${ORGCASE[@]}" MOCK_OLD_SHAPE="1"
+            # (d4) an enterprise-plan org read at ORG scope sees only its share of
+            #      a pooled allowance -> ambiguous, even with the pool left.
+            decide_case "enterprise-org-at-org-scope" "self-hosted" "1" \
+              ORG="example-ent-org-a" INCLUDED_MINUTES="50000" MOCK_PLAN="enterprise" \
+              MOCK_USAGE="enterprise-usage-2026-09.json" MOCK_UNTIL="2026-09-05"
+            # (d5) the public-repo listing fails -> cannot separate free usage.
+            decide_case "public-repo-listing-error" "self-hosted" "1" "''${ORGCASE[@]}" \
+              MOCK_UNTIL="2026-09-05" MOCK_FAIL_REPOS="1"
 
             # ---- Prometheus signals + stuck-state dead-man's-switch ----------
             run_metrics() {

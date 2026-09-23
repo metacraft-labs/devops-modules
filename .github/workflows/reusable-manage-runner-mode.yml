@@ -40,20 +40,45 @@
 #         min_minutes_remaining: 300
 #         included_minutes: 3000        # Team plan monthly allowance
 #         max_billed_amount: 0          # hard $0 cap; any overage -> self-hosted
+#         # runner: '["self-hosted","linux","x64"]'   # used when the ops repo is private
 #         # metrics_textfile: /var/lib/node_exporter/textfile/ci-runner-mode.prom
 #       secrets:
 #         billing_token: ${{ secrets.ORG_BILLING_READ_TOKEN }}
 #         variables_token: ${{ secrets.ORG_VARIABLES_WRITE_TOKEN }}
 #
+# An org on an ENTERPRISE plan shares ONE included pool with every other org of
+# its enterprise (e.g. agent-harbor + blocksense-network in schelling-point-labs:
+# 50,000 minutes, pooled). Its org-scoped report shows only its own share, so it
+# fails safe unless the enterprise scope is read:
+#
+#       with:
+#         org: agent-harbor
+#         enterprise: schelling-point-labs
+#         included_minutes: 50000       # Enterprise pool, shared by all its orgs
+#       secrets:
+#         billing_token: ${{ secrets.ENTERPRISE_BILLING_READ_TOKEN }}
+#         variables_token: ${{ secrets.ORG_VARIABLES_WRITE_TOKEN }}
+#
+# (One wrapper per org that should get the variable; each reads the same pool.)
+#
+# WHERE IT RUNS: the job runs on free `ubuntu-latest` only when the wrapping ops
+# repo is PUBLIC. In a private repo a hosted job cannot even START once the
+# included pool is exhausted (the $0 budget blocks it), which would freeze
+# CI_RUNNER_MODE at `github-hosted` exactly when it must flip — so a private
+# wrapper runs on the self-hosted `runner` label array instead.
 # Tokens (operator prerequisite):
-#   * billing_token   — org billing READ. May be a GOVERNANCE-APP installation
-#                       token (org billing:read via the App — verified 2026-09-15
-#                       that an App install token drives the enhanced-billing
-#                       endpoint `GET /organizations/{org}/settings/billing/usage`
-#                       -> 200), or a classic PAT (admin:org). Reads the enhanced
-#                       usage endpoint for the billed-amount (budget) dimension
-#                       and the classic `/orgs/{org}/settings/billing/actions`
-#                       endpoint for the included/used-minutes dimension.
+#   * billing_token   — billing READ for the scope that owns the pool.
+#                       Org scope: a GOVERNANCE-APP installation token (org
+#                       billing:read — verified 2026-09-15 that an App install
+#                       token drives `GET /organizations/{org}/settings/billing/usage`
+#                       -> 200) or a classic PAT (admin:org). Enterprise scope
+#                       (`enterprise:` set): a classic PAT of an enterprise
+#                       owner / billing manager with `manage_billing:enterprise`
+#                       (an org App installation cannot read enterprise billing).
+#                       Both dimensions (included-pool draw AND billed overage)
+#                       come from the enhanced usage report; the classic
+#                       `/orgs/{org}/settings/billing/actions` endpoint returns
+#                       HTTP 410 since GitHub's billing-platform migration.
 #   * variables_token — org VARIABLES write (fine-grained: Organization
 #                       "Variables" read/write). Writes CI_RUNNER_MODE.
 #     GITHUB_TOKEN cannot do either, so both are required secrets.
@@ -80,15 +105,32 @@ on:
         default: 300
       included_minutes:
         description: >-
-          Monthly included-minutes allowance for the plan (metacraft-labs Team =
-          3000). Used only if the classic billing endpoint omits it.
+          Monthly included-minutes POOL, in Linux-equivalent minutes: Team org =
+          3000; Enterprise = 50000, shared by every org of the enterprise (set
+          `enterprise` too). The pool is a dollar allowance (this x the Linux
+          per-minute price) drawn down by each SKU's gross price.
         type: number
         default: 3000
+      enterprise:
+        description: >-
+          Enterprise slug whose POOLED billing to read (enterprise-plan orgs).
+          Empty = org scope; an enterprise-plan org read at org scope fails safe.
+        type: string
+        default: ''
+      runner:
+        description: >-
+          Self-hosted label array (JSON) this job runs on when the calling repo
+          is NOT public (a private repo's hosted job cannot start once the pool
+          is exhausted). A public caller always uses free ubuntu-latest.
+        type: string
+        default: '["self-hosted","linux","x64"]'
       max_billed_amount:
         description: >-
-          Hard billed-amount cap in USD for the current cycle. Once the org has
-          been billed MORE than this for Actions, flip to self-hosted (budget
-          dimension). Default 0 enforces the $0 policy: any overage flips.
+          Hard billed-amount cap in USD for the current cycle. Once the scope
+          has been net-billed MORE than this for Actions MINUTES, flip to
+          self-hosted (budget dimension). Artifact/cache storage overage is
+          excluded: runner choice cannot change it (it has its own $0 budget).
+          Default 0 enforces the $0 policy: any minutes overage flips.
         type: number
         default: 0
       metrics_textfile:
@@ -118,9 +160,12 @@ on:
 
 jobs:
   manage:
-    # The poll itself is cheap and must always run for free: ubuntu-latest is a
-    # negligible slice of the included allowance.
-    runs-on: ubuntu-latest
+    # The poll must be able to run exactly when the pool is exhausted: free
+    # ubuntu-latest in a PUBLIC caller, else the self-hosted `runner` array (a
+    # private repo's hosted job is blocked by the $0 budget once the pool is
+    # spent, which would freeze the switch at github-hosted). An absent
+    # visibility (e.g. a schedule payload without `repository`) -> self-hosted.
+    runs-on: ${{ fromJSON(github.event.repository.visibility == 'public' && '["ubuntu-latest"]' || inputs.runner) }}
     outputs:
       mode: ${{ steps.decide.outputs.mode }}
       failsafe: ${{ steps.decide.outputs.failsafe }}
@@ -130,47 +175,100 @@ jobs:
           GH_TOKEN: ${{ secrets.billing_token }}
           ORG: ${{ inputs.org }}
           MIN_REMAIN: ${{ inputs.min_minutes_remaining }}
-          INCLUDED_DEFAULT: ${{ inputs.included_minutes }}
+          INCLUDED_MINUTES: ${{ inputs.included_minutes }}
+          BILLING_ENTERPRISE: ${{ inputs.enterprise }}
           MAX_BILLED: ${{ inputs.max_billed_amount }}
         run: |
           # No `set -e` at top level: a compute failure must NOT fail the job,
-          # it must resolve fail-safe to self-hosted. Errors are trapped by the
-          # subshell `set -e` inside compute() and surfaced as a non-zero status.
+          # it must resolve fail-safe to self-hosted. billing_remaining() runs
+          # in a subshell and turns every failure into a non-zero status.
           set -uo pipefail
 
-          # compute: read billing, echo "remaining|billed" or return non-zero on
-          # ANY unreachable/parse/ambiguous condition (subshell `set -e` + `jq
-          # -e` make every failure a non-zero return -> the caller fails safe).
-          compute() {
-            set -e
-            local aj included used remaining uj billed
-            # Minutes dimension — classic actions endpoint (RD3's proven read).
-            aj="$(gh api -H "X-GitHub-Api-Version: 2022-11-28" \
-              "/orgs/${ORG}/settings/billing/actions")"
-            included="$(printf '%s' "$aj" | jq -e -r '.included_minutes // empty')"
-            used="$(printf '%s' "$aj" | jq -e -r '.total_minutes_used')"
-            # included_minutes may be absent on some plans -> fall back to input.
-            [ -n "$included" ] || included="$INCLUDED_DEFAULT"
-            # Both must be non-negative integers, else the data is ambiguous.
-            [ "$included" -ge 0 ] 2>/dev/null || return 1
-            [ "$used" -ge 0 ] 2>/dev/null || return 1
-            remaining=$(( included - used ))
-            # Budget dimension — enhanced usage endpoint (works with a
-            # governance-App install token). Sum netAmount over Actions items =
-            # USD billed this cycle (0 while inside the free allowance).
-            uj="$(gh api -H "X-GitHub-Api-Version: 2022-11-28" \
-              "/organizations/${ORG}/settings/billing/usage")"
-            billed="$(printf '%s' "$uj" \
-              | jq -e -r '[.usageItems[]? | select(.product=="Actions") | .netAmount] | add // 0')"
-            printf '%s|%s\n' "$remaining" "$billed"
-          }
+          # >>> billing-remaining — SHARED, keep byte-identical in reusable-manage-runner-mode.yml,
+          # reusable-choose-runner.yml and reusable-sync-hosted-minutes.yml (t_runner_mode_manager
+          # fails if the three copies drift).
+          #
+          # billing_remaining: print "<remaining>|<billed>" for the CURRENT billing month and
+          # exit 0, or exit non-zero on ANY unreachable / unparseable / ambiguous read, so
+          # the caller fails safe to self-hosted.
+          #   remaining — included Actions minutes left in the pool, in LINUX-EQUIVALENT
+          #               minutes (integer, may be negative once exhausted).
+          #   billed    — USD net-billed for Actions MINUTES this month (overage).
+          # Env: ORG; INCLUDED_MINUTES (the pool: Team org 3000, Enterprise 50000);
+          #      BILLING_ENTERPRISE (optional enterprise slug — the POOLED scope).
+          #
+          # The classic GET /orgs/{org}/settings/billing/actions endpoint returns HTTP 410
+          # since GitHub's enhanced-billing migration. The enhanced usage report is the
+          # source now; it has no "included minutes remaining" field, so it is DERIVED:
+          #   * The included allowance is a DOLLAR pool — INCLUDED_MINUTES x the Linux
+          #     2-core per-minute price — drawn down by each SKU's gross price, not by the
+          #     old 1x/2x/10x minute multipliers. (Measured on live data 2026-09: an
+          #     enterprise pool stopped jobs at $300.87 gross = 50000 x $0.006 after 34005
+          #     raw minutes, having run on past the point a 2x Windows multiplier would
+          #     have exhausted it; a Team org stopped at exactly $18.00 = 3000 x $0.006.)
+          #   * The report's discount mixes the (free, unlimited) public-repo usage with
+          #     the included-pool usage, so the pool draw is the GROSS of every minutes
+          #     row NOT in a public repo. A repo that is not listed as public (private,
+          #     internal, deleted, renamed) counts against the pool: conservative.
+          #   * An enterprise-plan org draws on a pool SHARED by every org of its
+          #     enterprise, and its org-scoped report shows only its own share — so an
+          #     org scope on an enterprise-plan org is ambiguous and fails safe; read the
+          #     enterprise scope (BILLING_ENTERPRISE) instead.
+          billing_remaining() (
+            set -uo pipefail
+            hdr='X-GitHub-Api-Version: 2022-11-28'
+            [ "${INCLUDED_MINUTES:-}" -ge 0 ] 2>/dev/null \
+              || { echo "billing: INCLUDED_MINUTES='${INCLUDED_MINUTES:-}' is not a non-negative integer" >&2; exit 1; }
+            year="$(date -u +%Y)" || exit 1
+            month="$(date -u +%m)" || exit 1
+            month="${month#0}"
+            if [ -n "${BILLING_ENTERPRISE:-}" ]; then
+              path="/enterprises/${BILLING_ENTERPRISE}/settings/billing/usage?year=${year}&month=${month}"
+            else
+              plan="$(gh api -H "$hdr" "/orgs/${ORG}" --jq '.plan.name // ""')" || exit 1
+              if [ "$plan" = "enterprise" ]; then
+                echo "billing: ${ORG} is on an enterprise plan (pooled minutes); set the enterprise scope" >&2
+                exit 1
+              fi
+              path="/organizations/${ORG}/settings/billing/usage?year=${year}&month=${month}"
+            fi
+            usage="$(gh api -H "$hdr" "$path")" || exit 1
+            printf '%s' "$usage" | jq -e '.usageItems | type == "array"' >/dev/null \
+              || { echo "billing: usage report has no usageItems array" >&2; exit 1; }
+            orgs="$(printf '%s' "$usage" | jq -r --arg org "$ORG" \
+              '[.usageItems[] | select((.unitType // "" | ascii_downcase) == "minutes")
+                | (.organizationName // $org)] | unique | .[]')" || exit 1
+            public='[]'
+            for o in $orgs; do
+              names="$(gh api --paginate -H "$hdr" "/orgs/${o}/repos?type=public&per_page=100" \
+                --jq '.[].name')" || exit 1
+              public="$(printf '%s\n' "$names" | jq -R -s --arg o "$o" --argjson acc "$public" \
+                '$acc + [split("\n")[] | select(length > 0) | "\($o)/\(.)"]')" || exit 1
+            done
+            printf '%s' "$usage" | jq -e -r --arg org "$ORG" --argjson pub "$public" \
+              --argjson inc "$INCLUDED_MINUTES" '
+              ($pub | map({(.): true}) | add // {}) as $public
+              | [.usageItems[]
+                 | select((.product // "" | ascii_downcase) == "actions"
+                          and (.unitType // "" | ascii_downcase) == "minutes")] as $rows
+              | if ($rows | all((.grossAmount | type) == "number"
+                                and (.netAmount | type) == "number"))
+                then . else error("minutes row without numeric amounts") end
+              | ([$rows[] | select(.sku == "Actions Linux") | .pricePerUnit
+                  | select(type == "number" and . > 0)] | first // 0.006) as $linux
+              | ([$rows[]
+                  | select($public["\(.organizationName // $org)/\(.repositoryName // "")"] | not)
+                  | .grossAmount] | add // 0) as $drawn
+              | ([$rows[] | .netAmount] | add // 0) as $billed
+              | "\(($inc - ($drawn / $linux * 1000 | round) / 1000) | floor)|\($billed)"'
+          )
+          # <<< billing-remaining
 
-          # NB: call compute in a PLAIN subshell assignment (not `if compute`):
-          # bash disables `set -e` inside a function invoked in a tested context
-          # (an `if`/`&&`/`||` condition), which would swallow a mid-compute
-          # billing failure. A standalone `$( set -e; compute )` keeps set -e
-          # live, and its exit status is captured explicitly below.
-          result="$(set -e; compute)"
+          # NB: call it in a PLAIN assignment (not `if billing_remaining`): bash
+          # disables `set -e` inside a function invoked in a tested context. The
+          # function also checks every step explicitly (`|| exit 1`), so a
+          # mid-read failure surfaces as a non-zero status either way.
+          result="$(billing_remaining)"
           rc=$?
           if [ "$rc" -eq 0 ]; then
             remaining="${result%%|*}"
@@ -236,10 +334,10 @@ jobs:
             printf '# HELP ci_runner_mode The active runner mode (label = the written value).\n'
             printf '# TYPE ci_runner_mode gauge\n'
             printf 'ci_runner_mode{org="%s",mode="%s"} 1\n' "$ORG" "$MODE"
-            printf '# HELP ci_runner_mode_included_minutes_remaining Remaining included Actions minutes (-1 on fail-safe).\n'
+            printf '# HELP ci_runner_mode_included_minutes_remaining Remaining included Actions minutes, Linux-equivalent; negative once exhausted (-1 with failsafe_active=1 on fail-safe).\n'
             printf '# TYPE ci_runner_mode_included_minutes_remaining gauge\n'
             printf 'ci_runner_mode_included_minutes_remaining{org="%s"} %s\n' "$ORG" "$REMAINING"
-            printf '# HELP ci_runner_mode_billed_amount_usd USD billed for Actions this cycle (-1 on fail-safe).\n'
+            printf '# HELP ci_runner_mode_billed_amount_usd USD net-billed for Actions minutes this cycle (-1 on fail-safe).\n'
             printf '# TYPE ci_runner_mode_billed_amount_usd gauge\n'
             printf 'ci_runner_mode_billed_amount_usd{org="%s"} %s\n' "$ORG" "$BILLED"
             printf '# HELP ci_runner_mode_failsafe_active 1 if this run fell back to the fail-safe self-hosted default.\n'

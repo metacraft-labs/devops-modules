@@ -15,10 +15,22 @@ _top@{ ... }:
   # logic itself; the assertions pin the exact runs-on for each (mode,
   # visibility) pair, including the fail-safe defaults, so the test cannot pass
   # tautologically.
+  #
+  # It also pins WHERE the preflight runs: the REAL `decide.runs-on` expression is
+  # evaluated over a truth table, so a private repo whose hosted minutes are not
+  # known to be affordable runs the preflight SELF-HOSTED (a hosted preflight
+  # cannot start once the included pool is exhausted, which would skip every
+  # downstream job). And it drives the live-billing branch through the shared
+  # billing stub (fixtures/billing-usage/gh-stub.sh — the captured enhanced-
+  # billing report; mock justified there: the paid billing API cannot be put
+  # into a chosen state from a sandbox), including the HTTP 410 that the retired
+  # classic endpoint returns, which must resolve self-hosted WITHOUT failing
+  # the preflight.
   perSystem =
     { pkgs, ... }:
     let
       chooseWorkflow = ../.github/workflows/reusable-choose-runner.yml;
+      billingFixtures = ./fixtures/billing-usage;
       py = pkgs.python3.withPackages (ps: [ ps.pyyaml ]);
     in
     {
@@ -51,6 +63,43 @@ _top@{ ... }:
             on = wf.get("on", wf.get(True))
             outs = on["workflow_call"]["outputs"]
             assert "jobs.decide.outputs.runs_on" in outs["runs_on"]["value"], outs["runs_on"]
+            assert env.get("INCLUDED_MINUTES") == "${"$"}{{ inputs.included_minutes }}", env
+            assert env.get("BILLING_ENTERPRISE") == "${"$"}{{ inputs.billing_enterprise }}", env
+
+            # WHERE the preflight runs: evaluate the REAL runs-on expression.
+            # GitHub's `a && b || c` has Python's and/or operand semantics, so a
+            # token-level translation evaluates it faithfully for this grammar.
+            import json, re
+            expr = wf["jobs"]["decide"]["runs-on"]
+            m = re.fullmatch(r"\$\{\{(.*)\}\}", expr.strip(), re.S)
+            assert m, f"decide.runs-on must be an expression, got {expr!r}"
+            pyexpr = (m.group(1).replace("&&", " and ").replace("||", " or ")
+                      .replace("fromJSON(", "json.loads("))
+            class NS:
+                def __init__(self, **kw): self.__dict__.update(kw)
+                def __getattr__(self, k): return ""  # unset vars/inputs read as the empty string
+            PRE = on["workflow_call"]["inputs"]["preflight_runner"]["default"]
+            assert json.loads(PRE)[0] == "self-hosted", PRE
+            def where(vis, **vars_):
+                ctx = {"json": json,
+                       "github": NS(event=NS(repository=NS(visibility=vis) if vis else NS())),
+                       "vars": NS(**vars_), "inputs": NS(preflight_runner=PRE)}
+                return eval(pyexpr, ctx)
+            HOSTED, SELF = ["ubuntu-latest"], json.loads(PRE)
+            table = [
+                ("public, no vars",                 where("public"), HOSTED),
+                ("private, no vars",                where("private"), SELF),
+                ("internal, no vars",               where("internal"), SELF),
+                ("no repository payload",           where(None), SELF),
+                ("private, mode=github-hosted",     where("private", CI_RUNNER_MODE="github-hosted"), HOSTED),
+                ("private, mode=self-hosted",       where("private", CI_RUNNER_MODE="self-hosted", GH_HOSTED_OK="true"), SELF),
+                ("private, mode invalid",           where("private", CI_RUNNER_MODE="on"), SELF),
+                ("private, unset, GH_HOSTED_OK=true",  where("private", GH_HOSTED_OK="true"), HOSTED),
+                ("private, unset, GH_HOSTED_OK=false", where("private", GH_HOSTED_OK="false"), SELF),
+            ]
+            for name, got, want in table:
+                assert got == want, f"preflight runs-on for {name}: {got} != {want}"
+                print(f"[t_runner_mode_switch][ok] preflight runs-on: {name} -> {got}")
             PY
             ${pkgs.bash}/bin/bash -n pick.sh || fail "resolution run block is not valid bash"
 
@@ -132,6 +181,28 @@ _top@{ ... }:
             # default to free GitHub-hosted; RD3 branch 1).
             run_case "public/unset-mode" "$HOSTED" "true" \
               IS_PRIVATE="false"
+
+            # ---- The live-billing branch (CI_RUNNER_MODE + GH_HOSTED_OK unset) --
+            # Swap in the billing stub: from here on `gh` serves the captured
+            # enhanced-billing report instead of refusing every call.
+            { printf '#!%s\n' "${pkgs.bash}/bin/bash"; cat ${billingFixtures}/gh-stub.sh; } > mockbin/gh
+            LIVE=(IS_PRIVATE="true" GH_TOKEN="x" ORG="example-org" INCLUDED_MINUTES="3000"
+                  FIXTURES="${billingFixtures}" MOCK_USAGE="org-usage-2026-09.json")
+
+            run_case "private/live-healthy" "$HOSTED" "true" "''${LIVE[@]}" MOCK_UNTIL="2026-09-05"
+            run_case "private/live-exhausted" "$SELF" "false" "''${LIVE[@]}"
+            run_case "private/live-overage-billed" "$SELF" "false" "''${LIVE[@]}" MOCK_UNTIL="2026-09-05" \
+              MOCK_INJECT_SKU="Actions Linux 4-core" MOCK_INJECT_NET="0.5"
+            # The fail-safe cases must also EXIT 0 (run_case fails otherwise): a
+            # crashed preflight skips every downstream job instead of routing it.
+            run_case "private/live-http-410" "$SELF" "false" "''${LIVE[@]}" MOCK_USAGE_410="1"
+            run_case "private/live-unreachable" "$SELF" "false" "''${LIVE[@]}" MOCK_FAIL="1"
+            run_case "private/live-enterprise-org-at-org-scope" "$SELF" "false" "''${LIVE[@]}" \
+              MOCK_PLAN="enterprise" MOCK_UNTIL="2026-09-05"
+            run_case "private/live-enterprise-pool" "$HOSTED" "true" \
+              IS_PRIVATE="true" GH_TOKEN="x" ORG="example-ent-org-a" INCLUDED_MINUTES="50000" \
+              BILLING_ENTERPRISE="example-ent" MOCK_EXPECT_SCOPE="enterprise" \
+              FIXTURES="${billingFixtures}" MOCK_USAGE="enterprise-usage-2026-09.json" MOCK_UNTIL="2026-09-18"
 
             echo "[t_runner_mode_switch][PASS] CI_RUNNER_MODE + visibility deterministically resolve runs-on"
             touch $out

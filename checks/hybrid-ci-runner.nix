@@ -19,6 +19,7 @@ _top@{ ... }:
       cleanFixture = ../scripts/tests/fixtures/ci-runners/clean-public.yml;
       billedFixture = ../scripts/tests/fixtures/ci-runners/billed-public.yml;
       chooseWorkflow = ../.github/workflows/reusable-choose-runner.yml;
+      billingFixtures = ./fixtures/billing-usage;
       guardWorkflow = ../.github/workflows/reusable-public-runner-guard.yml;
       reusableWorkflowsDir = ../.github/workflows;
     in
@@ -118,17 +119,11 @@ _top@{ ... }:
             PY
             ${pkgs.bash}/bin/bash -n pick.sh || fail "preflight run block is not valid bash"
 
-            # A stub `gh` for the live-billing branch (branch 3). It echoes a
-            # billing JSON with a configurable remaining budget.
+            # A stub `gh` for the live-billing branch (branch 3): it replays the
+            # enhanced-billing usage report captured live (2026-09, anonymized) —
+            # see fixtures/billing-usage/gh-stub.sh and t_runner_mode_manager.
             mkdir -p mockbin
-            {
-              printf '#!%s\n' "${pkgs.bash}/bin/bash"
-              cat <<'SH'
-            # gh api ... /settings/billing/actions -> billing JSON from env.
-            printf '{"included_minutes": %s, "total_minutes_used": %s}\n' \
-              "''${MOCK_INCLUDED:-2000}" "''${MOCK_USED:-0}"
-            SH
-            } > mockbin/gh
+            { printf '#!%s\n' "${pkgs.bash}/bin/bash"; cat ${billingFixtures}/gh-stub.sh; } > mockbin/gh
             chmod +x mockbin/gh
             export PATH="$PWD/mockbin:${pkgs.jq}/bin:$PATH"
 
@@ -174,15 +169,19 @@ _top@{ ... }:
             run_case "private/no-signal" "$SELF" "false" \
               IS_PRIVATE="true"
 
-            # 5. Private + no variable + token + plenty remaining -> hosted (live check).
-            run_case "private/live-ok" "$HOSTED" "true" \
-              IS_PRIVATE="true" GH_TOKEN="x" ORG="metacraft-labs" \
-              MOCK_INCLUDED="2000" MOCK_USED="100"
+            LIVE=(IS_PRIVATE="true" GH_TOKEN="x" ORG="example-org" INCLUDED_MINUTES="3000"
+                  FIXTURES="${billingFixtures}" MOCK_USAGE="org-usage-2026-09.json")
 
-            # 6. Private + no variable + token + below buffer -> self-hosted (live check).
-            run_case "private/live-exhausted" "$SELF" "false" \
-              IS_PRIVATE="true" GH_TOKEN="x" ORG="metacraft-labs" \
-              MOCK_INCLUDED="2000" MOCK_USED="1900"
+            # 5. Private + no variable + token + plenty remaining -> hosted (live check).
+            run_case "private/live-ok" "$HOSTED" "true" "''${LIVE[@]}" MOCK_UNTIL="2026-09-05"
+
+            # 6. Private + no variable + token + pool exhausted -> self-hosted (live check).
+            run_case "private/live-exhausted" "$SELF" "false" "''${LIVE[@]}"
+
+            # 7. Private + live check hits a dead endpoint (HTTP 410) -> self-hosted,
+            #    and the preflight still EXITS 0 (a crash would skip every
+            #    downstream `needs: choose` job).
+            run_case "private/live-http-410" "$SELF" "false" "''${LIVE[@]}" MOCK_USAGE_410="1"
 
             echo "[t_private_repo_hybrid_fallback][PASS] preflight emits hosted while free, self-hosted once exhausted"
             touch $out

@@ -34,8 +34,22 @@
 #      This is the production default: no per-run billing API call, no admin
 #      token in every workflow (research-github-free-ci-hybrid.md §3.4).
 #   3. a live billing check — only if `GH_HOSTED_OK` is unset AND a billing-read
-#      token is supplied (the §3.3 preflight). Belt-and-braces / bootstrap.
+#      token is supplied (the §3.3 preflight). Belt-and-braces / bootstrap. It
+#      reads the enhanced usage report (the classic billing/actions endpoint is
+#      HTTP 410) via the shared `billing_remaining` function, and ANY read
+#      failure resolves to self-hosted rather than failing the preflight.
 #   4. no signal at all -> self-hosted (fail-safe; never risk a blocked/paid job).
+#
+# WHERE THE PREFLIGHT ITSELF RUNS. In a private/internal repo a GitHub-hosted job
+# cannot even START once the included pool is exhausted (the $0 budget blocks
+# it: "The job was not started because ... your spending limit needs to be
+# increased"), and a preflight that never starts means every downstream
+# `needs: choose` job is skipped — the fleet would be dark exactly when it must
+# take over. So the `decide` job only uses free `ubuntu-latest` when hosted is
+# already known to be affordable from the job-level contexts (a PUBLIC repo, or
+# CI_RUNNER_MODE=github-hosted, or CI_RUNNER_MODE unset and GH_HOSTED_OK=true);
+# every other case runs the preflight on the self-hosted `preflight_runner`
+# array, so the default path never depends on hosted minutes.
 #
 # Downstream jobs consume the decision as:
 #   runs-on: ${{ fromJson(needs.choose.outputs.runs_on) }}
@@ -62,6 +76,24 @@ on:
         description: 'Live-check buffer: only spend hosted minutes if at least this many remain.'
         type: number
         default: 300
+      included_minutes:
+        description: >-
+          Live check only: the included-minutes POOL in Linux-equivalent minutes
+          (Team org 3000; Enterprise 50000 shared across its orgs — set
+          billing_enterprise too).
+        type: number
+        default: 3000
+      billing_enterprise:
+        description: 'Live check only: enterprise slug whose pooled billing to read (enterprise-plan orgs).'
+        type: string
+        default: ''
+      preflight_runner:
+        description: >-
+          Self-hosted label array (JSON) the preflight itself runs on whenever
+          hosted is not already known to be affordable (see header). Must be a
+          Linux runner with bash + jq + gh.
+        type: string
+        default: '["self-hosted","linux","x64"]'
     outputs:
       runs_on:
         description: 'JSON array for `runs-on` — hosted (single element) or the self-hosted label set.'
@@ -71,15 +103,14 @@ on:
         value: ${{ jobs.decide.outputs.hosted }}
     secrets:
       billing_token:
-        description: 'Org billing-READ token (admin:org/repo). Omit for public repos and for the GH_HOSTED_OK path.'
+        description: 'Billing-READ token (org: admin:org or App billing:read; enterprise: manage_billing:enterprise). Omit for public repos and for the GH_HOSTED_OK path.'
         required: false
 
 jobs:
   decide:
-    # The preflight itself is cheap and must always be able to run for free:
-    # ubuntu-latest is free on public repos and consumes a negligible slice of
-    # the included allowance on private ones.
-    runs-on: ubuntu-latest
+    # Hosted only when already known affordable; otherwise self-hosted, so the
+    # preflight can start even when the included pool is exhausted (see header).
+    runs-on: ${{ fromJSON((github.event.repository.visibility == 'public' || vars.CI_RUNNER_MODE == 'github-hosted' || (vars.CI_RUNNER_MODE == '' && vars.GH_HOSTED_OK == 'true')) && '["ubuntu-latest"]' || inputs.preflight_runner) }}
     outputs:
       runs_on: ${{ steps.pick.outputs.runs_on }}
       hosted: ${{ steps.pick.outputs.hosted }}
@@ -89,6 +120,8 @@ jobs:
           PREFERRED: ${{ inputs.preferred }}
           FALLBACK: ${{ inputs.fallback }}
           MIN_REMAIN: ${{ inputs.min_minutes_remaining }}
+          INCLUDED_MINUTES: ${{ inputs.included_minutes }}
+          BILLING_ENTERPRISE: ${{ inputs.billing_enterprise }}
           IS_PRIVATE: ${{ github.event.repository.private }}
           CI_RUNNER_MODE: ${{ vars.CI_RUNNER_MODE }}
           GH_HOSTED_OK: ${{ vars.GH_HOSTED_OK }}
@@ -146,14 +179,106 @@ jobs:
               ;;
           esac
 
-          # 3. GH_HOSTED_OK unset and a billing token present: live check.
+          # >>> billing-remaining — SHARED, keep byte-identical in reusable-manage-runner-mode.yml,
+          # reusable-choose-runner.yml and reusable-sync-hosted-minutes.yml (t_runner_mode_manager
+          # fails if the three copies drift).
+          #
+          # billing_remaining: print "<remaining>|<billed>" for the CURRENT billing month and
+          # exit 0, or exit non-zero on ANY unreachable / unparseable / ambiguous read, so
+          # the caller fails safe to self-hosted.
+          #   remaining — included Actions minutes left in the pool, in LINUX-EQUIVALENT
+          #               minutes (integer, may be negative once exhausted).
+          #   billed    — USD net-billed for Actions MINUTES this month (overage).
+          # Env: ORG; INCLUDED_MINUTES (the pool: Team org 3000, Enterprise 50000);
+          #      BILLING_ENTERPRISE (optional enterprise slug — the POOLED scope).
+          #
+          # The classic GET /orgs/{org}/settings/billing/actions endpoint returns HTTP 410
+          # since GitHub's enhanced-billing migration. The enhanced usage report is the
+          # source now; it has no "included minutes remaining" field, so it is DERIVED:
+          #   * The included allowance is a DOLLAR pool — INCLUDED_MINUTES x the Linux
+          #     2-core per-minute price — drawn down by each SKU's gross price, not by the
+          #     old 1x/2x/10x minute multipliers. (Measured on live data 2026-09: an
+          #     enterprise pool stopped jobs at $300.87 gross = 50000 x $0.006 after 34005
+          #     raw minutes, having run on past the point a 2x Windows multiplier would
+          #     have exhausted it; a Team org stopped at exactly $18.00 = 3000 x $0.006.)
+          #   * The report's discount mixes the (free, unlimited) public-repo usage with
+          #     the included-pool usage, so the pool draw is the GROSS of every minutes
+          #     row NOT in a public repo. A repo that is not listed as public (private,
+          #     internal, deleted, renamed) counts against the pool: conservative.
+          #   * An enterprise-plan org draws on a pool SHARED by every org of its
+          #     enterprise, and its org-scoped report shows only its own share — so an
+          #     org scope on an enterprise-plan org is ambiguous and fails safe; read the
+          #     enterprise scope (BILLING_ENTERPRISE) instead.
+          billing_remaining() (
+            set -uo pipefail
+            hdr='X-GitHub-Api-Version: 2022-11-28'
+            [ "${INCLUDED_MINUTES:-}" -ge 0 ] 2>/dev/null \
+              || { echo "billing: INCLUDED_MINUTES='${INCLUDED_MINUTES:-}' is not a non-negative integer" >&2; exit 1; }
+            year="$(date -u +%Y)" || exit 1
+            month="$(date -u +%m)" || exit 1
+            month="${month#0}"
+            if [ -n "${BILLING_ENTERPRISE:-}" ]; then
+              path="/enterprises/${BILLING_ENTERPRISE}/settings/billing/usage?year=${year}&month=${month}"
+            else
+              plan="$(gh api -H "$hdr" "/orgs/${ORG}" --jq '.plan.name // ""')" || exit 1
+              if [ "$plan" = "enterprise" ]; then
+                echo "billing: ${ORG} is on an enterprise plan (pooled minutes); set the enterprise scope" >&2
+                exit 1
+              fi
+              path="/organizations/${ORG}/settings/billing/usage?year=${year}&month=${month}"
+            fi
+            usage="$(gh api -H "$hdr" "$path")" || exit 1
+            printf '%s' "$usage" | jq -e '.usageItems | type == "array"' >/dev/null \
+              || { echo "billing: usage report has no usageItems array" >&2; exit 1; }
+            orgs="$(printf '%s' "$usage" | jq -r --arg org "$ORG" \
+              '[.usageItems[] | select((.unitType // "" | ascii_downcase) == "minutes")
+                | (.organizationName // $org)] | unique | .[]')" || exit 1
+            public='[]'
+            for o in $orgs; do
+              names="$(gh api --paginate -H "$hdr" "/orgs/${o}/repos?type=public&per_page=100" \
+                --jq '.[].name')" || exit 1
+              public="$(printf '%s\n' "$names" | jq -R -s --arg o "$o" --argjson acc "$public" \
+                '$acc + [split("\n")[] | select(length > 0) | "\($o)/\(.)"]')" || exit 1
+            done
+            printf '%s' "$usage" | jq -e -r --arg org "$ORG" --argjson pub "$public" \
+              --argjson inc "$INCLUDED_MINUTES" '
+              ($pub | map({(.): true}) | add // {}) as $public
+              | [.usageItems[]
+                 | select((.product // "" | ascii_downcase) == "actions"
+                          and (.unitType // "" | ascii_downcase) == "minutes")] as $rows
+              | if ($rows | all((.grossAmount | type) == "number"
+                                and (.netAmount | type) == "number"))
+                then . else error("minutes row without numeric amounts") end
+              | ([$rows[] | select(.sku == "Actions Linux") | .pricePerUnit
+                  | select(type == "number" and . > 0)] | first // 0.006) as $linux
+              | ([$rows[]
+                  | select($public["\(.organizationName // $org)/\(.repositoryName // "")"] | not)
+                  | .grossAmount] | add // 0) as $drawn
+              | ([$rows[] | .netAmount] | add // 0) as $billed
+              | "\(($inc - ($drawn / $linux * 1000 | round) / 1000) | floor)|\($billed)"'
+          )
+          # <<< billing-remaining
+
+          # 3. GH_HOSTED_OK unset and a billing token present: live check. ANY
+          #    billing failure (410, network, bad JSON, ambiguous pool) resolves
+          #    to self-hosted — it must never fail the preflight, or every
+          #    downstream `needs: choose` job would be skipped. `set +e` around a
+          #    plain assignment keeps the status observable without tripping the
+          #    top-level `set -e`.
           if [ -n "${GH_TOKEN:-}" ]; then
-            resp="$(gh api -H "X-GitHub-Api-Version: 2022-11-28" \
-              "/orgs/${ORG}/settings/billing/actions")"
-            included="$(printf '%s' "$resp" | jq -r '.included_minutes // 0')"
-            used="$(printf '%s' "$resp" | jq -r '.total_minutes_used // 0')"
-            remaining=$(( included - used ))
-            if [ "$remaining" -ge "$MIN_REMAIN" ]; then
+            set +e
+            result="$(billing_remaining)"
+            rc=$?
+            set -e
+            if [ "$rc" -ne 0 ]; then
+              emit "$FALLBACK" "false" "private repo, live billing check failed (fail-safe self-hosted)"
+              exit 0
+            fi
+            remaining="${result%%|*}"
+            billed="${result#*|}"
+            if awk -v b="$billed" 'BEGIN { exit !(b > 0) }'; then
+              emit "$FALLBACK" "false" "private repo, Actions minutes overage billed (${billed} USD)"
+            elif [ "$remaining" -ge "$MIN_REMAIN" ]; then
               emit "$hosted" "true" "private repo, ${remaining}m remaining (>= ${MIN_REMAIN})"
             else
               emit "$FALLBACK" "false" "private repo, only ${remaining}m remaining (< ${MIN_REMAIN})"
