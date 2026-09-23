@@ -169,7 +169,9 @@ jobs:
       # which reads ~/.netrc and not Nix's own netrc. See write-netrc.sh.
       - name: Run the netrc contract test
         shell: bash
-        run: bash .github/setup-nix/tests/write-netrc-test.sh
+        # The HARNESS (not write-netrc.sh) uses grep/sed/cmp, which the
+        # minimal-PATH self-hosted runners (m3, high-mem-server) do not have.
+        run: nix shell nixpkgs#gnugrep nixpkgs#gnused nixpkgs#diffutils --command bash .github/setup-nix/tests/write-netrc-test.sh
 
   test-mcl-secret-integration:
     # Successful runs: at most 20 minutes (last 100 CI runs).

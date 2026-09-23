@@ -424,12 +424,12 @@ runs:
             ''
           }}
 
-          # See the `fallback` input for the exact trade-off in both values.
+          # See the 'fallback' input for the exact trade-off in both values.
           fallback = ${{ inputs.fallback == 'false' && 'false' || 'true' }}
           download-attempts = 5
-          # `connect-timeout` is libcurl's CURLOPT_CONNECTTIMEOUT, and libcurl
+          # connect-timeout is libcurl's CURLOPT_CONNECTTIMEOUT, and libcurl
           # charges the time a transfer spends QUEUED for a free connection
-          # (`http-connections` is CURLMOPT_MAX_TOTAL_CONNECTIONS) against it.
+          # (http-connections is CURLMOPT_MAX_TOTAL_CONNECTIONS) against it.
           # At 5s with an 8-connection pool, every narinfo/NAR queued behind
           # eight busy NAR downloads failed with "Operation timed out after
           # 5000 milliseconds with 0 bytes received" — no network fault at all
