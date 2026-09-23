@@ -1,0 +1,35 @@
+Byte-exact `POST /v1/exec` NDJSON response bodies captured from REAL
+`vm-harness serve` daemons, replayed verbatim by remote_lifecycle_test.go.
+
+Captured 2026-09-24 by running each binary as
+  vm-harness serve --listen 127.0.0.1:<port> --auth-token-file <f> --backend incus
+and POSTing {"v":"1","argv":[...]} with the provider's own argv:
+
+serve-e337cb6/  gosti e337cb6fa456aa7fd0d934e2e5a36eb3a9c7c551 — infra's `gosti`
+                input, i.e. the serve every Linux host (hms, gpu-server-001/002)
+                and m3 ran on 2026-09-24. Predates ephemeral-list/-label (#47).
+                Built: nix build github:metacraft-labs/gosti/e337cb6…#default
+  ephemeral-label.ndjson      ephemeral-label --backend incus --baseline garm-x
+                              --label garm-pool=P --label garm-controller=C
+                              --log-format json
+                              -> "vm-harness: Unknown flag: '--label'" + help, exit 2
+                              (identical bytes with only --label garm-controller=C)
+  ephemeral-list-pool.ndjson  ephemeral-list --backend incus --label garm-pool=P
+                              --log-format json
+                              -> "vm-harness: Unknown flag: '--label'" + help, exit 2
+  ephemeral-list-name.ndjson  ephemeral-list --backend incus --name garm-x
+                              --log-format json
+                              -> "vm-harness: unknown subcommand 'ephemeral-list'"
+                                 + help, exit 2
+
+serve-4d69242/  gosti 4d69242dd1bfe7b28bb7705666da34a2b318c5f0 (#47, the leak
+                fix). A CURRENT daemon's genuine usage errors, which must NOT be
+                mistaken for an old daemon.
+  label-bad-value.ndjson      … --label garm-pool …
+                              -> "vm-harness: --label expects key=value, got 'garm-pool'"
+  label-bad-key.ndjson        … --label 'bad key=v' …
+                              -> "vm-harness: --label key has invalid characters: bad key"
+
+`GET /v1/info` is identical in shape on both revisions
+({service, protocol:"1", host, backends}); it carries no version or verb list,
+so it cannot be used as a capability probe.

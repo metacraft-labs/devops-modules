@@ -43,6 +43,17 @@
 // produced on demand against a real daemon, and the unit tier must not need a
 // hypervisor. The real daemon is exercised by the nix gate
 // t_garm_provider_remote (checks/garm-provider-remote.nix).
+//
+// OLD-DAEMON AND USAGE-ERROR OUTPUT IS NOT EMULATED, IT IS REPLAYED. The first
+// version of this fixture made up the old daemon's answer ("unknown subcommand
+// 'ephemeral-label'"); the real old binary never prints that for the
+// provider's argv (its parser rejects `--label` before dispatch), the tests
+// passed, and the 2026-09-24 rollout failed every create on gpu-server-001/002.
+// So those responses are now the BYTE-EXACT /v1/exec NDJSON streams captured
+// from real daemons (testdata/serve-<rev>/, provenance in
+// testdata/README.provenance), written to the wire verbatim. The real old
+// binary is additionally driven end to end by t_garm_provider_remote_old_daemon
+// (checks/garm-provider-remote-old-daemon.nix).
 package backend
 
 import (
@@ -52,6 +63,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -71,11 +84,12 @@ type fakeHost struct {
 	labels    map[string]map[string]string // label records (may outlive instances)
 	argv      [][]string
 
-	listExit      int  // non-zero: ephemeral-list cannot enumerate
-	listNoResult  bool // exit 0 but no result line (protocol violation)
-	oldDaemon     bool // predates ephemeral-list / ephemeral-label (usage exit 2)
-	labelExit     int  // non-zero: ephemeral-label fails
-	destroyFailsN int  // remaining destroys that fail (transient busy)
+	listExit      int    // non-zero: ephemeral-list cannot enumerate
+	listNoResult  bool   // exit 0 but no result line (protocol violation)
+	oldDaemon     bool   // predates ephemeral-list / ephemeral-label: replays serve-e337cb6
+	labelExit     int    // non-zero: ephemeral-label fails with a non-usage error
+	labelReplay   string // non-empty: ephemeral-label answers with this captured stream
+	destroyFailsN int    // remaining destroys that fail (transient busy)
 }
 
 func newFakeHost() *fakeHost {
@@ -92,6 +106,34 @@ func flagValues(argv []string, flag string) []string {
 	return out
 }
 
+// Captured /v1/exec streams (see testdata/README.provenance).
+const (
+	// gosti e337cb6 — the serve the fleet ran on 2026-09-24.
+	replayOldLabel    = "testdata/serve-e337cb6/ephemeral-label.ndjson"     // ephemeral-label … --label …
+	replayOldListPool = "testdata/serve-e337cb6/ephemeral-list-pool.ndjson" // ephemeral-list … --label …
+	replayOldListName = "testdata/serve-e337cb6/ephemeral-list-name.ndjson" // ephemeral-list … --name …
+	// gosti 4d69242 — a CURRENT daemon's genuine usage errors (exit 2).
+	replayNewLabelBadValue = "testdata/serve-4d69242/label-bad-value.ndjson"
+	replayNewLabelBadKey   = "testdata/serve-4d69242/label-bad-key.ndjson"
+)
+
+// replay returns the captured stream to send verbatim for argv, or "".
+func (h *fakeHost) replay(argv []string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	switch {
+	case h.oldDaemon && argv[0] == "ephemeral-label":
+		return replayOldLabel
+	case h.oldDaemon && argv[0] == "ephemeral-list" && len(flagValues(argv, "--label")) > 0:
+		return replayOldListPool
+	case h.oldDaemon && argv[0] == "ephemeral-list":
+		return replayOldListName
+	case h.labelReplay != "" && argv[0] == "ephemeral-label":
+		return h.labelReplay
+	}
+	return ""
+}
+
 // run emulates one vm-harness invocation: returns log lines and exit code.
 func (h *fakeHost) run(argv []string) ([]string, int) {
 	h.mu.Lock()
@@ -106,12 +148,6 @@ func (h *fakeHost) run(argv []string) ([]string, int) {
 		h.instances[name] = &hostInstance{state: "running"}
 		return []string{`{"level":"info","msg":"ephemeral clone: kept running"}`}, 0
 	case "ephemeral-label":
-		if h.oldDaemon {
-			return []string{"vm-harness: unknown subcommand 'ephemeral-label'"}, 2
-		}
-		if h.labelExit == 2 {
-			return []string{"vm-harness: --label expects key=value, got 'garm-pool'"}, 2
-		}
 		if h.labelExit != 0 {
 			return []string{"cannot write label record"}, h.labelExit
 		}
@@ -123,9 +159,6 @@ func (h *fakeHost) run(argv []string) ([]string, int) {
 		h.labels[name] = l
 		return nil, 0
 	case "ephemeral-list":
-		if h.oldDaemon {
-			return []string{"vm-harness: unknown subcommand 'ephemeral-list'"}, 2
-		}
 		if h.listExit != 0 {
 			return []string{`{"level":"error","msg":"ephemeral-list: enumeration failed","error":"virsh: failed to connect to the hypervisor"}`}, h.listExit
 		}
@@ -185,6 +218,21 @@ func (h *fakeHost) server(t *testing.T) (*RemoteBackend, func()) {
 		var req execRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if f := h.replay(req.Argv); f != "" {
+			h.mu.Lock()
+			h.argv = append(h.argv, req.Argv)
+			h.mu.Unlock()
+			raw, err := os.ReadFile(filepath.FromSlash(f))
+			if err != nil {
+				t.Errorf("replay fixture: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(raw)
 			return
 		}
 		lines, code := h.run(req.Argv)
@@ -308,8 +356,16 @@ func TestRemoteListFailsClosed(t *testing.T) {
 			if !errors.Is(err, ErrEnumerationUnavailable) || errors.Is(err, garmErrors.ErrNotFound) {
 				t.Fatalf("err=%v: want ErrEnumerationUnavailable and NOT ErrNotFound", err)
 			}
-			if _, err := b.Get(context.Background(), "garm-live"); err == nil || errors.Is(err, garmErrors.ErrNotFound) {
+			// Only a POSITIVELY identified old daemon is reported as one.
+			if got, want := errors.Is(err, ErrDaemonPredatesInventory), name == "daemon predates verb"; got != want {
+				t.Fatalf("err=%v: ErrDaemonPredatesInventory=%v, want %v", err, got, want)
+			}
+			_, err = b.Get(context.Background(), "garm-live")
+			if err == nil || errors.Is(err, garmErrors.ErrNotFound) {
 				t.Fatalf("Get on an unenumerable host must fail, not report not-found: %v", err)
+			}
+			if got, want := errors.Is(err, ErrDaemonPredatesInventory), name == "daemon predates verb"; got != want {
+				t.Fatalf("Get err=%v: ErrDaemonPredatesInventory=%v, want %v", err, got, want)
 			}
 		})
 	}
@@ -392,17 +448,36 @@ func TestRemoteCreateLabelsAndToleratesOnlyAnOldDaemon(t *testing.T) {
 			t.Fatalf("Create against a daemon without ephemeral-label must not fail: %v", err)
 		}
 	})
-	t.Run("a usage error from a CURRENT daemon fails the create", func(t *testing.T) {
-		// Exit 2 is every usage error, not just an unknown verb: only the old
-		// daemon's "unknown subcommand" message may be tolerated.
+	t.Run("old daemon: label-less create is attempted and still succeeds", func(t *testing.T) {
+		// Controller-only attribution (no pool) takes the same path.
 		h := newFakeHost()
-		h.labelExit = 2
+		h.oldDaemon = true
 		b, done := h.server(t)
 		defer done()
-		if _, err := b.Create(context.Background(), CreateArgs{Name: "garm-u", PoolID: "P"}); err == nil {
-			t.Fatal("a rejected --label (exit 2) was mistaken for an old daemon and the instance left unattributed")
+		if _, err := b.Create(context.Background(), CreateArgs{Name: "garm-oc", ControllerID: "C"}); err != nil {
+			t.Fatalf("controller-only create against an old daemon: %v", err)
+		}
+		if _, labelled := h.labels["garm-oc"]; labelled {
+			t.Fatal("fixture: an old daemon cannot have recorded a label")
 		}
 	})
+	for name, fixture := range map[string]string{
+		"bad value": replayNewLabelBadValue,
+		"bad key":   replayNewLabelBadKey,
+	} {
+		t.Run("a usage error from a CURRENT daemon fails the create ("+name+")", func(t *testing.T) {
+			// Exit 2 is every usage error, not just an old daemon: only the old
+			// binary's exact text may be tolerated. These are a real 4d69242
+			// daemon's answers to a malformed --label.
+			h := newFakeHost()
+			h.labelReplay = fixture
+			b, done := h.server(t)
+			defer done()
+			if _, err := b.Create(context.Background(), CreateArgs{Name: "garm-u", PoolID: "P"}); err == nil {
+				t.Fatal("a rejected --label (exit 2) was mistaken for an old daemon and the instance left unattributed")
+			}
+		})
+	}
 	t.Run("label write failure fails the create", func(t *testing.T) {
 		h := newFakeHost()
 		h.labelExit = 1
@@ -412,4 +487,97 @@ func TestRemoteCreateLabelsAndToleratesOnlyAnOldDaemon(t *testing.T) {
 			t.Fatal("an unattributable instance must fail the create, not become invisible to its pool")
 		}
 	})
+}
+
+// TestOldDaemonFixturesAreTheRealOutput pins what the captured streams say, so a
+// re-capture that changed them (or a hand edit) is loud. These strings are the
+// contract isOldDaemonUsage is written against.
+func TestOldDaemonFixturesAreTheRealOutput(t *testing.T) {
+	for f, want := range map[string]string{
+		replayOldLabel:         "vm-harness: Unknown flag: '--label'",
+		replayOldListPool:      "vm-harness: Unknown flag: '--label'",
+		replayOldListName:      "vm-harness: unknown subcommand 'ephemeral-list'",
+		replayNewLabelBadValue: "vm-harness: --label expects key=value, got 'garm-pool'",
+		replayNewLabelBadKey:   "vm-harness: --label key has invalid characters: bad key",
+	} {
+		raw, err := os.ReadFile(filepath.FromSlash(f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+		var first, last wireEvent
+		if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		if err := json.Unmarshal([]byte(lines[len(lines)-1]), &last); err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		if first.Type != "log" || first.Line != want {
+			t.Errorf("%s: first event %+v, want log %q", f, first, want)
+		}
+		if last.Type != "exit" || last.Code != usageExitCode {
+			t.Errorf("%s: last event %+v, want exit %d", f, last, usageExitCode)
+		}
+	}
+}
+
+func TestIsOldDaemonUsage(t *testing.T) {
+	cases := []struct {
+		name  string
+		verb  string
+		code  int
+		lines []string
+		want  bool
+	}{
+		{"old: --label rejected by the parser (label)", "ephemeral-label", 2, []string{"vm-harness: Unknown flag: '--label'", "vm-harness <subcommand> [flags]"}, true},
+		{"old: --label rejected by the parser (list)", "ephemeral-list", 2, []string{"vm-harness: Unknown flag: '--label'"}, true},
+		{"old: unknown verb (list --name)", "ephemeral-list", 2, []string{"vm-harness: unknown subcommand 'ephemeral-list'"}, true},
+		{"old marker but not a usage exit", "ephemeral-label", 1, []string{"vm-harness: Unknown flag: '--label'"}, false},
+		{"another verb's unknown-subcommand", "ephemeral-label", 2, []string{"vm-harness: unknown subcommand 'ephemeral-list'"}, false},
+		{"current: bad --label value", "ephemeral-label", 2, []string{"vm-harness: --label expects key=value, got 'garm-pool'"}, false},
+		{"current: a different unknown flag", "ephemeral-list", 2, []string{"vm-harness: Unknown flag: '--labels'"}, false},
+		{"success", "ephemeral-list", 0, nil, false},
+	}
+	for _, c := range cases {
+		if got := isOldDaemonUsage(c.verb, c.code, c.lines); got != c.want {
+			t.Errorf("%s: isOldDaemonUsage=%v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestMixedFleetRollout is the 2026-09-24 rollout: the NEW provider driving one
+// host whose serve is already upgraded and one still on the old binary. Order
+// must not matter: creates succeed on both, the upgraded host lists its pool,
+// and the old host fails closed with the distinguishable error (so GARM's
+// reconcile skips it rather than recycling its runners).
+func TestMixedFleetRollout(t *testing.T) {
+	ctx := context.Background()
+	newHost, oldHost := newFakeHost(), newFakeHost()
+	oldHost.oldDaemon = true
+	nb, doneN := newHost.server(t)
+	defer doneN()
+	ob, doneO := oldHost.server(t)
+	defer doneO()
+
+	if _, err := nb.Create(ctx, CreateArgs{Name: "garm-n1", PoolID: "P", ControllerID: "C"}); err != nil {
+		t.Fatalf("create on upgraded host: %v", err)
+	}
+	if _, err := ob.Create(ctx, CreateArgs{Name: "garm-o1", PoolID: "P", ControllerID: "C"}); err != nil {
+		t.Fatalf("create on old host (the outage): %v", err)
+	}
+	if l, err := nb.List(ctx, "P"); err != nil || len(l) != 1 || l[0].Name != "garm-n1" {
+		t.Fatalf("upgraded host list=%+v err=%v", l, err)
+	}
+	for _, list := range []func() ([]Instance, error){
+		func() ([]Instance, error) { return ob.List(ctx, "P") },
+		func() ([]Instance, error) { return ob.ListByController(ctx, "C") },
+	} {
+		l, err := list()
+		if err == nil || !errors.Is(err, ErrDaemonPredatesInventory) || !errors.Is(err, ErrEnumerationUnavailable) {
+			t.Fatalf("old host list=%+v err=%v: want fail-closed ErrDaemonPredatesInventory", l, err)
+		}
+	}
+	if err := ob.Delete(ctx, "garm-o1"); err != nil {
+		t.Fatalf("delete on old host: %v", err)
+	}
 }

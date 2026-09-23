@@ -252,15 +252,65 @@ const (
 	// `virsh`/`incus` calls on the daemon host; a minute is generous.
 	listTimeout = 60 * time.Second
 	// usageExitCode is what vm-harness exits with for ANY usage error: an
-	// unknown verb (a daemon older than `ephemeral-label`), but equally an
-	// unknown flag or a rejected --label value on a current daemon. The exit
-	// code alone therefore cannot identify an old daemon; oldDaemonLabelMarker
-	// does.
+	// unknown verb, an unknown flag, or a rejected --label value on a current
+	// daemon. The exit code alone therefore cannot identify an old daemon; the
+	// markers below do.
 	usageExitCode = 2
-	// oldDaemonLabelMarker is what a vm-harness that predates the verb prints
-	// (`vm-harness: unknown subcommand '<verb>'`, then its help, exit 2).
-	oldDaemonLabelMarker = "unknown subcommand 'ephemeral-label'"
 )
+
+// OLD-DAEMON IDENTIFICATION. The markers are the EXACT text a vm-harness that
+// predates `ephemeral-list` / `ephemeral-label` (gosti #47, 4d69242) prints,
+// captured from the binary the fleet actually ran (gosti e337cb6, infra's
+// `gosti` input on 2026-09-24) — see testdata/old-daemon-e337cb6/.
+//
+// The first marker is the one that matters, and the one the 2026-09-24 rollout
+// missed. vm-harness parses the WHOLE argv before it dispatches on the verb,
+// and `--label` did not exist before #47, so an old daemon never gets as far
+// as "unknown subcommand": both `ephemeral-label … --label k=v` and
+// `ephemeral-list … --label k=v` die in the parser with
+//
+//	vm-harness: Unknown flag: '--label'
+//
+// (then the help text, exit 2). The provider used to look only for
+// "unknown subcommand 'ephemeral-label'", which an old daemon cannot print for
+// this argv, so every create against an old daemon failed.
+//
+// The "unknown subcommand" form is what an old daemon prints when the argv
+// carries no `--label` (Get's `ephemeral-list --name <n>`).
+//
+// A CURRENT daemon cannot print either for these argvs: it knows `--label`
+// (its usage errors say "--label expects key=value" or "--label key has
+// invalid characters") and both verbs. Identification needs exit 2 AND a
+// marker, so an unrelated usage error is never mistaken for an old daemon.
+const oldDaemonUnknownLabelFlag = "Unknown flag: '--label'"
+
+func oldDaemonUnknownVerb(verb string) string { return "unknown subcommand '" + verb + "'" }
+
+// isOldDaemonUsage reports whether a worker run of verb that exited with code
+// and printed lines was rejected because the daemon predates the verb.
+func isOldDaemonUsage(verb string, code int, lines []string) bool {
+	if code != usageExitCode {
+		return false
+	}
+	for _, l := range lines {
+		if strings.Contains(l, oldDaemonUnknownLabelFlag) || strings.Contains(l, oldDaemonUnknownVerb(verb)) {
+			return true
+		}
+	}
+	return false
+}
+
+// oldDaemonLogTag prefixes the one stderr line the provider prints when it
+// positively identifies an old daemon, so the condition is greppable apart
+// from genuine enumeration failures.
+const oldDaemonLogTag = "vmharness-provider old-daemon"
+
+// ErrDaemonPredatesInventory marks a daemon positively identified as older
+// than `ephemeral-list`/`ephemeral-label`. List/Get wrap it TOGETHER with
+// ErrEnumerationUnavailable: it is still a failure to enumerate (fail closed),
+// but a distinguishable one — the remedy is "upgrade that host's serve", not
+// "investigate the host".
+var ErrDaemonPredatesInventory = errors.New("remote vm-harness serve predates ephemeral-list/ephemeral-label (old daemon; upgrade its vm-harness)")
 
 // ErrEnumerationUnavailable marks a failure to enumerate the remote host. It
 // is deliberately NOT garmErrors.ErrNotFound: GARM treats "not found" / "not
@@ -275,12 +325,20 @@ var ErrEnumerationUnavailable = errors.New("remote instance enumeration unavaila
 // create (and deletes + retries it, as it does for any create error) than a
 // live runner that the next reconcile pass tears down.
 //
-// The one tolerated failure is a daemon too old to know the verb — exit 2 AND
-// its "unknown subcommand 'ephemeral-label'" message; any other usage error is
-// a real failure. Refusing every create during a rolling upgrade would be an
-// outage, and
-// such a daemon also cannot answer `ephemeral-list`, so List fails closed for
-// that host anyway and nothing is removed on the strength of an absent label.
+// The one tolerated failure is a daemon positively identified as too old to
+// know the verb (isOldDaemonUsage: exit 2 AND the old binary's exact text).
+// Any other failure, including any other usage error, fails the create.
+//
+// Why tolerating is safe: the unlabelled instance is exactly what the fleet
+// ran before the leak fix, and the same old daemon cannot answer
+// `ephemeral-list` either, so List fails closed for that host (below) and
+// nothing is removed on the strength of an absent label. Once that daemon is
+// upgraded, the unlabelled instance is not in its pool's list: GARM then
+// recycles it through the normal path (scale sets: removed from GitHub —
+// refused while it is running a job — then pending_delete and a provider
+// Delete; pools: the patched orphan sweep, offline runners only). Refusing
+// every create instead, during a rolling upgrade, is an outage — the one
+// observed on 2026-09-24.
 func (b *RemoteBackend) label(ctx context.Context, args CreateArgs) error {
 	if args.PoolID == "" && args.ControllerID == "" {
 		return nil
@@ -294,10 +352,10 @@ func (b *RemoteBackend) label(ctx context.Context, args CreateArgs) error {
 	}
 	argv = append(argv, "--log-format", "json")
 	logEv := logToStderr("label " + args.Name)
-	unknownVerb := false
+	var lines []string
 	code, err := b.Client.ExecStream(ctx, argv, func(ev ExecEvent) {
-		if ev.Kind == "log" && strings.Contains(ev.Line, oldDaemonLabelMarker) {
-			unknownVerb = true
+		if ev.Kind == "log" && len(lines) < maxDiagLines {
+			lines = append(lines, ev.Line)
 		}
 		logEv(ev)
 	})
@@ -307,12 +365,25 @@ func (b *RemoteBackend) label(ctx context.Context, args CreateArgs) error {
 	switch {
 	case code == 0:
 		return nil
-	case code == usageExitCode && unknownVerb:
-		fmt.Fprintf(os.Stderr, "remote Create %s: daemon does not support ephemeral-label (exit 2); instance is unattributed until the daemon is upgraded\n", args.Name)
+	case isOldDaemonUsage("ephemeral-label", code, lines):
+		fmt.Fprintf(os.Stderr, "%s endpoint=%s verb=ephemeral-label action=create-unlabelled instance=%s: daemon predates ephemeral-label; the instance is unattributed until the daemon is upgraded\n",
+			oldDaemonLogTag, b.Client.Endpoint, args.Name)
 		return nil
 	default:
-		return fmt.Errorf("remote Create %s: recording ownership labels: worker exit %d", args.Name, code)
+		return fmt.Errorf("remote Create %s: recording ownership labels: worker exit %d: %s", args.Name, code, strings.Join(firstN(lines, 3), " | "))
 	}
+}
+
+// maxDiagLines bounds how many worker lines are kept for classification and
+// diagnostics. The old-daemon marker is the FIRST line the old binary prints
+// (its help text follows), so a small bound is enough.
+const maxDiagLines = 8
+
+func firstN(xs []string, n int) []string {
+	if len(xs) > n {
+		return xs[:n]
+	}
+	return xs
 }
 
 // inventoryLine is the JSON shape of `ephemeral-list`'s result line.
@@ -346,7 +417,7 @@ func (b *RemoteBackend) inventory(ctx context.Context, filter ...string) ([]Inst
 		case "log":
 			line := strings.TrimSpace(ev.Line)
 			if !strings.Contains(line, inventoryMarker) {
-				if len(diag) < 5 {
+				if len(diag) < maxDiagLines {
 					diag = append(diag, line)
 				}
 				return
@@ -364,9 +435,31 @@ func (b *RemoteBackend) inventory(ctx context.Context, filter ...string) ([]Inst
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrEnumerationUnavailable, b.Client.Endpoint, err)
 	}
+	if isOldDaemonUsage("ephemeral-list", code, diag) {
+		// FAIL CLOSED, deliberately, even though the daemon is positively
+		// identified. The alternative — the pre-fix answer, an empty list — is
+		// not "the old behaviour" any more: it now feeds the PATCHED GARM.
+		//   - Scale sets (consolidateProviderState): every DB runner absent
+		//     from the list is removed from GitHub and set pending_delete, so
+		//     an empty list recycles every idle runner on the host on every
+		//     consolidation pass.
+		//   - Pools (cleanupOrphanedGithubRunners, fix-instance-lifecycle-
+		//     leaks.patch): an offline runner absent from the list is now
+		//     pending_delete'd AND deleted through the provider, so a guest
+		//     still booting at 5 minutes (every Windows guest) is killed and
+		//     re-created in a loop.
+		// Failing closed costs only the provider-side reconcile for this host
+		// (logged every pass, one pool skipped by the patched sweep), and
+		// creates keep working (label tolerates the same daemon). It is
+		// reported apart from a genuine failure so the remedy is obvious.
+		fmt.Fprintf(os.Stderr, "%s endpoint=%s verb=ephemeral-list action=fail-closed: daemon predates ephemeral-list\n",
+			oldDaemonLogTag, b.Client.Endpoint)
+		return nil, fmt.Errorf("%w: %w: %s: ephemeral-list --backend %s exited %d: %s",
+			ErrEnumerationUnavailable, ErrDaemonPredatesInventory, b.Client.Endpoint, b.TargetBackend, code, strings.Join(firstN(diag, 1), " | "))
+	}
 	if code != 0 {
 		return nil, fmt.Errorf("%w: %s: ephemeral-list --backend %s exited %d: %s",
-			ErrEnumerationUnavailable, b.Client.Endpoint, b.TargetBackend, code, strings.Join(diag, " | "))
+			ErrEnumerationUnavailable, b.Client.Endpoint, b.TargetBackend, code, strings.Join(firstN(diag, 5), " | "))
 	}
 	if parseErr != nil {
 		return nil, fmt.Errorf("%w: %s: %w", ErrEnumerationUnavailable, b.Client.Endpoint, parseErr)
