@@ -63,6 +63,41 @@ on:
         required: false
         default: ''
 
+      destroy_guard:
+        # Apply mode only. The PR-time destroy/replace gates judge the plan of
+        # the PR's OWN change. An apply on push judges nothing: it applies
+        # whatever the root's plan is at that moment, including changes that
+        # landed earlier and never applied (a red pipeline, a skipped root).
+        # On 2026-09-23 a CI-only push to infra re-applied every root, and one
+        # carried a days-old unmoved Cloudflare record -- a destroy + create of
+        # the same name; the create failed and SSO went down. With this on, the
+        # apply job runs terraform/ci/plan-destroy-guard on the saved plan it
+        # is about to apply and refuses any destroy/replace nobody authorized.
+        description: >-
+          Refuse to apply a plan containing destroy or replace actions unless
+          authorized by `allow_destroy` or by a pull request associated with the
+          pushed commit that carries `destroy_label`.
+        type: boolean
+        required: false
+        default: false
+
+      allow_destroy:
+        description: >-
+          Authorize destroy/replace actions for this apply (destroy_guard). Wire
+          it to an explicit workflow_dispatch input, never to a computed value.
+        type: boolean
+        required: false
+        default: false
+
+      destroy_label:
+        description: >-
+          PR label that authorizes destroy/replace on the push that lands the
+          PR (destroy_guard). Same label the PR-time destroy gate requires.
+          Empty disables label authorization.
+        type: string
+        required: false
+        default: 'allow-destroy'
+
       environment_name:
         description: 'GitHub Environment used by apply jobs as the credential boundary for the target branch.'
         type: string
@@ -1091,6 +1126,11 @@ jobs:
         env:
           BACKEND_CONFIG_FILE: ${{ inputs.backend_config_file }}
           WORKING_DIRECTORY: ${{ inputs.working_directory }}
+          DESTROY_GUARD: ${{ inputs.destroy_guard }}
+          ALLOW_DESTROY: ${{ inputs.allow_destroy }}
+          DESTROY_LABEL: ${{ inputs.destroy_label }}
+          GUARD_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/plan-destroy-guard
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -1149,6 +1189,43 @@ jobs:
           fi
           if [ "$plan_exit" -ne 2 ]; then
             exit "$plan_exit"
+          fi
+
+          # Destroy guard: judge the SAVED plan -- exactly what the apply below
+          # executes -- and refuse destroy/replace nobody authorized.
+          if [ "$DESTROY_GUARD" = "true" ]; then
+            plan_json="$apply_dir/plan.json"
+            run_tofu show -json "$plan_bin" > "$plan_json"
+
+            authorized=""
+            if [ "$ALLOW_DESTROY" = "true" ]; then
+              authorized="allow_destroy=true (${GITHUB_EVENT_NAME} by @${GITHUB_ACTOR})"
+            elif [ "$GITHUB_EVENT_NAME" = "push" ] && [ -n "$DESTROY_LABEL" ]; then
+              # A PR whose base is the pushed branch, containing the pushed
+              # commit, labelled by a human. Any API failure leaves this empty,
+              # i.e. fails closed (refused, then dispatch with allow_destroy).
+              labelled_pr="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                --jq "[.[] | select(.base.ref == \"${GITHUB_REF_NAME}\") | select(any(.labels[]; .name == \"${DESTROY_LABEL}\")) | .number] | first // empty" \
+                2>/dev/null || true)"
+              if [ -n "$labelled_pr" ]; then
+                authorized="PR #${labelled_pr} carries the '${DESTROY_LABEL}' label"
+              fi
+            fi
+
+            set +e
+            nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+              python3 "$GUARD_SCRIPT" "$plan_json" \
+                --authorized "$authorized" \
+                --summary "$GITHUB_STEP_SUMMARY"
+            guard_exit=$?
+            set -e
+            rm -f "$plan_json"
+
+            if [ "$guard_exit" -ne 0 ]; then
+              echo "failure-reason=destroy-refused" >> "$GITHUB_OUTPUT"
+              echo "::error::Refusing to apply ${WORKING_DIRECTORY}: the plan destroys or replaces resources and nothing authorized it. Nothing was applied."
+              exit 1
+            fi
           fi
 
           set +e

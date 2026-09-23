@@ -50,10 +50,64 @@ The one fixed rule: the state key must match its sensitivity —
 for `sensitive`, where `<config>` is the root path minus the leading
 `terraform/`. This keeps sensitive state on an auditable key prefix.
 
+## Apply-time destroy guard
+
+The PR-time gates (`allow-destroy`, `sensitive-change`) judge the plan of the
+pull request's own change. An apply on push judges nothing: it applies whatever
+the root's plan is at that moment, including changes that landed earlier and
+never applied because the pipeline was red or the root was skipped. That is how
+a CI-only push re-applied a days-old Cloudflare change on 2026-09-23 and took
+an SSO hostname down.
+
+Set `destroy_guard: true` on the apply call. The apply job then runs
+`plan-destroy-guard` on the saved plan it is about to execute and refuses any
+destroy or replace unless one of these authorizes it:
+
+- `allow_destroy: true` — wire it to an explicit `workflow_dispatch` input;
+- a pull request that contains the pushed commit, targets the pushed branch,
+  and carries `destroy_label` (default `allow-destroy`, the same label the
+  PR-time gate asks for).
+
+A refusal applies nothing, fails the job, and writes the destructive changes to
+the step summary. Two shapes get a specific diagnosis, because each has a
+zero-downtime fix that is not "approve the destroy":
+
+- **`unmoved-address`** — the same object is destroyed at one address and
+  created at another (a resource wrapped in `count`/`for_each`, or renamed).
+  Add `moved { from = <old> to = <new> }`. Across resource types (for example
+  `cloudflare_record` → `cloudflare_dns_record`), use
+  `removed { from = <old> lifecycle { destroy = false } }` plus
+  `import { to = <new> id = "<provider id>" }`, which adopts the live object
+  without touching it.
+- **`dns-replace`** — see the next section.
+
+### Same-name DNS record replacement
+
+`create_before_destroy` cannot help a DNS record: the provider refuses a second
+record with the same name (and a CNAME cannot coexist with anything), so a
+replace is always delete-then-create — a resolution gap — and if the create
+fails the gap is permanent until someone notices. Never let one ride along with
+an unrelated apply. Instead:
+
+1. **Prefer not replacing at all.** If only the Terraform address changed, use
+   `moved`; if the resource type changed, use `removed` (`destroy = false`) +
+   `import`. Both are zero-change for the live record. Land that alone and
+   confirm the next plan is empty for the record.
+2. **If the provider genuinely forces a replacement** (for example an attribute
+   that cannot be updated in place), do it as an attended, two-step change:
+   (a) a first PR that only lowers the record's TTL (in-place update), applied
+   and allowed to age past the old TTL; (b) a second PR that contains only the
+   replacement, labelled `allow-destroy`, applied while someone watches it,
+   with the old record's value written in the PR so a failed create can be
+   restored by hand (`flarectl`/dashboard) within minutes. Verify resolution
+   after the apply (`dig +short <name> @1.1.1.1`).
+
 ## Tests
 
 `tests/test-matrix.sh` covers the provider/backend credential matrix and
 negative validation directly, without credentials or network.
 `tests/test-matrix-mutations.sh` proves that the suite rejects semantic
 weakenings. The `terraform-ci-matrix` flake check runs both in a Nix sandbox on
-every supported system.
+every supported system. `tests/test-plan-destroy-guard.sh` exercises
+`plan-destroy-guard` against `tofu show -json`-shaped fixtures, including a
+replay of the 2026-09-23 incident; the same flake check runs it.
