@@ -88,6 +88,23 @@
       # ----- EPHEMERAL-INSTANCE INVENTORY EXPORTER --------------------------
       icfg = cfg.inventoryExporter;
       labelDir = "/var/lib/${runtimeDir}/ephemeral-labels";
+      # The snapshot is rendered by the serve user into its OWN state dir
+      # (0750) and published into the shared textfile dir by a separate
+      # privileged step: that dir is root:root 0755 fleet-wide (infra's
+      # services/monitoring/node-exporter-textfile.nix), so an unprivileged
+      # writer gets EACCES there even with ReadWritePaths, and loosening it
+      # (the old 0777) would let any local user feed node-exporter.
+      inventoryStateName = "vm-harness-serve-inventory";
+      inventoryStage = "/var/lib/${inventoryStateName}/vmh-ephemeral.prom";
+      inventoryPublishScript = pkgs.writeShellApplication {
+        name = "vm-harness-serve-inventory-publish";
+        runtimeInputs = [ pkgs.coreutils ];
+        text = ''
+          dir=${lib.escapeShellArg icfg.textfileDir}
+          install -m 0644 -o root -g root ${lib.escapeShellArg inventoryStage} "$dir/.vmh-ephemeral.prom.tmp"
+          mv -f "$dir/.vmh-ephemeral.prom.tmp" "$dir/vmh-ephemeral.prom"
+        '';
+      };
       inventoryScript = pkgs.writeShellApplication {
         name = "vm-harness-serve-inventory";
         runtimeInputs = [
@@ -98,7 +115,7 @@
         ]
         ++ cfg.extraPackages;
         text = ''
-          dir=${lib.escapeShellArg icfg.textfileDir}
+          dir="$(dirname ${lib.escapeShellArg inventoryStage})"
           tmp="$(mktemp "$dir/.vmh-ephemeral.XXXXXX")"
           trap 'rm -f "$tmp"' EXIT
           {
@@ -130,7 +147,7 @@
             done
           } >"$tmp"
           chmod 0644 "$tmp"
-          mv -f "$tmp" "$dir/vmh-ephemeral.prom"
+          mv -f "$tmp" ${lib.escapeShellArg inventoryStage}
           trap - EXIT
         '';
       };
@@ -618,8 +635,19 @@
           };
           textfileDir = mkOption {
             type = types.str;
-            default = "/var/lib/node-exporter/textfile";
-            description = "node-exporter textfile-collector directory the `.prom` snapshot is written into.";
+            # MUST equal node-exporter's `--collector.textfile.directory`; this
+            # is the fleet's one textfile dir (infra
+            # services/monitoring/node-exporter-textfile.nix). A different
+            # path is written happily and never scraped.
+            default = "/var/lib/prometheus-node-exporter/textfile";
+            description = ''
+              node-exporter textfile-collector directory the `.prom` snapshot is
+              published into. Must match node-exporter's
+              `--collector.textfile.directory`. The directory is kept
+              `root:root 0755`; the snapshot is rendered by the serve user in
+              its own state directory and installed here by a privileged
+              `ExecStartPost` step.
+            '';
           };
         };
 
@@ -852,14 +880,19 @@
         # ---- EPHEMERAL-INSTANCE INVENTORY EXPORTER: service + timer ----
         # Runs as the serve user with the serve daemon's groups and label dir,
         # so it enumerates exactly what the daemon's `ephemeral-list` workers
-        # see. Read-only apart from the textfile snapshot.
-        systemd.tmpfiles.rules = mkIf icfg.enable [ "d ${icfg.textfileDir} 0777 root root -" ];
+        # see. Read-only apart from its own 0750 state dir; the privileged
+        # ExecStartPost (`+`: full privileges, no sandbox) only installs the
+        # rendered file into the root-owned textfile dir.
+        systemd.tmpfiles.rules = mkIf icfg.enable [ "d ${icfg.textfileDir} 0755 root root -" ];
         systemd.services.vm-harness-serve-inventory = mkIf icfg.enable {
           description = "Publish vm-harness kept-instance inventory for orphan alerting";
           after = [ "vm-harness-serve.service" ];
           serviceConfig = {
             Type = "oneshot";
             ExecStart = lib.getExe inventoryScript;
+            ExecStartPost = "+${lib.getExe inventoryPublishScript}";
+            StateDirectory = inventoryStateName;
+            StateDirectoryMode = "0750";
             User = cfg.user;
             Group = cfg.group;
             SupplementaryGroups = cfg.extraGroups;
@@ -868,7 +901,6 @@
               "VMH_EPHEMERAL_LABEL_DIR=${labelDir}"
             ];
             ProtectSystem = "strict";
-            ReadWritePaths = [ icfg.textfileDir ];
             NoNewPrivileges = true;
             ProtectHome = true;
             PrivateTmp = true;

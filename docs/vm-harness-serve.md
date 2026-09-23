@@ -72,7 +72,12 @@ garm-pool=<id>`. The records live in `VMH_EPHEMERAL_LABEL_DIR`, which the
   `inventoryExporter.backends = [ "incus" ]` / `[ "libvirt" ]`). A timer runs
   `ephemeral-list` as the serve user and writes node-exporter textfile metrics
   `vmh_ephemeral_instances{backend,state,attributed}` and
-  `vmh_ephemeral_list_success{backend}`. The host is the only party that can
+  `vmh_ephemeral_list_success{backend}`. The snapshot is rendered into the
+  serve user's own `0750` state directory and installed into
+  `inventoryExporter.textfileDir` (default
+  `/var/lib/prometheus-node-exporter/textfile`, which must match node-exporter's
+  `--collector.textfile.directory`) by a privileged `ExecStartPost`, so that
+  directory stays `root:root 0755`. The host is the only party that can
   see an orphan — an instance GARM has forgotten is absent from GARM — so the
   `garm-fleet-alerts` library alerts from these on sustained STOPPED instances
   (`VmhEphemeralStoppedOrphans`), runner-named instances no pool owns

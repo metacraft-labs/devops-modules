@@ -277,7 +277,7 @@ top@{ ... }:
                 # An ORPHAN: a stopped runner-named container nobody owns.
                 host.succeed("incus launch vmh-base garm-orphan1 && incus stop --force garm-orphan1")
                 host.succeed("systemctl start vm-harness-serve-inventory.service")
-                prom = host.succeed("cat /var/lib/node-exporter/textfile/vmh-ephemeral.prom")
+                prom = host.succeed("cat /var/lib/prometheus-node-exporter/textfile/vmh-ephemeral.prom")
                 assert 'vmh_ephemeral_list_success{backend="incus"} 1' in prom, prom
                 assert 'vmh_ephemeral_instances{backend="incus",state="running",attributed="true"} 1' in prom, prom
                 assert 'vmh_ephemeral_instances{backend="incus",state="stopped",attributed="false"} 1' in prom, prom
