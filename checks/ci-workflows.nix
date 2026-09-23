@@ -627,6 +627,25 @@
             touch "$out"
           '';
 
+      # reusable-lint.yml hook-entry-point discovery: the `Check formatting`
+      # step is extracted verbatim and run against scratch checkouts with a
+      # stubbed `nix` (see the test's header for why that stub is justified).
+      checks.reusable-lint-hook-discovery =
+        pkgs.runCommand "reusable-lint-hook-discovery"
+          {
+            nativeBuildInputs = [
+              pkgs.bash
+              pkgs.gitMinimal
+              pkgs.gnugrep
+              pkgs.python3
+            ];
+          }
+          ''
+            cd ${../.}
+            python3 scripts/tests/test_reusable_lint_discovery.py
+            touch "$out"
+          '';
+
       checks.reusable-terraform-source-identity =
         pkgs.runCommand "reusable-terraform-source-identity"
           {
