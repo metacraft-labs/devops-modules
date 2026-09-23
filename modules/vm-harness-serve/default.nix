@@ -164,6 +164,20 @@
           # daemon is systemd's job (Restart=on-failure); probing a deliberately
           # stopped one must not manufacture a "recovery".
           if [ "$(systemctl is-active vm-harness-serve.service 2>/dev/null || true)" != "active" ]; then
+            # EXCEPT a start that failed on a DEPENDENCY. Then the unit is left
+            # inactive with Result=dependency — not `failed` — so Restart= never
+            # fires and nothing retries it, even once the dependency recovers.
+            # Observed on gpu-server-002: its disk briefly filled, incus.service
+            # core-dumped and self-restarted within seconds, but the daemon
+            # (Requires=incus.service) stayed down for 17 hours and its pools'
+            # teardowns backed up fleet-wide. A deliberate `systemctl stop`
+            # records Result=success, so it is still left alone.
+            if [ "$(systemctl show -p Result --value vm-harness-serve.service 2>/dev/null || true)" = "dependency" ]; then
+              log "vm-harness-serve.service is inactive after a DEPENDENCY failure (Result=dependency) — retrying start"
+              systemctl start --no-block vm-harness-serve.service || log "start request failed; will retry next interval"
+              printf '0' > "$fail_file"
+              exit 0
+            fi
             log "probe failed but vm-harness-serve.service is not active — leaving it to systemd (no watchdog action)"
             printf '0' > "$fail_file"
             exit 0
