@@ -99,6 +99,25 @@ buildGo126Module rec {
     # See upstream-patches/garm-stale-scaleset-job-reaper/ and the gate
     # t_garm_stale_scaleset_job_reaped.
     ./patches/fix-stale-scaleset-job-reaper.patch
+    # Instance-lifecycle leaks (three pool-manager defects, observed on central
+    # GARM, high-mem-server, 2026-09-22/23):
+    #  1. cleanupOrphanedGithubRunners DELETED the DB row of a runner that was
+    #     offline in GitHub and absent from ListInstances, never calling the
+    #     provider's DeleteInstance. With a provider that could not enumerate
+    #     (the remote vmharness backend answered every list with []) every
+    #     Windows runner still booting at 5 minutes was forgotten while its VM
+    #     ran on: ~210 leaked libvirt domains / 55 GiB. Now: pending_delete, so
+    #     the provider's (idempotent) delete runs first.
+    #  2. retryFailedInstances ran a pool's cleanup deletes in one
+    #     errgroup.WithContext: the first failure SIGKILLed every sibling
+    #     delete and all were retried every 5s (~88k failures/24h, ~31k
+    #     `signal: killed`, ~23k `context canceled`). Now: independent deletes,
+    #     per-instance backoff.
+    #  3. Fast-failing creates (full storage pool) were re-queued every 5s.
+    #     Now: 30s * 2^(attempt-1), capped at 20m.
+    # See upstream-patches/garm-instance-lifecycle-leaks/ and the gate
+    # t_garm_instance_lifecycle.
+    ./patches/fix-instance-lifecycle-leaks.patch
   ];
 
   # go-sqlite3 is a cgo module; the daemon needs cgo to link SQLite.
