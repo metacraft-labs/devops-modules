@@ -34,15 +34,19 @@
 # SKU strings (source: docs.github.com/en/billing/reference/product-and-sku-names
 # and the Budgets REST reference) are:
 #
-#   * budget_type = "ProductPricing" caps EVERY child SKU of a product. The only
-#     documented products are "actions" (covers actions_linux/…/actions_storage/
-#     actions_cache_storage) and "packages" (covers packages_storage/
-#     packages_bandwidth). So actions-storage/cache is already inside "actions";
-#     "packages" adds the Packages storage/bandwidth dimension.
-#   * Git LFS has NO product identifier — its spend lives only in the leaf SKUs
-#     "git_lfs_storage" and "git_lfs_bandwidth", which must be budgeted with
-#     budget_type = "SkuPricing". There is NO "shared_storage"/"storage"/
-#     "git_lfs" product; those are not valid budget_product_sku values.
+#   * budget_type = "ProductPricing" caps EVERY child SKU of a product:
+#     "actions" (actions_linux/…/actions_storage/actions_cache_storage),
+#     "packages" (packages_storage/packages_bandwidth), "codespaces", and
+#     "git_lfs" (git_lfs_storage + git_lfs_bandwidth). So actions storage/cache
+#     is already inside "actions".
+#   * Git LFS IS accepted as an ORG ProductPricing product: `budget_product_sku
+#     = "git_lfs"` exists live on metacraft-labs (budget 1592fa29, verified
+#     2026-09-23). An earlier revision of this header said LFS had no product
+#     identifier; that was wrong. The product form caps storage AND bandwidth.
+#     To cap only one of them, budget the leaf SKU "git_lfs_storage" or
+#     "git_lfs_bandwidth" with budget_type = "SkuPricing". At the enterprise
+#     scope the leaf SkuPricing form is the one in use (schelling-point-labs).
+#     There is NO "shared_storage"/"storage" product.
 #
 # So the $0-everywhere shape for an org is:
 #
@@ -50,10 +54,12 @@
 #     productSkus = [
 #       "actions"            # minutes + actions_storage + actions_cache_storage
 #       "packages"           # Packages storage + bandwidth
-#       "git_lfs_storage"    # Git LFS storage      (SkuPricing, auto-detected)
-#       "git_lfs_bandwidth"  # Git LFS bandwidth    (SkuPricing, auto-detected)
+#       "git_lfs"            # Git LFS storage + bandwidth (ProductPricing)
 #     ];
 #   };
+#
+# (A $0 "git_lfs" product budget also hard-stops LFS DOWNLOADS past the included
+# bandwidth. Use "git_lfs_storage" alone, SkuPricing, to cap only storage.)
 #
 # Each SKU entry may instead be an attrset carrying its own existing-budget id
 # (for import of a pre-existing budget) and/or per-SKU overrides:
@@ -64,8 +70,16 @@
 #       "git_lfs_storage"                         # bare string == { sku = …; }
 #     ];
 #
-# `budgetType` is inferred (git_lfs* → SkuPricing, ai_credits → BundlePricing,
-# else ProductPricing) but can be set explicitly per entry. Omitting
+# `budgetType` is inferred (git_lfs_storage / git_lfs_bandwidth → SkuPricing,
+# ai_credits → BundlePricing, else ProductPricing — including the "git_lfs"
+# product) but can be set explicitly per entry.
+#
+# ALERTING. Each budget is written with `budget_alerting = { will_alert = false;
+# alert_recipients = []; }` unless the entry (or the org/enterprise, as a
+# default) sets `alerting = { willAlert ? true; recipients ? [ ]; }`.
+# `budget_alerting` is a write-only attribute (never diffed), so ADOPTING a
+# hand-made budget that has alert recipients without `alerting` silently turns
+# its alerts off on the first PATCH. Set it to the live recipients to keep them. Omitting
 # `productSkus` keeps the legacy single-SKU shape (`{ id; amount?; productSku? }`)
 # and renders byte-for-byte as before: one org-named resource on the "actions"
 # product.
@@ -116,10 +130,13 @@
   #         preventFurtherUsage ? true; productSku ? "actions"; }
   #   * or the multi-SKU shape
   #       { productSkus = [ <sku-string | { sku; id ? null; amount ?;
-  #                          preventFurtherUsage ?; budgetType ? <inferred> }> … ];
-  #         amount ? 0; preventFurtherUsage ? true; }
-  #     where amount/preventFurtherUsage act as per-org defaults each SKU entry
-  #     may override. See the header comment for the valid SKU strings.
+  #                          preventFurtherUsage ?; budgetType ? <inferred>;
+  #                          alerting ? }> … ];
+  #         amount ? 0; preventFurtherUsage ? true; alerting ? null; }
+  #     where amount/preventFurtherUsage/alerting act as per-org defaults each
+  #     SKU entry may override. `alerting` is { willAlert ? true;
+  #     recipients ? [ ]; } (see ALERTING in the header). See the header comment
+  #     for the valid SKU strings.
   budgets ? { },
   # attrset: enterpriseSlug -> the SAME value shape as a `budgets` entry (legacy
   # single-SKU or multi-SKU `productSkus`). Each yields ENTERPRISE-scoped budget
@@ -151,15 +168,15 @@ let
   # Resource-name sanitizer: terraform resource labels can't carry "-"/".".
   sanitize = builtins.replaceStrings [ "-" "." ] [ "_" "_" ];
 
-  # A ProductPricing budget caps every child SKU of a product, but Git LFS is
-  # billed only through the leaf SKUs git_lfs_storage / git_lfs_bandwidth, which
-  # belong to NO product — so an LFS entry has to be a single-SKU (SkuPricing)
-  # budget. `ai_credits` is a metered BUNDLE (Copilot / Models credits), billed
-  # as BundlePricing rather than a product. Everything else defaults to the
+  # A ProductPricing budget caps every child SKU of a product, including the
+  # "git_lfs" product (LFS storage + bandwidth). The LFS LEAF SKUs
+  # git_lfs_storage / git_lfs_bandwidth are single-SKU (SkuPricing) budgets.
+  # `ai_credits` is a metered BUNDLE (Copilot / Models credits), billed as
+  # BundlePricing rather than a product. Everything else defaults to the
   # product-wide ProductPricing budget.
   inferBudgetType =
     sku:
-    if builtins.match "git_lfs.*" sku != null then
+    if builtins.match "git_lfs_.+" sku != null then
       "SkuPricing"
     else if sku == "ai_credits" then
       "BundlePricing"
@@ -179,7 +196,22 @@ let
       id = e.id or null;
       amount = e.amount or (cfg.amount or 0);
       preventFurtherUsage = e.preventFurtherUsage or (cfg.preventFurtherUsage or true);
+      alerting = e.alerting or (cfg.alerting or null);
     };
+
+  # budget_alerting body: off unless an `alerting` override is given.
+  alertingBody =
+    a:
+    if a == null then
+      {
+        will_alert = false;
+        alert_recipients = [ ];
+      }
+    else
+      {
+        will_alert = a.willAlert or true;
+        alert_recipients = a.recipients or [ ];
+      };
 
   # Per-entity effective settings with defaults. Yields a LIST of budget entries:
   # the multi-SKU shape maps `productSkus`; the legacy shape yields exactly one
@@ -201,6 +233,7 @@ let
               id = cfg.id or null;
               amount = cfg.amount or 0;
               preventFurtherUsage = cfg.preventFurtherUsage or true;
+              alerting = cfg.alerting or null;
             }
           ]
         else
@@ -281,10 +314,7 @@ let
           budget_entity_name = entityName;
           budget_type = e.budgetType;
           budget_product_sku = e.sku;
-          budget_alerting = {
-            will_alert = false;
-            alert_recipients = [ ];
-          };
+          budget_alerting = alertingBody e.alerting;
         };
 
         # These are sent on create/update but NOT tracked for drift: GitHub's GET
