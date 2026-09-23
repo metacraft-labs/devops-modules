@@ -82,8 +82,18 @@
   webhookDeliveryFor ? "30m",
   webhookHmacFor ? "10m",
   webhookProbeFor ? "5m",
+  # Instance lifecycle (leak detection). See the `garm-fleet-instance-lifecycle`
+  # group for the incidents these encode.
+  providerDeleteFailFor ? "15m",
+  absentFromProviderFor ? "0m",
+  orphanStoppedFor ? "10m",
+  orphanUnattributedFor ? "30m",
+  inventoryFailingFor ? "15m",
   # Thresholds.
   providerCreateFailCount ? 3, # >= this many CreateInstance failures in 15m.
+  providerDeleteFailCount ? 10, # >= this many DeleteInstance failures in 15m.
+  absentFromProviderCount ? 3, # >= this many "absent from provider" in 30m.
+  orphanStoppedCount ? 3, # STOPPED kept instances sustained over 30m.
   providerErrorRatioCrit ? "0.2", # errors/ops ratio over 15m.
   rateLimitWarn ? 200,
   rateLimitCrit ? 50,
@@ -391,6 +401,61 @@ let
             severity = "critical";
             summary = "GARM provider failing >${providerErrorRatioCrit} of operations ({{ $labels.provider }})";
             description = "Provider {{ $labels.provider }} is failing more than ${providerErrorRatioCrit} of its runner operations over 15m ({{ $value | humanizePercentage }}). The backend is broken (incus/libvirt/tart down, or AWS quota/subnet/AMI errors) — runners are not being provisioned.";
+          }
+        ];
+      }
+      {
+        name = "garm-fleet-instance-lifecycle";
+        comment = [
+          "# ── Instance lifecycle: deletes that fail, instances GARM stops seeing, and"
+          "# ── the orphans both leave behind on the provider hosts."
+          "# 2026-09-22/23: ~88k failed provider deletes/24h (a delete storm, see"
+          "# GarmProviderDeleteFailures), ~210 Windows VMs leaked on high-mem-server"
+          "# because the provider's ListInstances omitted them, and ~100 STOPPED"
+          "# containers filled gpu-server-001/002's storage pool."
+          "# vmh_* series come from the vm-harness-serve inventory exporter"
+          "# (services.vm-harness-serve.inventoryExporter) on each provider host."
+        ];
+        rules = [
+          {
+            name = "GarmProviderDeleteFailures";
+            expr = "sum by (provider) (increase(garm_runner_errors_total{operation=\"DeleteInstance\"}[15m])) >= ${s providerDeleteFailCount}";
+            for = providerDeleteFailFor;
+            severity = "warning";
+            summary = "GARM cannot delete runners on {{ $labels.provider }}";
+            description = "Provider {{ $labels.provider }} has failed at least ${s providerDeleteFailCount} DeleteInstance calls in each 15m window for ${providerDeleteFailFor}. Finished runners are not being reclaimed on that host (unreachable serve daemon, or a teardown that keeps failing, e.g. ZFS `dataset is busy`) — they will accumulate until the host's storage fills.";
+          }
+          {
+            name = "GarmInstancesAbsentFromProvider";
+            expr = "sum by (provider) (increase(garm_runner_absent_from_provider_total[30m])) >= ${s absentFromProviderCount}";
+            for = absentFromProviderFor;
+            severity = "warning";
+            summary = "GARM runners missing from {{ $labels.provider }}'s instance list";
+            description = "At least ${s absentFromProviderCount} instances GARM believes are running were absent from provider {{ $labels.provider }}'s ListInstances in 30m. They are routed to deletion, but repeated absences mean the provider cannot see its own instances (enumeration/attribution broken) — before the fix this is exactly how ~210 VMs leaked.";
+          }
+          {
+            name = "VmhEphemeralStoppedOrphans";
+            expr = "sum by (instance, backend) (min_over_time(vmh_ephemeral_instances{state=\"stopped\"}[30m])) >= ${s orphanStoppedCount}";
+            for = orphanStoppedFor;
+            severity = "warning";
+            summary = "Stopped runner instances are piling up on {{ $labels.instance }} ({{ $labels.backend }})";
+            description = "{{ $labels.instance }} has held at least ${s orphanStoppedCount} STOPPED per-job {{ $labels.backend }} instances continuously for 30m. A finished ephemeral runner is deleted within minutes, so these are orphans whose teardown failed or was never issued; they consume storage until the pool is full (gpu-server-001/002, 2026-09-23).";
+          }
+          {
+            name = "VmhEphemeralUnattributedInstances";
+            expr = "sum by (instance, backend) (min_over_time(vmh_ephemeral_instances{attributed=\"false\"}[1h])) > 0";
+            for = orphanUnattributedFor;
+            severity = "warning";
+            summary = "Runner instances with no owning GARM pool on {{ $labels.instance }} ({{ $labels.backend }})";
+            description = "{{ $labels.instance }} has carried {{ $value }} runner-named {{ $labels.backend }} instances with no GARM ownership record for over an hour. No pool lists them, so GARM will never delete them: they are orphans (typically created before attribution existed, or by a create whose labelling failed).";
+          }
+          {
+            name = "VmhEphemeralInventoryFailing";
+            expr = "vmh_ephemeral_list_success == 0";
+            for = inventoryFailingFor;
+            severity = "warning";
+            summary = "{{ $labels.instance }} cannot enumerate its {{ $labels.backend }} instances";
+            description = "`vm-harness ephemeral-list --backend {{ $labels.backend }}` has failed on {{ $labels.instance }} for ${inventoryFailingFor}. GARM's ListInstances for this host fails closed while this persists, so runners there are neither confirmed nor reconciled — fix the hypervisor/daemon access.";
           }
         ];
       }

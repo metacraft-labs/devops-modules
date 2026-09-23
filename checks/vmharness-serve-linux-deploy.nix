@@ -146,6 +146,12 @@ top@{ ... }:
                 backend = "incus";
                 overlayInterface = "eth1"; # firewall-open on the overlay iface only
                 authTokenFile = "/run/vmh-secrets/token";
+                # Orphan-detection inventory (driven by hand in subtest 5).
+                inventoryExporter = {
+                  enable = true;
+                  backends = [ "incus" ];
+                  interval = "1h";
+                };
               };
             };
 
@@ -250,6 +256,40 @@ top@{ ... }:
             with subtest("(2) NO residue — the per-job container is gone"):
                 names = host.succeed("incus list --format csv -c n")
                 assert "vmh-serve-job" not in names, f"leftover container: {names!r}"
+
+            with subtest("(5) kept instances are listed, attributed, inventoried, and truly destroyed"):
+                remote = ("vm-harness --remote ${overlayHostIp}:${toString servePort} "
+                          "--auth-token ${token} ")
+                # A GARM-style keep: launch and return, runner left running.
+                controller.succeed(remote + "run --ephemeral --backend incus "
+                                   "--baseline garm-keep1 --base-image vmh-base --keep")
+                # Ownership, as the provider records it right after a create.
+                controller.succeed(remote + "ephemeral-label --backend incus "
+                                   "--baseline garm-keep1 --label garm-pool=P1")
+                out = controller.succeed(remote + "ephemeral-list --backend incus "
+                                         "--label garm-pool=P1")
+                assert '"name":"garm-keep1","state":"running"' in out, out
+                # Another pool never sees it (the scale-set reconciler would delete it).
+                out = controller.succeed(remote + "ephemeral-list --backend incus "
+                                         "--label garm-pool=P2")
+                assert "garm-keep1" not in out, out
+
+                # An ORPHAN: a stopped runner-named container nobody owns.
+                host.succeed("incus launch vmh-base garm-orphan1 && incus stop --force garm-orphan1")
+                host.succeed("systemctl start vm-harness-serve-inventory.service")
+                prom = host.succeed("cat /var/lib/node-exporter/textfile/vmh-ephemeral.prom")
+                assert 'vmh_ephemeral_list_success{backend="incus"} 1' in prom, prom
+                assert 'vmh_ephemeral_instances{backend="incus",state="running",attributed="true"} 1' in prom, prom
+                assert 'vmh_ephemeral_instances{backend="incus",state="stopped",attributed="false"} 1' in prom, prom
+
+                # Teardown: gone for real, and its ownership record with it.
+                controller.succeed(remote + "ephemeral-destroy --backend incus --baseline garm-keep1")
+                controller.succeed(remote + "ephemeral-destroy --backend incus --baseline garm-orphan1")
+                names = host.succeed("incus list --format csv -c n")
+                assert "garm-keep1" not in names and "garm-orphan1" not in names, names
+                host.fail("test -e /var/lib/vm-harness-serve/ephemeral-labels/incus/garm-keep1.json")
+                # Deleting what is already gone is success (GARM retries deletes).
+                controller.succeed(remote + "ephemeral-destroy --backend incus --baseline garm-keep1")
 
             with subtest("(3) a wrong-token remote run is rejected"):
                 code, out = controller.execute(

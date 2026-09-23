@@ -52,11 +52,14 @@ _top@{ ... }:
               || fail "a fault-injection unit test did not fire/stay-silent as asserted"
 
             # Guard against silent shrinkage: every failure mode the gate names
-            # must have an alert. (15 alerts + 8 recording rules: 2 capacity +
+            # must have an alert. (20 alerts + 8 recording rules: 2 capacity +
             # 3 RC5 over-provision + 3 MA6 listener liveness.)
             for a in \
               GarmControllerDown GarmControllerUnhealthy GarmPoolManagerNotRunning \
               GarmProviderCreateFailures GarmProviderHighErrorRatio \
+              GarmProviderDeleteFailures GarmInstancesAbsentFromProvider \
+              VmhEphemeralStoppedOrphans VmhEphemeralUnattributedInstances \
+              VmhEphemeralInventoryFailing \
               GarmGithubRateLimitLow GarmGithubRateLimitCritical GarmFleetStarvation \
               GarmFleetOverProvision \
               GarmListenerSessionShortfall GarmListenerPollStalled \

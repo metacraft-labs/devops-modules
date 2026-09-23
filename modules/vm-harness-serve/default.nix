@@ -85,6 +85,56 @@
       runtimeDir = "vm-harness-serve";
       portFile = "/run/${runtimeDir}/port";
 
+      # ----- EPHEMERAL-INSTANCE INVENTORY EXPORTER --------------------------
+      icfg = cfg.inventoryExporter;
+      labelDir = "/var/lib/${runtimeDir}/ephemeral-labels";
+      inventoryScript = pkgs.writeShellApplication {
+        name = "vm-harness-serve-inventory";
+        runtimeInputs = [
+          cfg.package
+          pkgs.jq
+          pkgs.coreutils
+          pkgs.gnugrep
+        ]
+        ++ cfg.extraPackages;
+        text = ''
+          dir=${lib.escapeShellArg icfg.textfileDir}
+          tmp="$(mktemp "$dir/.vmh-ephemeral.XXXXXX")"
+          trap 'rm -f "$tmp"' EXIT
+          {
+            echo "# HELP vmh_ephemeral_instances Kept per-job instances on this host, by state and whether a GARM pool owns them."
+            echo "# TYPE vmh_ephemeral_instances gauge"
+            echo "# HELP vmh_ephemeral_list_success 1 if vm-harness could enumerate the backend on the last cycle."
+            echo "# TYPE vmh_ephemeral_list_success gauge"
+            backends=(${lib.escapeShellArgs icfg.backends})
+            for b in "''${backends[@]}"; do
+              # The result is ONE marker-keyed JSON line; a failed enumeration
+              # prints none and exits non-zero. Never report a failure as zero
+              # instances — emit list_success 0 and no instance series.
+              if line="$(vm-harness ephemeral-list --backend "$b" \
+                    --ephemeral-prefix ${lib.escapeShellArg icfg.namePrefix} \
+                    --log-format json 2>/dev/null | grep -F '"vmhEphemeralList"' | tail -n 1)" \
+                  && [ -n "$line" ]; then
+                echo "vmh_ephemeral_list_success{backend=\"$b\"} 1"
+                printf '%s\n' "$line" | jq -r --arg b "$b" '
+                  .instances as $i
+                  | ["running", "stopped", "error", "unknown"][] as $s
+                  | ["true", "false"][] as $a
+                  | ($i | map(select(.state == $s
+                        and ((((.labels // {})["garm-pool"] // "") != "") | tostring) == $a))
+                        | length) as $n
+                  | "vmh_ephemeral_instances{backend=\"\($b)\",state=\"\($s)\",attributed=\"\($a)\"} \($n)"'
+              else
+                echo "vmh_ephemeral_list_success{backend=\"$b\"} 0"
+              fi
+            done
+          } >"$tmp"
+          chmod 0644 "$tmp"
+          mv -f "$tmp" "$dir/vmh-ephemeral.prom"
+          trap - EXIT
+        '';
+      };
+
       # ----- MA12 SERVE-LISTENER WATCHDOG ---------------------------------
       hcfg = cfg.healthcheck;
 
@@ -529,6 +579,50 @@
           };
         };
 
+        # ── Ephemeral-instance inventory exporter (orphan detection) ─────────
+        inventoryExporter = {
+          enable = mkOption {
+            type = types.bool;
+            default = false;
+            description = ''
+              Periodically run `vm-harness ephemeral-list` for each of
+              {option}`backends` and publish the result as node-exporter textfile
+              metrics:
+
+                vmh_ephemeral_instances{backend,state,attributed}  gauge
+                vmh_ephemeral_list_success{backend}                gauge (1/0)
+
+              This host is the only party that can SEE an orphan: an instance
+              GARM has forgotten is, by definition, absent from GARM. The
+              garm-fleet-alerts library alerts on sustained STOPPED instances
+              (a teardown that failed or was never issued — gpu-server-001/002
+              filled their pool this way) and on runner-named instances no GARM
+              pool owns (the ~210 leaked Windows domains on high-mem-server).
+            '';
+          };
+          backends = mkOption {
+            type = types.listOf types.str;
+            default = [ ];
+            example = [ "incus" ];
+            description = "Backends to enumerate (`incus`, `libvirt`, …): the ones GARM drives on this host.";
+          };
+          namePrefix = mkOption {
+            type = types.str;
+            default = "garm-";
+            description = "Only instances whose name starts with this are counted (GARM's runner prefix), so durable VMs on the same hypervisor are never reported as orphans.";
+          };
+          interval = mkOption {
+            type = types.str;
+            default = "2m";
+            description = "systemd OnUnitActiveSec interval between inventory snapshots.";
+          };
+          textfileDir = mkOption {
+            type = types.str;
+            default = "/var/lib/node-exporter/textfile";
+            description = "node-exporter textfile-collector directory the `.prom` snapshot is written into.";
+          };
+        };
+
         overlayInterface = mkOption {
           type = types.nullOr types.str;
           default = "nb-default";
@@ -669,7 +763,15 @@
             StateDirectoryMode = "0700";
             WorkingDirectory = "/var/lib/${runtimeDir}";
             # The incus CLI writes its config under $HOME; keep it in the state dir.
-            Environment = [ "HOME=/var/lib/${runtimeDir}" ];
+            # VMH_EPHEMERAL_LABEL_DIR: where `ephemeral-label` records which GARM
+            # pool owns each kept instance, so the provider's ListInstances can
+            # return exactly one pool's instances. It must be writable under
+            # ProtectSystem=strict, i.e. inside the StateDirectory; named
+            # explicitly rather than left to vm-harness's $STATE_DIRECTORY default.
+            Environment = [
+              "HOME=/var/lib/${runtimeDir}"
+              "VMH_EPHEMERAL_LABEL_DIR=${labelDir}"
+            ];
 
             # ---- systemd hardening (mirrors the garm incus-strict posture) ----
             NoNewPrivileges = true;
@@ -744,6 +846,42 @@
             NoNewPrivileges = true;
             ProtectHome = true;
             PrivateTmp = true;
+          };
+        };
+
+        # ---- EPHEMERAL-INSTANCE INVENTORY EXPORTER: service + timer ----
+        # Runs as the serve user with the serve daemon's groups and label dir,
+        # so it enumerates exactly what the daemon's `ephemeral-list` workers
+        # see. Read-only apart from the textfile snapshot.
+        systemd.tmpfiles.rules = mkIf icfg.enable [ "d ${icfg.textfileDir} 0777 root root -" ];
+        systemd.services.vm-harness-serve-inventory = mkIf icfg.enable {
+          description = "Publish vm-harness kept-instance inventory for orphan alerting";
+          after = [ "vm-harness-serve.service" ];
+          serviceConfig = {
+            Type = "oneshot";
+            ExecStart = lib.getExe inventoryScript;
+            User = cfg.user;
+            Group = cfg.group;
+            SupplementaryGroups = cfg.extraGroups;
+            Environment = [
+              "HOME=/var/lib/${runtimeDir}"
+              "VMH_EPHEMERAL_LABEL_DIR=${labelDir}"
+            ];
+            ProtectSystem = "strict";
+            ReadWritePaths = [ icfg.textfileDir ];
+            NoNewPrivileges = true;
+            ProtectHome = true;
+            PrivateTmp = true;
+          };
+        };
+        systemd.timers.vm-harness-serve-inventory = mkIf icfg.enable {
+          description = "Periodic vm-harness kept-instance inventory snapshot";
+          wantedBy = [ "timers.target" ];
+          timerConfig = {
+            OnBootSec = icfg.interval;
+            OnUnitActiveSec = icfg.interval;
+            AccuracySec = "10s";
+            Unit = "vm-harness-serve-inventory.service";
           };
         };
 
