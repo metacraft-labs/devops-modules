@@ -31,23 +31,35 @@
 //
 // THE PRODUCTION DEFECTS (central GARM, high-mem-server, 2026-09-22/23)
 //
-//	1. cleanupOrphanedGithubRunners: a runner offline in GitHub for >5 min
-//	   whose name is absent from the provider's ListInstances had its DB row
-//	   DELETED and the provider's DeleteInstance was never called. The remote
-//	   vmharness provider answered every ListInstances with an empty list, so
-//	   every Windows runner (still booting at 5 min) was forgotten while its VM
-//	   ran on: ~210 leaked libvirt domains. TestDroppedInstanceIsDeletedViaProvider.
+//  1. cleanupOrphanedGithubRunners: a runner offline in GitHub for >5 min
+//     whose name is absent from the provider's ListInstances had its DB row
+//     DELETED and the provider's DeleteInstance was never called. The remote
+//     vmharness provider answered every ListInstances with an empty list, so
+//     every Windows runner (still booting at 5 min) was forgotten while its VM
+//     ran on: ~210 leaked libvirt domains. TestDroppedInstanceIsDeletedViaProvider.
 //
-//	2. retryFailedInstancesForOnePool ran a pool's cleanup deletes in one
-//	   errgroup.WithContext: the first failure CANCELLED every sibling delete
-//	   (the provider binary is SIGKILLed) and they were all retried every 5s.
-//	   ~88k "failed to delete instance from provider" in 24h, ~31k of them
-//	   `signal: killed` and ~23k `context canceled`.
-//	   TestFailedDeleteDoesNotCancelSiblings, TestFailedCleanupDeleteBacksOff.
+//  2. retryFailedInstancesForOnePool ran a pool's cleanup deletes in one
+//     errgroup.WithContext: the first failure CANCELLED every sibling delete
+//     (the provider binary is SIGKILLed) and they were all retried every 5s.
+//     ~88k "failed to delete instance from provider" in 24h, ~31k of them
+//     `signal: killed` and ~23k `context canceled`.
+//     TestFailedDeleteDoesNotCancelSiblings, TestFailedCleanupDeleteBacksOff.
 //
-//	3. A create that fails fast (full storage pool) was re-queued every 5s,
-//	   burning all attempts in seconds (~143 creates/hour/pool observed).
-//	   TestCreateRetryIsBackedOff.
+//  3. A create that fails fast (full storage pool) was re-queued every 5s,
+//     burning all attempts in seconds (~143 creates/hour/pool observed).
+//     TestCreateRetryIsBackedOff.
+//
+//  4. cleanupOrphanedGithubRunners RETURNED on the first pool whose
+//     ListInstances failed, skipping every other pool of the entity. One
+//     unreachable serve (m3: ~42.5k connection-refused/day, with tart pools
+//     in all three orgs) therefore stalled the orphan sweep — and with it
+//     defect 1's fix — org-wide, on every pass.
+//     TestFailingPoolDoesNotBlockOtherPools.
+//
+//     The per-instance delete backoff this patch introduces is an in-memory
+//     map; TestRetryBackoffEntriesAreDropped pins that its entries are removed
+//     once nothing will retry them (it passes vacuously without the patch,
+//     which has no such entries).
 //
 // WHY IT DISCRIMINATES
 //
@@ -213,6 +225,96 @@ func (s *InstanceLifecycleSuite) TestDroppedInstanceIsDeletedViaProvider() {
 		"the DB record was deleted outright: DeleteInstance will never be called and the VM leaks")
 	s.Require().Equal(commonParams.InstancePendingDelete, inst.Status,
 		"the instance must be handed to the deletion path, which calls the provider's DeleteInstance")
+}
+
+// ---------------------------------------------------------------------------
+// 4. One pool's provider failure must not stop the sweep for the others.
+// ---------------------------------------------------------------------------
+
+func (s *InstanceLifecycleSuite) TestFailingPoolDoesNotBlockOtherPools() {
+	entity, err := s.pool.GetEntity()
+	s.Require().NoError(err)
+	// A second pool of the same org, served by another (unreachable) host.
+	otherPool, err := s.store.CreateEntityPool(s.adminCtx, entity, params.CreatePoolParams{
+		ProviderName: "hms-libvirt",
+		MaxRunners:   10,
+		Image:        "other-golden",
+		Flavor:       "other",
+		OSType:       "linux",
+		OSArch:       "arm64",
+		Tags:         []string{"self-hosted", "macos", "arm64"},
+		Enabled:      true,
+	})
+	s.Require().NoError(err)
+	cache.SetEntityPool(entity.ID, otherPool)
+
+	_, err = s.store.CreateInstance(s.adminCtx, otherPool.ID, params.CreateInstanceParams{
+		Name: "garm-other-host", OSType: "linux", OSArch: "arm64",
+		Status: commonParams.InstanceRunning, RunnerStatus: params.RunnerPending,
+	})
+	s.Require().NoError(err)
+	s.age("garm-other-host", 6*time.Minute)
+	s.newInstance("garm-this-host", commonParams.InstanceRunning, 1)
+	s.age("garm-this-host", 6*time.Minute)
+
+	// The unreachable pool is visited FIRST.
+	s.provider.On("ListInstances", mock.Anything, otherPool.ID, mock.Anything).
+		Return(nil, errors.New("dial tcp 192.0.2.11:8873: connect: connection refused")).Once()
+	s.provider.On("ListInstances", mock.Anything, s.pool.ID, mock.Anything).
+		Return([]commonParams.ProviderInstance{}, nil).Once()
+	s.ghcli.On("RemoveEntityRunner", mock.Anything, int64(5252)).Return(nil).Maybe()
+
+	err = s.mgr.cleanupOrphanedGithubRunners([]forgeRunner{
+		s.offlineRunner(5151, "garm-other-host"),
+		s.offlineRunner(5252, "garm-this-host"),
+	})
+	s.Require().Error(err, "a pool that could not be checked must still be reported")
+
+	other, getErr := s.store.GetInstance(s.adminCtx, "garm-this-host")
+	s.Require().NoError(getErr)
+	s.Require().Equal(commonParams.InstancePendingDelete, other.Status,
+		"the healthy pool was never swept: one pool's ListInstances failure blocked the others")
+
+	skipped, getErr := s.store.GetInstance(s.adminCtx, "garm-other-host")
+	s.Require().NoError(getErr)
+	s.Require().Equal(commonParams.InstanceRunning, skipped.Status,
+		"an instance whose provider could not answer must be left alone")
+}
+
+func (s *InstanceLifecycleSuite) TestRetryBackoffEntriesAreDropped() {
+	const key = "retry-failed/garm-exhausted"
+	s.newInstance("garm-exhausted", commonParams.InstanceError, 1)
+	s.age("garm-exhausted", 10*time.Minute)
+	s.provider.On("DeleteInstance", mock.Anything, "garm-exhausted", mock.Anything).
+		Return(errors.New("connect: connection refused")).Once()
+	_ = s.mgr.retryFailedInstancesForOnePool(s.adminCtx, s.pool)
+
+	// Out of create attempts: it will never be retried, so its entry must go.
+	conn, err := sql.Open("sqlite3", s.dbCfg.SQLite.DBFile)
+	s.Require().NoError(err)
+	_, err = conn.Exec("UPDATE instances SET create_attempt = ? WHERE name = ?", maxCreateAttempts, "garm-exhausted")
+	conn.Close()
+	s.Require().NoError(err)
+	_ = s.mgr.retryFailedInstancesForOnePool(s.adminCtx, s.pool)
+	ok, _ := s.mgr.backoff.ShouldProcess(key)
+	s.Require().True(ok, "the retry backoff entry of an exhausted instance was kept")
+
+	// Deleted instance: its entry goes with the record.
+	const gone = "retry-failed/garm-gone"
+	s.newInstance("garm-gone", commonParams.InstancePendingDelete, 1)
+	for i := 0; i < 4; i++ { // ~17s: longer than this test waits
+		s.mgr.backoff.RecordFailure(gone)
+	}
+	s.provider.On("DeleteInstance", mock.Anything, "garm-gone", mock.Anything).Return(nil).Once()
+	s.Require().NoError(s.mgr.deletePendingInstances())
+	s.Require().Eventually(func() bool {
+		_, err := s.store.GetInstance(s.adminCtx, "garm-gone")
+		return err != nil
+	}, 15*time.Second, 100*time.Millisecond)
+	s.Require().Eventually(func() bool {
+		ok, _ := s.mgr.backoff.ShouldProcess(gone)
+		return ok
+	}, 5*time.Second, 50*time.Millisecond, "the retry backoff entry outlived the instance record")
 }
 
 // ---------------------------------------------------------------------------

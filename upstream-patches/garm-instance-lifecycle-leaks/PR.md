@@ -2,9 +2,9 @@
 
 ## Summary
 
-Three pool-manager fixes that together stop instances from leaking on the
-provider and stop one unreachable provider host from turning into a retry
-storm against every other host.
+Four pool-manager fixes that together stop instances from leaking on the
+provider and stop one unreachable provider host from stalling the pool
+manager or turning into a retry storm against every other host.
 
 ## The bugs
 
@@ -30,6 +30,11 @@ storm against every other host.
    (e.g. a full storage pool) is re-queued on every 5s tick, so all
    `maxCreateAttempts` are spent within seconds.
 
+4. **One failing pool stops the orphan sweep for all of them.**
+   `cleanupOrphanedGithubRunners` returns on the first pool whose
+   `ListInstances` fails, so a single unreachable provider host skips the
+   orphan check for every other pool of the entity, on every pass.
+
 ## The fix
 
 1. Mark such an instance `pending_delete` instead; `deletePendingInstances`
@@ -41,10 +46,15 @@ storm against every other host.
    goroutine, and back off a failing instance with the existing instance
    backoff.
 3. Re-queue an errored instance only after `30s * 2^(attempt-1)` (capped at 20
-   minutes) since it last changed.
+   minutes) since it last changed. The per-instance backoff entry is dropped
+   once nothing will retry it (delete succeeded, attempts exhausted, record
+   deleted), so the in-memory map does not grow without bound.
+4. Skip only the failing pool for the rest of the pass, keep sweeping the
+   others, and return the skipped pools as one error after the sweep.
 
 ## Tests
 
 `runner/pool/instance_lifecycle_test.go` drives the real functions against the
-real SQLite store with a mocked provider and forge. All four tests fail on the
-current tree and pass with the fix.
+real SQLite store with a mocked provider and forge. The five defect tests fail
+on the current tree and pass with the fix; a sixth pins that the backoff
+entries introduced here are released.
