@@ -1,0 +1,172 @@
+diff --git a/metrics/instance.go b/metrics/instance.go
+index 7e604bc..3a071d5 100644
+--- a/metrics/instance.go
++++ b/metrics/instance.go
+@@ -39,4 +39,15 @@ var (
+ 		Name:      "errors_total",
+ 		Help:      "Total number of failed instance operation attempts",
+ 	}, []string{"operation", "provider"})
++
++	// InstanceAbsentFromProviderCount counts instances the pool manager
++	// believed were running (and whose runner was offline in the forge) that
++	// the provider's ListInstances did not return. Each is routed to deletion;
++	// a sustained rate means the provider cannot see its own instances.
++	InstanceAbsentFromProviderCount = prometheus.NewCounterVec(prometheus.CounterOpts{
++		Namespace: metricsNamespace,
++		Subsystem: metricsRunnerSubsystem,
++		Name:      "absent_from_provider_total",
++		Help:      "Total number of running instances that were absent from the provider's instance list",
++	}, []string{"provider"})
+ )
+diff --git a/metrics/metrics.go b/metrics/metrics.go
+index bd38e8a..25c7333 100644
+--- a/metrics/metrics.go
++++ b/metrics/metrics.go
+@@ -74,6 +74,7 @@ func RegisterMetrics() error {
+ 		// runner instances
+ 		InstanceOperationCount,
+ 		InstanceOperationFailedCount,
++		InstanceAbsentFromProviderCount,
+ 		// github
+ 		GithubOperationCount,
+ 		GithubOperationFailedCount,
+diff --git a/runner/pool/pool.go b/runner/pool/pool.go
+index 2215c1d..2d806ff 100644
+--- a/runner/pool/pool.go
++++ b/runner/pool/pool.go
+@@ -41,6 +41,7 @@ import (
+ 	"github.com/cloudbase/garm/database/watcher"
+ 	garmErrors "github.com/cloudbase/garm/internal/errors"
+ 	"github.com/cloudbase/garm/locking"
++	"github.com/cloudbase/garm/metrics"
+ 	"github.com/cloudbase/garm/params"
+ 	"github.com/cloudbase/garm/runner/common"
+ 	garmUtil "github.com/cloudbase/garm/util"
+@@ -727,7 +728,7 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+ // first remove the instance from github, and then from our database.
+ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) error {
+ 	poolInstanceCache := map[string][]commonParams.ProviderInstance{}
+-	g, ctx := errgroup.WithContext(r.ctx)
++	g, _ := errgroup.WithContext(r.ctx)
+ 	g.SetLimit(10)
+ 	for _, runner := range runners {
+ 		if !isManagedRunner(labelsFromRunner(runner), r.controllerInfo.ControllerID.String()) {
+@@ -851,14 +852,23 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
+ 						return fmt.Errorf("error removing runner from github: %w", err)
+ 					}
+ 				}
+-				// Remove the database entry for the runner.
++				// Do NOT delete the database entry directly. "Absent from the
++				// provider's list" is the provider's claim, and a provider that
++				// cannot see a class of instance (or answers an enumeration
++				// failure with an empty list) makes that claim about instances
++				// that are still running. Deleting the record here forgets them
++				// for good: nothing ever calls DeleteInstance, and the VM leaks.
++				// Route it through the normal deletion path instead:
++				// deletePendingInstances() calls the provider's DeleteInstance,
++				// which is idempotent for an instance that really is gone, and
++				// only then removes the record.
++				metrics.InstanceAbsentFromProviderCount.WithLabelValues(dbInstance.ProviderName).Inc()
+ 				slog.InfoContext(
+-					r.ctx, "Removing from database",
++					r.ctx, "Marking instance pending_delete so the provider can reclaim it",
+ 					"runner_name", dbInstance.Name)
+-				if err := r.store.DeleteInstance(ctx, dbInstance.PoolID, dbInstance.Name); err != nil {
+-					return fmt.Errorf("error removing runner from database: %w", err)
++				if _, err := r.setInstanceStatus(dbInstance.Name, commonParams.InstancePendingDelete, nil, true); err != nil {
++					return fmt.Errorf("error marking runner pending_delete: %w", err)
+ 				}
+-				deleteMux = true
+ 				return nil
+ 			}
+ 
+@@ -1422,6 +1432,24 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
+ 	return nil
+ }
+ 
++// createRetryBackoff is how long an instance whose create failed stays in the
++// error state before retryFailedInstances re-queues it: 30s after the first
++// failure, doubling per attempt, capped at maxCreateRetryBackoff. With
++// maxCreateAttempts = 5 the attempts are spread over ~7.5 minutes instead of
++// the ~25 seconds a 5s consolidation tick allowed.
++func createRetryBackoff(createAttempt int) time.Duration {
++	if createAttempt < 1 {
++		createAttempt = 1
++	}
++	d := 30 * time.Second
++	for i := 1; i < createAttempt && d < maxCreateRetryBackoff; i++ {
++		d *= 2
++	}
++	return min(d, maxCreateRetryBackoff)
++}
++
++const maxCreateRetryBackoff = 20 * time.Minute
++
+ func (r *basePoolManager) retryFailedInstancesForOnePool(ctx context.Context, pool params.Pool) error {
+ 	if !pool.Enabled {
+ 		return nil
+@@ -1435,7 +1463,14 @@ func (r *basePoolManager) retryFailedInstancesForOnePool(ctx context.Context, po
+ 		return fmt.Errorf("failed to list instances for pool %s: %w", pool.ID, err)
+ 	}
+ 
+-	g, errCtx := errgroup.WithContext(ctx)
++	// A plain errgroup, NOT errgroup.WithContext: with a shared cancellable
++	// context the FIRST failing provider delete cancelled every sibling delete
++	// of the pool mid-flight (the provider binary is SIGKILLed), and the
++	// returned error aborted the pass. One unreachable provider host thus
++	// turned into a storm of killed deletes against every other host, retried
++	// every PoolConsilitationInterval (5s). Failures are now per instance:
++	// logged, backed off, and never allowed to cancel their siblings.
++	g := new(errgroup.Group)
+ 	for _, instance := range existingInstances {
+ 		if instance.Status != commonParams.InstanceError {
+ 			continue
+@@ -1443,6 +1478,19 @@ func (r *basePoolManager) retryFailedInstancesForOnePool(ctx context.Context, po
+ 		if instance.CreateAttempt >= maxCreateAttempts {
+ 			continue
+ 		}
++		if wait := createRetryBackoff(instance.CreateAttempt); time.Since(instance.UpdatedAt) < wait {
++			// Back off between create attempts. Without this, a create that
++			// fails fast (a full storage pool, a broken image) was retried
++			// every 5s, burning all attempts in well under a minute and then
++			// being replaced by a fresh instance that did the same.
++			continue
++		}
++		retryKey := "retry-failed/" + instance.Name
++		if ok, _ := r.backoff.ShouldProcess(retryKey); !ok {
++			// A previous cleanup delete of this instance failed; wait out
++			// its backoff instead of hammering the provider every tick.
++			continue
++		}
+ 
+ 		slog.DebugContext(
+ 			ctx, "attempting to retry failed instance",
+@@ -1464,19 +1512,19 @@ func (r *basePoolManager) retryFailedInstancesForOnePool(ctx context.Context, po
+ 			// NOTE(gabriel-samfira): this is done in parallel. If there are many failed instances
+ 			// this has the potential to create many API requests to the target provider.
+ 			// TODO(gabriel-samfira): implement request throttling.
+-			if err := r.deleteInstanceFromProvider(errCtx, instance); err != nil {
++			if err := r.deleteInstanceFromProvider(ctx, instance); err != nil {
+ 				slog.With(slog.Any("error", err)).ErrorContext(
+ 					ctx, "failed to delete instance from provider",
+ 					"runner_name", instance.Name)
+-				// Bail here, otherwise we risk creating multiple failing instances, and losing track
+-				// of them. If Create instance failed to return a proper provider ID, we rely on the
+-				// name to delete the instance. If we don't bail here, and end up with multiple
+-				// instances with the same name, using the name to clean up failed instances will fail
+-				// on any subsequent call, unless the external or native provider takes into account
+-				// non unique names and loops over all of them. Something which is extremely hacky and
+-				// which we would rather avoid.
+-				return err
++				// Do not requeue: otherwise we risk creating multiple failing instances, and losing
++				// track of them. If Create instance failed to return a proper provider ID, we rely on
++				// the name to delete the instance; with duplicate names that cleanup could no longer
++				// be addressed. The instance stays in error and is retried after a backoff. The
++				// failure is NOT returned: that would cancel sibling deletes (see above).
++				r.backoff.RecordFailure(retryKey)
++				return nil
+ 			}
++			r.backoff.Delete(retryKey)
+ 			slog.DebugContext(
+ 				ctx, "cleanup of previously failed instance complete",
+ 				"runner_name", instance.Name)

@@ -33,6 +33,7 @@
     ./ci-runs-on-capability.nix
     ./garm-reconcile.nix
     ./garm-stale-scaleset-job-reaped.nix
+    ./garm-instance-lifecycle.nix
     ./garm-macos-pools-supported.nix
     ./garm-incus-runner-host.nix
     ./garm-incus-storage-pool-source.nix
