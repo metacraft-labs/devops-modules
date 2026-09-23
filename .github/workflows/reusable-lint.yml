@@ -13,12 +13,16 @@ name: 'Lint'
 #
 #   1. devShells.<system>.pre-commit      -> `prek run --all-files` in it
 #                                            (the original behaviour, unchanged)
-#   2. checks.<system>.pre-commit-check   -> `nix build` the check
-#      checks.<system>.pre-commit
-#   3. devShells.<system>.hooks, .lint, .default, in that order -> enter the
+#   2. devShells.<system>.hooks, .lint, .default, in that order -> enter the
 #      shell; if it then provides a `.pre-commit-config.yaml` and prek (or
 #      pre-commit), run it with `--all-files`; otherwise try the next shell
+#   3. checks.<system>.pre-commit-check   -> `nix build` the check (hermetic,
+#      checks.<system>.pre-commit            but sandboxed hooks lack the dev
+#                                            shell's tools, hence after 2)
 #   4. a committed `.pre-commit-config.yaml` -> `prek` from nixpkgs
+#
+# The new tiers pass --no-write-lock-file so a stale flake.lock is not
+# rewritten mid-run and then reported by the hooks as a modified file.
 #
 # If nothing matches, the job FAILS with the list of what was probed — a repo
 # wired to this workflow must never pass by running nothing.
@@ -133,7 +137,7 @@ jobs:
           attr_names() {
             local out err
             err=$(mktemp)
-            if out=$(nix eval --raw --accept-flake-config ".#$1.$system" \
+            if out=$(nix eval --raw --no-write-lock-file --accept-flake-config ".#$1.$system" \
                 --apply 'a: builtins.concatStringsSep " " (builtins.attrNames a)' 2>"$err"); then
               echo "$out"
             else
@@ -148,16 +152,16 @@ jobs:
           has() { [[ " $1 " == *" $2 "* ]]; }
 
           run_check() {
-            run_logged nix build -L --no-link --accept-flake-config ".#checks.$system.$1"
+            run_logged nix build -L --no-link --no-write-lock-file --accept-flake-config ".#checks.$system.$1"
           }
 
           # run_in_shell <shell> -> runs LINT_COMMAND or the auto runner;
           # returns NO_ENTRY when the shell carries no hook entry point.
           run_in_shell() {
             if [ -n "$LINT_COMMAND" ]; then
-              run_logged nix develop --accept-flake-config ".#$1" -c bash -euo pipefail -c "$LINT_COMMAND"
+              run_logged nix develop --no-write-lock-file --accept-flake-config ".#$1" -c bash -euo pipefail -c "$LINT_COMMAND"
             else
-              run_logged nix develop --accept-flake-config ".#$1" -c bash -c "$auto_runner" reusable-lint "${runner_flags[@]}"
+              run_logged nix develop --no-write-lock-file --accept-flake-config ".#$1" -c bash -c "$auto_runner" reusable-lint "${runner_flags[@]}"
             fi
           }
 
@@ -200,20 +204,11 @@ jobs:
           fi
           probed+=("devShells.$system.pre-commit")
 
-          # 2. A git-hooks.nix check derivation. (`checks` is probed only now:
-          #    evaluating its names can be slow, and tier 1 does not need it.)
-          if [ -f flake.nix ]; then
-            checks=$(attr_names checks)
-          fi
-          for c in pre-commit-check pre-commit; do
-            if has "$checks" "$c"; then
-              run_check "$c"
-              exit
-            fi
-            probed+=("checks.$system.$c")
-          done
-
-          # 3. A dev shell that sets the hooks up.
+          # 2. A dev shell that sets the hooks up — where a developer's commit
+          #    runs them. Preferred over the check derivation below because
+          #    git-hooks.nix `language: system` hooks routinely call tools
+          #    (just, nimble, cargo, ...) that only the dev shell provides and
+          #    the build sandbox does not.
           for s in hooks lint default; do
             if has "$shells" "$s"; then
               run_in_shell "$s"
@@ -223,6 +218,19 @@ jobs:
             else
               probed+=("devShells.$system.$s")
             fi
+          done
+
+          # 3. A git-hooks.nix check derivation. (`checks` is probed only now:
+          #    evaluating its names can be slow.)
+          if [ -f flake.nix ]; then
+            checks=$(attr_names checks)
+          fi
+          for c in pre-commit-check pre-commit; do
+            if has "$checks" "$c"; then
+              run_check "$c"
+              exit
+            fi
+            probed+=("checks.$system.$c")
           done
 
           # 4. A committed config, run with prek from nixpkgs.
