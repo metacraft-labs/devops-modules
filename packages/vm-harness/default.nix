@@ -32,8 +32,8 @@ stdenv.mkDerivation (finalAttrs: {
     # unchanged by the rename. The in-repo vm-harness/vmh CLI brand rename
     # (pname, binary, share/ paths, serve service) is the GOSTI1b follow-up.
     repo = "gosti";
-    rev = "6e0106ea9108f137d63c2b508688426cfe250d3d";
-    hash = "sha256-Mjx2mvG90+7jPfhZeceygHckP+YI8kj2HazlE1ivVGY=";
+    rev = "4d69242dd1bfe7b28bb7705666da34a2b318c5f0";
+    hash = "sha256-fm78BD2VATbJmHB4JoCbi7hSh/Qdw8o3fe/9wgIibJM=";
   };
 
   nativeBuildInputs = [ nim ];
