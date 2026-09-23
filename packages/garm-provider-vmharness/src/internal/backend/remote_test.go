@@ -413,12 +413,14 @@ func TestRemoteCreateNonZeroExitFails(t *testing.T) {
 	}
 }
 
-func TestRemoteDeleteNonZeroIsIdempotent(t *testing.T) {
-	// A non-zero teardown exit (guest already gone) is treated as success.
+func TestRemoteDeleteNonZeroExitFails(t *testing.T) {
+	// ephemeral-destroy exits 0 for an absent guest, so a non-zero exit is a
+	// failed teardown of a guest that may still exist. It must be surfaced so
+	// GARM retries, never swallowed (that leaks the clone).
 	b, _, closeFn := newFakeBackend(t, "noop", 5)
 	defer closeFn()
-	if err := b.Delete(context.Background(), "x"); err != nil {
-		t.Fatalf("Delete non-zero exit should be idempotent success, got %v", err)
+	if err := b.Delete(context.Background(), "x"); err == nil {
+		t.Fatal("Delete with worker exit 5 should error so GARM retries")
 	}
 }
 

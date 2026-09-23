@@ -198,9 +198,14 @@ func (b *RemoteBackend) Create(ctx context.Context, args CreateArgs) (Instance, 
 }
 
 // Delete reclaims the per-job guest on the remote host over RPC. It is
-// idempotent: a transport/auth failure is surfaced, but a non-zero worker exit
-// (the guest is already gone) is treated as success so a repeated Delete of an
-// absent instance still reports success — matching the local backends' contract.
+// idempotent in the way GARM needs: `ephemeral-destroy` already exits 0 for a
+// guest that is absent (vm-run backends return early on a missing kept-instance
+// record, incus deletes with --force, libvirt checks the domain is gone), so a
+// repeated Delete of an absent instance still reports success. A NON-ZERO exit
+// therefore means the teardown failed and the guest may still exist, and it is
+// surfaced: GARM keeps the instance in pending_delete and retries. Swallowing
+// it would make GARM drop the row while the clone keeps running, leaking it
+// where neither GARM nor List can see it.
 func (b *RemoteBackend) Delete(ctx context.Context, idOrName string) error {
 	argv := b.recipe().del(b.TargetBackend, idOrName)
 	code, err := b.Client.ExecStream(ctx, argv, logToStderr("delete "+idOrName))
@@ -213,8 +218,7 @@ func (b *RemoteBackend) Delete(ctx context.Context, idOrName string) error {
 		return fmt.Errorf("remote Delete %s: %w", idOrName, err)
 	}
 	if code != 0 {
-		// Idempotent: the ephemeral guest is gone either way. Log and succeed.
-		fmt.Fprintf(os.Stderr, "remote Delete %s: teardown worker exit %d (treated as idempotent success)\n", idOrName, code)
+		return fmt.Errorf("remote Delete %s: teardown worker exit %d (guest may still exist; GARM will retry)", idOrName, code)
 	}
 	return nil
 }
