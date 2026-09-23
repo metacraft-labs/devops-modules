@@ -67,3 +67,7 @@ jobs:
       - name: Run the netrc file contract test
         shell: bash
         run: bash .github/setup-nix/tests/write-netrc-test.sh
+
+      - name: Run the binary-cache preflight contract test
+        shell: bash
+        run: bash .github/setup-nix/tests/probe-substituters-test.sh

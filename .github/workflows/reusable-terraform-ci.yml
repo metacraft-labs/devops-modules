@@ -170,6 +170,17 @@ on:
         required: false
         default: ''
 
+      substituter_preflight:
+        description: >-
+          setup-nix `substituter-preflight` mode: `fail` stops the job when any
+          configured binary cache is unreadable (no/bad Attic token, network
+          ACL 403, unreachable) instead of letting Nix build the closure from
+          source; `warn` (default) only annotates non-upstream caches; `off`
+          skips the probe.
+        type: string
+        required: false
+        default: 'warn'
+
     secrets:
       AGENIX_CI_PRIVATE_KEY:
         description: 'SSH private key for agenix secret decryption'
@@ -182,6 +193,16 @@ on:
         required: false
       NIX_GITHUB_TOKEN:
         description: 'GitHub token for Nix flake fetches'
+        required: false
+      ATTIC_PULL_TOKEN:
+        description: >-
+          Read-only Attic token for the private substituters in
+          vars.SUBSTITUTERS. Without it (or ATTIC_TOKEN) Nix reads a private
+          cache anonymously, gets 401, skips it, and builds every path only it
+          holds from source.
+        required: false
+      ATTIC_TOKEN:
+        description: 'Fallback Attic token when ATTIC_PULL_TOKEN is not provided (read access is all this workflow uses).'
         required: false
 
 permissions:
@@ -284,6 +305,10 @@ jobs:
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # Read-only: written to the netrc Nix uses for the private cache.
+          # No attic-cache is set, so nothing is pushed.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+          substituter-preflight: ${{ inputs.substituter_preflight }}
 
       - name: Lockfile check
         run: |
@@ -503,6 +528,10 @@ jobs:
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # Read-only: written to the netrc Nix uses for the private cache.
+          # No attic-cache is set, so nothing is pushed.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+          substituter-preflight: ${{ inputs.substituter_preflight }}
 
       - name: Decrypt provider credentials
         if: inputs.agenix_plan_secret_path != ''
@@ -1038,6 +1067,10 @@ jobs:
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # Read-only: written to the netrc Nix uses for the private cache.
+          # No attic-cache is set, so nothing is pushed.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+          substituter-preflight: ${{ inputs.substituter_preflight }}
 
       - name: Lockfile existence gate
         run: |
@@ -1352,6 +1385,10 @@ jobs:
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # Read-only: written to the netrc Nix uses for the private cache.
+          # No attic-cache is set, so nothing is pushed.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+          substituter-preflight: ${{ inputs.substituter_preflight }}
 
       - name: Decrypt provider credentials
         if: inputs.agenix_plan_secret_path != ''
