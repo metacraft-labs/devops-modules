@@ -20,12 +20,19 @@
 // identical backend code on the remote host.
 //
 // STATELESSNESS. The provider keeps NO local lifecycle state in remote mode.
-// The provider_id is GARM's own unique instance name (GARM's DB is the source
-// of truth), and host/instance liveness is recovered from the remote daemon's
-// authenticated `/v1/info` — never from a local store. This preserves the
-// stateless-provider non-negotiable across the network boundary: a fresh
-// provider process (GARM spawns one per command) reconstructs everything it
-// needs from the config + the remote endpoint.
+// The provider_id is GARM's own unique instance name, and instance existence,
+// state and ownership are recovered from the DAEMON HOST on every query
+// (`ephemeral-list`, joined there with the ownership labels `ephemeral-label`
+// recorded at create) — never from a local store. A fresh provider process
+// (GARM spawns one per command) reconstructs everything it needs from the
+// config + the remote endpoint.
+//
+// FAIL CLOSED. GARM treats an instance absent from ListInstances as "already
+// gone" and forgets it without calling DeleteInstance, and treats a successful
+// DeleteInstance as "gone". So: a host that cannot be enumerated is an ERROR
+// (ErrEnumerationUnavailable), never an empty list or ErrNotFound; and a
+// teardown that exits non-zero is an ERROR, never idempotent success (the
+// daemon side already exits 0 for an absent instance).
 //
 // Per-target LIFECYCLE RECIPES map a create/delete to the concrete vm-harness
 // verbs a given remote backend understands. RB1 ships:
@@ -44,9 +51,11 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	garmErrors "github.com/cloudbase/garm-provider-common/errors"
@@ -185,6 +194,9 @@ func (b *RemoteBackend) Create(ctx context.Context, args CreateArgs) (Instance, 
 	if code != 0 {
 		return Instance{}, fmt.Errorf("remote Create %s: worker exit %d", args.Name, code)
 	}
+	if err := b.label(ctx, args); err != nil {
+		return Instance{}, err
+	}
 	return Instance{
 		ProviderID:   args.Name,
 		Name:         args.Name,
@@ -213,59 +225,197 @@ func (b *RemoteBackend) Delete(ctx context.Context, idOrName string) error {
 		return fmt.Errorf("remote Delete %s: %w", idOrName, err)
 	}
 	if code != 0 {
-		// Idempotent: the ephemeral guest is gone either way. Log and succeed.
-		fmt.Fprintf(os.Stderr, "remote Delete %s: teardown worker exit %d (treated as idempotent success)\n", idOrName, code)
+		// NOT idempotent success. `ephemeral-destroy` already exits 0 for an
+		// instance that is absent (that is where idempotence lives, next to the
+		// state it can see). A non-zero exit therefore means the teardown did
+		// NOT complete — incus `dataset is busy`, a libvirt domain that
+		// survived `undefine`, an unreachable hypervisor — and the guest may
+		// still exist. Reporting success here is what let GARM forget ~100
+		// STOPPED containers on gpu-server-001/002 until their pool filled.
+		// Surfacing it keeps the instance in pending_delete, so GARM retries.
+		return fmt.Errorf("remote Delete %s: teardown worker exit %d; the instance may still exist", idOrName, code)
 	}
 	return nil
 }
 
-// Get recovers a best-effort view of one instance. The provider holds no local
-// state and the RA1 protocol has no per-instance query yet (an enumeration
-// endpoint is an RB2/RA6 follow-up), so Get confirms the remote host is
-// reachable + the credential is valid via /v1/info and reports the GARM-known
-// instance as running. A rejected credential is surfaced; a transport failure
-// is surfaced (GARM treats it as transient) rather than mis-reported as absent,
-// so a live runner is never spuriously reaped over a blind spot.
-func (b *RemoteBackend) Get(ctx context.Context, idOrName string) (Instance, error) {
-	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+// Attribution labels recorded on the daemon host for every instance this
+// provider creates (see `ephemeral-label` in vm-harness). List filters on them
+// so a pool is shown only its own instances.
+const (
+	labelPool       = "garm-pool"
+	labelController = "garm-controller"
+	// inventoryMarker is the key of the single result line `ephemeral-list`
+	// prints into the (merged stdout+stderr) worker log stream.
+	inventoryMarker = "vmhEphemeralList"
+	// listTimeout bounds one enumeration round-trip. Enumeration is a couple of
+	// `virsh`/`incus` calls on the daemon host; a minute is generous.
+	listTimeout = 60 * time.Second
+	// usageExitCode is what vm-harness exits with for an unknown verb or flag,
+	// i.e. what a daemon older than `ephemeral-label` answers.
+	usageExitCode = 2
+)
+
+// ErrEnumerationUnavailable marks a failure to enumerate the remote host. It
+// is deliberately NOT garmErrors.ErrNotFound: GARM treats "not found" / "not
+// in the list" as "already gone" and forgets the instance without deleting it.
+var ErrEnumerationUnavailable = errors.New("remote instance enumeration unavailable")
+
+// label records pool/controller attribution for a freshly created instance.
+//
+// Why a failure here fails the CREATE: an instance nobody can attribute is
+// invisible to its pool's ListInstances, and GARM's scale-set reconciler
+// removes a runner the provider does not list. Better that GARM sees a failed
+// create (and deletes + retries it, as it does for any create error) than a
+// live runner that the next reconcile pass tears down.
+//
+// The one tolerated failure is a daemon too old to know the verb (usage exit
+// 2): refusing every create during a rolling upgrade would be an outage, and
+// such a daemon also cannot answer `ephemeral-list`, so List fails closed for
+// that host anyway and nothing is removed on the strength of an absent label.
+func (b *RemoteBackend) label(ctx context.Context, args CreateArgs) error {
+	if args.PoolID == "" && args.ControllerID == "" {
+		return nil
+	}
+	argv := []string{"ephemeral-label", "--backend", b.TargetBackend, "--baseline", args.Name}
+	if args.PoolID != "" {
+		argv = append(argv, "--label", labelPool+"="+args.PoolID)
+	}
+	if args.ControllerID != "" {
+		argv = append(argv, "--label", labelController+"="+args.ControllerID)
+	}
+	argv = append(argv, "--log-format", "json")
+	code, err := b.Client.ExecStream(ctx, argv, logToStderr("label "+args.Name))
+	if err != nil {
+		return fmt.Errorf("remote Create %s: recording ownership labels: %w", args.Name, err)
+	}
+	switch code {
+	case 0:
+		return nil
+	case usageExitCode:
+		fmt.Fprintf(os.Stderr, "remote Create %s: daemon does not support ephemeral-label (exit 2); instance is unattributed until the daemon is upgraded\n", args.Name)
+		return nil
+	default:
+		return fmt.Errorf("remote Create %s: recording ownership labels: worker exit %d", args.Name, code)
+	}
+}
+
+// inventoryLine is the JSON shape of `ephemeral-list`'s result line.
+type inventoryLine struct {
+	Marker    *int   `json:"vmhEphemeralList"`
+	Backend   string `json:"backend"`
+	Instances []struct {
+		Name   string            `json:"name"`
+		State  string            `json:"state"`
+		Labels map[string]string `json:"labels"`
+	} `json:"instances"`
+}
+
+// inventory runs `ephemeral-list` on the daemon host and returns the matching
+// instances. It FAILS CLOSED: a transport or auth error, a non-zero exit (the
+// daemon could not enumerate, or predates the verb), or a stream with no
+// result line is an ERROR wrapping ErrEnumerationUnavailable — never an empty
+// slice. An empty slice is returned only when the daemon positively
+// enumerated the host and found nothing matching.
+func (b *RemoteBackend) inventory(ctx context.Context, filter ...string) ([]Instance, error) {
+	cctx, cancel := context.WithTimeout(ctx, listTimeout)
 	defer cancel()
-	if _, err := b.Client.Info(cctx); err != nil {
+	argv := append([]string{"ephemeral-list", "--backend", b.TargetBackend}, filter...)
+	argv = append(argv, "--log-format", "json")
+
+	var result *inventoryLine
+	var parseErr error
+	var diag []string
+	code, err := b.Client.ExecStream(cctx, argv, func(ev ExecEvent) {
+		switch ev.Kind {
+		case "log":
+			line := strings.TrimSpace(ev.Line)
+			if !strings.Contains(line, inventoryMarker) {
+				if len(diag) < 5 {
+					diag = append(diag, line)
+				}
+				return
+			}
+			var inv inventoryLine
+			if e := json.Unmarshal([]byte(line), &inv); e != nil || inv.Marker == nil {
+				parseErr = fmt.Errorf("undecodable ephemeral-list result %q: %v", line, e)
+				return
+			}
+			result = &inv
+		case "error":
+			diag = append(diag, ev.Message)
+		}
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", ErrEnumerationUnavailable, b.Client.Endpoint, err)
+	}
+	if code != 0 {
+		return nil, fmt.Errorf("%w: %s: ephemeral-list --backend %s exited %d: %s",
+			ErrEnumerationUnavailable, b.Client.Endpoint, b.TargetBackend, code, strings.Join(diag, " | "))
+	}
+	if parseErr != nil {
+		return nil, fmt.Errorf("%w: %s: %w", ErrEnumerationUnavailable, b.Client.Endpoint, parseErr)
+	}
+	if result == nil {
+		return nil, fmt.Errorf("%w: %s: ephemeral-list printed no result line", ErrEnumerationUnavailable, b.Client.Endpoint)
+	}
+	out := make([]Instance, 0, len(result.Instances))
+	for _, it := range result.Instances {
+		out = append(out, Instance{
+			ProviderID:   it.Name,
+			Name:         it.Name,
+			ControllerID: it.Labels[labelController],
+			PoolID:       it.Labels[labelPool],
+			OSName:       b.GuestOS,
+			Status:       it.State,
+		})
+	}
+	return out, nil
+}
+
+// Get returns one instance's view from the daemon host's own enumeration.
+// Absent => garmErrors.ErrNotFound; enumeration failure => an error that is
+// NOT ErrNotFound, so a live runner is never reported gone over a blind spot.
+func (b *RemoteBackend) Get(ctx context.Context, idOrName string) (Instance, error) {
+	insts, err := b.inventory(ctx, "--name", idOrName)
+	if err != nil {
 		return Instance{}, err
 	}
-	return Instance{
-		ProviderID: idOrName,
-		Name:       idOrName,
-		OSName:     b.GuestOS,
-		Status:     "running",
-	}, nil
-}
-
-// List cannot enumerate remote instances in RB1 (the RA1 protocol exposes no
-// list endpoint; a stateless provider process holds nothing to list). It probes
-// the endpoint for auth/liveness and returns an empty set — the honest answer
-// under GARM's DB-as-truth model. Fleet-wide remote enumeration is an RB2
-// deliverable (a serve-side list verb).
-func (b *RemoteBackend) List(ctx context.Context, poolID string) ([]Instance, error) {
-	return b.listProbe(ctx)
-}
-
-// ListByController mirrors List (used by RemoveAllInstances).
-func (b *RemoteBackend) ListByController(ctx context.Context, controllerID string) ([]Instance, error) {
-	return b.listProbe(ctx)
-}
-
-func (b *RemoteBackend) listProbe(ctx context.Context) ([]Instance, error) {
-	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	if _, err := b.Client.Info(cctx); err != nil {
-		var authErr *ServeAuthError
-		if errors.As(err, &authErr) {
-			return nil, err
+	for _, inst := range insts {
+		if inst.Name == idOrName {
+			return inst, nil
 		}
-		// Transport error: report empty rather than fail the whole reconcile.
-		return nil, nil
 	}
-	return nil, nil
+	return Instance{}, fmt.Errorf("remote instance %s: %w", idOrName, garmErrors.ErrNotFound)
+}
+
+// List returns the instances attributed to poolID on the daemon host.
+//
+// This used to return an EMPTY LIST unconditionally (the RB1 protocol had no
+// enumeration). GARM's orphaned-runner sweep reads "not in ListInstances" as
+// "the provider already lost it" and deletes the record WITHOUT calling
+// DeleteInstance, so every runner still offline in GitHub five minutes after
+// creation — every Windows guest, which takes longer than that to boot and
+// register — was forgotten while its VM kept running: ~210 leaked domains
+// (55 GiB) on high-mem-server in a day.
+//
+// Filtering by pool is load-bearing, not cosmetic: GARM's scale-set worker
+// DELETES listed instances it has no record of, so a host-wide list would let
+// one pool destroy another's runners.
+func (b *RemoteBackend) List(ctx context.Context, poolID string) ([]Instance, error) {
+	if poolID == "" {
+		return nil, fmt.Errorf("%w: refusing to list without a pool ID (a host-wide list is unsafe)", ErrEnumerationUnavailable)
+	}
+	return b.inventory(ctx, "--label", labelPool+"="+poolID)
+}
+
+// ListByController returns the instances attributed to controllerID (used by
+// RemoveAllInstances, which deletes everything returned — hence the same
+// refusal to answer host-wide).
+func (b *RemoteBackend) ListByController(ctx context.Context, controllerID string) ([]Instance, error) {
+	if controllerID == "" {
+		return nil, fmt.Errorf("%w: refusing to list without a controller ID (a host-wide list is unsafe)", ErrEnumerationUnavailable)
+	}
+	return b.inventory(ctx, "--label", labelController+"="+controllerID)
 }
 
 // Start is not meaningful for one-shot ephemeral remote instances; the guest is
@@ -293,7 +443,5 @@ func logToStderr(tag string) func(ExecEvent) {
 	}
 }
 
-// Ensure RemoteBackend satisfies the Backend seam and ErrNotFound is imported
-// for parity with the other backends' idempotency contract.
+// Ensure RemoteBackend satisfies the Backend seam.
 var _ Backend = (*RemoteBackend)(nil)
-var _ = garmErrors.ErrNotFound

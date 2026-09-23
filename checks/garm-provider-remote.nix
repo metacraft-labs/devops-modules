@@ -59,6 +59,10 @@
 
               # ---- 1. Stand up a REAL `vm-harness serve` (noop backend) --------
               printf '%s' "$TOKEN" > "$work/token"
+              # Ownership records written by `ephemeral-label` (the provider
+              # labels every instance it creates). The sandbox HOME is not
+              # writable, so point it at the scratch dir as the serve units do.
+              export VMH_EPHEMERAL_LABEL_DIR="$work/ephemeral-labels"
               "$vmHarness" serve \
                 --listen 127.0.0.1:0 \
                 --auth-token-file "$work/token" \
@@ -173,6 +177,24 @@
               run CreateInstance "$work/bad.toml" "GARM_POOL_ID=$POOL_ID" < "$work/bootstrap.json"
               test "$LAST_CODE" -ne 0 || { echo "create with WRONG token unexpectedly succeeded" >&2; exit 1; }
               grep -qi '401\|unauthor' "$work/err" || { echo "wrong-token failure did not mention 401/unauthorized" >&2; cat "$work/err" >&2; exit 1; }
+
+              # ---- 8. ListInstances answers from the daemon's enumeration ----
+              # A live daemon enumerates (noop keeps nothing, so the pool's list
+              # is a positive, EMPTY answer, exit 0) ...
+              echo "== ListInstances (remote, live daemon) =="
+              run ListInstances "$work/config.toml" "GARM_POOL_ID=$POOL_ID" </dev/null
+              test "$LAST_CODE" -eq 0 || { echo "list exit=$LAST_CODE: $(cat "$work/err")" >&2; exit 1; }
+
+              # ... and an UNREACHABLE daemon is an ERROR, never `[]`. GARM reads
+              # an instance's absence from ListInstances as "already gone" and
+              # forgets it without calling DeleteInstance; answering `[]` for a
+              # host it could not see is how ~210 Windows VMs leaked.
+              echo "== ListInstances fails closed when the daemon is down =="
+              kill "$SERVE_PID" 2>/dev/null || true
+              wait "$SERVE_PID" 2>/dev/null || true
+              run ListInstances "$work/config.toml" "GARM_POOL_ID=$POOL_ID" </dev/null
+              test "$LAST_CODE" -ne 0 || { echo "ListInstances against a DOWN daemon succeeded with: $(cat "$RESP")" >&2; exit 1; }
+              grep -q 'enumeration unavailable' "$work/err" || { echo "down-daemon list failed without the fail-closed error" >&2; cat "$work/err" >&2; exit 1; }
 
               echo "ALL REMOTE-TARGET ASSERTIONS PASSED"
               touch "$out"

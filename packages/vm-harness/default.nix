@@ -24,7 +24,7 @@
 # Bump `rev`/`hash` to roll the serve binary forward; the mainline is `dev`.
 stdenv.mkDerivation (finalAttrs: {
   pname = "vm-harness";
-  version = "0.1.0-unstable-2026-09-14";
+  version = "0.1.0-unstable-2026-09-23";
 
   src = fetchFromGitHub {
     owner = "metacraft-labs";
@@ -32,8 +32,8 @@ stdenv.mkDerivation (finalAttrs: {
     # unchanged by the rename. The in-repo vm-harness/vmh CLI brand rename
     # (pname, binary, share/ paths, serve service) is the GOSTI1b follow-up.
     repo = "gosti";
-    rev = "b5df21a2375446d2929a583a112d70d564085d21";
-    hash = "sha256-XKtLJTpM+54EILNVeBOL3tHc1b8b9x0yw28CzkxAq3I=";
+    rev = "2c3165bc4d9c85a89c24968b8ac718c7195e5c84";
+    hash = "sha256-qpxuA7wt+H0p+bzEecBb2p7Y8DtOWUCKguGRP7FgYXw=";
   };
 
   nativeBuildInputs = [ nim ];
