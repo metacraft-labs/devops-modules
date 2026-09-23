@@ -47,6 +47,17 @@
   # launchd-native analogue of the Linux sibling's systemd timer, doing the
   # same probe and issuing `launchctl kickstart -k` where the Linux side issues
   # `systemctl restart`.
+  #
+  # Two darwin-specific corrections learned from the 2026-09-20..23 m3 outage
+  # (serve down ~2 days, every central-GARM call `connection refused`):
+  #
+  #  * The probe cannot rely on connecting to the overlay address from the
+  #    host itself — under userspace NetBird that never works, so the original
+  #    watchdog "recovered" a healthy daemon every 10 minutes. A failed
+  #    handshake is now judged by the kernel's accept queue instead.
+  #  * Both jobs start through `/bin/wait4path /nix/store`, and the watchdog
+  #    re-bootstraps (rather than kickstarts) a job launchd has stopped
+  #    spawning, with every launchctl call time-bounded.
   flake.modules.darwin.vm-harness-serve =
     {
       config,
@@ -92,74 +103,156 @@
       # into a root-run periodic job.
       healthProbeURL = "http://${cfg.listenAddress}:${toString cfg.port}/v1/info";
 
+      # launchd's own `/nix/store` race. On nix-darwin `/nix` is a separate
+      # APFS volume that `org.nixos.darwin-store` mounts DURING boot, while
+      # every `RunAtLoad` daemon is spawned at the same time. A job whose
+      # `ProgramArguments[0]` is a store path therefore loses the race: launchd
+      # cannot find the executable, records `last exit code = 78: EX_CONFIG`,
+      # puts the job in its penalty box, and NEVER spawns it again — KeepAlive
+      # does not apply to a job that never ran. That is exactly what took m3's
+      # serve down for two days after its 2026-09-21 reboot (`runs = 1`,
+      # `state = spawn scheduled`, nothing in stderr.log because the binary
+      # never started).
+      #
+      # nix-darwin's own `command`/`script` options avoid this by prefixing
+      # `/bin/wait4path /nix/store`; a raw `serviceConfig.ProgramArguments`
+      # does not get that for free, so do it explicitly. `sh -c '… exec "$@"'
+      # <name> <argv…>` passes the argv through verbatim — no re-quoting, so
+      # the posture assertions on individual flags still hold.
+      waitForNixStore =
+        name: argv:
+        [
+          "/bin/sh"
+          "-c"
+          ''/bin/wait4path /nix/store && exec "$@"''
+          name
+        ]
+        ++ argv;
+
+      # The launchd plist nix-darwin installs for the daemon. The watchdog
+      # re-bootstraps from it when `kickstart` cannot help (see below).
+      servePlist = "/Library/LaunchDaemons/${cfg.label}.plist";
+
       healthCheckScript = pkgs.writeShellApplication {
         name = "vm-harness-serve-healthcheck";
         runtimeInputs = [
           pkgs.coreutils
           pkgs.curl
+          pkgs.gawk
+          pkgs.gnugrep
+          pkgs.gnused
         ];
         text = ''
           set -euo pipefail
 
           url="${healthProbeURL}"
+          # netstat -L prints a listening socket as `<addr>.<port>`.
+          listen_socket=${lib.escapeShellArg "${cfg.listenAddress}.${toString cfg.port}"}
           state="${cfg.stateDir}/healthcheck"
           fail_file="$state/consecutive-failures"
           last_restart_file="$state/last-restart"
           threshold=${toString hcfg.failureThreshold}
           min_gap_s=${toString hcfg.minRestartIntervalSec}
           label=${lib.escapeShellArg cfg.label}
+          plist=${lib.escapeShellArg servePlist}
+
+          # Overridable ONLY so the posture check can drive every branch with
+          # recording shims; launchd runs this with none of them set.
+          launchctl_cmd="''${VMH_HC_LAUNCHCTL:-/bin/launchctl}"
+          netstat_cmd="''${VMH_HC_NETSTAT:-/usr/sbin/netstat}"
+          launchctl_timeout="''${VMH_HC_LAUNCHCTL_TIMEOUT:-30}"
 
           mkdir -p "$state"
           log() { echo "vm-harness-serve-healthcheck: $*"; }
 
-          # Inspect the STATUS, not merely curl's exit code: a 503 means the
-          # daemon is up but every request handler is busy, which is a real
-          # degradation the watchdog must count as a failure rather than wave
-          # through as "it answered".
-          # `-w %{http_code}` ALREADY prints 000 when curl cannot reach the
-          # listener, so the old `|| echo "000"` appended a SECOND 000 and the
-          # variable became "000000" — which matched neither the `000)` wedge
-          # branch nor `200|401`, so the daemon's most important failure mode
-          # was logged as "unexpected HTTP". It still counted as a failure, so
-          # recovery worked; the diagnosis it printed did not. Keep curl's own
-          # output and only neutralise its exit status.
-          code=$(curl -s -o /dev/null -w '%{http_code}' \
-                   --max-time ${toString hcfg.probeTimeout} "$url" </dev/null \
-                 || true)
-          code=''${code:-000}
+          # EVERY launchctl call is bounded. On 2026-09-21 this watchdog issued
+          # `kickstart -k` against a job launchd had penalty-boxed after a
+          # spawn failure; kickstart blocked FOREVER, and because launchd never
+          # starts a `StartInterval` job while its previous run is still alive,
+          # the watchdog itself went silent for two days while the daemon it
+          # supervises stayed down.
+          lctl() { timeout "$launchctl_timeout" "$launchctl_cmd" "$@"; }
 
-          case "$code" in
-            401|200)
-              if [ -f "$fail_file" ] && [ "$(cat "$fail_file" 2>/dev/null || echo 0)" != "0" ]; then
-                log "listener healthy again (HTTP $code from $url) — resetting failure counter"
-              fi
-              printf '0' > "$fail_file"
-              exit 0
-              ;;
-            503)
-              log "listener answered 503 — every request handler is busy (saturated)"
-              ;;
-            000)
-              log "listener did not answer within ${toString hcfg.probeTimeout}s (timeout/refused) — the wedge signature"
-              ;;
-            *)
-              log "listener answered unexpected HTTP $code"
-              ;;
-          esac
+          healthy() {
+            if [ -f "$fail_file" ] && [ "$(cat "$fail_file" 2>/dev/null || echo 0)" != "0" ]; then
+              log "listener healthy again ($*) — resetting failure counter"
+            fi
+            printf '0' > "$fail_file"
+            exit 0
+          }
 
           # Only act if launchd believes the job is loaded. `launchctl print`
           # exits non-zero for an unknown/unloaded label, which is the darwin
           # analogue of the Linux sibling's `systemctl is-active` guard: a
           # deliberately unloaded daemon must not be "recovered".
-          if ! /bin/launchctl print "system/$label" >/dev/null 2>&1; then
-            log "probe failed but launchd job $label is not loaded — no watchdog action"
+          if ! job="$(lctl print "system/$label" 2>/dev/null)"; then
+            log "launchd job $label is not loaded — no watchdog action"
             printf '0' > "$fail_file"
             exit 0
           fi
 
+          running=1
+          if ! grep -Eq '^[[:space:]]*state = running$' <<<"$job"; then
+            running=0
+            exit_line="$(grep -Em1 'last exit code' <<<"$job" | sed 's/^[[:space:]]*//' || true)"
+            log "launchd job $label is loaded but NOT running (''${exit_line:-no exit recorded}) — launchd will not respawn a job it failed to spawn"
+          else
+            # Inspect the STATUS, not merely curl's exit code: a 503 means the
+            # daemon is up but every request handler is busy, which is a real
+            # degradation the watchdog must count as a failure rather than
+            # wave through as "it answered". `%{time_connect}` separates "the
+            # TCP handshake never completed" from "connected, then silence".
+            probe="$(curl -s -o /dev/null -w '%{http_code} %{time_connect}' \
+                       --max-time ${toString hcfg.probeTimeout} "$url" </dev/null \
+                     || true)"
+            code="''${probe%% *}"
+            connect_s="''${probe#* }"
+            code="''${code:-000}"
+
+            case "$code" in
+              401|200)
+                healthy "HTTP $code from $url"
+                ;;
+              503)
+                log "listener answered 503 — every request handler is busy (saturated)"
+                ;;
+              *)
+                if [ "$code" != "000" ]; then
+                  log "listener answered unexpected HTTP $code"
+                elif awk -v t="''${connect_s:-0}" 'BEGIN { exit !(t + 0 > 0) }'; then
+                  log "listener accepted the connection but did not answer within ${toString hcfg.probeTimeout}s — the wedge signature"
+                else
+                  # THE HANDSHAKE ITSELF FAILED. The daemon binds only its
+                  # overlay address, and on a darwin host running NetBird in
+                  # userspace mode that address is the PEER of a point-to-point
+                  # utun, so a connection from the host to itself leaves
+                  # through the tunnel and is dropped: it never reaches the
+                  # local socket. Measured on m3 — 0 of 193 probes ever
+                  # succeeded while the controller reached the same socket
+                  # fine, and every "recovery" was a kickstart that killed a
+                  # healthy daemon (and its in-flight creates) every 10min.
+                  #
+                  # So a failed connect alone proves nothing here. Ask the
+                  # kernel instead: is the socket listening, and is its accept
+                  # queue draining? A wedged daemon that stops calling accept()
+                  # leaves completed connections piling up in `qlen`.
+                  queue="$("$netstat_cmd" -Lan -p tcp 2>/dev/null \
+                             | awk -v s="$listen_socket" '$2 == s { print $1; exit }' || true)"
+                  if [ -z "$queue" ]; then
+                    log "nothing is listening on $listen_socket (connect to $url failed)"
+                  elif [ "''${queue%%/*}" -gt 0 ] 2>/dev/null; then
+                    log "accept queue on $listen_socket is backed up (qlen/incqlen/maxqlen $queue) — the daemon is not accepting"
+                  else
+                    healthy "self-probe cannot reach $url on this host, but $listen_socket is listening with an empty accept queue ($queue)"
+                  fi
+                fi
+                ;;
+            esac
+          fi
+
           fails=$(( $(cat "$fail_file" 2>/dev/null || echo 0) + 1 ))
           printf '%s' "$fails" > "$fail_file"
-          log "probe failed ($url); consecutive failures = $fails/$threshold"
+          log "probe failed; consecutive failures = $fails/$threshold"
 
           if [ "$fails" -lt "$threshold" ]; then
             exit 0
@@ -174,14 +267,28 @@
             fi
           fi
 
-          log "listener dead for $fails consecutive probes — kickstarting $label (watchdog recovery)"
           printf '%s' "$now" > "$last_restart_file"
           printf '0' > "$fail_file"
+
           # `kickstart -k` kills the running job and starts it again — the
-          # launchd equivalent of `systemctl restart`. Plain `kickstart` would
-          # be a no-op against a job that is already (uselessly) running.
-          /bin/launchctl kickstart -k "system/$label"
-          log "$label kickstart issued"
+          # launchd equivalent of `systemctl restart`. It is useless (and, on
+          # a penalty-boxed job, blocks) when launchd has given up spawning
+          # the job, so a job that is not running — or a kickstart that does
+          # not return — is re-bootstrapped from its plist instead, which
+          # resets launchd's spawn state.
+          if [ "$running" = 1 ]; then
+            log "listener dead for $fails consecutive probes — kickstarting $label (watchdog recovery)"
+            if lctl kickstart -k "system/$label"; then
+              log "$label kickstart issued"
+              exit 0
+            fi
+            log "kickstart of $label failed or timed out — falling back to bootout + bootstrap"
+          else
+            log "$label not running for $fails consecutive probes — re-bootstrapping it from $plist (watchdog recovery)"
+          fi
+          lctl bootout "system/$label" || true
+          lctl bootstrap system "$plist"
+          log "$label re-bootstrapped"
         '';
       };
     in
@@ -545,45 +652,47 @@
         launchd.daemons.vm-harness-serve = {
           serviceConfig = {
             Label = cfg.label;
-            ProgramArguments = [
-              (lib.getExe cfg.package)
-              "serve"
-              "--listen"
-              "${cfg.listenAddress}:${toString cfg.port}"
-              "--backend"
-              cfg.backend
-              "--auth-token-file"
-              (toString cfg.authTokenFile)
-              "--port-file"
-              portFile
-            ]
-            ++ optionals (cfg.workerExe != null) [
-              "--worker-exe"
-              (toString cfg.workerExe)
-            ]
-            # RA6: sign /v1/manifest when an enrollment secret is provided.
-            ++ optionals (cfg.enrollSecretFile != null) [
-              "--enroll-secret-file"
-              (toString cfg.enrollSecretFile)
-            ]
-            ++ optionals (cfg.identityTtlSec != null) [
-              "--identity-ttl-sec"
-              (toString cfg.identityTtlSec)
-            ]
-            ++ optionals (cfg.hostId != null) [
-              "--host-id"
-              cfg.hostId
-            ]
-            # MA12: concurrency bound + per-exec deadline. Both null by default,
-            # leaving the daemon's own documented defaults in force.
-            ++ optionals (cfg.serveThreads != null) [
-              "--serve-threads"
-              (toString cfg.serveThreads)
-            ]
-            ++ optionals (cfg.execDeadlineSec != null) [
-              "--exec-deadline-sec"
-              (toString cfg.execDeadlineSec)
-            ];
+            ProgramArguments = waitForNixStore "vm-harness-serve" (
+              [
+                (lib.getExe cfg.package)
+                "serve"
+                "--listen"
+                "${cfg.listenAddress}:${toString cfg.port}"
+                "--backend"
+                cfg.backend
+                "--auth-token-file"
+                (toString cfg.authTokenFile)
+                "--port-file"
+                portFile
+              ]
+              ++ optionals (cfg.workerExe != null) [
+                "--worker-exe"
+                (toString cfg.workerExe)
+              ]
+              # RA6: sign /v1/manifest when an enrollment secret is provided.
+              ++ optionals (cfg.enrollSecretFile != null) [
+                "--enroll-secret-file"
+                (toString cfg.enrollSecretFile)
+              ]
+              ++ optionals (cfg.identityTtlSec != null) [
+                "--identity-ttl-sec"
+                (toString cfg.identityTtlSec)
+              ]
+              ++ optionals (cfg.hostId != null) [
+                "--host-id"
+                cfg.hostId
+              ]
+              # MA12: concurrency bound + per-exec deadline. Both null by default,
+              # leaving the daemon's own documented defaults in force.
+              ++ optionals (cfg.serveThreads != null) [
+                "--serve-threads"
+                (toString cfg.serveThreads)
+              ]
+              ++ optionals (cfg.execDeadlineSec != null) [
+                "--exec-deadline-sec"
+                (toString cfg.execDeadlineSec)
+              ]
+            );
 
             EnvironmentVariables = {
               PATH = lib.makeBinPath ([ cfg.package ] ++ cfg.extraPackages ++ [ pkgs.coreutils ]);
@@ -653,7 +762,9 @@
         launchd.daemons.vm-harness-serve-healthcheck = lib.mkIf hcfg.enable {
           serviceConfig = {
             Label = "${cfg.label}-healthcheck";
-            ProgramArguments = [ (lib.getExe healthCheckScript) ];
+            ProgramArguments = waitForNixStore "vm-harness-serve-healthcheck" [
+              (lib.getExe healthCheckScript)
+            ];
             StartInterval = hcfg.interval;
             # Do NOT RunAtLoad: the first probe should land one interval after
             # activation, not race the daemon's own startup and count a

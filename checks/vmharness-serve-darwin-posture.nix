@@ -10,12 +10,23 @@ top@{ ... }:
   # nothing. Neither shows up in `launchctl print`, and both were found only
   # from the controller's side, reading provider errors.
   #
-  # Mock policy: the watchdog assertions RUN the real rendered script with
-  # `curl` and `launchctl` replaced by shims that record their argv. Nothing
-  # else is stubbed — the branching, the counter file and the rate limit are
+  # Mock policy: the watchdog assertions RUN the real rendered script against a
+  # REAL HTTP responder (curl is not shimmed). Only the two macOS system tools
+  # the sandbox cannot provide are replaced, through the script's own
+  # `VMH_HC_LAUNCHCTL` / `VMH_HC_NETSTAT` hooks: a `launchctl` shim that
+  # reports a scripted job state and RECORDS the argv it was asked to run, and
+  # a `netstat` shim that prints a scripted listen-queue table. Justification:
+  # launchd and the kernel listen queue do not exist in a Nix build sandbox,
+  # and the decisions under test (what to count, and whether to kickstart or
+  # re-bootstrap) are made entirely from what those two tools report. The
+  # branching, the counter file, the rate limit and the launchctl timeout are
   # the production code. Asserting on the script's TEXT instead would pass
   # against a script that reads correctly and behaves wrongly, which is the
   # specific failure this tier exists to catch.
+  #
+  # A third property joined them after the 2026-09-21 m3 reboot: both launchd
+  # jobs must start through `/bin/wait4path /nix/store`, or launchd loses the
+  # boot-time race with the /nix volume mount and never spawns them again.
   perSystem =
     {
       pkgs,
@@ -73,8 +84,11 @@ top@{ ... }:
               pkgs.coreutils
               pkgs.python3
             ];
-            # ProgramArguments is a list; its head is the rendered script.
-            healthScript = builtins.head healthJob.ProgramArguments;
+            # The job execs `/bin/sh -c 'wait4path … && exec "$@"' <name> <script>`,
+            # so the rendered script is the LAST argv element.
+            healthScript = lib.last healthJob.ProgramArguments;
+            serveArgv = builtins.toJSON serveJob.ProgramArguments;
+            healthArgv = builtins.toJSON healthJob.ProgramArguments;
             inherit fdLimit;
           }
           ''
@@ -92,13 +106,28 @@ top@{ ... }:
                 ''note "ok: NumberOfFiles=${toString fdLimit} (> macOS default ${toString macosDefaultMaxFiles})"''
             }
 
+            echo "== launchd jobs wait for /nix/store =="
+            for job in serve health; do
+              if [ "$job" = serve ]; then argv="$serveArgv"; else argv="$healthArgv"; fi
+              if python3 -c '
+            import json, sys
+            a = json.loads(sys.argv[1])
+            ok = (len(a) >= 5 and a[0] == "/bin/sh" and a[1] == "-c"
+                  and a[2].startswith("/bin/wait4path /nix/store && exec ")
+                  and a[4].startswith("/nix/store/"))
+            sys.exit(0 if ok else 1)' "$argv"; then
+                note "ok: $job job execs through /bin/wait4path /nix/store"
+              else
+                bad "$job job does not wait for /nix/store before exec'ing a store path (argv: $argv) — launchd spawns it before the /nix volume is mounted at boot, records EX_CONFIG and never retries"
+              fi
+            done
+
             echo "== watchdog probe -> action =="
-            mkdir -p work state
+            mkdir -p work state shims
 
             # Stand a REAL responder at the probe URL rather than shimming curl.
             # `writeShellApplication` puts its own `runtimeInputs` curl first on
-            # PATH, so a PATH shim is silently ignored — which is exactly how an
-            # earlier revision of this check passed while asserting nothing.
+            # PATH, so a PATH shim would be silently ignored.
             serve_code() {
               # stdout/stderr MUST be detached from the command substitution that
               # captures the pid: a backgrounded child inheriting that pipe keeps
@@ -116,24 +145,69 @@ top@{ ... }:
               echo $!
             }
 
-            reset_state() { rm -rf "$PWD/state"; mkdir -p "$PWD/state"; }
+            # launchctl shim: `print` reports $SHIM_JOB (running | stuck |
+            # unloaded); every call is appended to work/launchctl.log;
+            # `kickstart` sleeps when SHIM_KICKSTART_HANGS=1, reproducing the
+            # 2026-09-21 hang against a penalty-boxed job.
+            cat > shims/launchctl <<'SH'
+            #!/bin/sh
+            echo "$*" >> "$SHIM_LOG"
+            case "$1" in
+              print)
+                case "$SHIM_JOB" in
+                  unloaded) exit 113 ;;
+                  running) printf 'system/x = {\n\tstate = running\n\tpid = 4242\n\t\tstate = active\n}\n' ;;
+                  stuck) printf 'system/x = {\n\tstate = spawn scheduled\n\tlast exit code = 78: EX_CONFIG\n\t\tstate = active\n}\n' ;;
+                esac ;;
+              kickstart) [ "''${SHIM_KICKSTART_HANGS:-0}" = 1 ] && sleep 30 ;;
+            esac
+            exit 0
+            SH
+            # netstat shim: prints the scripted listen-queue table.
+            cat > shims/netstat <<'SH'
+            #!/bin/sh
+            echo 'Current listen queue sizes (qlen/incqlen/maxqlen)'
+            echo 'Listen         Local Address'
+            [ -n "''${SHIM_QUEUE:-}" ] && echo "$SHIM_QUEUE        127.0.0.1.${toString fixturePort}"
+            exit 0
+            SH
+            chmod +x shims/launchctl shims/netstat
 
-            # Rewrite the baked-in state dir to a BUILD-LOCAL one. The script
-            # resolves stateDir at nix-eval time, so a fixed absolute path is
-            # unavoidable in the fixture — but a shared /tmp path leaks between
-            # builds and is owned by whichever nix build user got there first.
-            # Redirecting the copy keeps this hermetic while still running the
-            # real script.
+            reset_state() { rm -rf "$PWD/state" work/launchctl.log; mkdir -p "$PWD/state/healthcheck"; : > work/launchctl.log; }
+            counter() { cat "$PWD/state/healthcheck/consecutive-failures" 2>/dev/null || echo missing; }
+            actions() { grep -v '^print' work/launchctl.log | tr '\n' ';' || true; }
+
+            # Rewrite the baked-in state dir to a BUILD-LOCAL one (the script
+            # resolves stateDir at nix-eval time).
             sed "s#${fixtureStateDir}#$PWD/state#g" "$healthScript" > work/healthcheck
             chmod +x work/healthcheck
-            healthScript="$PWD/work/healthcheck"
 
-            probe() {  # $1 = label; runs one watchdog pass, records rc + output
+            probe() {  # $1 = label; runs one watchdog pass with the shims
               set +e
-              sh "$healthScript" >"work/out.$1" 2>&1
+              SHIM_LOG="$PWD/work/launchctl.log" \
+                VMH_HC_LAUNCHCTL="$PWD/shims/launchctl" \
+                VMH_HC_NETSTAT="$PWD/shims/netstat" \
+                VMH_HC_LAUNCHCTL_TIMEOUT=2 \
+                "$PWD/work/healthcheck" >"work/out.$1" 2>&1
               echo "$?" > "work/rc.$1"
               set -e
             }
+
+            expect() {  # $1 label, $2 expected counter, $3 expected actions, $4 what
+              local got act
+              got=$(counter); act=$(actions)
+              if [ "$(cat "work/rc.$1")" != 0 ]; then
+                bad "$4: watchdog exited $(cat "work/rc.$1"): $(cat "work/out.$1")"
+              elif [ "$got" != "$2" ]; then
+                bad "$4: counter '$got', expected '$2': $(cat "work/out.$1")"
+              elif [ "$act" != "$3" ]; then
+                bad "$4: launchctl actions '$act', expected '$3': $(cat "work/out.$1")"
+              else
+                note "ok: $4"
+              fi
+            }
+
+            export SHIM_JOB=running SHIM_QUEUE="" SHIM_KICKSTART_HANGS=0
 
             # --- a serving listener must be left alone -----------------------
             for code in 200 401; do
@@ -141,15 +215,7 @@ top@{ ... }:
               pid=$(serve_code "$code"); sleep 1
               probe "ok$code"
               kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
-              rc=$(cat "work/rc.ok$code")
-              fails=$(cat $PWD/state/healthcheck/consecutive-failures 2>/dev/null || echo missing)
-              if [ "$rc" != "0" ]; then
-                bad "HTTP $code should be a clean no-op but exited $rc: $(cat "work/out.ok$code")"
-              elif [ "$fails" != "0" ]; then
-                bad "HTTP $code left the failure counter at '$fails', expected 0"
-              else
-                note "ok: HTTP $code -> exit 0, counter reset"
-              fi
+              expect "ok$code" 0 "" "HTTP $code -> no action, counter reset"
             done
 
             # --- 503 is saturation: a real failure, not an answer ------------
@@ -157,34 +223,64 @@ top@{ ... }:
             pid=$(serve_code 503); sleep 1
             probe busy
             kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
-            fails=$(cat $PWD/state/healthcheck/consecutive-failures 2>/dev/null || echo missing)
-            if [ "$fails" = "1" ] && grep -qi "busy\|saturat" "work/out.busy"; then
-              note "ok: HTTP 503 counted as a failure (counter=1)"
-            else
-              bad "HTTP 503 not counted as saturation (counter='$fails'): $(cat work/out.busy)"
-            fi
+            expect busy 1 "" "HTTP 503 counted as a failure"
 
-            # --- no listener at all: the wedge signature ---------------------
+            # --- THE m3 REGRESSION: the host cannot reach its own overlay
+            # address, but the socket is listening and draining. This must NOT
+            # count — the original watchdog restarted a healthy daemon every
+            # 10 minutes for exactly this.
             reset_state
-            probe dead
-            fails=$(cat $PWD/state/healthcheck/consecutive-failures 2>/dev/null || echo missing)
-            if [ "$fails" = "1" ] && grep -qi "wedge signature\|did not answer" "work/out.dead"; then
-              note "ok: no answer counted as a failure (counter=1)"
-            else
-              bad "an unreachable listener was not counted (counter='$fails'): $(cat work/out.dead)"
-            fi
+            printf '2' > state/healthcheck/consecutive-failures
+            SHIM_QUEUE="0/0/128" probe hairpin
+            expect hairpin 0 "" "failed self-connect + listening socket with empty accept queue -> healthy"
+
+            # --- nothing listening at all ------------------------------------
+            reset_state
+            SHIM_QUEUE="" probe dead
+            expect dead 1 "" "failed connect + no listening socket counted as a failure"
+
+            # --- listening but not accepting (the wedge) ---------------------
+            reset_state
+            SHIM_QUEUE="7/0/128" probe backlog
+            expect backlog 1 "" "failed connect + backed-up accept queue counted as a failure"
 
             # --- the counter must ACCUMULATE toward the threshold ------------
-            # A watchdog that resets on every pass never reaches its threshold
-            # and so never recovers anything.
             reset_state
             probe d1; probe d2
-            fails=$(cat $PWD/state/healthcheck/consecutive-failures 2>/dev/null || echo missing)
-            if [ "$fails" = "2" ]; then
-              note "ok: consecutive failures accumulate (counter=2)"
-            else
-              bad "failure counter did not accumulate across probes (got '$fails')"
-            fi
+            expect d2 2 "" "consecutive failures accumulate"
+
+            # --- threshold, job running: kickstart -k ------------------------
+            reset_state
+            printf '2' > state/healthcheck/consecutive-failures
+            probe kick
+            expect kick 0 "kickstart -k system/org.metacraft-labs.vm-harness-serve;" "threshold on a running job -> kickstart -k"
+
+            # --- threshold, kickstart hangs: bounded, then re-bootstrap ------
+            reset_state
+            printf '2' > state/healthcheck/consecutive-failures
+            SHIM_KICKSTART_HANGS=1 probe hang
+            expect hang 0 "kickstart -k system/org.metacraft-labs.vm-harness-serve;bootout system/org.metacraft-labs.vm-harness-serve;bootstrap system /Library/LaunchDaemons/org.metacraft-labs.vm-harness-serve.plist;" \
+              "a kickstart that never returns is timed out and replaced by bootout + bootstrap"
+
+            # --- THE m3 BOOT FAILURE: loaded, never spawned (EX_CONFIG) ------
+            reset_state
+            printf '2' > state/healthcheck/consecutive-failures
+            SHIM_JOB=stuck probe stuck
+            expect stuck 0 "bootout system/org.metacraft-labs.vm-harness-serve;bootstrap system /Library/LaunchDaemons/org.metacraft-labs.vm-harness-serve.plist;" \
+              "a loaded-but-not-running job is re-bootstrapped, never kickstarted"
+
+            # --- rate limit ---------------------------------------------------
+            reset_state
+            printf '2' > state/healthcheck/consecutive-failures
+            date +%s > state/healthcheck/last-restart
+            probe limited
+            expect limited 3 "" "a second recovery inside minRestartIntervalSec is rate-limited"
+
+            # --- a deliberately unloaded daemon is never "recovered" ---------
+            reset_state
+            printf '2' > state/healthcheck/consecutive-failures
+            SHIM_JOB=unloaded probe unloaded
+            expect unloaded 0 "" "unloaded job -> no action"
 
             if [ "$fail" -eq 0 ]; then
               echo "vmharness-serve-darwin-posture OK"

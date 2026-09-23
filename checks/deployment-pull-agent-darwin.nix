@@ -215,6 +215,10 @@ top@{
           (throw "second Darwin pull-agent immutable launchd launcher is absent")
           staticB.config.environment.systemPackages;
       expectedLaunchdArguments = [
+        "/bin/sh"
+        "-c"
+        ''/bin/wait4path /nix/store && exec "$@"''
+        "mcl-deploy-agent"
         (lib.getExe staticLaunchdLauncherPackage)
         stableEntrypoint
         "120"
@@ -873,7 +877,7 @@ top@{
             test ${lib.escapeShellArg (toString staticServiceA.Label)} = ${lib.escapeShellArg (toString staticServiceB.Label)}
             test ${lib.escapeShellArg (builtins.toJSON staticServiceA.ProgramArguments)} = ${lib.escapeShellArg (builtins.toJSON staticServiceB.ProgramArguments)}
             launcher=${lib.escapeShellArg (lib.getExe staticLaunchdLauncherPackage)}
-            test "$(printf '%s' ${lib.escapeShellArg (builtins.toJSON staticServiceA.ProgramArguments)} | ${pkgs.jq}/bin/jq -r '.[0]')" = "$launcher"
+            test "$(printf '%s' ${lib.escapeShellArg (builtins.toJSON staticServiceA.ProgramArguments)} | ${pkgs.jq}/bin/jq -r '.[4]')" = "$launcher"
             test "$launcher" != ${lib.escapeShellArg stableEntrypoint}
             test ${lib.escapeShellArg (lib.getExe staticEntrypointPackage)} != ${lib.escapeShellArg (lib.getExe staticEntrypointPackageB)}
             test ${lib.escapeShellArg (lib.getExe staticLaunchdLauncherPackage)} = ${lib.escapeShellArg (lib.getExe staticLaunchdLauncherPackageB)}

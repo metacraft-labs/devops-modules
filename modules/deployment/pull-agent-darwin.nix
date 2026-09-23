@@ -129,6 +129,18 @@
           ${lib.optionalString (cfg.runtimePrerequisite != "") ''
             ${escapeShellArg cfg.runtimePrerequisite}
           ''}
+          # macOS empties /private/var/run at every boot, and the lock file's
+          # directory lives there. The activation-time preparation that
+          # creates it does not run again until the NEXT deployment — which
+          # this agent is the only thing that performs — so after a reboot
+          # every poll died at `flock: cannot open lock file … No such file or
+          # directory` (EX_NOINPUT) and the host silently stopped converging
+          # (m3, 2026-09-21). Re-run the same canonical, idempotent
+          # preparation when the directory is missing — after the runtime
+          # prerequisite, so a failing prerequisite still touches nothing.
+          if [ ! -d ${escapeShellArg (builtins.dirOf cfg.lockFile)} ]; then
+            ${getExe preparationPackage}
+          fi
           exec flock -n ${escapeShellArg cfg.lockFile} ${
             escapeShellArgs (
               [
@@ -980,7 +992,17 @@
         launchd.daemons.mcl-deploy-agent = {
           serviceConfig = {
             Label = "org.metacraft-labs.mcl-deploy-agent";
+            # `/bin/wait4path /nix/store` first: at boot launchd spawns
+            # RunAtLoad jobs before the /nix APFS volume is mounted, and a job
+            # whose executable is a store path then fails with EX_CONFIG and
+            # is never spawned again (m3, 2026-09-21: no poll for two days).
+            # nix-darwin's `command` option adds this; raw ProgramArguments
+            # must do it explicitly. `exec "$@"` keeps the argv verbatim.
             ProgramArguments = [
+              "/bin/sh"
+              "-c"
+              ''/bin/wait4path /nix/store && exec "$@"''
+              "mcl-deploy-agent"
               (getExe launchdLauncherPackage)
               stableEntrypoint
               "120"
