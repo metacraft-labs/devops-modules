@@ -70,6 +70,44 @@ The example is validated against the real `integrations/github` provider
 schema (`tofu validate` → `Success`). A real consumer swaps the fixture for the
 shared policy file and its own repository list.
 
+## `mainline-protection.nix` — mainline PR-only rulesets for `governance.nix`
+
+Renders one `mainline-protect` repository ruleset per repository whose
+**mainline** branch (every policy branch class with `role = "mainline"`: product
+`dev`, spec `latest`, infra `live`) is protectable, as plain entries in the
+engine's `repositoryRulesets` schema. Each ruleset forbids deletion and
+force-push and requires a pull request (PR-only), keeps an `OrganizationAdmin`
+bypass (not `enforce_admins`), and pins **no** required status checks. The
+`agents` integration branch is never targeted.
+
+```nix
+let
+  mainline = import "${devops-modules}/terraform/github/mainline-protection.nix" {
+    policy = builtins.fromJSON (builtins.readFile ./branch-protection-policy.json);
+    repositories = inventory.repositories;
+    overrides = { product = "dev"; };   # real mainline != inventory default branch
+    excludeRepos = [ "some-fork" ];      # rebased onto upstream (force-push)
+    directPushRepos = [ "workspace" ];   # tooling pushes directly: no PR rule
+    visibilities = [ "public" ];         # GitHub Free: rulesets 403 on private
+    enforcement = "evaluate";            # Enterprise: dry-run a cycle first
+    requiredApprovingReviewCount = 0;    # null = derive from the policy class
+  };
+in
+{
+  governance = inventory // {
+    repositoryRulesets = inventory.repositoryRulesets ++ mainline.rulesets;
+  };
+}
+```
+
+It also returns `protectedRepos`, `prOnlyRepos`, `directPushRepos`, `mainlines`
+and `uncovered` (repo -> reason) for the caller's coverage report. Unknown repo
+names in the corrections, and overrides naming a non-mainline branch, fail the
+evaluation. Unlike `branch-protection.nix` (raw resources for a hand-written
+map), these entries flow through `governance.nix` and any caller-side filter,
+such as an import-only adoption window. Tested offline by
+[`tests/test-mainline-protection.sh`](./tests/test-mainline-protection.sh).
+
 ## `tf-bootstrap.nix` — CI-enabling GitHub Layer-0 root
 
 The GitHub counterpart of the AWS `tf-bootstrap.nix`: a value-independent module
