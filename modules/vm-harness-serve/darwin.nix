@@ -167,6 +167,18 @@
           ps_cmd="''${VMH_HC_PS:-/bin/ps}"
           stuck_threshold=${toString hcfg.stuckWorkerThreshold}
           stuck_grace_s=${toString hcfg.stuckWorkerGraceSec}
+          # Present from just BEFORE a watchdog `bootout` until the matching
+          # `bootstrap` has succeeded. It is what tells "not loaded because the
+          # watchdog's own re-bootstrap did not finish" apart from "not loaded
+          # because an operator unloaded it" — without it, a bootstrap that
+          # fails right after the bootout (launchd answers `5: Input/output
+          # error` or `37: Operation already in progress` while it is still
+          # tearing the old instance down) leaves the daemon down until the
+          # next reboot, because every later pass reads the missing job as a
+          # deliberate unload. Delete it by hand to cancel a pending recovery.
+          rebootstrap_marker="$state/rebootstrap-pending"
+          bootstrap_attempts="''${VMH_HC_BOOTSTRAP_ATTEMPTS:-4}"
+          bootstrap_backoff_s="''${VMH_HC_BOOTSTRAP_BACKOFF_SEC:-2}"
 
           mkdir -p "$state"
           log() { echo "vm-harness-serve-healthcheck: $*"; }
@@ -194,7 +206,18 @@
               echo 0
               return
             fi
-            "$ps_cmd" -axo ppid=,stat=,etime= 2>/dev/null | awk -v p="$pid" -v g="$stuck_grace_s" '
+            # Capture first, count second, default last. Piping `ps` straight
+            # into awk with a trailing `|| echo 0` printed TWO lines ("N\n0")
+            # whenever ps exited non-zero under pipefail; the numeric test in
+            # healthy() then errored, and an error there reads as "not stuck".
+            # Whatever ps did print is still counted: a partial listing that
+            # already shows stuck workers is evidence, not noise.
+            local listing count ps_rc=0
+            listing="$("$ps_cmd" -axo ppid=,stat=,etime= 2>/dev/null)" || ps_rc=$?
+            if [ "$ps_rc" != 0 ]; then
+              log "ps exited $ps_rc while listing workers of pid $pid; counting from its partial output" >&2
+            fi
+            count="$(awk -v p="$pid" -v g="$stuck_grace_s" '
               function secs(e,   d, x, a, n, i, s) {
                 d = 0
                 if (index(e, "-")) { split(e, x, "-"); d = x[1]; e = x[2] }
@@ -203,7 +226,11 @@
                 return d * 86400 + s
               }
               $1 == p && $2 ~ /^Z/ && secs($3) >= g { c++ }
-              END { print c + 0 }' || echo 0
+              END { print c + 0 }' <<<"$listing" || true)"
+            case "$count" in
+              "" | *[!0-9]*) echo 0 ;;
+              *) echo "$count" ;;
+            esac
           }
 
           # "Answered" is not enough on its own: a daemon whose handlers are
@@ -223,22 +250,76 @@
             exit 0
           }
 
+          # Bootstrap the job from its plist, retrying with backoff. The
+          # marker is removed only once launchd holds the job again, so a pass
+          # that gives up (or is killed) hands the recovery to the next pass.
+          bootstrap_job() {
+            local attempt=1 rc delay="$bootstrap_backoff_s"
+            while :; do
+              rc=0
+              lctl bootstrap system "$plist" || rc=$?
+              if [ "$rc" = 0 ]; then
+                rm -f "$rebootstrap_marker"
+                log "$label re-bootstrapped"
+                return 0
+              fi
+              # launchd also refuses a bootstrap (exit 5) when the job is
+              # ALREADY loaded — which is the outcome this is after.
+              if lctl print "system/$label" >/dev/null 2>&1; then
+                rm -f "$rebootstrap_marker"
+                log "bootstrap of $label exited $rc, but launchd now reports it loaded"
+                return 0
+              fi
+              if [ "$attempt" -ge "$bootstrap_attempts" ]; then
+                log "bootstrap of $label failed $attempt time(s), last exit $rc — leaving $rebootstrap_marker so the next pass completes the recovery instead of reading the unloaded job as an operator unload"
+                return 1
+              fi
+              log "bootstrap of $label failed (exit $rc, attempt $attempt/$bootstrap_attempts) — retrying in ''${delay}s"
+              sleep "$delay"
+              attempt=$(( attempt + 1 ))
+              delay=$(( delay * 2 ))
+            done
+          }
+
           # Only act if launchd believes the job is loaded. `launchctl print`
           # exits non-zero for an unknown/unloaded label, which is the darwin
           # analogue of the Linux sibling's `systemctl is-active` guard: a
-          # deliberately unloaded daemon must not be "recovered".
-          if ! job="$(lctl print "system/$label" 2>/dev/null)"; then
+          # deliberately unloaded daemon must not be "recovered" — unless the
+          # watchdog itself unloaded it and has not yet loaded it back.
+          #
+          # A `print` that TIMES OUT (124) says nothing about the job: launchd
+          # itself is not answering. Reading that as "not loaded" reset the
+          # failure counter on every pass and hid a hung launchd for as long
+          # as it stayed hung, so it counts as a failed probe instead.
+          print_rc=0
+          job="$(lctl print "system/$label" 2>/dev/null)" || print_rc=$?
+          running=1
+          if [ "$print_rc" = 124 ]; then
+            running=unknown
+            log "launchctl print system/$label did not return within ''${launchctl_timeout}s — launchd is unresponsive; job state UNKNOWN, counting a failed probe"
+          elif [ "$print_rc" != 0 ]; then
+            if [ -f "$rebootstrap_marker" ]; then
+              log "launchd job $label is not loaded because a watchdog re-bootstrap did not complete ($rebootstrap_marker) — completing it"
+              printf '0' > "$fail_file"
+              bootstrap_job || exit 1
+              exit 0
+            fi
             log "launchd job $label is not loaded — no watchdog action"
             printf '0' > "$fail_file"
             exit 0
           fi
 
-          running=1
-          if ! grep -Eq '^[[:space:]]*state = running$' <<<"$job"; then
+          if [ "$running" = unknown ]; then
+            :
+          elif ! grep -Eq '^[[:space:]]*state = running$' <<<"$job"; then
             running=0
             exit_line="$(grep -Em1 'last exit code' <<<"$job" | sed 's/^[[:space:]]*//' || true)"
             log "launchd job $label is loaded but NOT running (''${exit_line:-no exit recorded}) — launchd will not respawn a job it failed to spawn"
           else
+            if [ -f "$rebootstrap_marker" ]; then
+              log "$label is loaded and running again — clearing the pending re-bootstrap marker"
+              rm -f "$rebootstrap_marker"
+            fi
             # Inspect the STATUS, not merely curl's exit code: a 503 means the
             # daemon is up but every request handler is busy, which is a real
             # degradation the watchdog must count as a failure rather than
@@ -317,8 +398,10 @@
           # a penalty-boxed job, blocks) when launchd has given up spawning
           # the job, so a job that is not running — or a kickstart that does
           # not return — is re-bootstrapped from its plist instead, which
-          # resets launchd's spawn state.
-          if [ "$running" = 1 ]; then
+          # resets launchd's spawn state. A job whose state is UNKNOWN
+          # (launchd did not answer `print`) takes the kickstart path: every
+          # call is bounded, and the marker covers a half-done fallback.
+          if [ "$running" != 0 ]; then
             log "listener dead for $fails consecutive probes — kickstarting $label (watchdog recovery)"
             if lctl kickstart -k "system/$label"; then
               log "$label kickstart issued"
@@ -328,9 +411,12 @@
           else
             log "$label not running for $fails consecutive probes — re-bootstrapping it from $plist (watchdog recovery)"
           fi
+          # Marker BEFORE bootout: from here until a bootstrap succeeds, a
+          # missing job is the watchdog's own doing, whatever cuts this pass
+          # short (a failed bootstrap, the launchctl timeout, a kill).
+          printf '%s' "$now" > "$rebootstrap_marker"
           lctl bootout "system/$label" || true
-          lctl bootstrap system "$plist"
-          log "$label re-bootstrapped"
+          bootstrap_job || exit 1
         '';
       };
     in

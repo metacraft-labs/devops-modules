@@ -342,6 +342,7 @@ top@{
         assert requireAssertions "disabled fixture" disabledSystem;
         assert requireAssertions "agent integration fixture" integrationSystem;
         assert requireAssertions "lock-contention fixture" lockSystem;
+        assert requireAssertions "lock-directory recovery fixture" lockDirSystem;
         assert missingRecoveryAssertionPresent;
         assert missingRecoveryAssertionGateTrips;
         pkgs.runCommand "test-darwin-pull-agent-assertion-gate" { } ''
@@ -923,6 +924,98 @@ top@{
             fi
             mkdir -p "$out"
             printf '%s\n' 'test_darwin_pull_agent_entrypoint_survives_generation_change: passed' > "$out/result"
+          '';
+
+      # ---- lock directory emptied by a reboot ------------------------------
+      # macOS clears /private/var/run at boot, taking the lock file's
+      # directory with it; only a deployment re-runs the activation-time path
+      # preparation, and only this agent performs deployments. The entrypoint
+      # therefore re-runs that preparation itself when the directory is gone.
+      #
+      # This runs the REAL generated entrypoint and the REAL preparation
+      # package (which honours MCL_DEPLOY_PREP_ROOT in fixture mode), so it
+      # also runs on Linux builders. The only substitution: the configured
+      # absolute lock path is rewritten under $TMPDIR in a copy of the
+      # entrypoint, because a build sandbox cannot create /private/tmp, and
+      # `package` is a recorder standing in for mcl-devops (the agent's own
+      # behaviour is covered by the integration check; what is under test is
+      # whether flock can open the lock at all). No other mocking.
+      lockDirNamespace = "/private/tmp/mcl-darwin-pull-agent-lockdir";
+      lockDirRoot = "${lockDirNamespace}/agent";
+      lockDirRecorder = pkgs.writeShellApplication {
+        name = "mcl-devops";
+        text = ''
+          printf '%s\n' "$*" >> "$MCL_LOCKDIR_TEST_RUNS"
+        '';
+      };
+      lockDirSystem = checkedSystem "lock-directory recovery fixture" (
+        inputs.nix-darwin.lib.darwinSystem {
+          system = pkgs.stdenv.hostPlatform.system;
+          modules = [
+            flake.modules.darwin.deployment-pull-agent
+            {
+              networking.hostName = "m3";
+              system.stateVersion = 6;
+              services.mcl-deploy-agent = fixturePathOptions // {
+                enable = true;
+                package = lockDirRecorder;
+                targetName = "m3";
+                manifestPublicKeys = [ manifestPublicKey ];
+                manifestDirectories = [ "${lockDirRoot}/state/inbox" ];
+                stateDir = "${lockDirRoot}/state";
+                eventLog = "${lockDirRoot}/logs/events.jsonl";
+                standardOutLog = "${lockDirRoot}/logs/stdout.log";
+                standardErrorLog = "${lockDirRoot}/logs/stderr.log";
+                lockFile = "${lockDirRoot}/run/agent.lock";
+              };
+            }
+          ];
+        }
+      );
+      lockDirEntrypointPackage =
+        lib.findFirst (package: lib.getName package == "mcl-deploy-agent")
+          (throw "lock-directory fixture Darwin pull-agent entrypoint package is absent")
+          lockDirSystem.config.environment.systemPackages;
+      lockDirRecoveryCheck =
+        pkgs.runCommand "test-darwin-pull-agent-recreates-missing-lock-dir"
+          { nativeBuildInputs = [ pkgs.coreutils ]; }
+          ''
+            set -euo pipefail
+            root="$TMPDIR/root"
+            mkdir -p "$root/private/tmp"
+            export MCL_DEPLOY_PREP_ROOT="$root"
+            export MCL_DEPLOY_PREP_EXPECTED_UID="$(id -u)"
+            export MCL_DEPLOY_PREP_EXPECTED_GID="$(id -g)"
+            export MCL_DEPLOY_PREP_FIXTURE_CHOWN_LOG="$TMPDIR/chown.log"
+            export MCL_LOCKDIR_TEST_RUNS="$TMPDIR/runs"
+            lock_dir=${lib.escapeShellArg "${lockDirRoot}/run"}
+
+            entrypoint=${lib.escapeShellArg (lib.getExe lockDirEntrypointPackage)}
+            grep -Fq -- "flock -n $lock_dir/agent.lock" "$entrypoint"
+            sed "s#${lockDirNamespace}#$root${lockDirNamespace}#g" "$entrypoint" > "$TMPDIR/entrypoint"
+            chmod +x "$TMPDIR/entrypoint"
+
+            # The boot state: nothing under the (rewritten) /private/tmp.
+            test ! -e "$root$lock_dir"
+            if ! "$TMPDIR/entrypoint" > "$TMPDIR/first.out" 2>&1; then
+              echo 'entrypoint failed when the lock directory was missing:' >&2
+              cat "$TMPDIR/first.out" >&2
+              exit 1
+            fi
+            test -d "$root$lock_dir"
+            test -e "$root$lock_dir/agent.lock"
+            test "$(wc -l < "$MCL_LOCKDIR_TEST_RUNS" | tr -d ' ')" = 1
+            grep -q '^deploy-agent ' "$MCL_LOCKDIR_TEST_RUNS"
+            grep -Fxq "directory $root$lock_dir" "$TMPDIR/chown.log"
+
+            # Directory present: preparation is not re-run on every poll.
+            chown_before="$(wc -l < "$TMPDIR/chown.log")"
+            "$TMPDIR/entrypoint"
+            test "$(wc -l < "$MCL_LOCKDIR_TEST_RUNS" | tr -d ' ')" = 2
+            test "$(wc -l < "$TMPDIR/chown.log")" = "$chown_before"
+
+            mkdir -p "$out"
+            printf '%s\n' 'test_darwin_pull_agent_recreates_missing_lock_dir: passed' > "$out/result"
           '';
 
       integrationNamespace = "/private/tmp/mcl-darwin-pull-agent-integration";
@@ -1592,7 +1685,11 @@ top@{
           '';
     in
     {
-      checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
+      checks = {
+        # Needs no /private or real nix store, so it runs on every builder.
+        test_darwin_pull_agent_recreates_missing_lock_dir = lockDirRecoveryCheck;
+      }
+      // lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
         test_darwin_pull_agent_assertion_gate = assertionGateCheck;
         test_darwin_pull_agent_launchd_contract = launchdContractCheck;
         test_darwin_pull_agent_entrypoint_survives_generation_change = generationStabilityCheck;
