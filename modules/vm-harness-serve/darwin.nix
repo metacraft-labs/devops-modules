@@ -588,6 +588,9 @@
             EnvironmentVariables = {
               PATH = lib.makeBinPath ([ cfg.package ] ++ cfg.extraPackages ++ [ pkgs.coreutils ]);
               HOME = cfg.stateDir;
+              # Ownership records for kept ephemeral instances (see the Linux
+              # module); launchd provides no $STATE_DIRECTORY, so name it.
+              VMH_EPHEMERAL_LABEL_DIR = "${cfg.stateDir}/ephemeral-labels";
             }
             // cfg.environment;
 

@@ -59,6 +59,26 @@ consumes these options.
   registered hypervisor backend synchronously — measured 2026-09-18 at 16.7 s
   authenticated versus 5 ms unauthenticated.
 
+- **Ownership records for kept GARM instances.** The remote GARM provider
+  records which pool owns each instance it creates (`vm-harness
+ephemeral-label`) and lists a pool's instances with `ephemeral-list --label
+garm-pool=<id>`. The records live in `VMH_EPHEMERAL_LABEL_DIR`, which the
+  unit sets to `/var/lib/vm-harness-serve/ephemeral-labels` (inside its
+  StateDirectory, the only writable state under `ProtectSystem=strict`; the
+  darwin module uses `<stateDir>/ephemeral-labels`). A pool must see only its
+  own instances: GARM's scale-set reconciler deletes any listed instance it has
+  no record of.
+- **An opt-in kept-instance inventory exporter** (`inventoryExporter.enable`,
+  `inventoryExporter.backends = [ "incus" ]` / `[ "libvirt" ]`). A timer runs
+  `ephemeral-list` as the serve user and writes node-exporter textfile metrics
+  `vmh_ephemeral_instances{backend,state,attributed}` and
+  `vmh_ephemeral_list_success{backend}`. The host is the only party that can
+  see an orphan — an instance GARM has forgotten is absent from GARM — so the
+  `garm-fleet-alerts` library alerts from these on sustained STOPPED instances
+  (`VmhEphemeralStoppedOrphans`), runner-named instances no pool owns
+  (`VmhEphemeralUnattributedInstances`) and a host that cannot enumerate
+  (`VmhEphemeralInventoryFailing`).
+
 The daemon's single `vm-harness` binary already contains `serve`; the module
 defaults `package` to this flake's vendored `vm-harness` package
 (`packages/vm-harness`).

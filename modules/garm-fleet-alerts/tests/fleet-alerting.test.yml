@@ -111,6 +111,131 @@ tests:
               summary: 'GARM provider failing to create runners (vmharness)'
               description: 'Provider vmharness has had at least 3 CreateInstance failures in the last 15m. The backend (incus/libvirt/tart/EC2) is likely broken — check the provider host.'
 
+  # ── GarmProviderDeleteFailures ─────────────────────────────────────────────
+  - interval: 1m
+    name: 'a delete storm against one provider pages; one failed delete does not'
+    input_series:
+      # gpu001 on 2026-09-23: ~20 failed DeleteInstance/min, sustained.
+      - series: 'garm_runner_errors_total{operation="DeleteInstance", provider="gpu001-incus"}'
+        values: '0+20x40'
+      # A single transient teardown failure, then healthy.
+      - series: 'garm_runner_errors_total{operation="DeleteInstance", provider="hms-incus"}'
+        values: '0 1+0x39'
+    alert_rule_test:
+      - eval_time: 10m # for: 15m not elapsed
+        alertname: GarmProviderDeleteFailures
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: GarmProviderDeleteFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: garm-fleet
+              provider: gpu001-incus
+            exp_annotations:
+              summary: 'GARM cannot delete runners on gpu001-incus'
+              description: "Provider gpu001-incus has failed at least 10 DeleteInstance calls in each 15m window for 15m. Finished runners are not being reclaimed on that host (unreachable serve daemon, or a teardown that keeps failing, e.g. ZFS `dataset is busy`) — they will accumulate until the host's storage fills."
+
+  # ── GarmInstancesAbsentFromProvider ────────────────────────────────────────
+  - interval: 1m
+    name: 'repeated provider-absent runners page; a single one does not'
+    input_series:
+      # hms-libvirt on 2026-09-23: a booting Windows runner dropped every few min.
+      - series: 'garm_runner_absent_from_provider_total{provider="hms-libvirt"}'
+        values: '0+1x20'
+      - series: 'garm_runner_absent_from_provider_total{provider="hms-incus"}'
+        values: '0 1+0x19'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GarmInstancesAbsentFromProvider
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: GarmInstancesAbsentFromProvider
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: garm-fleet
+              provider: hms-libvirt
+            exp_annotations:
+              summary: "GARM runners missing from hms-libvirt's instance list"
+              description: "At least 3 instances GARM believes are running were absent from provider hms-libvirt's ListInstances in 30m. They are routed to deletion, but repeated absences mean the provider cannot see its own instances (enumeration/attribution broken) — before the fix this is exactly how ~210 VMs leaked."
+
+  # ── VmhEphemeralStoppedOrphans ─────────────────────────────────────────────
+  - interval: 1m
+    name: 'stopped instances that never go away page; churn that clears does not'
+    input_series:
+      # gpu-server-001: STOPPED garm-* containers accumulate and stay.
+      - series: 'vmh_ephemeral_instances{instance="gpu-server-001", backend="incus", state="stopped", attributed="true"}'
+        values: '5+1x60'
+      # hms: finished runners are stopped briefly, then deleted.
+      - series: 'vmh_ephemeral_instances{instance="high-mem-server", backend="incus", state="stopped", attributed="true"}'
+        values: '4 0 0 0 3 0 0 0 4 0 0 0 2 0 0 0 5 0 0 0 3 0 0 0 4 0 0 0 3 0 0 0 4 0 0 0 3 0 0 0 4 0 0 0 3 0 0 0 4 0 0 0 3 0 0 0 4 0 0 0 3'
+    alert_rule_test:
+      - eval_time: 5m # for: 10m not elapsed
+        alertname: VmhEphemeralStoppedOrphans
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: VmhEphemeralStoppedOrphans
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: garm-fleet
+              instance: gpu-server-001
+              backend: incus
+            exp_annotations:
+              summary: 'Stopped runner instances are piling up on gpu-server-001 (incus)'
+              description: 'gpu-server-001 has held at least 3 STOPPED per-job incus instances continuously for 30m. A finished ephemeral runner is deleted within minutes, so these are orphans whose teardown failed or was never issued; they consume storage until the pool is full (gpu-server-001/002, 2026-09-23).'
+
+  # ── VmhEphemeralUnattributedInstances ──────────────────────────────────────
+  - interval: 1m
+    name: 'instances no pool owns page; ones that get attributed do not'
+    input_series:
+      # high-mem-server: 161 leaked garm-* domains from before attribution.
+      - series: 'vmh_ephemeral_instances{instance="high-mem-server", backend="libvirt", state="running", attributed="false"}'
+        values: '161x120'
+      # A transient unattributed instance (between create and label) that clears.
+      - series: 'vmh_ephemeral_instances{instance="gpu-server-002", backend="incus", state="running", attributed="false"}'
+        values: '1 0x119'
+    alert_rule_test:
+      - eval_time: 20m # for: 30m not elapsed
+        alertname: VmhEphemeralUnattributedInstances
+        exp_alerts: []
+      - eval_time: 100m
+        alertname: VmhEphemeralUnattributedInstances
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: garm-fleet
+              instance: high-mem-server
+              backend: libvirt
+            exp_annotations:
+              summary: 'Runner instances with no owning GARM pool on high-mem-server (libvirt)'
+              description: 'high-mem-server has carried 161 runner-named libvirt instances with no GARM ownership record for over an hour. No pool lists them, so GARM will never delete them: they are orphans (typically created before attribution existed, or by a create whose labelling failed).'
+
+  # ── VmhEphemeralInventoryFailing ───────────────────────────────────────────
+  - interval: 1m
+    name: 'a host that cannot enumerate pages; one failed cycle does not'
+    input_series:
+      - series: 'vmh_ephemeral_list_success{instance="gpu-server-002", backend="incus"}'
+        values: '0x30'
+      - series: 'vmh_ephemeral_list_success{instance="high-mem-server", backend="libvirt"}'
+        values: '1 0 1x28'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: VmhEphemeralInventoryFailing
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: VmhEphemeralInventoryFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: garm-fleet
+              instance: gpu-server-002
+              backend: incus
+            exp_annotations:
+              summary: 'gpu-server-002 cannot enumerate its incus instances'
+              description: "`vm-harness ephemeral-list --backend incus` has failed on gpu-server-002 for 15m. GARM's ListInstances for this host fails closed while this persists, so runners there are neither confirmed nor reconciled — fix the hypervisor/daemon access."
+
   # ── GarmProviderHighErrorRatio ─────────────────────────────────────────────
   - interval: 1m
     name: 'a backend failing 40% of ops pages; a busy healthy one does not'
