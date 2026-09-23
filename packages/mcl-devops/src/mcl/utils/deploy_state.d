@@ -1133,8 +1133,21 @@ unittest
         auto stateLock = acquireDeployTargetStateLock(stateDir, "target");
         scope(exit) stateLock.release();
         assert((root.getAttributes & 1023) == 1023);
-        assert((boundary.getAttributes & permissionBits) == stateDirectoryCreateMode);
+        assert(isStateDirectoryCreateModeUnderUmask(boundary.getAttributes & permissionBits));
         assert(targetStateLockPath(stateDir, "target").exists);
+    }
+}
+
+version (Posix) version (unittest)
+{
+    // `mkdirat` applies the process umask, so a directory created with 0750 is
+    // only 0750 under a permissive umask. The NixOS `github-runner` service
+    // runs with `UMask=0066`, which yields 0710 — narrower, never wider. Accept
+    // exactly the modes 0750 can become under a umask: never wider than 0750,
+    // and always owner-rwx (which the lock path itself needs).
+    private bool isStateDirectoryCreateModeUnderUmask(uint mode)
+    {
+        return (mode & ~stateDirectoryCreateMode) == 0 && (mode & 448) == 448;
     }
 }
 
@@ -1166,7 +1179,7 @@ unittest
         auto stateLock = acquireDeployTargetStateLock(stateDir, "target");
         scope(exit) stateLock.release();
         assert((container.getAttributes & 1023) == 1023);
-        assert((stateDir.getAttributes & permissionBits) == stateDirectoryCreateMode);
+        assert(isStateDirectoryCreateModeUnderUmask(stateDir.getAttributes & permissionBits));
         assert(targetStateLockPath(stateDir, "target").exists);
     }
 }
