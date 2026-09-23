@@ -23,6 +23,10 @@ jobs:
     secrets: inherit
 
   test-mcl:
+    # Measured over the last 100 CI runs: successful runs take 2-3 minutes.
+    # Without a bound, a hung test (see mcl.utils.process) held a self-hosted
+    # runner for the 6-hour default on every PR, starving other repos' jobs.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       # Test setup-nix's support for specifying which Nix version to install
@@ -59,6 +63,8 @@ jobs:
   # `.github/setup-nix/tests/devshell-fixture/`.
   test-setup-nix-devshell:
     name: Validate setup-nix devShell build-failure detection
+    # Successful runs: at most 5 minutes (last 100 CI runs).
+    timeout-minutes: 20
     runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout first to use locally defined actions
@@ -119,6 +125,8 @@ jobs:
   # these real platform contracts says so.
   test-setup-nix-verification:
     name: Validate setup-nix verification (${{ matrix.system }})
+    # Successful runs: at most 1 minute; failures at most 10 (last 100 CI runs).
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -164,6 +172,8 @@ jobs:
         run: bash .github/setup-nix/tests/write-netrc-test.sh
 
   test-mcl-secret-integration:
+    # Successful runs: at most 20 minutes (last 100 CI runs).
+    timeout-minutes: 45
     runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout first to use locally defined actions
@@ -231,6 +241,8 @@ jobs:
   # `eph-linux-x64-nested` class is a transitional alias for the same container
   # and carries no extra capability.
   test-act:
+    # Successful runs: at most 26 minutes (last 100 CI runs).
+    timeout-minutes: 60
     runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout first to use locally defined actions
