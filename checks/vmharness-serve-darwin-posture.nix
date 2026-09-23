@@ -171,7 +171,13 @@ top@{ ... }:
             [ -n "''${SHIM_QUEUE:-}" ] && echo "$SHIM_QUEUE        127.0.0.1.${toString fixturePort}"
             exit 0
             SH
-            chmod +x shims/launchctl shims/netstat
+            # ps shim: prints $SHIM_PS verbatim (ppid stat etime rows).
+            cat > shims/ps <<'SH'
+            #!/bin/sh
+            printf '%b' "''${SHIM_PS:-}"
+            exit 0
+            SH
+            chmod +x shims/launchctl shims/netstat shims/ps
 
             reset_state() { rm -rf "$PWD/state" work/launchctl.log; mkdir -p "$PWD/state/healthcheck"; : > work/launchctl.log; }
             counter() { cat "$PWD/state/healthcheck/consecutive-failures" 2>/dev/null || echo missing; }
@@ -187,6 +193,7 @@ top@{ ... }:
               SHIM_LOG="$PWD/work/launchctl.log" \
                 VMH_HC_LAUNCHCTL="$PWD/shims/launchctl" \
                 VMH_HC_NETSTAT="$PWD/shims/netstat" \
+                VMH_HC_PS="$PWD/shims/ps" \
                 VMH_HC_LAUNCHCTL_TIMEOUT=2 \
                 "$PWD/work/healthcheck" >"work/out.$1" 2>&1
               echo "$?" > "work/rc.$1"
@@ -233,6 +240,26 @@ top@{ ... }:
             printf '2' > state/healthcheck/consecutive-failures
             SHIM_QUEUE="0/0/128" probe hairpin
             expect hairpin 0 "" "failed self-connect + listening socket with empty accept queue -> healthy"
+
+            # --- THE m3 503 WEDGE: listener fine, handlers leaking -----------
+            # Four workers of the serve pid (4242 in the launchctl shim) dead
+            # for over an hour and never reaped: a failure even though the
+            # socket drains. Two stale + one fresh zombie is below threshold.
+            reset_state
+            SHIM_QUEUE="0/0/128" \
+              SHIM_PS='4242 Z 01:16:00\n4242 Z 58:50\n4242 Z 1-02:00:00\n4242 Z 12:00\n999 Z 99:00\n4242 S 80:00\n' \
+              probe stuck_handlers
+            expect stuck_handlers 1 "" "4 long-dead unreaped workers count as a failure despite a draining listener"
+            reset_state
+            SHIM_QUEUE="0/0/128" \
+              SHIM_PS='4242 Z 01:16:00\n4242 Z 58:50\n4242 Z 00:05\n999 Z 99:00\n999 Z 99:00\n' \
+              probe few_stuck
+            expect few_stuck 0 "" "stale zombies below the threshold (and other parents' zombies) are tolerated"
+            reset_state
+            pid=$(serve_code 401); sleep 1
+            SHIM_PS='4242 Z 01:16:00\n4242 Z 58:50\n4242 Z 1-02:00:00\n4242 Z 12:00\n' probe stuck_401
+            kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+            expect stuck_401 1 "" "an answering daemon with leaked handlers still counts as a failure"
 
             # --- nothing listening at all ------------------------------------
             reset_state
