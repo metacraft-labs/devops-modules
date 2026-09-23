@@ -123,19 +123,25 @@ func TestRemoteCreateDeleteNoop(t *testing.T) {
 	// The noop recipe stays byte-for-byte unchanged and cannot receive Incus
 	// capability flags.
 	wantCreate := []string{"provision", "--backend", "noop", "--baseline", "garm-r-1", "--log-format", "json"}
-	if len(fs.execArgv) != 1 || !reflect.DeepEqual(fs.execArgv[0], wantCreate) {
+	if len(fs.execArgv) != 2 || !reflect.DeepEqual(fs.execArgv[0], wantCreate) {
 		t.Fatalf("create argv=%v want exact %v", fs.execArgv, wantCreate)
+	}
+	// Then the ownership labels, so the pool's ListInstances can see it.
+	wantLabel := []string{"ephemeral-label", "--backend", "noop", "--baseline", "garm-r-1",
+		"--label", "garm-pool=pool", "--label", "garm-controller=ctrl", "--log-format", "json"}
+	if !reflect.DeepEqual(fs.execArgv[1], wantLabel) {
+		t.Fatalf("label argv=%v want exact %v", fs.execArgv[1], wantLabel)
 	}
 
 	if err := b.Delete(ctx, "garm-r-1"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if len(fs.execArgv) != 2 || fs.execArgv[1][0] != "ephemeral-destroy" {
+	if len(fs.execArgv) != 3 || fs.execArgv[2][0] != "ephemeral-destroy" {
 		t.Fatalf("delete argv=%v want ephemeral-destroy", fs.execArgv)
 	}
 	wantDelete := []string{"ephemeral-destroy", "--backend", "noop", "--baseline", "garm-r-1", "--log-format", "json"}
-	if !reflect.DeepEqual(fs.execArgv[1], wantDelete) {
-		t.Fatalf("delete argv=%v want exact %v", fs.execArgv[1], wantDelete)
+	if !reflect.DeepEqual(fs.execArgv[2], wantDelete) {
+		t.Fatalf("delete argv=%v want exact %v", fs.execArgv[2], wantDelete)
 	}
 }
 
@@ -413,12 +419,16 @@ func TestRemoteCreateNonZeroExitFails(t *testing.T) {
 	}
 }
 
-func TestRemoteDeleteNonZeroIsIdempotent(t *testing.T) {
-	// A non-zero teardown exit (guest already gone) is treated as success.
+func TestRemoteDeleteNonZeroIsAnError(t *testing.T) {
+	// REVERSED from the RB1 contract, which treated a non-zero teardown exit as
+	// idempotent success. `ephemeral-destroy` exits 0 for an absent instance,
+	// so a non-zero exit means the teardown did NOT complete and the guest may
+	// still exist; swallowing it leaked STOPPED containers on the GPU hosts.
+	// See TestRemoteDeleteSurfacesFailedTeardown for the full lifecycle.
 	b, _, closeFn := newFakeBackend(t, "noop", 5)
 	defer closeFn()
-	if err := b.Delete(context.Background(), "x"); err != nil {
-		t.Fatalf("Delete non-zero exit should be idempotent success, got %v", err)
+	if err := b.Delete(context.Background(), "x"); err == nil {
+		t.Fatal("Delete with teardown exit 5 must fail")
 	}
 }
 
@@ -436,7 +446,7 @@ func TestRemoteWrongTokenRejected(t *testing.T) {
 	if err := b.Delete(ctx, "x"); err == nil {
 		t.Fatal("Delete with wrong token should surface the auth error")
 	}
-	// Get probes /v1/info and must surface the 401.
+	// Get enumerates over /v1/exec and must surface the 401.
 	if _, err := b.Get(ctx, "x"); err == nil {
 		t.Fatal("Get with wrong token should fail")
 	}
@@ -471,15 +481,14 @@ func TestServeClientExecStreamEvents(t *testing.T) {
 	}
 }
 
-func TestGetReportsRunningOnLiveHost(t *testing.T) {
+func TestGetOnAHostWithoutEnumerationIsNotRunning(t *testing.T) {
+	// REVERSED: Get used to report ANY name as "running" whenever /v1/info
+	// answered. The fake daemon here prints no ephemeral-list result, so Get
+	// must fail rather than invent a running instance.
 	b, _, closeFn := newFakeBackend(t, "noop", 0)
 	defer closeFn()
-	inst, err := b.Get(context.Background(), "garm-r-9")
-	if err != nil {
-		t.Fatalf("Get: %v", err)
-	}
-	if inst.Name != "garm-r-9" || inst.Status != "running" {
-		t.Fatalf("Get instance=%+v", inst)
+	if inst, err := b.Get(context.Background(), "garm-r-9"); err == nil {
+		t.Fatalf("Get invented %+v without an enumeration", inst)
 	}
 }
 
