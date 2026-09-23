@@ -189,7 +189,6 @@ jobs:
           checks=""
           if [ -f flake.nix ]; then
             shells=$(attr_names devShells)
-            checks=$(attr_names checks)
           else
             probed+=("no flake.nix")
           fi
@@ -201,7 +200,11 @@ jobs:
           fi
           probed+=("devShells.$system.pre-commit")
 
-          # 2. A git-hooks.nix check derivation.
+          # 2. A git-hooks.nix check derivation. (`checks` is probed only now:
+          #    evaluating its names can be slow, and tier 1 does not need it.)
+          if [ -f flake.nix ]; then
+            checks=$(attr_names checks)
+          fi
           for c in pre-commit-check pre-commit; do
             if has "$checks" "$c"; then
               run_check "$c"
