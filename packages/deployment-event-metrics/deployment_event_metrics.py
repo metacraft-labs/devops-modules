@@ -324,12 +324,27 @@ def classify_operation(method: str) -> str:
     return "other"
 
 
+# The Attic vhost also serves the signed deployment manifests under
+# `/mcl-deployments/`, which carry their own location-level ACL and legitimately
+# answer 403 to callers outside it. Only a 403 on a CACHE path means a Nix
+# client was refused by the cache's network ACL (Attic itself answers a missing
+# or bad token with 401), so the two must not share one counter.
+DEPLOYMENT_MANIFEST_PREFIX = "/mcl-deployments/"
+
+
+def classify_path(uri: str) -> str:
+    return "deployments" if uri.startswith(DEPLOYMENT_MANIFEST_PREFIX) else "cache"
+
+
 def nginx_metrics(nginx_logs: list[str]) -> dict[tuple[str, tuple[tuple[str, str], ...]], Metric]:
     metrics: dict[tuple[str, tuple[tuple[str, str], ...]], Metric] = {}
     parse_errors: Counter = Counter()
     request_counts: Counter = Counter()
     byte_counts: Counter = Counter()
     object_failures: Counter = Counter()
+    # Zero-seeded so the FIRST cache-path 403 is an increase Prometheus can
+    # see (increase() over a series that appears at 1 reports nothing).
+    forbidden: Counter = Counter({("cache", "GET"): 0, ("cache", "HEAD"): 0})
 
     def set_metric(name: str, labels: dict[str, object], value: float | int) -> None:
         key = metric_key(name, labels)
@@ -368,6 +383,9 @@ def nginx_metrics(nginx_logs: list[str]) -> dict[tuple[str, tuple[tuple[str, str
             if operation in {"upload", "download"} and status_int >= 400:
                 object_failures[(operation, method, status)] += 1
 
+            if status_int == 403:
+                forbidden[(classify_path(str(entry.get("uri", ""))), method)] += 1
+
     for source, count in parse_errors.items():
         set_metric("mcl_attic_nginx_log_parse_errors_total", {"source": source}, count)
 
@@ -395,6 +413,14 @@ def nginx_metrics(nginx_logs: list[str]) -> dict[tuple[str, tuple[tuple[str, str
             count,
         )
 
+    for key, count in forbidden.items():
+        path_class, method = key
+        set_metric(
+            "mcl_attic_nginx_forbidden_total",
+            {"path_class": path_class, "method": method},
+            count,
+        )
+
     return metrics
 
 
@@ -415,6 +441,7 @@ HELP_TEXT = {
     "mcl_attic_nginx_requests_total": "Count of Attic nginx requests by cache operation, method, and status.",
     "mcl_attic_nginx_bytes_total": "Attic nginx byte volume by cache operation, direction, and status.",
     "mcl_attic_nginx_cache_object_failures_total": "Count of failed Attic cache object requests.",
+    "mcl_attic_nginx_forbidden_total": "Count of Attic vhost HTTP 403 responses by path class (cache = refused by the cache network ACL; deployments = /mcl-deployments/ manifest ACL) and method.",
     "mcl_attic_nginx_log_parse_errors_total": "Count of Attic nginx access log parse errors by source.",
 }
 
@@ -744,6 +771,26 @@ def self_test() -> None:
                             "body_bytes_sent": "64",
                         }
                     ),
+                    json.dumps(
+                        {
+                            "time": "2026-05-13T09:00:02+00:00",
+                            "method": "GET",
+                            "uri": "/cache/nix-cache-info",
+                            "status": "403",
+                            "request_length": "200",
+                            "body_bytes_sent": "146",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "time": "2026-05-13T09:00:03+00:00",
+                            "method": "GET",
+                            "uri": "/mcl-deployments/app-server-01/latest.json",
+                            "status": "403",
+                            "request_length": "200",
+                            "body_bytes_sent": "146",
+                        }
+                    ),
                 ]
             )
             + "\n"
@@ -770,6 +817,9 @@ def self_test() -> None:
             'mcl_deployment_in_progress_age_seconds{cache="cache",controller="direct-ssh",phase="switch",status="running",target="app-server-02",transport="direct-ssh"} 50',
             'mcl_attic_nginx_requests_total{method="PUT",operation="upload",status="200"} 1',
             'mcl_attic_nginx_cache_object_failures_total{method="GET",operation="download",status="404"} 1',
+            'mcl_attic_nginx_forbidden_total{method="GET",path_class="cache"} 1',
+            'mcl_attic_nginx_forbidden_total{method="GET",path_class="deployments"} 1',
+            'mcl_attic_nginx_forbidden_total{method="HEAD",path_class="cache"} 0',
         ]
         missing = [line for line in required if line not in output]
         if missing:
