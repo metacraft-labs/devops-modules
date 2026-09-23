@@ -94,8 +94,39 @@ else
   echo "WARN[$gate]: could not load HEAD engine for byte-for-byte diff (skipping that sub-check)" >&2
 fi
 
+# --- (4) the "git_lfs" PRODUCT is ProductPricing; the LFS leaf SKUs stay ------
+# SkuPricing; `alerting` overrides reach the body and default to off ----------
+# GitHub accepts `budget_product_sku = "git_lfs"` as an org ProductPricing
+# budget (live: metacraft-labs 1592fa29). An adoption must not try to flip it to
+# SkuPricing (budget_type is a tracked field).
+lfs_expr='{ useS3Backend = false; budgets."example-lfs" = {
+  alerting = { recipients = [ "org-default" ]; };
+  productSkus = [
+    { sku = "git_lfs"; id = "1592fa29-0000-0000-0000-000000000000";
+      alerting = { recipients = [ "a" "b" ]; }; }
+    "git_lfs_storage"
+    { sku = "git_lfs_bandwidth"; alerting = null; }
+  ]; }; }'
+lfs="$(nix eval --json --impure --expr "(import ${engine} ${lfs_expr}).resource.restful_resource")"
+lfs_field() { jq -c ".example_lfs_${1}.body.${2}" <<<"$lfs"; }
+[[ "$(lfs_field git_lfs budget_type)" == '"ProductPricing"' ]] \
+  || err "the git_lfs PRODUCT must infer ProductPricing, got $(lfs_field git_lfs budget_type)"
+[[ "$(lfs_field git_lfs_storage budget_type)" == '"SkuPricing"' ]] \
+  || err "git_lfs_storage must stay SkuPricing, got $(lfs_field git_lfs_storage budget_type)"
+[[ "$(lfs_field git_lfs_bandwidth budget_type)" == '"SkuPricing"' ]] \
+  || err "git_lfs_bandwidth must stay SkuPricing, got $(lfs_field git_lfs_bandwidth budget_type)"
+[[ "$(lfs_field git_lfs budget_alerting)" == '{"alert_recipients":["a","b"],"will_alert":true}' ]] \
+  || err "a per-SKU alerting override must reach the body, got $(lfs_field git_lfs budget_alerting)"
+[[ "$(lfs_field git_lfs_storage budget_alerting)" == '{"alert_recipients":["org-default"],"will_alert":true}' ]] \
+  || err "the org-level alerting default must apply, got $(lfs_field git_lfs_storage budget_alerting)"
+[[ "$(lfs_field git_lfs_bandwidth budget_alerting)" == '{"alert_recipients":[],"will_alert":false}' ]] \
+  || err "alerting = null must render alerts OFF, got $(lfs_field git_lfs_bandwidth budget_alerting)"
+# Without any override the legacy/multi renders keep alerts off (unchanged).
+[[ "$(jq -c '.example_legacy.body.budget_alerting' <<<"$new_render")" == '{"alert_recipients":[],"will_alert":false}' ]] \
+  || err "default budget_alerting must stay off"
+
 if [[ "$fail" == "0" ]]; then
-  echo "PASS: $gate (3 multi-SKU budgets: actions+packages+git_lfs_storage; legacy actions budget = HEAD + the two intended fixes)"
+  echo "PASS: $gate (3 multi-SKU budgets: actions+packages+git_lfs_storage; git_lfs product = ProductPricing; alerting overrides; legacy actions budget = HEAD + the two intended fixes)"
 else
   exit 1
 fi
