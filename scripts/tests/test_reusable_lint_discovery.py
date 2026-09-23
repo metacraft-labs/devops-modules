@@ -227,29 +227,17 @@ def main() -> None:
             ["develop pre-commit", f"prek {RUN_ARGS}"],
         )
 
-        # 2. git-hooks.nix checks, pre-commit-check preferred over pre-commit.
+        # 2. Dev shells: hooks before lint before default; a shell without a
+        #    config/runner falls through; a red hook run does NOT fall through.
+        #    A hook-carrying dev shell wins over a check derivation.
         expect(
-            "check pre-commit-check",
-            h.run("chk", shells="default", checks="package pre-commit pre-commit-check"),
-            0,
-            [f"build .#checks.{SYSTEM}.pre-commit-check"],
-        )
-        expect(
-            "check pre-commit",
-            h.run("chk2", shells="default", checks="package pre-commit",
+            "default shell preferred over the check",
+            h.run("shell-over-check", shells="default", checks="package pre-commit-check",
                   hook_shells="default"),
             0,
-            [f"build .#checks.{SYSTEM}.pre-commit"],
+            ["develop default", f"prek {RUN_ARGS}"],
+            contains=["nix develop --no-write-lock-file --accept-flake-config .#default"],
         )
-        expect(
-            "check red propagates",
-            h.run("chk3", checks="pre-commit-check", extra_env={"FAKE_BUILD_RC": "1"}),
-            1,
-            [f"build .#checks.{SYSTEM}.pre-commit-check"],
-        )
-
-        # 3. Dev shells: hooks before lint before default; a shell without a
-        #    config/runner falls through; a red hook run does NOT fall through.
         expect(
             "hooks shell",
             h.run("hooks", shells="ci default hooks", checks="", hook_shells="hooks default"),
@@ -271,9 +259,31 @@ def main() -> None:
         expect(
             "red hooks in a shell do not fall through",
             h.run("red", shells="hooks default", hook_shells="hooks default",
-                  extra_env={"FAKE_HOOK_RC": "1"}),
+                  checks="pre-commit-check", extra_env={"FAKE_HOOK_RC": "1"}),
             1,
             ["develop hooks", f"prek {RUN_ARGS}"],
+        )
+
+        # 3. git-hooks.nix checks when no shell carries the hooks,
+        #    pre-commit-check preferred over pre-commit.
+        expect(
+            "check pre-commit-check after a hookless default shell",
+            h.run("chk", shells="default", checks="package pre-commit pre-commit-check"),
+            0,
+            ["develop default", f"build .#checks.{SYSTEM}.pre-commit-check"],
+            contains=["nix build -L --no-link --no-write-lock-file"],
+        )
+        expect(
+            "check pre-commit",
+            h.run("chk2", shells="", checks="package pre-commit"),
+            0,
+            [f"build .#checks.{SYSTEM}.pre-commit"],
+        )
+        expect(
+            "check red propagates",
+            h.run("chk3", checks="pre-commit-check", extra_env={"FAKE_BUILD_RC": "1"}),
+            1,
+            [f"build .#checks.{SYSTEM}.pre-commit-check"],
         )
 
         # 4. Committed config with no usable flake entry point.
