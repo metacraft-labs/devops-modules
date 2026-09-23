@@ -84,6 +84,12 @@ struct NixCommand
                 commandName,
             ] ~ args ~ path;
 
+            // In the unit-test binary every Nix call is time-bounded, so a
+            // stuck evaluation or fetch fails the test instead of occupying a
+            // CI runner until the job-level timeout.
+            version (unittest)
+                command = ["timeout", "--kill-after=30s", "10m"] ~ command;
+
             auto output = command.execute(printCommand: printCommand, throwOnError: true).strip();
 
             static if (is(T == JSONValue))
