@@ -60,7 +60,7 @@ git am --3way "${HERE}/fix.patch"
 #        named production server and `codetracer-ci` is a PRIVATE repository.
 #        The numeric run IDs and scale-set UUIDs are opaque and are kept, so
 #        the fixture still stands for something concrete. Same rule as PR.md
-#        (see ../CLAUDE.md: "written for a public upstream audience — no
+#        (see ../AGENTS.md: "written for a public upstream audience — no
 #        private infra details"), and the same class of scrub as
 #        `chore: scrub recon-grade private names from deployment fixtures/tests`.
 sed -e '/^\/\/ Gate t_garm_stale_scaleset_job_reaped/,/^\/\/ WHAT IS UNDER TEST$/{/^\/\/ WHAT IS UNDER TEST$/!d}' \
