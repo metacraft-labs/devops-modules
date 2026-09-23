@@ -12,10 +12,27 @@ to consumer repos.
   unlimited**. Self-hosted is free too. The **only** way a public repo incurs
   charges is a **larger or GPU** hosted runner — those bill from minute 0, and
   under the $0 org budget (RD1) they are _blocked_, not billed.
-- **Private repos**: a fixed monthly _included-minutes_ allowance (Free plan =
-  2,000 Linux min/org; Windows ×2, macOS ×10 against the allowance). Past the
-  allowance, the **$0 budget hard-stops** hosted jobs — they _fail to start_
-  with a billing message, never a bill.
+- **Private/internal repos**: a fixed monthly _included-minutes_ pool (Team
+  org = 3,000; Enterprise = 50,000, **pooled across every org of the
+  enterprise**). Since GitHub's enhanced-billing platform the pool is a
+  **dollar** allowance — included minutes × the Linux 2-core price ($0.006) —
+  drawn down by each SKU's gross price (Windows ≈1.67×, macOS ≈10.3× a Linux
+  minute), not by the old 1×/2×/10× multipliers. Measured on live data
+  2026-09: the schelling-point-labs pool stopped jobs at $300.87 gross after
+  34,005 raw minutes (a 2× Windows multiplier would have exhausted it two days
+  earlier), and metacraft-labs stopped at exactly $18.00. Past the pool, the
+  **$0 budget hard-stops** hosted jobs — they _fail to start_ ("The job was
+  not started because … your spending limit needs to be increased"), never a
+  bill.
+- **Reading it**: the classic `GET /orgs/{org}/settings/billing/actions`
+  endpoint returns **HTTP 410** since the migration. The workflows below read
+  the enhanced usage report (`GET /organizations/{org}/settings/billing/usage`,
+  or `/enterprises/{ent}/…` for a pooled enterprise) and derive the remaining
+  pool as `included − Σ gross(minutes rows not in a public repo) / $0.006` —
+  the report's discount column mixes free public-repo usage with pool usage,
+  so public repos are excluded by name. The logic is one shared
+  `billing_remaining` shell function, kept byte-identical across the three
+  workflows (gated by `t_runner_mode_manager`).
 
 The two mechanisms below turn those facts into policy that cannot be violated by
 accident.
@@ -50,9 +67,18 @@ GitHub has **no** native hosted↔self-hosted fallback, so
    `true` → hosted, `false` → self-hosted. _This is the production default_
    — no per-run billing API call, no admin token in every workflow.
 3. **Private repo, `GH_HOSTED_OK` unset + a `billing_token` secret** → a live
-   `GET /orgs/{org}/settings/billing/actions` check against a
-   `min_minutes_remaining` buffer. Bootstrap / belt-and-braces.
-4. **No signal** → self-hosted (fail-safe; never risk a blocked/paid job).
+   enhanced-billing usage check (`billing_remaining`, see above) against a
+   `min_minutes_remaining` buffer; any read failure → self-hosted, never a
+   failed preflight. Bootstrap / belt-and-braces.
+
+**Where the preflight runs.** A private repo's hosted job cannot start once the
+pool is exhausted, and a preflight that never starts skips every downstream
+`needs: choose` job. So `decide` runs on free `ubuntu-latest` only when hosted is
+already known affordable from job-level contexts (public repo,
+`CI_RUNNER_MODE=github-hosted`, or `CI_RUNNER_MODE` unset with
+`GH_HOSTED_OK=true`); otherwise it runs on the self-hosted `preflight_runner`
+(default `["self-hosted","linux","x64"]`). The two cron workflows below apply
+the same rule to themselves via a `runner` input. 4. **No signal** → self-hosted (fail-safe; never risk a blocked/paid job).
 
 Consumer pattern (with the reactive safety net):
 
@@ -93,7 +119,14 @@ on:
 jobs:
   sync:
     uses: metacraft-labs/devops-modules/.github/workflows/reusable-sync-hosted-minutes.yml@dev
-    with: { org: metacraft-labs, min_minutes_remaining: 300 }
+    with:
+      {
+        org: metacraft-labs,
+        min_minutes_remaining: 300,
+        included_minutes: 3000,
+      }
+    # enterprise-plan org: add `enterprise: schelling-point-labs` and
+    # `included_minutes: 50000` (and an enterprise-billing token)
     secrets:
       billing_token: ${{ secrets.ORG_BILLING_READ_TOKEN }}
       variables_token: ${{ secrets.ORG_VARIABLES_WRITE_TOKEN }}
@@ -101,14 +134,14 @@ jobs:
 
 ## Operator prerequisites
 
-| Item                        | What                                                                                                                                        | Scope   |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `ORG_BILLING_READ_TOKEN`    | Reads `GET /orgs/{org}/settings/billing/actions`. Classic PAT `admin:org`/`repo`, or a GitHub App install token with org **billing: read**. | per org |
-| `ORG_VARIABLES_WRITE_TOKEN` | Writes the `GH_HOSTED_OK` org variable. Fine-grained token with org **Variables: read/write** (may equal the billing token if it has both). | per org |
-| Cron wrapper                | One `sync-hosted-minutes.yml` per org (`metacraft-labs`, `blocksense-network`, `agent-harbor`) in an ops repo, on a ~30-min schedule.       | per org |
-| `GH_HOSTED_OK` seed         | Optional: set it to `true` initially so private repos start on hosted before the first cron run.                                            | per org |
-| Verify allowance            | Confirm each org's `included_minutes` on its live Billing page — the whole private-repo path depends on this number. Free = 2,000.          | per org |
-| `$0` budget (RD1)           | The hard guarantee that a wrong estimate can only ever _fail_ a hosted job, never bill. Must be live for all three orgs.                    | per org |
+| Item                        | What                                                                                                                                                                                                                                                                                                          | Scope   |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
+| `ORG_BILLING_READ_TOKEN`    | Reads the enhanced usage report (`/organizations/{org}/settings/billing/usage`) + the org's public-repo list. Classic PAT `admin:org`, or a GitHub App install token with org **billing: read**. Enterprise-plan orgs need the **enterprise** report instead: a classic PAT with `manage_billing:enterprise`. | per org |
+| `ORG_VARIABLES_WRITE_TOKEN` | Writes the `GH_HOSTED_OK` org variable. Fine-grained token with org **Variables: read/write** (may equal the billing token if it has both).                                                                                                                                                                   | per org |
+| Cron wrapper                | One `sync-hosted-minutes.yml` per org (`metacraft-labs`, `blocksense-network`, `agent-harbor`) in an ops repo, on a ~30-min schedule.                                                                                                                                                                         | per org |
+| `GH_HOSTED_OK` seed         | Optional: set it to `true` initially so private repos start on hosted before the first cron run.                                                                                                                                                                                                              | per org |
+| Verify allowance            | Pass the pool size as `included_minutes`: Team org 3,000; Enterprise 50,000 (pooled — set `enterprise` too); Free 2,000.                                                                                                                                                                                      | per org |
+| `$0` budget (RD1)           | The hard guarantee that a wrong estimate can only ever _fail_ a hosted job, never bill. Must be live for all three orgs.                                                                                                                                                                                      | per org |
 
 `GITHUB_TOKEN` **cannot** read billing or write org variables — both dedicated
 tokens are required.
@@ -117,7 +150,7 @@ tokens are required.
 
 Pilot: **`codetracer-test-mirror`** (private, small) — wired end to end
 (`choose` + guard + `continue-on-error`/`if: failure()` retry; macOS routed
-straight to self-hosted per the 10× multiplier).
+straight to self-hosted — a macOS minute draws ~10.3× a Linux minute from the pool).
 
 Staged rollout, safest-first — **do not flag-day**:
 
