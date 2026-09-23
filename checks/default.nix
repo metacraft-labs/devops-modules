@@ -40,6 +40,7 @@
     ./garm-macos-runner-install-wrapper.nix
     ./garm-provider-vmharness-backend.nix
     ./garm-provider-remote.nix
+    ./garm-provider-remote-old-daemon.nix
     ./garm-remote-incus-capabilities.nix
     ./garm-central-multi-host.nix
     ./garm-central-recovery.nix

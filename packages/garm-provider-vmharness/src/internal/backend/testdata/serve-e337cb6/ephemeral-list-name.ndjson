@@ -1,0 +1,247 @@
+{"v":"1","type":"log","line":"vm-harness: unknown subcommand 'ephemeral-list'"}
+{"v":"1","type":"log","line":"vm-harness <subcommand> [flags]"}
+{"v":"1","type":"log","line":""}
+{"v":"1","type":"log","line":"Subcommands:"}
+{"v":"1","type":"log","line":"  provision               Ensure a baseline image exists (idempotent)."}
+{"v":"1","type":"log","line":"  boot                    Boot ISO/QCOW2/VHDX media in a transient VM."}
+{"v":"1","type":"log","line":"                          Use --keep to leave it running, or --expect REGEX"}
+{"v":"1","type":"log","line":"                          to assert a serial boot marker and clean it up."}
+{"v":"1","type":"log","line":"  install                 Boot an ISO into a caller-owned target disk, require"}
+{"v":"1","type":"log","line":"                          a serial success marker and clean guest shutdown,"}
+{"v":"1","type":"log","line":"                          then remove the transient VM but preserve the disk."}
+{"v":"1","type":"log","line":"  run                     One-shot revert + exec + harvest + cleanup."}
+{"v":"1","type":"log","line":"  ephemeral-destroy       libvirt/incus: reclaim an ephemeral instance left"}
+{"v":"1","type":"log","line":"                          running by `run --ephemeral --keep` (destroy +"}
+{"v":"1","type":"log","line":"                          undefine --nvram + remove overlay/config-drive/"}
+{"v":"1","type":"log","line":"                          nvram — no residue). Requires --baseline."}
+{"v":"1","type":"log","line":"  instance wait <name>    Wait for an existing Incus container to accept exec."}
+{"v":"1","type":"log","line":"  instance exec <name> -- <command...>"}
+{"v":"1","type":"log","line":"                          Execute argv in an existing Incus container."}
+{"v":"1","type":"log","line":"  instance copy-to <name> <host-path> <guest-path>"}
+{"v":"1","type":"log","line":"  instance copy-from <name> <guest-path> <host-path>"}
+{"v":"1","type":"log","line":"                          Transfer a file or directory through the backend."}
+{"v":"1","type":"log","line":"  instance start <name>   Start and await an existing Incus container."}
+{"v":"1","type":"log","line":"  instance stop <name>    Stop an existing Incus container without deleting it."}
+{"v":"1","type":"log","line":"  instance <start|ssh|exec|status|logs|stop|destroy|screenshot> <name>"}
+{"v":"1","type":"log","line":"        --state-dir <root> [--instance-id <uuid>]"}
+{"v":"1","type":"log","line":"                          Linux/libvirt durable media lifecycle. Start also"}
+{"v":"1","type":"log","line":"                          restores a default-destroyed instance from saved XML."}
+{"v":"1","type":"log","line":"                          Bare ssh is interactive; exec takes argv after --."}
+{"v":"1","type":"log","line":"                          status/start emit status with --log-format json."}
+{"v":"1","type":"log","line":"                          logs accepts --follow; screenshot requires --screenshot."}
+{"v":"1","type":"log","line":"                          stop/destroy accept --force for hard poweroff."}
+{"v":"1","type":"log","line":"                          destroy preserves data unless --purge AND --instance-id"}
+{"v":"1","type":"log","line":"                          are supplied. Purge never removes caller-owned inputs."}
+{"v":"1","type":"log","line":"  probe                   Print available backends as JSON."}
+{"v":"1","type":"log","line":"  manifest                Print THIS host's capability manifest as JSON (RA6)."}
+{"v":"1","type":"log","line":"                          With --remote <addr>, fetch the remote daemon's"}
+{"v":"1","type":"log","line":"                          SIGNED identity + manifest over GET /v1/manifest."}
+{"v":"1","type":"log","line":"  shell                   (placeholder) Open an interactive shell into a baseline."}
+{"v":"1","type":"log","line":"  backends                Tabular listing of every known backend."}
+{"v":"1","type":"log","line":"  snapshot create [--running] <vm> <name>"}
+{"v":"1","type":"log","line":"                          Take a named snapshot of <vm>. With --running, the"}
+{"v":"1","type":"log","line":"                          snapshot includes memory + CPU + device state and"}
+{"v":"1","type":"log","line":"                          restore is a memory load rather than a fresh boot"}
+{"v":"1","type":"log","line":"                          (Hyper-V: Standard Checkpoint; Tart: tart suspend"}
+{"v":"1","type":"log","line":"                          — planned)."}
+{"v":"1","type":"log","line":"  snapshot restore <vm> <name>"}
+{"v":"1","type":"log","line":"                          Restore <vm> from snapshot <name>."}
+{"v":"1","type":"log","line":"  snapshot list <vm>      List snapshots for <vm>."}
+{"v":"1","type":"log","line":"  baseline export <vm> <dest-dir> [--baseline <name>]"}
+{"v":"1","type":"log","line":"                          Export a baseline VM (and its snapshot tree) to"}
+{"v":"1","type":"log","line":"                          <dest-dir> as a self-contained, transferable"}
+{"v":"1","type":"log","line":"                          artifact. --baseline asserts the named snapshot"}
+{"v":"1","type":"log","line":"                          exists before exporting."}
+{"v":"1","type":"log","line":"  baseline import <src-dir>"}
+{"v":"1","type":"log","line":"                          Import a previously-exported baseline bundle."}
+{"v":"1","type":"log","line":"                          Prints the snapshot names now available."}
+{"v":"1","type":"log","line":"  layer gc <layer-path> --image-pool-dir <dir> [--dry-run]"}
+{"v":"1","type":"log","line":"                          Delete a base image / snapshot / backing file --"}
+{"v":"1","type":"log","line":"                          REFUSING with exit 3, and naming the referent, while"}
+{"v":"1","type":"log","line":"                          any overlay, defined domain, container or snapshot"}
+{"v":"1","type":"log","line":"                          still resolves onto it. Deleting a layer under a"}
+{"v":"1","type":"log","line":"                          live overlay destroys that overlay outright, so"}
+{"v":"1","type":"log","line":"                          there is no warn-and-continue mode."}
+{"v":"1","type":"log","line":"  layer sweep-overlays --image-pool-dir <dir> [--older-than <sec>] [--dry-run]"}
+{"v":"1","type":"log","line":"                          Remove per-job CoW overlays that no defined instance"}
+{"v":"1","type":"log","line":"                          owns and that are older than the age guard (default"}
+{"v":"1","type":"log","line":"                          86400s). A base image has no backing file and is"}
+{"v":"1","type":"log","line":"                          therefore never a candidate. Reports reclaimed bytes"}
+{"v":"1","type":"log","line":"                          as BOTH apparent and allocated: a CoW overlay is"}
+{"v":"1","type":"log","line":"                          sparse and one number alone misstates it by orders"}
+{"v":"1","type":"log","line":"                          of magnitude."}
+{"v":"1","type":"log","line":"  prune --ephemeral-prefix <p> [--backend all|tart|qemu-windows-arm]"}
+{"v":"1","type":"log","line":"        [--state-dir <dir>] [--tart-vms-dir <dir>] [--older-than <sec>]"}
+{"v":"1","type":"log","line":"        [--sweep-tmp] [--dry-run]"}
+{"v":"1","type":"log","line":"                          Reclaim ephemeral instances/clones leaked by"}
+{"v":"1","type":"log","line":"                          hard-killed launchers, scoped to --ephemeral-prefix."}
+{"v":"1","type":"log","line":"                          A running instance (advisory lock held, or creator"}
+{"v":"1","type":"log","line":"                          PID alive) is never removed. --older-than guards the"}
+{"v":"1","type":"log","line":"                          PID-fallback path (default 3600s; 0 disables)."}
+{"v":"1","type":"log","line":"                          The tart sweep also reclaims VM directories that"}
+{"v":"1","type":"log","line":"                          `tart list` cannot see because they carry no"}
+{"v":"1","type":"log","line":"                          disk.img — `tart delete` cannot reach those, so"}
+{"v":"1","type":"log","line":"                          nothing else can. --tart-vms-dir names Tart's VM"}
+{"v":"1","type":"log","line":"                          directory explicitly (default $TART_HOME/vms)."}
+{"v":"1","type":"log","line":"                          --sweep-tmp also age-removes transient /tmp scratch"}
+{"v":"1","type":"log","line":"                          files (SSH password files, mount-share scripts)."}
+{"v":"1","type":"log","line":"                          --dry-run reports what would be reclaimed."}
+{"v":"1","type":"log","line":""}
+{"v":"1","type":"log","line":"Common flags:"}
+{"v":"1","type":"log","line":"  --backend <auto|noop|hyperv|wsl|tart-macos|tart-linux-arm|"}
+{"v":"1","type":"log","line":"             utm-windows-arm|qemu-windows-arm|libvirt|lima>"}
+{"v":"1","type":"log","line":"  --guest <linux|windows|macos>   Required when --backend auto."}
+{"v":"1","type":"log","line":"  --baseline <name>               Logical baseline tag (== libvirt domain name)."}
+{"v":"1","type":"log","line":"  --name <vm>                     Alias for --baseline (canonical libvirt M4"}
+{"v":"1","type":"log","line":"                                  command shape; see docs/m4-libvirt.md)."}
+{"v":"1","type":"log","line":"                                  With boot --keep --state-dir, durable name."}
+{"v":"1","type":"log","line":"  --state-dir <root>             Durable boot/instance receipts and owned disks."}
+{"v":"1","type":"log","line":"  --instance-id <uuid>           Expected actual libvirt UUID (optional ownership"}
+{"v":"1","type":"log","line":"                                  precondition; required for destroy --purge)."}
+{"v":"1","type":"log","line":"  --lock-timeout-sec <sec>       Durable operation lock wait, 0..300 (default 10)."}
+{"v":"1","type":"log","line":"  --recipe <id>                   Selects guest-recipes/<id>/ as the source of"}
+{"v":"1","type":"log","line":"                                  per-baseline artifacts (autounattend.xml,"}
+{"v":"1","type":"log","line":"                                  build-autounattend-iso.sh, ...). Required by"}
+{"v":"1","type":"log","line":"                                  backends that consume recipe-shaped inputs."}
+{"v":"1","type":"log","line":"  --source-image <ref>"}
+{"v":"1","type":"log","line":"  --secondary-iso <path>          `boot`/`install`: attach a second read-only ISO."}
+{"v":"1","type":"log","line":"  --target-disk <path>            `install`: create and preserve this blank disk."}
+{"v":"1","type":"log","line":"  --kind <auto|iso|qcow2|vhdx|rootfs-tar|kernel>"}
+{"v":"1","type":"log","line":"                                  Media kind for `boot` (default: extension)."}
+{"v":"1","type":"log","line":"                                  `kernel` direct-boots --source-image as a"}
+{"v":"1","type":"log","line":"                                  Linux kernel (qemu-boot backend); pair it"}
+{"v":"1","type":"log","line":"                                  with --initrd and --kernel-cmdline below."}
+{"v":"1","type":"log","line":"  --expect <regex>                `boot`: wait for a serial-console match."}
+{"v":"1","type":"log","line":"  --wait-for-shutdown             `boot`: require a clean guest poweroff after"}
+{"v":"1","type":"log","line":"                                  the serial assertion before cleanup."}
+{"v":"1","type":"log","line":"  --generation <1|2>             `boot`: legacy BIOS or UEFI (default: 2,"}
+{"v":"1","type":"log","line":"                                  or 1 for --kind kernel)."}
+{"v":"1","type":"log","line":"  --tpm                          `boot`: attach a virtual TPM 2.0 (swtpm)."}
+{"v":"1","type":"log","line":"  --secure-boot                  `boot`: request a secure-boot firmware"}
+{"v":"1","type":"log","line":"                                  profile (needs key-enrolled OVMF vars)."}
+{"v":"1","type":"log","line":"  --acceleration <auto|kvm|tcg> `boot`: execution mode (default: auto)."}
+{"v":"1","type":"log","line":"  --graphics <none|vnc|spice>    `boot`: graphical console (default: none)."}
+{"v":"1","type":"log","line":"  --video <model>                `boot`: video model (default: virtio)."}
+{"v":"1","type":"log","line":"  --viewer                       `boot`: open virt-viewer for libvirt and"}
+{"v":"1","type":"log","line":"                                  clean up when the window closes."}
+{"v":"1","type":"log","line":"  --screenshot <path>            `boot`: capture the graphical console after"}
+{"v":"1","type":"log","line":"                                  --expect succeeds, then clean up by default."}
+{"v":"1","type":"log","line":"  --screenshot-delay-sec <int>   `boot`: settle time after --expect before"}
+{"v":"1","type":"log","line":"                                  capture (default: 0)."}
+{"v":"1","type":"log","line":"  --ssh-forward-port <port|auto> `boot`: forward a loopback host port to"}
+{"v":"1","type":"log","line":"                                  guest TCP 22 (`auto` selects a free port)."}
+{"v":"1","type":"log","line":"  --ssh-user <name>              `boot`: SSH user for a command after `--`."}
+{"v":"1","type":"log","line":"  --ssh-password-env <name>      `boot`: environment variable containing the"}
+{"v":"1","type":"log","line":"                                  SSH password; the value is never put in argv."}
+{"v":"1","type":"log","line":"  --ssh-private-key <path>       `boot`: private key for key-only SSH."}
+{"v":"1","type":"log","line":"  --ssh-known-hosts <path>       `boot`: persist and verify the guest host key."}
+{"v":"1","type":"log","line":"  --ssh-host-key-alias <name>    `boot`: stable host identity across forwarded"}
+{"v":"1","type":"log","line":"                                  port changes; requires --ssh-known-hosts."}
+{"v":"1","type":"log","line":"  --cpus <int>                    Backend default applies when omitted."}
+{"v":"1","type":"log","line":"  --vcpu <int>                    Alias for --cpus (canonical libvirt M4 shape)."}
+{"v":"1","type":"log","line":"  --memory-mb <int>"}
+{"v":"1","type":"log","line":"  --memory-gb <int>               Alias for --memory-mb, expressed in GiB."}
+{"v":"1","type":"log","line":"  --disk-gb <int>"}
+{"v":"1","type":"log","line":"  --network-bridge <name>         libvirt-only: host bridge for the guest NIC"}
+{"v":"1","type":"log","line":"                                  (default: backend's configured value, e.g."}
+{"v":"1","type":"log","line":"                                  virbr0). Ignored by other backends."}
+{"v":"1","type":"log","line":"  --image-pool-dir <dir>          libvirt-only: directory the domain's qcow2"}
+{"v":"1","type":"log","line":"                                  disk is written to; the disk lands at"}
+{"v":"1","type":"log","line":"                                  <dir>/<name>.qcow2. Use it when your storage"}
+{"v":"1","type":"log","line":"                                  lives outside the default"}
+{"v":"1","type":"log","line":"                                  /var/lib/libvirt/images (e.g. a ZFS pool at"}
+{"v":"1","type":"log","line":"                                  /storage). Ignored by other backends."}
+{"v":"1","type":"log","line":"  --first-boot-script <path>      libvirt-only: host path to a script the"}
+{"v":"1","type":"log","line":"                                  recipe wraps into the per-VM autounattend"}
+{"v":"1","type":"log","line":"                                  ISO. Requires --recipe."}
+{"v":"1","type":"log","line":"  --provision-script <path>       lima-only (repeatable): host path to a shell"}
+{"v":"1","type":"log","line":"                                  script baked into the generated Lima"}
+{"v":"1","type":"log","line":"                                  template's provision: block so every per-gate"}
+{"v":"1","type":"log","line":"                                  ephemeral boots already provisioned."}
+{"v":"1","type":"log","line":"  --controller-pubkey <path>      libvirt-only: SSH public key the recipe"}
+{"v":"1","type":"log","line":"                                  bakes into the autounattend ISO so the"}
+{"v":"1","type":"log","line":"                                  guest's FirstLogonCommands installs it in"}
+{"v":"1","type":"log","line":"                                  authorized_keys before first boot."}
+{"v":"1","type":"log","line":"                                  Requires --recipe."}
+{"v":"1","type":"log","line":"  --ephemeral                     run ONE per-job clone VM then destroy it, no"}
+{"v":"1","type":"log","line":"                                  residue (the per-job reset the GARM provider"}
+{"v":"1","type":"log","line":"                                  drives). libvirt: CoW overlay from"}
+{"v":"1","type":"log","line":"                                  --golden-image booted on KVM. incus: fresh"}
+{"v":"1","type":"log","line":"                                  container from --base-image. hyperv (RA4):"}
+{"v":"1","type":"log","line":"                                  New-VHD/New-VM clone of the --golden-image"}
+{"v":"1","type":"log","line":"                                  VHDX, boot, JIT-probe, Remove-VM (see the"}
+{"v":"1","type":"log","line":"                                  VMH_HYPERV_* env seams). A positional arg"}
+{"v":"1","type":"log","line":"                                  after -- is a serial marker (libvirt) or the"}
+{"v":"1","type":"log","line":"                                  in-guest probe command (incus/hyperv)."}
+{"v":"1","type":"log","line":"  --keep                          Leave a `boot` VM running, or keep an"}
+{"v":"1","type":"log","line":"                                  ephemeral clone after startup."}
+{"v":"1","type":"log","line":"  --golden-image <path>           libvirt/hyperv: the golden image the"}
+{"v":"1","type":"log","line":"                                  ephemeral clone is derived from (libvirt: a"}
+{"v":"1","type":"log","line":"                                  qcow2 CoW backing file; hyperv: a golden"}
+{"v":"1","type":"log","line":"                                  VHDX). Requires --ephemeral."}
+{"v":"1","type":"log","line":"  --incus-security-nesting       Incus run --ephemeral only: configure"}
+{"v":"1","type":"log","line":"                                  security.nesting and the mknod/setxattr"}
+{"v":"1","type":"log","line":"                                  intercepts before first start."}
+{"v":"1","type":"log","line":"  --incus-nested-kvm             Incus run --ephemeral only: configure"}
+{"v":"1","type":"log","line":"                                  security.nesting and attach a fixed"}
+{"v":"1","type":"log","line":"                                  read/write /dev/kvm device before first"}
+{"v":"1","type":"log","line":"                                  start. Requires host nested KVM support."}
+{"v":"1","type":"log","line":"  --kernel <path>                 libvirt-only: optional direct-kernel-boot"}
+{"v":"1","type":"log","line":"                                  bzImage for --ephemeral (tiny Linux golden)."}
+{"v":"1","type":"log","line":"  --initrd <path>                 Initramfs for a direct-kernel boot: the"}
+{"v":"1","type":"log","line":"                                  libvirt --ephemeral clone, or `boot --kind"}
+{"v":"1","type":"log","line":"                                  kernel` on the qemu-boot backend."}
+{"v":"1","type":"log","line":"  --kernel-cmdline <str>          Kernel cmdline for the same two paths."}
+{"v":"1","type":"log","line":"  --output-dir <path>"}
+{"v":"1","type":"log","line":"  --ephemeral-prefix <prefix>     Backend-specific prefix for ephemeral VMs."}
+{"v":"1","type":"log","line":"  --env KEY=VAL                   (repeatable)"}
+{"v":"1","type":"log","line":"  --copy-to host:guest            (repeatable)"}
+{"v":"1","type":"log","line":"  --copy-from guest:host          (repeatable)"}
+{"v":"1","type":"log","line":"  --install-shim binary:logpath   (repeatable)"}
+{"v":"1","type":"log","line":"  --timeout-sec <int>"}
+{"v":"1","type":"log","line":"  --ssh-ready-timeout-sec <int>   Maximum wait for SSH before a boot command."}
+{"v":"1","type":"log","line":"  --log-format <human|json>"}
+{"v":"1","type":"log","line":"  --allow-noop-fallback           Use NoopBackend if the real one isn't installed."}
+{"v":"1","type":"log","line":"  --remote <host:port>            Route this subcommand to a remote"}
+{"v":"1","type":"log","line":"                                  `vm-harness serve` daemon (drives that host's"}
+{"v":"1","type":"log","line":"                                  VMs) instead of running it locally. Requires"}
+{"v":"1","type":"log","line":"                                  a bearer token (--auth-token/--auth-token-file"}
+{"v":"1","type":"log","line":"                                  or $VMH_SERVE_TOKEN). The daemon's output is"}
+{"v":"1","type":"log","line":"                                  streamed back live."}
+{"v":"1","type":"log","line":"  --auth-token <tok>              Bearer token (serve + --remote). Prefer"}
+{"v":"1","type":"log","line":"                                  --auth-token-file so the secret is not in argv."}
+{"v":"1","type":"log","line":"  --auth-token-file <path>        Read the bearer token from a file."}
+{"v":"1","type":"log","line":"  --                              End of flags; remainder is the gate command."}
+{"v":"1","type":"log","line":""}
+{"v":"1","type":"log","line":"serve daemon (RA1 remoting — the authenticated network access point):"}
+{"v":"1","type":"log","line":"  vm-harness serve --listen <host:port> [--auth-token-file <f> | --auth-token <t>]"}
+{"v":"1","type":"log","line":"                   [--worker-exe <path>] [--port-file <f>] [--quiet]"}
+{"v":"1","type":"log","line":"                   [--serve-threads <n>] [--exec-deadline-sec <n>]"}
+{"v":"1","type":"log","line":"                   [--enroll-secret-file <f>] [--identity-ttl-sec <n>]"}
+{"v":"1","type":"log","line":"                   [--host-id <name>]"}
+{"v":"1","type":"log","line":"    Expose the vm-harness CLI backend ops over a versioned HTTP/JSON RPC"}
+{"v":"1","type":"log","line":"    (protocol v1) so a remote controller can drive this host's VMs/containers."}
+{"v":"1","type":"log","line":"    Every op runs the SAME local vm-harness binary (a thin network front-end,"}
+{"v":"1","type":"log","line":"    not a reimplementation). Bind to a NetBird overlay IP only — NEVER a public"}
+{"v":"1","type":"log","line":"    interface. The bearer token also reads from $VMH_SERVE_TOKEN. Connections"}
+{"v":"1","type":"log","line":"    are served CONCURRENTLY by a pool of handler threads (--serve-threads,"}
+{"v":"1","type":"log","line":"    default: max(4, CPU count) capped at 32) behind a dedicated acceptor, so"}
+{"v":"1","type":"log","line":"    one slow op cannot stall others and a fully saturated pool answers 503"}
+{"v":"1","type":"log","line":"    rather than letting connections pile up unanswered. --exec-deadline-sec"}
+{"v":"1","type":"log","line":"    bounds ONE exec (default 46800 = 13h, sized above the 12h runner lifetime"}
+{"v":"1","type":"log","line":"    the GARM provider forwards) so a hung guest op cannot hold a slot forever."}
+{"v":"1","type":"log","line":"    See docs/serve.md."}
+{"v":"1","type":"log","line":""}
+{"v":"1","type":"log","line":"  RA6 enrollment / signed capability manifest (GET /v1/manifest):"}
+{"v":"1","type":"log","line":"  --enroll-secret-file <path>     Per-host enrollment secret (prefer over"}
+{"v":"1","type":"log","line":"                                  --enroll-secret; agenix/LoadCredential"}
+{"v":"1","type":"log","line":"                                  friendly). Also $VMH_ENROLL_SECRET; else a"}
+{"v":"1","type":"log","line":"                                  secret is self-bootstrapped under --state-dir."}
+{"v":"1","type":"log","line":"                                  The daemon prints its keyId at startup — enroll"}
+{"v":"1","type":"log","line":"                                  that keyId on the controller. See"}
+{"v":"1","type":"log","line":"                                  docs/serve-enrollment.md."}
+{"v":"1","type":"log","line":"  --enroll-secret <s>             The secret inline (avoid — visible in argv)."}
+{"v":"1","type":"log","line":"  --identity-ttl-sec <n>          Signed-identity lifetime (default 3600)."}
+{"v":"1","type":"log","line":"  --host-id <name>                Identity host label (default: OS hostname)."}
+{"v":"1","type":"log","line":""}
+{"v":"1","type":"exit","code":2}
