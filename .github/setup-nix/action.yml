@@ -80,6 +80,28 @@ inputs:
     type: boolean
     required: false
     default: false
+  fallback:
+    description: >-
+      Value of Nix's `fallback` setting. Default `false`. With `true`, one
+      transient download error makes Nix DISABLE that substituter for 60
+      seconds for the whole process, and every path it would have fetched is
+      scheduled for a source build instead — which is how a `nix develop` that
+      only needed `age` ended up building stdenv and hanging a job for 5 hours.
+      With `false`, a download that keeps failing after `download-attempts`
+      retries fails the job, loudly. Derivations that are in no cache are
+      still built either way; this only governs failed downloads.
+    required: false
+    default: 'false'
+  substituter-preflight:
+    description: >-
+      Probe every configured substituter's `nix-cache-info` (with the netrc Nix
+      will use) before anything asks Nix to substitute. `fail`: any unusable
+      cache fails the job with the diagnosed cause (401 no/bad token, 403
+      network ACL, unreachable). `warn` (default): cache.nixos.org must be
+      usable, other caches only produce a warning annotation. `off`: no probe.
+      See probe-substituters.sh.
+    required: false
+    default: 'warn'
   netbird-setup-key:
     description: Optional NetBird setup key. When set on a Linux GitHub-hosted runner, the action joins NetBird before configuring Nix substituters.
     required: false
@@ -397,16 +419,27 @@ runs:
             ''
           }}
 
-          fallback = true
-          download-attempts = 2
-          connect-timeout = 5
+          # See the `fallback` input: `true` turns one transient error into
+          # "substituter disabled for 60s" + a source build of the closure.
+          fallback = ${{ inputs.fallback == 'true' && 'true' || 'false' }}
+          download-attempts = 5
+          # `connect-timeout` is libcurl's CURLOPT_CONNECTTIMEOUT, and libcurl
+          # charges the time a transfer spends QUEUED for a free connection
+          # (`http-connections` is CURLMOPT_MAX_TOTAL_CONNECTIONS) against it.
+          # At 5s with an 8-connection pool, every narinfo/NAR queued behind
+          # eight busy NAR downloads failed with "Operation timed out after
+          # 5000 milliseconds with 0 bytes received" — no network fault at all
+          # — and with fallback on, that disabled cache.nixos.org. Keep the
+          # pool at Nix's default and give queued transfers real headroom;
+          # genuinely silent transfers are bounded by stalled-download-timeout.
+          connect-timeout = 60
           # Persistent self-hosted runners have observed a group of multiplexed
           # cache.nixos.org NAR transfers make no progress until the job ceiling.
-          # Bound silent transfers and prefer a smaller HTTP/1.1 pool so Nix can
-          # retry an individual object instead of wedging the whole substitution.
+          # Bound silent transfers and use HTTP/1.1 so Nix can retry an
+          # individual object instead of wedging the whole substitution.
           stalled-download-timeout = 30
           http2 = false
-          http-connections = 8
+          http-connections = 25
           narinfo-cache-negative-ttl = 120
           allow-import-from-derivation = true
           experimental-features = ${{ inputs.experimental-features }}
@@ -467,6 +500,20 @@ runs:
       env:
         SETUP_NIX_REQUIRED_EXPERIMENTAL_FEATURES: ${{ inputs.experimental-features }}
       run: bash "${{ github.action_path }}/verify-nix-config.sh"
+
+    # Prove the caches Nix was just told about are READABLE, with the netrc it
+    # will use, before any step asks it to substitute. An unreadable cache is
+    # otherwise one warning line followed by a source build of the closure.
+    - name: Probe binary caches
+      if: ${{ inputs.substituter-preflight != 'off' }}
+      shell: bash
+      env:
+        SETUP_NIX_PROBE_SUBSTITUTERS: https://cache.nixos.org ${{ inputs.substituters }}
+        SETUP_NIX_PROBE_MODE: ${{ inputs.substituter-preflight }}
+        SETUP_NIX_PROBE_TOKEN_SUPPLIED: ${{ inputs.attic-token != '' && 'true' || 'false' }}
+      run: |
+        SETUP_NIX_PROBE_NETRC="$HOME/.config/nix/netrc" \
+          bash "${{ github.action_path }}/probe-substituters.sh"
 
     - name: Start Attic watch-store
       if: ${{ inputs.attic-token != '' && inputs.attic-cache != '' }}
