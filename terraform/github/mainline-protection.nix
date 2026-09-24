@@ -42,7 +42,12 @@
 #   * `pullRequest`                  — THIS is "no direct push / PR-only": the
 #     ruleset `pull_request` rule requires a pull request to update the branch.
 #     A required approving-review count of 0 still enforces the PR gate; it only
-#     drops the approval requirement.
+#     drops the approval requirement. Emitted only when the mainline's policy
+#     class says `requirePullRequest` (absent = true, so a mainline is PR-only
+#     unless the policy explicitly opts it out — e.g. Metacraft's spec `latest`,
+#     which accepts direct pushes) AND the caller did not name the repository in
+#     `directPushRepos`. A class with `requirePullRequest = false` still gets
+#     `deletion` + `nonFastForward`.
 #   * NO `requiredStatusChecks`.     The engine's ruleset schema does not express
 #     them, and pinning a check context that does not exist yet makes every PR
 #     unmergeable. Concrete required checks are a later, per-repo layer.
@@ -114,6 +119,23 @@ let
   # `live`). The attribute KEY is the concrete branch name.
   mainlineKeys = filter (k: (branchClasses.${k}.role or "") == "mainline") (attrNames branchClasses);
 
+  # Whether a mainline class is PR-only, per the policy's explicit per-class
+  # `requirePullRequest`. Absent means true: backward compatible with policies
+  # that predate the field, and a new mainline class is PR-only by default.
+  # (`requirePullRequestReview` is separate: it only sets the approval count.)
+  classRequiresPullRequest =
+    branch:
+    let
+      v = branchClasses.${branch}.requirePullRequest or true;
+    in
+    assert
+      builtins.isBool v
+      || throw "mainline-protection: policy branch class `${branch}` has a non-boolean requirePullRequest";
+    v;
+
+  # Mainline classes the policy opts out of PR-only (direct pushes accepted).
+  directPushClasses = filter (k: !(classRequiresPullRequest k)) mainlineKeys;
+
   # Resolve a repository to the mainline branch it should protect, or null.
   mainlineBranchFor =
     repo:
@@ -155,7 +177,7 @@ let
     repo:
     let
       branch = mainlineBranchFor repo;
-      prOnly = !(elem repo.name directPushRepos);
+      prOnly = !(elem repo.name directPushRepos) && classRequiresPullRequest branch;
     in
     assert
       (elem branch mainlineKeys)
@@ -206,8 +228,22 @@ assert
 
   # Coverage report, for the caller's README / gates.
   protectedRepos = map (r: r.name) covered;
-  prOnlyRepos = map (r: r.name) (filter (r: !(elem r.name directPushRepos)) covered);
+  # protectedRepos = prOnlyRepos ++ directPushRepos ++ policyDirectPushRepos
+  # (a partition; a caller-named repository on a direct-push class is reported
+  # under directPushRepos).
+  prOnlyRepos = map (r: r.name) (
+    filter (r: !(elem r.name directPushRepos) && classRequiresPullRequest (mainlineBranchFor r)) covered
+  );
+  # Direct push because the CALLER named the repository.
   directPushRepos = map (r: r.name) (filter (r: elem r.name directPushRepos) covered);
+  # Direct push because the POLICY class says `requirePullRequest = false`.
+  policyDirectPushRepos = map (r: r.name) (
+    filter (
+      r: !(elem r.name directPushRepos) && !(classRequiresPullRequest (mainlineBranchFor r))
+    ) covered
+  );
+  # The mainline classes whose policy opts out of PR-only.
+  inherit directPushClasses;
   mainlines = listToAttrs (
     map (r: {
       name = r.name;

@@ -76,9 +76,12 @@ Renders one `mainline-protect` repository ruleset per repository whose
 **mainline** branch (every policy branch class with `role = "mainline"`: product
 `dev`, spec `latest`, infra `live`) is protectable, as plain entries in the
 engine's `repositoryRulesets` schema. Each ruleset forbids deletion and
-force-push and requires a pull request (PR-only), keeps an `OrganizationAdmin`
-bypass (not `enforce_admins`), and pins **no** required status checks. The
-`agents` integration branch is never targeted.
+force-push, keeps an `OrganizationAdmin` bypass (not `enforce_admins`), and pins
+**no** required status checks. It also requires a pull request (PR-only) unless
+the mainline's policy class sets `requirePullRequest = false` (absent means
+`true`, so older policies stay PR-only) or the caller lists the repository in
+`directPushRepos`; such mainlines keep deletion + force-push protection only.
+The `agents` integration branch is never targeted.
 
 ```nix
 let
@@ -100,8 +103,10 @@ in
 }
 ```
 
-It also returns `protectedRepos`, `prOnlyRepos`, `directPushRepos`, `mainlines`
-and `uncovered` (repo -> reason) for the caller's coverage report. Unknown repo
+It also returns `protectedRepos`, `prOnlyRepos`, `directPushRepos` (named by the
+caller), `policyDirectPushRepos` (on a `requirePullRequest = false` class),
+`directPushClasses`, `mainlines` and `uncovered` (repo -> reason) for the
+caller's coverage report; the three repo lists partition `protectedRepos`. Unknown repo
 names in the corrections, and overrides naming a non-mainline branch, fail the
 evaluation. Unlike `branch-protection.nix` (raw resources for a hand-written
 map), these entries flow through `governance.nix` and any caller-side filter,
