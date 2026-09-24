@@ -54,8 +54,8 @@ case "$1" in
     fi
     for a in "$@"; do
       case "$a" in
-        .#devShells.*) var=FAKE_SHELLS ;;
-        .#checks.*) var=FAKE_CHECKS ;;
+        .*#devShells.*) var=FAKE_SHELLS ;;
+        .*#checks.*) var=FAKE_CHECKS ;;
       esac
     done
     if [ -z "${!var+x}" ]; then
@@ -72,7 +72,7 @@ case "$1" in
       printf '%s\n' "$FAKE_REPRO_OUT"; exit 0
     fi
     attr=""
-    for a in "$@"; do [[ "$a" == .#* ]] && attr="$a"; done
+    for a in "$@"; do [[ "$a" == .*#* ]] && attr="$a"; done
     log "build $attr"
     exit "${FAKE_BUILD_RC:-0}" ;;
   run)
@@ -84,7 +84,7 @@ case "$1" in
     while [ $# -gt 0 ]; do
       case "$1" in
         -c) shift; break ;;
-        .#*) shell="${1#.#}" ;;
+        .*#*) shell="${1#*#}" ;;
       esac
       shift
     done
@@ -167,6 +167,7 @@ class Harness:
         runner: str = "prek",
         flake: bool = True,
         committed_config: bool = False,
+        gitmodules: bool = False,
         inputs: dict[str, str] | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> tuple[int, list[str], str]:
@@ -179,6 +180,9 @@ class Harness:
         if committed_config:
             (work / ".pre-commit-config.yaml").write_text("repos: []\n")
             subprocess.run(["git", "-C", str(work), "add", ".pre-commit-config.yaml"], check=True)
+        if gitmodules:
+            (work / ".gitmodules").write_text('[submodule "x"]\n\tpath = x\n\turl = ../x\n')
+            subprocess.run(["git", "-C", str(work), "add", ".gitmodules"], check=True)
         log = self.root / f"case{self.count}.log"
         log.write_text("")
         env = {
@@ -342,6 +346,30 @@ def main() -> None:
             [],
             contains=["::warning title=reusable-lint::evaluating .#devShells",
                       "infinite recursion", "no hook entry point found"],
+        )
+
+        # 5b. Submodules: the flake is evaluated WITH them once initialized,
+        #     otherwise a flake reading one cannot evaluate; `off` keeps `.`.
+        expect(
+            "tracked .gitmodules evaluates the flake with submodules",
+            h.run("sub", shells="default", hook_shells="default", gitmodules=True),
+            0,
+            ["develop default", f"prek {RUN_ARGS}"],
+            contains=["--accept-flake-config .?submodules=1#default"],
+        )
+        expect(
+            "submodules off keeps the plain flake ref",
+            h.run("sub-off", shells="pre-commit", hook_shells="pre-commit", gitmodules=True,
+                  extra_env={"LINT_SUBMODULES": "off"}),
+            0,
+            ["develop pre-commit", f"prek {RUN_ARGS}"],
+            contains=["--accept-flake-config .#pre-commit"],
+        )
+        expect(
+            "submodule-aware check",
+            h.run("sub-chk", checks="pre-commit-check", gitmodules=True),
+            0,
+            [f"build .?submodules=1#checks.{SYSTEM}.pre-commit-check"],
         )
 
         # 6. Explicit overrides.
@@ -601,6 +629,28 @@ def test_develop_set() -> None:
         check("rerun over existing checkouts", h.run(work, env=auto, json_doc=develop_json(nodes)),
               0, contains=["materialized 2"])
         assert not (base / "ws" / "sib-a" / "stray").exists()
+
+        # A sibling's own submodules are initialized (unless submodules: off).
+        base, work, a, b, nodes = workspace()
+        vendor = make_remote(base / "remotes" / "vendor", commits=1)
+        sib_a = base / "remotes" / "sib-a"
+        git("submodule", "add", "-q", f"file://{base}/remotes/vendor", "third_party/v", cwd=sib_a)
+        git("commit", "-q", "-m", "vendor", cwd=sib_a)
+        a_with_sub = git("rev-parse", "HEAD", cwd=sib_a)
+        (work / "repro.lock").write_text(lock_text([
+            ("host", ".", "https://example.invalid/host", "0" * 40),
+            ("sib-a", "../sib-a", f"file://{sib_a}", a_with_sub),
+        ]))
+        one = [("sib-a", str(base / "ws" / "sib-a"), a_with_sub, True)]
+        check("sibling submodules off", h.run(work, env={**auto, "LINT_SUBMODULES": "off"},
+                                              json_doc=develop_json(one)), 0,
+              contains=["materialized 1"])
+        assert not (base / "ws" / "sib-a" / "third_party" / "v" / "file.txt").exists()
+        check("sibling submodules initialized", h.run(work, env=auto, json_doc=develop_json(one)),
+              0, contains=["materialized 1"])
+        sub = base / "ws" / "sib-a" / "third_party" / "v"
+        assert git("rev-parse", "HEAD", cwd=sub) == vendor[0]
+        assert_no_persisted_credential(base / "ws" / "sib-a")
 
         # repro absent from PATH: installed through nix from the pinned flake.
         base, work, a, b, nodes = workspace()
