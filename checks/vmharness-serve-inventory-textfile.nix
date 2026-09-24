@@ -70,7 +70,8 @@ top@{ ... }:
           msg = "the textfile dir is not declared root:root 0755";
         }
         {
-          ok = !(lib.any (r: lib.hasInfix infraTextfileDir r && lib.hasInfix "0777" r) cfg.systemd.tmpfiles.rules);
+          ok =
+            !(lib.any (r: lib.hasInfix infraTextfileDir r && lib.hasInfix "0777" r) cfg.systemd.tmpfiles.rules);
           msg = "the textfile dir is created world-writable";
         }
         {
@@ -78,7 +79,9 @@ top@{ ... }:
           msg = "the snapshot is not published by a privileged ExecStartPost (got '${postExec}')";
         }
         {
-          ok = (sc.StateDirectoryMode or "") == "0750" && (sc.StateDirectory or "") == "vm-harness-serve-inventory";
+          ok =
+            (sc.StateDirectoryMode or "") == "0750"
+            && (sc.StateDirectory or "") == "vm-harness-serve-inventory";
           msg = "the serve-user staging dir is not a private 0750 StateDirectory";
         }
         {
