@@ -28,3 +28,10 @@ jobs:
     runs-on: [self-hosted, linux, x64, x86-64-v3]
     steps:
       - run: just test
+
+  # 4. The persistent-class pin from the 2026-09-24 sweep: a node/cargo job that
+  #    uses no host NixOS state, KVM or perf counters, pinned to bare-metal NixOS.
+  needless-bare-metal:
+    runs-on: [self-hosted, nixos, x86-64-v3, bare-metal]
+    steps:
+      - run: yarn test

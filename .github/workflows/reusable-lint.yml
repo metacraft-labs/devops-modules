@@ -151,6 +151,33 @@ jobs:
           owner: ${{ github.repository_owner }}
           permission-contents: read
 
+      # Warning-only (does not fail the build yet): flag restrictive runs-on
+      # labels (bare-metal, nixos, x86-64-v3, gpu, …) that carry no
+      # justification comment. Policy: metacraft-dev-guidelines
+      # policies/ci-workflow-standards.md "Choosing runs-on labels for a job".
+      - name: Check runs-on labels are justified (warning only)
+        if: ${{ hashFiles('.github/workflows/*.yml', '.github/workflows/*.yaml') != '' }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          dir="$(mktemp -d)"
+          # Always the current checker from dev: this step only warns.
+          base="https://raw.githubusercontent.com/metacraft-labs/devops-modules/dev/scripts/ci"
+          for f in check_over_constrained_runs_on.py check_public_repo_runners.py; do
+            curl -fsSL --retry 3 -o "$dir/$f" "$base/$f" || { echo "::warning title=runs-on labels::could not fetch $f; skipping"; exit 0; }
+          done
+          # shellcheck disable=SC2016 # a Nix expression, not a shell one
+          nix shell --impure --expr \
+            '(builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}.python3.withPackages (p: [ p.pyyaml ])' \
+            -c python3 "$dir/check_over_constrained_runs_on.py" .github/workflows 2>&1 \
+            | while IFS= read -r line; do
+                case "$line" in
+                  *" :: job "*) echo "::warning title=runs-on labels::${line#*✗ }" ;;
+                  *) echo "$line" ;;
+                esac
+              done
+          exit 0
+
       - name: Setup Nix
         uses: metacraft-labs/devops-modules/.github/setup-nix@dev
         with:

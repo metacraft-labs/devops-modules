@@ -48,6 +48,10 @@ comment naming the label::
     # cap-justify: gpu (Vulkan visual-replay tests need a real GPU)
     # cap-justify: x86-64-v3 (AVX2 codepath under test)
 
+or, equivalently, the inline form shown in the policy's justification rule::
+
+    # `bare-metal`: nixosTest VMs need /dev/kvm; ephemeral runners have no KVM.
+
 Each ``cap-justify`` line whitelists ONE narrowing label for the whole file.
 A narrowing label with a matching justification passes; one without fails.
 
@@ -95,13 +99,27 @@ NARROWING_LABELS = {
     "libvirt",
     "hyperv",
     "tart",
+    # Persistent-class labels. None of them is advertised by the ephemeral
+    # pools, so each one excludes the whole ephemeral fleet (2026-09-24 sweep:
+    # agent-harbor CI pinned to [nixos, x86-64-v3, bare-metal] queued on four
+    # runners while the org's ephemeral runners sat idle).
+    "bare-metal",  # /dev/kvm, kernel access, perf counters, timing-sensitive work
+    "nixos",  # host NixOS state only — "uses Nix" is NOT a reason
+    "topology-host",
+    "microvm",
 }
 
 # A legacy single-name ephemeral class (the scheme this campaign migrates OFF).
 EPH_CLASS = re.compile(r"^eph-[a-z0-9-]+$")
+# Named GARM scale sets that are routed BY NAME on purpose (the release lane —
+# infra lib/infra-constants.nix `releaseLane`); not a legacy class.
+RELEASE_LANE_NAMES = {"eph-linux-x64-release"}
 
 # ``# cap-justify: <label> [free-text reason]`` — one narrowing label per line.
 CAP_JUSTIFY = re.compile(r"#\s*cap-justify:\s*([A-Za-z0-9._:-]+)")
+# The inline form the policy's "Justification rule" shows next to a runs-on:
+#     # `bare-metal`: nixosTest VMs need /dev/kvm; ephemeral runners have no KVM.
+INLINE_JUSTIFY = re.compile(r"#\s*`([A-Za-z0-9._:-]+)`\s*:\s*\S")
 
 # The migration table (RC1) — bare class name -> minimum capability label set.
 MIGRATION = {
@@ -125,7 +143,9 @@ MIGRATION = {
 
 def _justified_labels(text: str) -> set[str]:
     """Every narrowing label whitelisted by a ``# cap-justify:`` line (file-scoped)."""
-    return {m.group(1) for m in CAP_JUSTIFY.finditer(text)}
+    return {m.group(1) for m in CAP_JUSTIFY.finditer(text)} | {
+        m.group(1) for m in INLINE_JUSTIFY.finditer(text)
+    }
 
 
 def _suggest(cls: str) -> str:
@@ -165,7 +185,11 @@ def check_workflow(path: Path) -> tuple[list[str], list[list[str]]]:
             resolved.append(labels)
 
             # 1. A bare single-name ephemeral class.
-            if len(labels) == 1 and EPH_CLASS.match(labels[0]):
+            if (
+                len(labels) == 1
+                and EPH_CLASS.match(labels[0])
+                and labels[0] not in RELEASE_LANE_NAMES
+            ):
                 violations.append(
                     f"{path.name} :: job '{job_name}' :: runs-on '{labels[0]}' — "
                     f"bare ephemeral class name; express it as a capability label "
