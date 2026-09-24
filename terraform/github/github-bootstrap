@@ -226,10 +226,6 @@ mapfile -t governance_app_secret_targets < <(
     | "\($type).secret_" + (.providerId | gsub("[/:.]"; "_"))
   '
 )
-if [[ ${#governance_app_secret_targets[@]} -eq 0 ]]; then
-  echo "No github-governance-app secrets found in ${governance_manifest}." >&2
-  exit 2
-fi
 
 plan_governance_app_secrets() {
   if [[ ! -f "${src}/root.nix" && ! "$config" == *governance* ]]; then
@@ -240,6 +236,13 @@ EOF
     exit 2
   fi
 
+  # Only this action needs the governance-app secrets. Checking for them at the
+  # top level made plain `plan`/`apply` fail for every root without a secrets
+  # manifest (e.g. a repo-settings Layer-0 root such as <org>-prod).
+  if [[ ${#governance_app_secret_targets[@]} -eq 0 ]]; then
+    echo "No github-governance-app secrets found in ${governance_manifest}." >&2
+    exit 2
+  fi
   # Import blocks are intentionally excluded from this one-time targeted
   # bootstrap. The only side effect should be writing the two app credentials
   # that let normal governance CI authenticate with the dedicated GitHub App.
