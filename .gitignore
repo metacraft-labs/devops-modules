@@ -26,3 +26,7 @@ precalc-matrix.json
 # Agent worktrees (per-session scratch, never shared). Scoped to worktrees/ so
 # committed .claude settings (settings.json, agents, skills) stay possible.
 .claude/worktrees/
+
+# Python bytecode from the git-hooks implementations
+__pycache__/
+*.pyc
