@@ -60,7 +60,10 @@ name: 'Lint'
 #
 # Both authenticate with the same token as setup-nix (NIX_GITHUB_TOKEN, else
 # GH_READ_METACRAFT_PRIVATE_REPOS), passed as a per-command HTTP header and
-# never written into any .git/config.
+# never written into any .git/config. An org with neither (agent-harbor) is
+# served by its CI token-provider App instead: with CI_TOKEN_PROVIDER_PRIVATE_KEY
+# and an app id (secret or variable CI_TOKEN_PROVIDER_APP_ID) available, a
+# short-lived read-only installation token is minted for the job.
 #
 # The discovery step, and the sibling / submodule steps, are exercised
 # hermetically by checks/ci-workflows.nix (`reusable-lint-hook-discovery`).
@@ -115,20 +118,41 @@ on:
       NIX_GITLAB_TOKEN:
         description: GitLab token to add as access-token in nix.conf
         required: false
+      CI_TOKEN_PROVIDER_APP_ID:
+        description: 'CI token-provider GitHub App id (or set the CI_TOKEN_PROVIDER_APP_ID variable); used only when neither token above is set'
+        required: false
+      CI_TOKEN_PROVIDER_PRIVATE_KEY:
+        description: 'CI token-provider GitHub App private key; used only when neither NIX_GITHUB_TOKEN nor GH_READ_METACRAFT_PRIVATE_REPOS is set'
+        required: false
 
 jobs:
   lint:
     runs-on: ${{ fromJSON(inputs.runner) }}
+    env:
+      # Booleans only (secrets cannot appear in `if:`): whether a static
+      # private-repo token was passed, and whether the App can mint one.
+      LINT_HAS_STATIC_TOKEN: ${{ secrets.NIX_GITHUB_TOKEN != '' || secrets.GH_READ_METACRAFT_PRIVATE_REPOS != '' }}
+      LINT_HAS_TOKEN_APP: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY != '' && (secrets.CI_TOKEN_PROVIDER_APP_ID != '' || vars.CI_TOKEN_PROVIDER_APP_ID != '') }}
     steps:
       - uses: actions/checkout@v6.0.2
         with:
           fetch-depth: ${{ inputs.fetch-depth }}
 
+      - name: Mint a read-only token from the CI token-provider App
+        id: app-token
+        if: env.LINT_HAS_STATIC_TOKEN != 'true' && env.LINT_HAS_TOKEN_APP == 'true'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID || vars.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+
       - name: Setup Nix
         uses: metacraft-labs/devops-modules/.github/setup-nix@dev
         with:
           push-to-cache: false
-          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || steps.app-token.outputs.token }}
           nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
@@ -137,7 +161,7 @@ jobs:
       - name: Initialize submodules
         env:
           LINT_SUBMODULES: ${{ inputs.submodules }}
-          LINT_GIT_TOKEN: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+          LINT_GIT_TOKEN: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           case "$LINT_SUBMODULES" in
@@ -169,7 +193,7 @@ jobs:
       - name: Materialize the develop set
         env:
           LINT_DEVELOP_SET: ${{ inputs.develop-set }}
-          LINT_GIT_TOKEN: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+          LINT_GIT_TOKEN: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || steps.app-token.outputs.token }}
           # The org's single reprobuild pin lives in devops-modules' flake
           # (`inputs.reprobuild`); reading it from there keeps this `repro`
           # the one the fleet runs, with no second pin to drift.
