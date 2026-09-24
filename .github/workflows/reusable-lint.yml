@@ -34,8 +34,36 @@ name: 'Lint'
 #   command: a bash command; run inside `shell` when that is set, otherwise
 #            directly in the checkout (it may invoke nix itself)
 #
-# The discovery step is exercised hermetically by
-# checks/ci-workflows.nix (`reusable-lint-hook-discovery`).
+# CROSS-REPO SIBLINGS AND SUBMODULES
+#
+# Hooks often read files outside the repository: a `just lint` that compiles
+# against `../nim-pty`, a flake whose dev shell points into a submodule. So
+# before the hooks run, this workflow materializes:
+#
+#   * the repo's reprobuild DEVELOP SET, at the revisions its committed
+#     `repro.lock` pins (input `develop-set`, default `auto`). WHICH repos at
+#     WHICH revisions and WHERE is answered by the `repro` CLI itself
+#     (`repro develop --all --dry-run --json`, read-only) — the tool that owns
+#     the lock format — built from the org's single reprobuild pin (the
+#     `reprobuild` input of devops-modules' flake, served from the binary
+#     cache). Each node is then fetched at its exact 40-hex revision with
+#     plain git, at the path repro reports (`../<name>` by default). Placement
+#     is done by git rather than by `repro develop --all` because that command
+#     first clones the lock's ADVISORY `ref` branch and fails outright when
+#     that branch is not on the remote — common, since the pre-push gate
+#     records the pusher's local branch name — even though the pinned commit
+#     is there.
+#     `auto` installs and clones nothing when there is no `repro.lock` or it
+#     pins no sibling (every deps entry is `path = "."`, the repo itself).
+#   * git submodules, recursively, when `.gitmodules` is tracked (input
+#     `submodules`, default `auto`).
+#
+# Both authenticate with the same token as setup-nix (NIX_GITHUB_TOKEN, else
+# GH_READ_METACRAFT_PRIVATE_REPOS), passed as a per-command HTTP header and
+# never written into any .git/config.
+#
+# The discovery step, and the sibling / submodule steps, are exercised
+# hermetically by checks/ci-workflows.nix (`reusable-lint-hook-discovery`).
 
 on:
   # Allow this workflow to be reused by other workflows:
@@ -61,6 +89,21 @@ on:
         default: ''
         required: false
         type: string
+      develop-set:
+        description: 'Materialize the reprobuild develop set (the siblings the committed repro.lock pins) before the hooks: auto (when repro.lock pins a sibling) | off'
+        default: 'auto'
+        required: false
+        type: string
+      submodules:
+        description: 'Initialize git submodules recursively before the hooks: auto (when .gitmodules is tracked) | off'
+        default: 'auto'
+        required: false
+        type: string
+      fetch-depth:
+        description: 'actions/checkout fetch-depth (0 = full history, for flakes that cannot evaluate from a shallow clone)'
+        default: 1
+        required: false
+        type: number
 
     secrets:
       NIX_GITHUB_TOKEN:
@@ -78,6 +121,8 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runner) }}
     steps:
       - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: ${{ inputs.fetch-depth }}
 
       - name: Setup Nix
         uses: metacraft-labs/devops-modules/.github/setup-nix@dev
@@ -88,6 +133,185 @@ jobs:
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+
+      - name: Initialize submodules
+        env:
+          LINT_SUBMODULES: ${{ inputs.submodules }}
+          LINT_GIT_TOKEN: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+        run: |
+          set -euo pipefail
+          case "$LINT_SUBMODULES" in
+            auto) ;;
+            off) echo "reusable-lint: submodules: off"; exit 0 ;;
+            *) echo "::error title=reusable-lint::'submodules' must be auto or off (got '$LINT_SUBMODULES')"; exit 1 ;;
+          esac
+          if ! git ls-files --error-unmatch .gitmodules >/dev/null 2>&1; then
+            echo "reusable-lint: no tracked .gitmodules; nothing to initialize"
+            exit 0
+          fi
+          # The token travels as a one-command HTTP header: the empty value
+          # first RESETS any header actions/checkout persisted (two
+          # Authorization headers are rejected), and `git -c` reaches the
+          # nested clones through GIT_CONFIG_PARAMETERS. SSH-style URLs are
+          # rewritten to https so the same header applies.
+          auth=(-c "url.https://github.com/.insteadOf=git@github.com:"
+            -c "url.https://github.com/.insteadOf=ssh://git@github.com/")
+          if [ -n "$LINT_GIT_TOKEN" ]; then
+            basic=$(printf 'x-access-token:%s' "$LINT_GIT_TOKEN" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            auth+=(-c "http.https://github.com/.extraheader="
+              -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $basic")
+          fi
+          echo "reusable-lint: + git submodule update --init --recursive"
+          git "${auth[@]}" submodule update --init --recursive
+          git submodule status --recursive
+
+      - name: Materialize the develop set
+        env:
+          LINT_DEVELOP_SET: ${{ inputs.develop-set }}
+          LINT_GIT_TOKEN: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}
+          # The org's single reprobuild pin lives in devops-modules' flake
+          # (`inputs.reprobuild`); reading it from there keeps this `repro`
+          # the one the fleet runs, with no second pin to drift.
+          LINT_REPRO_FLAKE: github:metacraft-labs/devops-modules/dev
+        run: |
+          # Actions runs this with `bash -e`; every failure below is handled
+          # explicitly (probing commands are allowed to fail).
+          set +e -uo pipefail
+          die() {
+            echo "::error title=reusable-lint develop-set::$*"
+            exit 1
+          }
+          case "$LINT_DEVELOP_SET" in
+            auto) ;;
+            off) echo "reusable-lint: develop-set: off"; exit 0 ;;
+            *) die "'develop-set' must be auto or off (got '$LINT_DEVELOP_SET')" ;;
+          esac
+          if [ ! -f repro.lock ]; then
+            echo "reusable-lint: no repro.lock; no develop set to materialize"
+            exit 0
+          fi
+
+          # Static pre-check (no tool needed): does the lock pin any sibling,
+          # i.e. a deps entry whose path is not "." (the repo itself)? If not,
+          # nothing is installed and nothing is cloned.
+          deps_line=""
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in 'deps = ['*) deps_line="$line" ;; esac
+          done <repro.lock
+          siblings=0
+          rest="$deps_line"
+          while :; do
+            case "$rest" in
+              *'path = "'*)
+                rest="${rest#*path = \"}"
+                [ "${rest%%\"*}" = "." ] || siblings=$((siblings + 1))
+                ;;
+              *) break ;;
+            esac
+          done
+          if [ "$siblings" -eq 0 ]; then
+            echo "reusable-lint: repro.lock pins no sibling (root-only); no develop set to materialize"
+            exit 0
+          fi
+
+          # The repro CLI decides the set: it owns the lock format.
+          if command -v repro >/dev/null 2>&1; then
+            repro=repro
+          else
+            echo "reusable-lint: + nix build (the reprobuild pinned by $LINT_REPRO_FLAKE)"
+            # shellcheck disable=SC2016
+            outs=$(nix build --no-link --print-out-paths --impure --accept-flake-config --expr \
+              '(builtins.getFlake (builtins.getEnv "LINT_REPRO_FLAKE")).inputs.reprobuild.packages.${builtins.currentSystem}.reprobuild') ||
+              die "could not build the pinned repro CLI from $LINT_REPRO_FLAKE"
+            repro=""
+            while IFS= read -r o; do
+              [ -x "$o/bin/repro" ] && repro="$o/bin/repro" && break
+            done <<<"$outs"
+            [ -n "$repro" ] || die "the pinned reprobuild package has no bin/repro (outputs: $outs)"
+          fi
+          err=$(mktemp)
+          json=$("$repro" develop --all --dry-run --json 2>"$err")
+          rc=$?
+          echo "::group::repro develop --all --dry-run --json (exit $rc)"
+          printf '%s\n' "$json"
+          cat "$err"
+          echo "::endgroup::"
+          rm -f "$err"
+
+          # Read the nodes out of the pretty-printed document (no jq on the
+          # runner is assumed). Unparseable output fails closed below.
+          names=() paths=() revs=() oks=()
+          n=-1
+          in_nodes=0
+          doc_exit=""
+          while IFS= read -r line || [ -n "$line" ]; do
+            t="${line#"${line%%[![:space:]]*}"}"
+            t="${t%,}"
+            if [ "$in_nodes" -eq 1 ]; then
+              case "$t" in
+                ']') in_nodes=0; continue ;;
+                '"node": "'*) n=$((n + 1)); v="${t#*: \"}"; names[n]="${v%\"}"; paths[n]=""; revs[n]=""; oks[n]="" ;;
+                '"path": "'*) v="${t#*: \"}"; paths[n]="${v%\"}" ;;
+                '"revision": "'*) v="${t#*: \"}"; revs[n]="${v%\"}" ;;
+                '"ok": '*) oks[n]="${t#*: }" ;;
+              esac
+              continue
+            fi
+            case "$t" in
+              '"nodes": [') in_nodes=1 ;;
+              '"exitCode": '*) doc_exit="${t#*: }" ;;
+            esac
+          done <<<"$json"
+          count=$((n + 1))
+          [ "$rc" -eq 0 ] && [ "$doc_exit" = "0" ] ||
+            die "repro could not resolve the develop set from repro.lock (exit $rc, document exitCode '${doc_exit:-none}'); see the group above"
+          [ "$count" -gt 0 ] ||
+            die "repro.lock pins $siblings sibling(s) but repro resolved none; see the group above"
+
+          auth=()
+          if [ -n "$LINT_GIT_TOKEN" ]; then
+            basic=$(printf 'x-access-token:%s' "$LINT_GIT_TOKEN" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            auth=(-c "http.https://github.com/.extraheader="
+              -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $basic")
+          fi
+          here=$(pwd -P)
+          for ((i = 0; i < count; i++)); do
+            name="${names[i]}" path="${paths[i]}" rev="${revs[i]}"
+            [ "${oks[i]}" = "true" ] || die "repro rejected develop-set node '$name'; see the group above"
+            [ "${#rev}" -eq 40 ] && [ -z "${rev//[0-9a-f]/}" ] ||
+              die "node '$name' is not pinned to an exact 40-hex revision ('$rev')"
+            case "$path" in
+              /*) ;;
+              *) die "node '$name' has no absolute placement path ('$path')" ;;
+            esac
+            case "$here/" in
+              "$path"/*) die "node '$name' would be placed at '$path', which contains this checkout" ;;
+            esac
+            # The clone URL is the lock's own `url` for this entry.
+            entry="${deps_line#*"{ name = \"$name\", "}"
+            [ "$entry" != "$deps_line" ] || die "node '$name' has no deps entry in repro.lock"
+            entry="${entry%%\}*}"
+            case "$entry" in
+              *'url = "'*) url="${entry#*url = \"}"; url="${url%%\"*}" ;;
+              *) die "the repro.lock entry for '$name' carries no url" ;;
+            esac
+            echo "reusable-lint: develop-set $name @ $rev -> $path ($url)"
+            if [ -e "$path" ] && [ ! -e "$path/.git" ]; then
+              die "'$path' exists and is not a git checkout; refusing to overwrite it"
+            fi
+            [ -e "$path/.git" ] || git init -q "$path" || die "git init $path failed"
+            git -C "$path" remote remove origin >/dev/null 2>&1
+            if ! { git -C "$path" remote add origin "$url" &&
+              git "${auth[@]}" -C "$path" fetch -q --depth 1 origin "$rev" &&
+              git -C "$path" checkout -q --force --detach "$rev" &&
+              git -C "$path" clean -qffdx; }; then
+              die "could not fetch '$name' at $rev from $url"
+            fi
+            [ "$(git -C "$path" rev-parse HEAD)" = "$rev" ] || die "'$name' did not land on $rev"
+          done
+          echo "reusable-lint: materialized $count develop-set sibling(s) from repro.lock"
 
       - name: Check formatting
         env:

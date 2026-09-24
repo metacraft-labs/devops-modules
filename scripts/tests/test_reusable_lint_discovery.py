@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
-"""Hermetic tests for the hook-entry-point discovery in reusable-lint.yml.
+"""Hermetic tests for reusable-lint.yml's pre-hook steps.
 
-The `Check formatting` step's run block is extracted verbatim from the
-workflow and executed with bash against a scratch git checkout. `nix` is
-replaced by a stub on PATH: it answers the two attribute-name probes from the
-FAKE_SHELLS / FAKE_CHECKS environment variables, and records `develop`,
-`build` and `run` invocations instead of performing them. That stub is the
-only double here, and it is justified: the property under test is WHICH entry
-point the step selects and how it reacts to each outcome — reproducing it for
-real would need a Nix daemon, network access and one real flake per shape,
-none of which exist in the Nix build sandbox this test runs in. Everything
-else (bash, git, the filesystem, the step's own control flow) is real.
+Each step's run block is extracted verbatim from the workflow and executed
+with bash against scratch git checkouts.
+
+`Check formatting` (hook-entry-point discovery): `nix` is replaced by a stub
+on PATH that answers the two attribute-name probes from the FAKE_SHELLS /
+FAKE_CHECKS environment variables, and records `develop`, `build` and `run`
+invocations instead of performing them.
+
+`Materialize the develop set`: `repro` is replaced by a stub that prints a
+canned `repro develop --all --dry-run --json` document (and `nix build`, when
+the step has to install repro, by the same nix stub printing the stub's
+directory). Everything the step DOES with that answer is real: the sibling
+"remotes" are real git repositories reached over file://, and the test checks
+that each sibling lands on the exact locked commit — deliberately NOT the
+branch tip — and that no credential is persisted into any .git/config.
+
+`Initialize submodules`: no double at all — a real superproject with a real
+submodule over file://.
+
+The two stubs are the only doubles, and they are justified: the real `nix`
+needs a daemon, network access and one real flake per shape, and the real
+`repro` is built from a flake input fetched over the network; none of that
+exists in the Nix build sandbox this test runs in. The property under test is
+how each step reacts to what those tools answer, which the stubs pin exactly.
 """
 
 from __future__ import annotations
@@ -52,6 +66,11 @@ case "$1" in
     fi
     printf '%s' "${!var}"; exit 0 ;;
   build)
+    if [[ " $* " == *" --print-out-paths "* ]]; then
+      log "build-repro"
+      [ -n "${FAKE_REPRO_OUT:-}" ] || exit 1
+      printf '%s\n' "$FAKE_REPRO_OUT"; exit 0
+    fi
     attr=""
     for a in "$@"; do [[ "$a" == .#* ]] && attr="$a"; done
     log "build $attr"
@@ -91,12 +110,12 @@ exit "${FAKE_HOOK_RC:-0}"
 """
 
 
-def extract_step_script() -> str:
+def extract_step_script(marker: str = STEP_MARKER) -> str:
     lines = WORKFLOW_PATH.read_text().splitlines()
-    starts = [i for i, line in enumerate(lines) if line == STEP_MARKER]
-    assert len(starts) == 1, f"expected one {STEP_MARKER!r} step, got {len(starts)}"
+    starts = [i for i, line in enumerate(lines) if line == marker]
+    assert len(starts) == 1, f"expected one {marker!r} step, got {len(starts)}"
     run_starts = [i for i in range(starts[0], len(lines)) if lines[i] == RUN_MARKER]
-    assert run_starts, "run block not found in the Check formatting step"
+    assert run_starts, f"run block not found in {marker!r}"
     body = []
     for line in lines[run_starts[0] + 1 :]:
         if not line.strip():
@@ -376,6 +395,303 @@ def main() -> None:
         )
 
     print(f"reusable-lint discovery: {h.count} cases passed")
+    test_develop_set()
+    test_submodules()
+
+
+# ---------------------------------------------------------------------------
+# `Materialize the develop set` and `Initialize submodules`
+# ---------------------------------------------------------------------------
+
+DEVSET_MARKER = "      - name: Materialize the develop set"
+SUBMODULE_MARKER = "      - name: Initialize submodules"
+STEP_TOOLS = ("bash", "env", "git", "grep", "mktemp", "rm", "cat", "base64", "tr", "sh")
+TOKEN = "test-token-value"
+
+# `repro develop --all --dry-run --json` stand-in: logs its argv, prints the
+# document in $FAKE_REPRO_JSON, exits $FAKE_REPRO_RC.
+REPRO_STUB = r"""#!/usr/bin/env bash
+printf 'repro %s\n' "$*" >> "$FAKE_LOG"
+cat "$FAKE_REPRO_JSON"
+exit "${FAKE_REPRO_RC:-0}"
+"""
+
+
+def git(*args: str, cwd: Path | None = None) -> str:
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": os.environ.get("HOME", "/tmp"),
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow",
+        "GIT_CONFIG_VALUE_0": "always",
+    }
+    return subprocess.run(["git", *args], cwd=cwd, env=env, check=True, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
+
+
+def make_remote(path: Path, commits: int = 2) -> list[str]:
+    """A real repo with `commits` commits; returns their SHAs, oldest first."""
+    git("init", "-q", "-b", "dev", str(path))
+    shas = []
+    for i in range(commits):
+        (path / "file.txt").write_text(f"v{i}\n")
+        git("add", "file.txt", cwd=path)
+        git("commit", "-q", "-m", f"c{i}", cwd=path)
+        shas.append(git("rev-parse", "HEAD", cwd=path))
+    return shas
+
+
+def lock_text(entries: list[tuple[str, str, str, str]]) -> str:
+    """entries: (name, path, url, revision); the first is the root."""
+    deps = ", ".join(
+        f'{{ name = "{n}", path = "{p}", coord_kind = "vcs", url = "{u}", '
+        f'ref = "never-pushed", revision = "{r}", integrity = "git-sha1:{r}", '
+        f'version = "", visibility = "public", participation = "", depends = "", groups = "" }}'
+        for n, p, u, r in entries)
+    return ('schema = "reprobuild.solved-graph-lock.v2"\n\n[lock]\nplatform = "amd64-linux"\n'
+            'packages = [{ name = "decoy", version = "1", source = "decoy" }]\n'
+            f"deps = [{deps}]\n")
+
+
+def develop_json(nodes: list[tuple[str, str, str, bool]], exit_code: int = 0) -> str:
+    """The shape `repro develop --all --dry-run --json` pretty-prints."""
+    items = []
+    for name, path, rev, ok in nodes:
+        items.append(
+            "    {\n"
+            f'      "node": "{name}",\n'
+            f'      "path": "{path}",\n'
+            f'      "revision": "{rev}",\n'
+            '      "mode": "would-clone",\n'
+            f'      "ok": {"true" if ok else "false"}\n'
+            "    }")
+    nodes_txt = ("[\n" + ",\n".join(items) + "\n  ]") if items else "[]"
+    return ("{\n"
+            '  "schemaId": "reprobuild.develop-all.v1",\n'
+            '  "workspaceRoot": "/x",\n'
+            f'  "nodes": {nodes_txt},\n'
+            '  "notices": [],\n'
+            '  "backends": [\n    {\n      "tier": "public",\n      "repos": []\n    }\n  ],\n'
+            f'  "exitCode": {exit_code}\n'
+            "}\n")
+
+
+class StepHarness:
+    def __init__(self, root: Path, marker: str) -> None:
+        self.root = root / marker.split("name: ")[1].replace(" ", "-")
+        self.root.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        write_exe(self.bin / "nix", NIX_STUB)
+        for tool in STEP_TOOLS:
+            found = shutil.which(tool)
+            assert found, f"required tool {tool!r} not on PATH"
+            (self.bin / tool).symlink_to(found)
+        self.repro_dir = self.root / "repro-pkg" / "bin"
+        self.repro_dir.mkdir(parents=True)
+        write_exe(self.repro_dir / "repro", REPRO_STUB)
+        self.script = self.root / "step.sh"
+        self.script.write_text(extract_step_script(marker))
+        self.count = 0
+
+    def case(self) -> Path:
+        self.count += 1
+        base = self.root / f"case{self.count}"
+        base.mkdir()
+        return base
+
+    def run(self, work: Path, *, env: dict[str, str], repro_on_path: bool = True,
+            json_doc: str | None = None) -> tuple[int, list[str], str]:
+        log = work.parent / "calls.log"
+        log.write_text("")
+        doc = work.parent / "develop.json"
+        doc.write_text(json_doc or "")
+        path = str(self.bin)
+        if repro_on_path:
+            path = f"{self.repro_dir}:{path}"
+        full = {
+            "PATH": path,
+            "HOME": str(self.root),
+            "FAKE_LOG": str(log),
+            "FAKE_REPRO_JSON": str(doc),
+            "FAKE_REPRO_OUT": str(self.repro_dir.parent),
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "protocol.file.allow",
+            "GIT_CONFIG_VALUE_0": "always",
+            "LINT_GIT_TOKEN": TOKEN,
+            "LINT_REPRO_FLAKE": "github:example/devops-modules/dev",
+        }
+        full.update(env)
+        result = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-eo", "pipefail", str(self.script)],
+            cwd=work, env=full, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        calls = [line for line in log.read_text().splitlines() if line]
+        return result.returncode, calls, result.stdout
+
+
+def check(name: str, got, rc: int, contains=(), calls=None) -> None:
+    code, actual_calls, output = got
+    assert code == rc, f"{name}: exit {code}, expected {rc}\ncalls={actual_calls}\n{output}"
+    if calls is not None:
+        assert actual_calls == calls, f"{name}: calls {actual_calls}, expected {calls}\n{output}"
+    for needle in contains:
+        assert needle in output, f"{name}: {needle!r} not in output\n{output}"
+    assert TOKEN not in output, f"{name}: the raw token leaked into the log\n{output}"
+
+
+def assert_no_persisted_credential(repo: Path) -> None:
+    config = (repo / ".git" / "config").read_text()
+    assert "extraheader" not in config.lower() and TOKEN not in config, \
+        f"credential persisted in {repo}/.git/config:\n{config}"
+
+
+DRY_RUN = "repro develop --all --dry-run --json"
+
+
+def test_develop_set() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        h = StepHarness(Path(tmp), DEVSET_MARKER)
+        auto = {"LINT_DEVELOP_SET": "auto"}
+
+        def workspace(with_siblings: bool = True):
+            base = h.case()
+            a = make_remote(base / "remotes" / "sib-a")
+            b = make_remote(base / "remotes" / "sib-b")
+            work = base / "ws" / "host"
+            git("init", "-q", str(work))
+            entries = [("host", ".", "https://example.invalid/host", "0" * 40)]
+            if with_siblings:
+                entries += [
+                    ("sib-a", "../sib-a", f"file://{base}/remotes/sib-a", a[0]),
+                    ("sib-b", "../sib-b", f"file://{base}/remotes/sib-b", b[0]),
+                ]
+            (work / "repro.lock").write_text(lock_text(entries))
+            nodes = [("sib-a", str(base / "ws" / "sib-a"), a[0], True),
+                     ("sib-b", str(base / "ws" / "sib-b"), b[0], True)]
+            return base, work, a, b, nodes
+
+        # No lock / root-only lock: nothing is installed, nothing is cloned.
+        base = h.case()
+        work = base / "host"
+        git("init", "-q", str(work))
+        check("no repro.lock", h.run(work, env=auto), 0,
+              contains=["no repro.lock"], calls=[])
+        base, work, a, b, nodes = workspace(with_siblings=False)
+        check("root-only lock", h.run(work, env=auto, repro_on_path=False), 0,
+              contains=["pins no sibling"], calls=[])
+
+        # The happy path: every sibling lands on the LOCKED commit, which is
+        # deliberately not its remote's tip, with no credential persisted.
+        base, work, a, b, nodes = workspace()
+        check("siblings materialized", h.run(work, env=auto, json_doc=develop_json(nodes)), 0,
+              contains=["materialized 2 develop-set sibling(s)", "::add-mask::"],
+              calls=[DRY_RUN])
+        for name, shas in (("sib-a", a), ("sib-b", b)):
+            sib = base / "ws" / name
+            assert git("rev-parse", "HEAD", cwd=sib) == shas[0] != shas[1], name
+            assert_no_persisted_credential(sib)
+        assert (work / "repro.lock").exists()
+
+        # Re-running over existing checkouts (a persistent runner) re-pins them.
+        (base / "ws" / "sib-a" / "stray").write_text("x")
+        check("rerun over existing checkouts", h.run(work, env=auto, json_doc=develop_json(nodes)),
+              0, contains=["materialized 2"])
+        assert not (base / "ws" / "sib-a" / "stray").exists()
+
+        # repro absent from PATH: installed through nix from the pinned flake.
+        base, work, a, b, nodes = workspace()
+        check("repro installed via nix",
+              h.run(work, env=auto, repro_on_path=False, json_doc=develop_json(nodes)), 0,
+              contains=["materialized 2"], calls=["build-repro", DRY_RUN])
+
+        # Failures are loud and leave nothing half-done behind them.
+        base, work, a, b, nodes = workspace()
+        check("repro reports an error",
+              h.run(work, env=auto, json_doc=develop_json(nodes, exit_code=1)), 1,
+              contains=["::error title=reusable-lint develop-set::repro could not resolve"])
+        check("repro process fails",
+              h.run(work, env={**auto, "FAKE_REPRO_RC": "2"}, json_doc=develop_json(nodes)), 1,
+              contains=["repro could not resolve"])
+        check("unparseable repro output", h.run(work, env=auto, json_doc="garbage\n"), 1,
+              contains=["repro could not resolve"])
+        check("repro resolves nothing", h.run(work, env=auto, json_doc=develop_json([])), 1,
+              contains=["pins 2 sibling(s) but repro resolved none"])
+        bad = [(n, p, r, False) if n == "sib-b" else (n, p, r, ok) for n, p, r, ok in nodes]
+        check("node rejected", h.run(work, env=auto, json_doc=develop_json(bad)), 1,
+              contains=["repro rejected develop-set node 'sib-b'"])
+        short = [(n, p, r[:12], ok) for n, p, r, ok in nodes]
+        check("abbreviated revision", h.run(work, env=auto, json_doc=develop_json(short)), 1,
+              contains=["not pinned to an exact 40-hex revision"])
+        ghost = [(n, p, "f" * 40, ok) for n, p, r, ok in nodes]
+        check("unfetchable revision", h.run(work, env=auto, json_doc=develop_json(ghost)), 1,
+              contains=["could not fetch 'sib-a'"])
+        unknown = [("sib-z", str(base / "ws" / "sib-z"), a[0], True)]
+        check("node missing from the lock", h.run(work, env=auto, json_doc=develop_json(unknown)), 1,
+              contains=["'sib-z' has no deps entry in repro.lock"])
+
+        base, work, a, b, nodes = workspace()
+        occupied = base / "ws" / "sib-a"
+        occupied.mkdir()
+        (occupied / "keep").write_text("mine")
+        check("occupied non-git path", h.run(work, env=auto, json_doc=develop_json(nodes)), 1,
+              contains=["exists and is not a git checkout"])
+        assert (occupied / "keep").read_text() == "mine"
+
+        # Opt-out and input validation.
+        check("develop-set off", h.run(work, env={"LINT_DEVELOP_SET": "off"}), 0,
+              contains=["develop-set: off"], calls=[])
+        check("bad develop-set value", h.run(work, env={"LINT_DEVELOP_SET": "yes"}), 1,
+              contains=["'develop-set' must be auto or off"], calls=[])
+    print(f"reusable-lint develop-set: {h.count} workspaces passed")
+
+
+def test_submodules() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        h = StepHarness(Path(tmp), SUBMODULE_MARKER)
+        auto = {"LINT_SUBMODULES": "auto"}
+
+        base = h.case()
+        work = base / "plain"
+        git("init", "-q", str(work))
+        check("no .gitmodules", h.run(work, env=auto), 0, contains=["no tracked .gitmodules"])
+
+        # A real superproject with a nested submodule, cloned fresh (as
+        # actions/checkout leaves it: submodules registered, not populated).
+        base = h.case()
+        inner = make_remote(base / "inner", commits=1)
+        lib = make_remote(base / "lib", commits=1)
+        git("submodule", "add", "-q", f"file://{base}/inner", "vendor/inner", cwd=base / "lib")
+        git("commit", "-q", "-m", "nest", cwd=base / "lib")
+        sup = base / "super"
+        make_remote(sup, commits=1)
+        git("submodule", "add", "-q", f"file://{base}/lib", "libs/lib", cwd=sup)
+        git("commit", "-q", "-m", "sub", cwd=sup)
+        work = base / "checkout"
+        git("clone", "-q", f"file://{sup}", str(work))
+        assert not (work / "libs" / "lib" / "file.txt").exists()
+        check("submodules initialized recursively", h.run(work, env=auto), 0,
+              contains=["git submodule update --init --recursive", "::add-mask::"])
+        assert (work / "libs" / "lib" / "file.txt").exists()
+        assert (work / "libs" / "lib" / "vendor" / "inner" / "file.txt").exists()
+        assert git("rev-parse", "HEAD", cwd=work / "libs" / "lib" / "vendor" / "inner") == inner[0]
+        assert_no_persisted_credential(work)
+        assert "extraheader" not in git("config", "--list", "--show-origin",
+                                         cwd=work / "libs" / "lib").lower()
+        del lib
+
+        base = h.case()
+        work2 = base / "c2"
+        git("clone", "-q", f"file://{sup}", str(work2))
+        check("submodules off", h.run(work2, env={"LINT_SUBMODULES": "off"}), 0,
+              contains=["submodules: off"])
+        assert not (work2 / "libs" / "lib" / "file.txt").exists()
+        check("bad submodules value", h.run(work2, env={"LINT_SUBMODULES": "always"}), 1,
+              contains=["'submodules' must be auto or off"])
+    print(f"reusable-lint submodules: {h.count} checkouts passed")
 
 
 if __name__ == "__main__":
