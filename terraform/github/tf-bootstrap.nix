@@ -15,8 +15,16 @@
   githubRepo ? "infra",
   githubEnvironment ? "production",
   protectedBranch ? "live",
-  # { name, slug, description, initialMaintainer }
+  # { name, slug, description, initialMaintainer, additionalMaintainers ? [ ] }
+  # `additionalMaintainers` are further GitHub logins made team maintainers;
+  # `initialMaintainer` keeps its own resource address so existing state is
+  # unaffected.
   reviewerTeam,
+  # Whether classic branch protection binds org/repo admins too. The Phase P
+  # model is "protect the mainline, but NOT enforce_admins" (admins keep the
+  # escape hatch; see mainline-protection.nix). Defaults to true only so that
+  # existing callers render unchanged; new callers should pass false.
+  enforceAdmins ? true,
   # During single-maintainer bootstrap, mandatory PR-review gates would block
   # every PR. Required checks stay enforced regardless; flip to false once the
   # reviewer team has at least two admins.
@@ -62,11 +70,23 @@ in
       privacy = "closed";
     };
 
-    github_team_membership.infra_initial_maintainer = {
-      team_id = "\${github_team.infra.id}";
-      username = reviewerTeam.initialMaintainer;
-      role = "maintainer";
-    };
+    github_team_membership = {
+      infra_initial_maintainer = {
+        team_id = "\${github_team.infra.id}";
+        username = reviewerTeam.initialMaintainer;
+        role = "maintainer";
+      };
+    }
+    // builtins.listToAttrs (
+      map (login: {
+        name = "infra_maintainer_${builtins.replaceStrings [ "-" "." ] [ "_" "_" ] login}";
+        value = {
+          team_id = "\${github_team.infra.id}";
+          username = login;
+          role = "maintainer";
+        };
+      }) (reviewerTeam.additionalMaintainers or [ ])
+    );
 
     github_team_repository.infra = {
       team_id = "\${github_team.infra.id}";
@@ -132,7 +152,7 @@ in
     github_branch_protection.main = {
       repository_id = githubRepo;
       pattern = protectedBranch;
-      enforce_admins = true;
+      enforce_admins = enforceAdmins;
       allows_deletions = false;
       allows_force_pushes = false;
       require_conversation_resolution = true;
