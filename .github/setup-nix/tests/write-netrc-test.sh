@@ -656,9 +656,12 @@ for workflow_and_count in \
   ' "$workflow"
   check "$workflow_name documents the fallback as lower-precedence and optional" $?
 
-  # The literal GitHub expression must reach the workflow unchanged.
+  # The literal GitHub expression must reach the workflow unchanged. The one
+  # permitted extension is a LAST-resort App-minted token (reusable-lint's
+  # `app-token` step, which runs only when neither secret is set), so the
+  # static secrets keep their order and precedence.
   # shellcheck disable=SC2016
-  precedence_count="$(grep -Fc 'nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS }}' "$workflow")"
+  precedence_count="$(grep -Ec 'nix-github-token: \$\{\{ secrets\.NIX_GITHUB_TOKEN \|\| secrets\.GH_READ_METACRAFT_PRIVATE_REPOS( \|\| steps\.app-token\.outputs\.token)? \}\}$' "$workflow")"
   token_input_count="$(grep -Ec '^[[:space:]]+nix-github-token:' "$workflow")"
   [[ "$precedence_count" -eq "$expected_precedence_count" ]] &&
     [[ "$token_input_count" -eq "$expected_precedence_count" ]]
