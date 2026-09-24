@@ -190,6 +190,16 @@ on:
         required: false
         default: 'warn'
 
+      plan_timeout_minutes:
+        description: >-
+          Upper bound for the credentialed PR plan and the drift plan steps. A
+          plan that exceeds it fails the job instead of holding a runner for
+          hours (e.g. a provider sleeping on rate limits with its output
+          redirected).
+        type: number
+        required: false
+        default: 60
+
     secrets:
       AGENIX_CI_PRIVATE_KEY:
         description: 'SSH private key for agenix secret decryption'
@@ -630,8 +640,22 @@ jobs:
           NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from . --accept-flake-config)
           nix develop --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
 
+      # A github provider without a credential does not fail: it falls back to
+      # anonymous access (60 requests/hour) and sleeps until each rate-limit
+      # reset, silently. Refuse before init instead. See the script header.
+      - name: GitHub provider credential gate
+        env:
+          GATE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-provider-credential-gate
+          GITHUB_APP_OWNER: ${{ inputs.github_app_owner }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$GATE_SCRIPT" "$WORKING_DIRECTORY" --github-app-owner "$GITHUB_APP_OWNER"
+
       - name: Plan
         id: plan
+        timeout-minutes: ${{ inputs.plan_timeout_minutes }}
         env:
           BACKEND_CONFIG_FILE: ${{ inputs.backend_config_file }}
           WORKING_DIRECTORY: ${{ inputs.working_directory }}
@@ -672,6 +696,8 @@ jobs:
           plan_stderr="$plan_dir/plan.stderr"
           plan_json="$plan_dir/plan.json"
 
+          # stdout is streamed (tee) so a slow or stuck refresh is visible in
+          # the job log while it happens, not only after tofu exits.
           set +e
           run_tofu plan \
             -input=false \
@@ -679,11 +705,10 @@ jobs:
             -lock=false \
             -detailed-exitcode \
             -out="$plan_bin" \
-            >"$plan_text" 2>"$plan_stderr"
-          plan_exit=$?
+            2>"$plan_stderr" | tee "$plan_text"
+          plan_exit=${PIPESTATUS[0]}
           set -e
 
-          cat "$plan_text"
           cat "$plan_stderr" >&2
 
           if [ "$plan_exit" -eq 1 ]; then
@@ -1166,6 +1191,19 @@ jobs:
           NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from . --accept-flake-config)
           nix develop --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
 
+      # A github provider without a credential does not fail: it falls back to
+      # anonymous access (60 requests/hour) and sleeps until each rate-limit
+      # reset, silently. Refuse before init instead. See the script header.
+      - name: GitHub provider credential gate
+        env:
+          GATE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-provider-credential-gate
+          GITHUB_APP_OWNER: ${{ inputs.github_app_owner }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$GATE_SCRIPT" "$WORKING_DIRECTORY" --github-app-owner "$GITHUB_APP_OWNER"
+
       - name: Apply
         id: apply
         env:
@@ -1478,6 +1516,19 @@ jobs:
           NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from . --accept-flake-config)
           nix develop --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
 
+      # A github provider without a credential does not fail: it falls back to
+      # anonymous access (60 requests/hour) and sleeps until each rate-limit
+      # reset, silently. Refuse before init instead. See the script header.
+      - name: GitHub provider credential gate
+        env:
+          GATE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-provider-credential-gate
+          GITHUB_APP_OWNER: ${{ inputs.github_app_owner }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$GATE_SCRIPT" "$WORKING_DIRECTORY" --github-app-owner "$GITHUB_APP_OWNER"
+
       - name: Init
         env:
           BACKEND_CONFIG_FILE: ${{ inputs.backend_config_file }}
@@ -1509,6 +1560,7 @@ jobs:
 
       - name: Detect drift
         id: drift
+        timeout-minutes: ${{ inputs.plan_timeout_minutes }}
         run: |
           set -euo pipefail
 

@@ -25,6 +25,10 @@
             export PLAN_DESTROY_GUARD_SCRIPT=${../terraform/ci/plan-destroy-guard}
             export PLAN_DESTROY_GUARD_PYTHON=${pkgs.python3}/bin/python3
             ${pkgs.bash}/bin/bash ${../terraform/ci/tests/test-plan-destroy-guard.sh}
+
+            export GITHUB_PROVIDER_CREDENTIAL_GATE_SCRIPT=${../terraform/ci/github-provider-credential-gate}
+            export GITHUB_PROVIDER_CREDENTIAL_GATE_PYTHON=${pkgs.python3}/bin/python3
+            ${pkgs.bash}/bin/bash ${../terraform/ci/tests/test-github-provider-credential-gate.sh}
             touch "$out"
           '';
     };

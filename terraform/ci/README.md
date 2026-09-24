@@ -111,3 +111,34 @@ weakenings. The `terraform-ci-matrix` flake check runs both in a Nix sandbox on
 every supported system. `tests/test-plan-destroy-guard.sh` exercises
 `plan-destroy-guard` against `tofu show -json`-shaped fixtures, including a
 replay of the 2026-09-23 incident; the same flake check runs it.
+`tests/test-github-provider-credential-gate.sh` exercises
+`github-provider-credential-gate`, including a replay of the 2026-09-24
+incident; the same flake check runs it.
+
+## GitHub provider credential gate
+
+The `integrations/github` provider does not fail when it has no credential: it
+tries `gh auth token`, then runs anonymously (60 requests/hour per source IP),
+and answers every primary rate-limit 403 by sleeping until the reset and
+retrying, logging only at WARN. A governance root refreshes hundreds of objects,
+so an uncredentialed plan sleeps for hours with no output. On 2026-09-24 that
+happened to a caller that forwarded its matrix row without `github_app_owner`
+and the `GH_APP_*` secrets.
+
+`github-provider-credential-gate` runs before init in the plan, apply and drift
+jobs. It refuses a root whose `metadata.json` says `credential_mode: github-app`
+when the caller passed no `github_app_owner`, and any root whose `github`
+provider has neither `token` nor `app_auth` while `GITHUB_TOKEN` is empty.
+Callers with a `github-app` root must pass:
+
+```yaml
+with:
+  github_app_owner: ${{ matrix.github_app_owner }}
+secrets:
+  GH_APP_ID: ${{ secrets.GH_GOVERNANCE_APP_ID }}
+  GH_APP_PRIVATE_KEY: ${{ secrets.GH_GOVERNANCE_APP_PRIVATE_KEY }}
+```
+
+The credentialed PR plan and the drift plan are also bounded by
+`plan_timeout_minutes` (default 60), and the PR plan streams its stdout to the
+job log, so any other stall fails visibly instead of holding a runner.
