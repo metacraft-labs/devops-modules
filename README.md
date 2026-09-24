@@ -46,7 +46,11 @@ jobs:
 
 #### [`reusable-lint.yml`](.github/workflows/reusable-lint.yml)
 
-Runs pre-commit hooks for linting and formatting checks.
+Runs pre-commit hooks for linting and formatting checks. Before the hooks run
+it initializes git submodules (`submodules: auto`) and materializes the repo's
+reprobuild develop set — the sibling repos its committed `repro.lock` pins, at
+the pinned revisions, placed where `repro develop` would place them
+(`develop-set: auto`). Set either input to `off` to skip it.
 
 ```yml
 jobs:
