@@ -30,3 +30,6 @@ precalc-matrix.json
 # Python bytecode from the git-hooks implementations
 __pycache__/
 *.pyc
+
+# Repro development environment artifacts
+.repro/
