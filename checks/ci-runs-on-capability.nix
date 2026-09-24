@@ -105,6 +105,7 @@
             grep -q "legacy-class"  oc.err   || fail "linter did not name the legacy-class job"
             grep -q "gpu"           oc.err   || fail "linter did not flag the needless gpu capability"
             grep -q "x86-64-v3"     oc.err   || fail "linter did not flag the needless x86-64-v3 capability"
+            grep -q "needless-bare-metal" oc.err || fail "linter did not flag the needless bare-metal/nixos pin"
             # And it suggests the migration-table label set for the bare class.
             grep -q "self-hosted" oc.err     || fail "linter did not suggest the capability label set"
 
@@ -127,6 +128,7 @@
             check_route "v3-only"       '["self-hosted","linux","x64","x86-64-v3"]'
             check_route "gpu"           '["self-hosted","linux","x64","gpu"]'
             check_route "windows"       '["self-hosted","windows","x64"]'
+            check_route "kvm"           '["self-hosted","linux","x64","bare-metal"]'
 
             # ---- 2d. the repo's OWN reusable workflows pass the lint -------------
             # Their runs-on is parameterised (fromJSON(inputs.*)) -> dynamic ->
