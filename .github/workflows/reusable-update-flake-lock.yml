@@ -59,7 +59,7 @@ jobs:
       pull-request-number: ${{ steps.create-pr.outputs.pull-request-number }}
 
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: metacraft-labs/devops-modules/.github/setup-nix@dev
