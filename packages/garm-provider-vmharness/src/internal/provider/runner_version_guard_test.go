@@ -32,9 +32,17 @@ package provider
 // is no GARM to call. The runner installs are real directory trees on disk
 // with a Runner.Listener.deps.json shaped like the one a real 2.337.0 install
 // ships (`"Runner.Listener/2.337.0": {`); only the runner binaries are absent,
-// which the guard never touches (it must not execute the runner).
+// which the guard never touches (it must not execute the runner). The
+// upstream-Linux guard downloads the offered runner itself; its test serves a
+// real tar.gz built on disk through a file:// URL with the real curl, so no
+// network is involved and nothing about the download is faked.
 
 import (
+	"archive/tar"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -453,7 +461,8 @@ func checkGuardOutcome(t *testing.T, c guardCase, home, launcher, out string, wh
 
 // TestRunnerVersionGuardExecutesInShell runs each POSIX-shell guard exactly as
 // rendered, under the enclosing template's strictness (`set -e`, pipefail for
-// bash, `set -eu` for the macOS sh template).
+// bash, `set -eu` for the macOS sh template). The upstream-Linux guard, which
+// replaces the runner in place instead, has its own test below.
 func TestRunnerVersionGuardExecutesInShell(t *testing.T) {
 	type shellPath struct {
 		pathName string
@@ -467,7 +476,6 @@ func TestRunnerVersionGuardExecutesInShell(t *testing.T) {
 		paths[p.name] = p
 	}
 	for _, sp := range []shellPath{
-		{"upstream-linux-incus", "bash", "set -e\nset -o pipefail\n", "sendStatus", true},
 		{"own-linux-foreground-tart", "bash", "set -e\nset -o pipefail\n", "status", false},
 		{"own-macos-tart", "sh", "set -eu\n", "status", false},
 	} {
@@ -547,5 +555,222 @@ func TestRunnerVersionGuardExecutesInPowerShell(t *testing.T) {
 				checkGuardOutcome(t, c, home, "run.cmd", out, pp.wholeDir)
 			})
 		}
+	}
+}
+
+// ---- upstream Linux: replace in place ---------------------------------------
+
+// runnerTarball writes a tar.gz shaped like an actions/runner release (./bin,
+// ./externals, ./run.sh) for the given Runner.Listener version and returns its
+// path and sha256.
+func runnerTarball(t *testing.T, dir, version string) (string, string) {
+	t.Helper()
+	path := filepath.Join(dir, "actions-runner-linux-x64-"+version+".tar.gz")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	add := func(name, body string, mode int64) {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: mode, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(body)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, d := range []string{"./bin/", "./externals/", "./externals/node20/", "./externals/node20/bin/"} {
+		if err := tw.WriteHeader(&tar.Header{Name: d, Mode: 0o755, Typeflag: tar.TypeDir}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("./bin/Runner.Listener.deps.json", depsJSON(version), 0o644)
+	add("./externals/node20/bin/node", "node-"+version, 0o755)
+	add("./run.sh", "#!/bin/sh\n# runner "+version+"\n", 0o755)
+	add("./config.sh", "#!/bin/sh\n", 0o755)
+	for _, c := range []interface{ Close() error }{tw, gz, f} {
+		if err := c.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	return path, hex.EncodeToString(sum[:])
+}
+
+// upstreamLinuxGuard renders the upstream-Linux bootstrap for a tools entry
+// served from url and returns its guard exactly as injected, with the chown
+// target switched from the guest's runner user (absent here) to the test
+// process's own uid:gid -- the one substitution made to the rendered text.
+func upstreamLinuxGuard(t *testing.T, url, sha string) string {
+	t.Helper()
+	file := "actions-runner-linux-x64-" + offeredVersion + ".tar.gz"
+	params := guardBootstrap(commonParams.Linux, commonParams.Amd64, "linux", "x64", file, url)
+	if sha != "" {
+		params.Tools[0].SHA256Checksum = strptr(sha)
+	}
+	p := guardPath{name: "upstream-linux", backend: config.BackendIncus, params: params, decision: `if [ ! -d "$RUN_HOME" ];then`}
+	guard := extractGuard(t, p)
+	if !strings.Contains(guard, shellQuote(url)) {
+		t.Fatalf("guard does not download the offered runner URL %q:\n%s", url, guard)
+	}
+	if strings.Contains(guard, "installdependencies") {
+		t.Fatalf("in-place replacement must not run installdependencies:\n%s", guard)
+	}
+	ownerLine := "GARM_RUNNER_OWNER='runner:runner'"
+	if strings.Count(guard, ownerLine) != 1 {
+		t.Fatalf("guard must chown to the upstream runner user exactly once (%q):\n%s", ownerLine, guard)
+	}
+	return strings.Replace(guard, ownerLine, fmt.Sprintf("GARM_RUNNER_OWNER='%d:%d'", os.Getuid(), os.Getgid()), 1)
+}
+
+func cachedRunnerVersion(t *testing.T, home string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(home, "bin", "Runner.Listener.deps.json"))
+	if err != nil {
+		return ""
+	}
+	m := strings.SplitN(string(data), `"Runner.Listener/`, 2)
+	if len(m) != 2 {
+		return ""
+	}
+	return strings.SplitN(m[1], `"`, 2)[0]
+}
+
+// TestUpstreamLinuxGuardReplacesRunnerInPlace executes the upstream-Linux guard
+// exactly as injected (bash, `set -e` + pipefail as upstream sets) against real
+// runner homes, downloading a real tarball with curl over file://. On mismatch
+// the runner binaries must be replaced IN PLACE -- the home survives, so
+// upstream continues down its "using cached runner" branch and never runs
+// installdependencies (apt) -- and any download/verify/extract failure must
+// call fail rather than fall back silently.
+func TestUpstreamLinuxGuardReplacesRunnerInPlace(t *testing.T) {
+	bash := findShell(t, "bash", "CONFIG_SHELL", "SHELL")
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl not found on PATH")
+	}
+	fixtures := t.TempDir()
+	goodTar, goodSHA := runnerTarball(t, fixtures, offeredVersion)
+	wrongDir := filepath.Join(fixtures, "wrong")
+	if err := os.MkdirAll(wrongDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wrongTar, _ := runnerTarball(t, wrongDir, "2.330.0")
+
+	cases := []struct {
+		name  string
+		url   string
+		sha   string
+		setup func(t *testing.T, home string)
+		// outcome
+		wantReplaced bool
+		wantFail     string
+		wantStatus   []string
+	}{
+		{name: "matching-version-kept", url: "file://" + goodTar, setup: stagedRunner(offeredVersion, "run.sh")},
+		{name: "older-version-replaced", url: "file://" + goodTar, setup: stagedRunner("2.328.0", "run.sh"), wantReplaced: true,
+			wantStatus: []string{"cached runner 2.328.0", "offered " + offeredVersion, "replacing runner binaries in place"}},
+		{name: "older-version-replaced-checksum-verified", url: "file://" + goodTar, sha: goodSHA, setup: stagedRunner("2.328.0", "run.sh"), wantReplaced: true,
+			wantStatus: []string{"cached runner 2.328.0"}},
+		{name: "missing-deps-replaced", url: "file://" + goodTar, setup: stagedRunner("", "run.sh"), wantReplaced: true,
+			wantStatus: []string{"cached runner unknown"}},
+		{name: "no-runner-untouched", url: "file://" + goodTar, setup: func(*testing.T, string) {}},
+		{name: "download-failure-fails", url: "file://" + filepath.Join(fixtures, "absent.tar.gz"), setup: stagedRunner("2.328.0", "run.sh"),
+			wantFail: "failed to download runner " + offeredVersion},
+		{name: "checksum-mismatch-fails", url: "file://" + goodTar, sha: strings.Repeat("0", 64), setup: stagedRunner("2.328.0", "run.sh"),
+			wantFail: "checksum mismatch"},
+		{name: "wrong-archive-version-fails", url: "file://" + wrongTar, setup: stagedRunner("2.328.0", "run.sh"),
+			wantFail: "installed version 2.330.0, not the offered " + offeredVersion},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			guard := upstreamLinuxGuard(t, c.url, c.sha)
+			dir := t.TempDir()
+			home := filepath.Join(dir, "actions-runner")
+			c.setup(t, home)
+			staged := exists(home)
+			if staged {
+				// Only in the stale runner: must not survive a replacement.
+				writeFile(t, filepath.Join(home, "bin", "stale-only-in-old-runner"), "")
+			}
+			script := "set -e\nset -o pipefail\n" +
+				"sendStatus() { echo \"STATUS: $1\"; }\n" +
+				"fail() { echo \"FAIL: $1\"; exit 1; }\n" +
+				"TMPDIR=" + shellQuote(dir) + "\n" +
+				"RUN_HOME=" + shellQuote(home) + "\n" +
+				guard +
+				"echo GUARD-DONE\n"
+			outB, err := exec.Command(bash, "-c", script).CombinedOutput()
+			out := string(outB)
+
+			if c.wantFail != "" {
+				if err == nil || !strings.Contains(out, "FAIL: ") || !strings.Contains(out, c.wantFail) {
+					t.Fatalf("want failure containing %q, got err=%v:\n%s", c.wantFail, err, out)
+				}
+				if strings.Contains(out, "GUARD-DONE") {
+					t.Fatalf("guard continued after a failure:\n%s", out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("guard exited with %v:\n%s\n--- script ---\n%s", err, out, script)
+			}
+			if !strings.Contains(out, "GUARD-DONE") || strings.Contains(out, "FAIL:") {
+				t.Fatalf("guard did not complete cleanly:\n%s", out)
+			}
+			if leftovers, _ := filepath.Glob(filepath.Join(dir, "garm-actions-runner.*")); len(leftovers) > 0 {
+				t.Fatalf("downloaded archive left behind: %v", leftovers)
+			}
+			if !staged {
+				if exists(home) {
+					t.Fatalf("guard created %s:\n%s", home, out)
+				}
+				if strings.Contains(out, "STATUS:") {
+					t.Fatalf("status reported with no cached runner:\n%s", out)
+				}
+				return
+			}
+			// The home must survive in every non-failing case, so upstream takes
+			// its cached-runner branch (no installdependencies).
+			if !exists(home) {
+				t.Fatalf("runner home %s was removed:\n%s", home, out)
+			}
+			if !exists(filepath.Join(home, ".env")) {
+				t.Fatalf(".env did not survive:\n%s", out)
+			}
+			if got := cachedRunnerVersion(t, home); got != offeredVersion {
+				t.Fatalf("runner version after guard = %q, want %q:\n%s", got, offeredVersion, out)
+			}
+			stale := exists(filepath.Join(home, "bin", "stale-only-in-old-runner"))
+			if c.wantReplaced {
+				if stale {
+					t.Fatalf("stale bin/ content survived the replacement:\n%s", out)
+				}
+				node, _ := os.ReadFile(filepath.Join(home, "externals", "node20", "bin", "node"))
+				if string(node) != "node-"+offeredVersion {
+					t.Fatalf("externals/ was not replaced (node = %q):\n%s", node, out)
+				}
+				runSh, _ := os.ReadFile(filepath.Join(home, "run.sh"))
+				if !strings.Contains(string(runSh), "runner "+offeredVersion) {
+					t.Fatalf("run.sh was not replaced from the offered archive:\n%s", out)
+				}
+				for _, w := range c.wantStatus {
+					if !strings.Contains(out, w) {
+						t.Fatalf("status output missing %q:\n%s", w, out)
+					}
+				}
+			} else {
+				if !stale {
+					t.Fatalf("matching runner was modified:\n%s", out)
+				}
+				if strings.Contains(out, "STATUS:") {
+					t.Fatalf("status reported although the runner matches:\n%s", out)
+				}
+			}
+		})
 	}
 }
