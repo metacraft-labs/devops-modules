@@ -202,7 +202,7 @@ jobs:
           grep -q "^machine $h " "$HOME/.config/nix/netrc" 2>/dev/null || \
             printf 'machine %s password %s\n' "$h" "$ATTIC_TOKEN" >> "$HOME/.config/nix/netrc"
 
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
 
       - name: Generate Shard Matrix
         id: generate-matrix
@@ -257,7 +257,7 @@ jobs:
           grep -q "^machine $h " "$HOME/.config/nix/netrc" 2>/dev/null || \
             printf 'machine %s password %s\n' "$h" "$ATTIC_TOKEN" >> "$HOME/.config/nix/netrc"
 
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
 
       - name: Generate CI Matrix
         id: generate-matrix
@@ -298,7 +298,7 @@ jobs:
     if: needs.shard-matrix.outputs.eval_matrix != '{"include":[]}' &&
       needs.eval-matrix.result == 'success'
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: metacraft-labs/devops-modules/.github/setup-nix@dev
@@ -659,7 +659,7 @@ jobs:
         run: |
           echo "All evaluated outputs were already present in the configured caches."
 
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
         if: ${{ !matrix.noop }}
 
       - name: Setup Nix
