@@ -26,7 +26,6 @@
 #       repositories = inventory.repositories;
 #       overrides = { my-product = "dev"; };      # default branch is `stable`
 #       directPushRepos = [ "workspace" ];        # tool-driven direct pushes
-#       enforcement = "evaluate";                 # Enterprise: dry-run first
 #     };
 #   in mkGovernance {
 #     governance = inventory // {
@@ -51,9 +50,17 @@
 #   * NO `requiredStatusChecks`.     The engine's ruleset schema does not express
 #     them, and pinning a check context that does not exist yet makes every PR
 #     unmergeable. Concrete required checks are a later, per-repo layer.
-#   * `bypassActors`                 — default: OrganizationAdmin/always, i.e.
-#     "protect the mainline, but NOT enforce_admins". Callers may add narrowly
-#     scoped actors (e.g. a release App by its Integration id).
+#   * `bypassActors = [ ]`, `enforcement = "active"` — the policy's `noBypass`
+#     rule (branch-protection-policy.json, branching-policy.md "No bypass").
+#     Agents act under their operator's identity, so an OrganizationAdmin (or
+#     any other) bypass the operator holds is a bypass every agent holds: the
+#     ruleset would protect the mainline from everyone except the actors most
+#     likely to push to it by mistake. Deviating from either default is an
+#     explicit, documented exception: a non-empty `bypassActors` requires
+#     `bypassException`, a non-`active` enforcement requires
+#     `enforcementException` (each the reason, >= 20 characters), and the
+#     render throws otherwise. (Until 2026-09-25 the default was
+#     OrganizationAdmin/always — "protect the mainline, but NOT enforce_admins".)
 #
 # The `agents` integration branch is INTENTIONALLY never targeted: agents push to
 # it directly and reach the mainline only through a pull request.
@@ -93,19 +100,19 @@
   ],
   # enforcement: "active" | "evaluate" | "disabled". `evaluate` (Enterprise
   #   only) records what WOULD be blocked in rule insights without blocking.
+  #   Anything but "active" requires `enforcementException`.
   enforcement ? "active",
+  # enforcementException: the documented reason for a non-"active" enforcement.
+  enforcementException ? null,
   # requiredApprovingReviewCount: null derives it from the policy class
   #   (`requirePullRequestReview` -> 1, else 0); an integer forces it for every
   #   mainline.
   requiredApprovingReviewCount ? null,
-  # bypassActors: the ruleset bypass list (engine schema).
-  bypassActors ? [
-    {
-      actorId = 0;
-      actorType = "OrganizationAdmin";
-      bypassMode = "always";
-    }
-  ],
+  # bypassActors: the ruleset bypass list (engine schema). The policy forbids
+  #   bypass, so a non-empty list requires `bypassException`.
+  bypassActors ? [ ],
+  # bypassException: the documented reason for a non-empty `bypassActors`.
+  bypassException ? null,
   # name: the ruleset name (also part of the engine's resource key).
   name ? "mainline-protect",
 }:
@@ -260,10 +267,20 @@ let
     in
     branch != null && elem branch mainlineKeys && !(classRequiresPullRequest branch)
   ) directPushRepos;
+  # The policy's `noBypass` rule: an exception must say why.
+  documented = reason: builtins.isString reason && builtins.stringLength reason >= 20;
 in
 assert
   unknown == [ ]
   || throw "mainline-protection: unknown repositories in excludeRepos/directPushRepos/overrides: ${builtins.concatStringsSep ", " unknown}";
+assert
+  bypassActors == [ ]
+  || documented bypassException
+  || throw "mainline-protection: bypassActors ${builtins.toJSON bypassActors} without a documented `bypassException` — the branch-protection policy forbids bypass (agents act under their operator's identity)";
+assert
+  enforcement == "active"
+  || documented enforcementException
+  || throw "mainline-protection: enforcement `${enforcement}` without a documented `enforcementException` — the branch-protection policy requires `active`";
 {
   # Entries in the engine's `repositoryRulesets` schema. Append them to
   # `governance.repositoryRulesets`.

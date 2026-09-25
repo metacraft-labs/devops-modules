@@ -73,6 +73,7 @@ args='
   overrides = { product = "dev"; stale = "live"; };
   directPushRepos = [ "manifests" ];
   enforcement = "evaluate";
+  enforcementException = "test fixture: exercise the pass-through";
 '
 out="$(helper_eval "$args")"
 
@@ -94,8 +95,10 @@ check "direct-push repo keeps no-delete/no-force-push but no pull_request rule" 
   '(.rulesets[] | select(.repository == "manifests") | .rules) == {deletion: true, nonFastForward: true}' "$out"
 check "approval count derives from the policy class (dev=1, latest/live=0)" \
   '([.rulesets[] | select(.conditions.refNameInclude[0] == "refs/heads/dev") | .rules.pullRequest.requiredApprovingReviewCount] | all(. == 1)) and ([.rulesets[] | select(.repository == "infra") | .rules.pullRequest.requiredApprovingReviewCount] == [0])' "$out"
-check "default bypass is OrganizationAdmin only (not enforce_admins)" \
-  '[.rulesets[].bypassActors] | all(. == [{actorId: 0, actorType: "OrganizationAdmin", bypassMode: "always"}])' "$out"
+check "default bypass is EMPTY (the policy's noBypass rule: no admin bypass)" \
+  '[.rulesets[].bypassActors] | all(. == [])' "$out"
+check "default enforcement is active" \
+  '[.rulesets[].enforcement] | all(. == "active")' "$(helper_eval 'excludeRepos = [ "fork" ];')"
 check "absent requirePullRequest defaults to PR-only (latest keeps pull_request)" \
   '((.rulesets[] | select(.repository == "specs") | .rules.pullRequest) != null) and (.policyDirectPushRepos == []) and (.directPushClasses == [])' "$out"
 
@@ -161,6 +164,30 @@ else
   echo "ok: a non-boolean requirePullRequest is rejected"
 fi
 
+# The noBypass policy: a bypass or a non-active enforcement is an explicit,
+# documented exception, never a silent argument.
+if helper_eval 'bypassActors = [ { actorId = 0; actorType = "OrganizationAdmin"; bypassMode = "always"; } ];' >/dev/null 2>&1; then
+  echo "FAIL: an OrganizationAdmin bypass without bypassException was accepted"
+  fail=1
+else
+  echo "ok: a bypass without a documented bypassException is rejected"
+fi
+if helper_eval 'bypassActors = [ { actorId = 0; actorType = "OrganizationAdmin"; bypassMode = "always"; } ]; bypassException = "short";' >/dev/null 2>&1; then
+  echo "FAIL: a bypass with an undocumented (too short) reason was accepted"
+  fail=1
+else
+  echo "ok: a bypass with a too-short reason is rejected"
+fi
+if helper_eval 'enforcement = "evaluate";' >/dev/null 2>&1; then
+  echo "FAIL: evaluate enforcement without enforcementException was accepted"
+  fail=1
+else
+  echo "ok: a non-active enforcement without a documented enforcementException is rejected"
+fi
+outEx="$(helper_eval 'bypassActors = [ { actorId = 42; actorType = "Integration"; bypassMode = "always"; } ]; bypassException = "release App 42 tags releases on the mainline";')"
+check "a documented bypassException is honoured (the actor is passed through)" \
+  '[.rulesets[].bypassActors] | all(. == [{actorId: 42, actorType: "Integration", bypassMode: "always"}])' "$outEx"
+
 # Round-trip through the real engine: the entries are valid repositoryRulesets.
 rendered="$(nix eval --json --impure --expr "
   let m = import ${helper} ({ policy = ${policy}; repositories = ${repos}; } // { ${args} });
@@ -189,8 +216,8 @@ rendered="$(nix eval --json --impure --expr "
 ")"
 check "engine renders one github_repository_ruleset per covered repository" \
   '(.resource.github_repository_ruleset | length) == 6' "$rendered"
-check "rendered PR-only ruleset carries pull_request and the admin bypass" \
-  '[.resource.github_repository_ruleset[] | select(.repository == "infra")][0] | (.rules[0].pull_request | length == 1) and (.bypass_actors[0].actor_type == "OrganizationAdmin") and (.enforcement == "evaluate") and (.conditions[0].ref_name[0].include == ["refs/heads/live"])' "$rendered"
+check "rendered PR-only ruleset carries pull_request and NO bypass_actors" \
+  '[.resource.github_repository_ruleset[] | select(.repository == "infra")][0] | (.rules[0].pull_request | length == 1) and (has("bypass_actors") | not) and (.enforcement == "evaluate") and (.conditions[0].ref_name[0].include == ["refs/heads/live"])' "$rendered"
 check "rendered direct-push ruleset has no pull_request block" \
   '[.resource.github_repository_ruleset[] | select(.repository == "manifests")][0].rules[0] | has("pull_request") | not' "$rendered"
 

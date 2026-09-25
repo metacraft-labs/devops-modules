@@ -23,6 +23,25 @@
     version = 1;
     payloads = { };
   },
+  # noBypassPolicy: opt-in enforcement of the shared branch-protection policy's
+  # `noBypass` rule (metacraft-dev-guidelines/policies/branch-protection-policy.json,
+  # branching-policy.md "No bypass"): every rendered ruleset is `active` with NO
+  # bypass actors, and every classic branch protection sets `enforce_admins`
+  # and names no pull-request bypassers. Agents run under their operator's
+  # identity, so any bypass an operator holds is a bypass every agent holds.
+  #
+  #   null (default)  — not checked (backward compatible for callers that have
+  #                     not adopted the rule yet).
+  #   { rulesetExceptions ? { }; branchProtectionExceptions ? { }; }
+  #                   — checked; the render THROWS on a violation. Exceptions
+  #                     are keyed by the engine resource key
+  #                     ("repository-ruleset:<repo>:<name>",
+  #                     "organization-ruleset:<name>",
+  #                     "branch-protection:<repo>:<pattern>") and map to the
+  #                     documented reason (at least 20 characters). An exception
+  #                     that no longer names a rendered resource also throws, so
+  #                     a stale exemption cannot outlive what it exempted.
+  noBypassPolicy ? null,
 }:
 let
   inherit (builtins)
@@ -861,6 +880,97 @@ let
     };
 
   countAttrs = attrs: length (attrNames attrs);
+
+  # --- the no-bypass policy gate (see `noBypassPolicy` above) ---
+  rulesetEntries =
+    map (rs: {
+      key = "repository-ruleset:${rs.repository}:${rs.name}";
+      value = rs;
+    }) (governance.repositoryRulesets or [ ])
+    ++ map (rs: {
+      key = "organization-ruleset:${rs.name}";
+      value = rs;
+    }) (governance.organizationRulesets or [ ]);
+  branchProtectionEntries = map (bp: {
+    key = "branch-protection:${bp.repository}:${bp.pattern}";
+    value = bp;
+  }) governance.branchProtections;
+
+  rulesetBypassCount = foldl' (n: e: n + length (e.value.bypassActors or [ ])) 0 rulesetEntries;
+  rulesetNonActiveCount = length (filter (e: e.value.enforcement != "active") rulesetEntries);
+  branchProtectionAdminBypassCount = length (
+    filter (
+      e: !e.value.enforceAdmins || (e.value.requiredPullRequestReviews.pullRequestBypassers or [ ]) != [ ]
+    ) branchProtectionEntries
+  );
+
+  noBypassViolations =
+    if noBypassPolicy == null then
+      [ ]
+    else
+      let
+        rsEx = noBypassPolicy.rulesetExceptions or { };
+        bpEx = noBypassPolicy.branchProtectionExceptions or { };
+        allKeys = map (e: e.key) (rulesetEntries ++ branchProtectionEntries);
+        exempt = ex: key: hasAttr key ex;
+        badReason = ex: filter (k: builtins.stringLength ex.${k} < 20) (attrNames ex);
+        stale = ex: filter (k: !(elem k allKeys)) (attrNames ex);
+      in
+      concatMap (
+        e:
+        (
+          if exempt rsEx e.key then
+            [ ]
+          else
+            (
+              if (e.value.bypassActors or [ ]) != [ ] then
+                [
+                  "${e.key}: has bypass actors ${builtins.toJSON e.value.bypassActors} (the policy forbids bypass)"
+                ]
+              else
+                [ ]
+            )
+            ++ (
+              if e.value.enforcement != "active" then
+                [ "${e.key}: enforcement is `${e.value.enforcement}`, not `active`" ]
+              else
+                [ ]
+            )
+        )
+      ) rulesetEntries
+      ++ concatMap (
+        e:
+        if exempt bpEx e.key then
+          [ ]
+        else
+          (
+            if !e.value.enforceAdmins then
+              [ "${e.key}: enforce_admins is false (admins would bypass the protection)" ]
+            else
+              [ ]
+          )
+          ++ (
+            if (e.value.requiredPullRequestReviews.pullRequestBypassers or [ ]) != [ ] then
+              [
+                "${e.key}: names pull-request bypassers ${builtins.toJSON e.value.requiredPullRequestReviews.pullRequestBypassers}"
+              ]
+            else
+              [ ]
+          )
+      ) branchProtectionEntries
+      ++ map (k: "noBypassPolicy exception `${k}` has no documented reason (>= 20 chars)") (
+        badReason rsEx ++ badReason bpEx
+      )
+      ++ map (k: "noBypassPolicy exception `${k}` names no rendered resource; drop it") (
+        stale rsEx ++ stale bpEx
+      );
+
+  checkedResources =
+    if noBypassViolations != [ ] then
+      throw "governance: the no-bypass branch-protection policy is violated:\n  - ${concatStringsSep "\n  - " noBypassViolations}"
+    else
+      resources;
+
   countTopics = foldl' (sum: repo: sum + length (repo.topics or [ ])) 0 governance.repositories;
 
   resources =
@@ -895,7 +1005,7 @@ in
     owner = githubOwner;
   };
 
-  resource = resources;
+  resource = checkedResources;
 
   output = {
     expected_aws_account_id = {
@@ -1002,6 +1112,21 @@ in
     github_governance_branch_protection_count = {
       value = countAttrs branchProtectionResources;
       description = "Branch protection resources emitted by the governance model.";
+    };
+
+    github_governance_ruleset_bypass_actor_count = {
+      value = rulesetBypassCount;
+      description = "Bypass actors across every rendered repository and organization ruleset (the no-bypass policy wants 0).";
+    };
+
+    github_governance_ruleset_non_active_count = {
+      value = rulesetNonActiveCount;
+      description = "Rendered rulesets whose enforcement is not `active` (evaluate/disabled).";
+    };
+
+    github_governance_branch_protection_admin_bypass_count = {
+      value = branchProtectionAdminBypassCount;
+      description = "Classic branch protections that let admins through (enforce_admins = false) or name pull-request bypassers.";
     };
 
     github_governance_environment_count = {
