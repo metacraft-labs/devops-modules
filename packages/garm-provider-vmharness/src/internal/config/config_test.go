@@ -251,3 +251,46 @@ func TestResolveToken(t *testing.T) {
 		t.Fatal("no token source should error")
 	}
 }
+
+func TestRemoteIncusResourceLimitsParseAndRejectBackendMismatch(t *testing.T) {
+	t.Setenv(DefaultAuthTokenEnv, "")
+
+	cfg, err := ParseBytes([]byte(`
+backend = "remote"
+[remote]
+endpoint = "runner.example.test:8873"
+target_backend = "incus"
+auth_token = "t"
+incus_limits_cpu = 6
+incus_limits_memory_mb = 16384
+`))
+	if err != nil {
+		t.Fatalf("remote Incus resource limits rejected: %v", err)
+	}
+	if cfg.Remote.IncusLimitsCPU != 6 || cfg.Remote.IncusLimitsMemoryMB != 16384 {
+		t.Fatalf("remote Incus resource limits did not parse: %+v", cfg.Remote)
+	}
+
+	for _, flags := range []string{"incus_limits_cpu = 6", "incus_limits_memory_mb = 1024"} {
+		_, err := ParseBytes([]byte(`
+backend = "remote"
+[remote]
+endpoint = "runner.example.test:8873"
+target_backend = "libvirt"
+auth_token = "t"
+` + flags + "\n"))
+		if err == nil || !strings.Contains(err.Error(), `remote.target_backend "incus"`) {
+			t.Fatalf("%s on a libvirt target: want an actionable rejection, got %v", flags, err)
+		}
+	}
+	if _, err := ParseBytes([]byte(`
+backend = "remote"
+[remote]
+endpoint = "runner.example.test:8873"
+target_backend = "incus"
+auth_token = "t"
+incus_limits_cpu = -1
+`)); err == nil {
+		t.Fatal("a negative incus_limits_cpu was accepted")
+	}
+}

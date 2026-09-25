@@ -51,6 +51,13 @@ top@{ ... }:
         remoteProvider "incus" {
           incusSecurityNesting = true;
           incusNestedKvm = true;
+          incusLimitsCpu = 6;
+          incusLimitsMemoryMb = 16384;
+        }
+      );
+      badLimitsTarget = mkSystem (
+        remoteProvider "libvirt" {
+          incusLimitsCpu = 6;
         }
       );
       badSecurityTarget = mkSystem (
@@ -75,6 +82,7 @@ top@{ ... }:
         config: map (a: a.message) (builtins.filter (a: !a.assertion) (config.assertions or [ ]));
       securityMessage = "remote.incusSecurityNesting requires backend = \"remote\" and remote.targetBackend = \"incus\"";
       kvmMessage = "remote.incusNestedKvm requires backend = \"remote\" and remote.targetBackend = \"incus\"";
+      limitsMessage = "remote.incusLimitsCpu/incusLimitsMemoryMb require backend = \"remote\" and remote.targetBackend = \"incus\"";
       isExactFailure =
         needle: config:
         let
@@ -97,7 +105,10 @@ top@{ ... }:
             "remote.incusNestedKvm did not fail exactly once for targetBackend=libvirt: ${toString (failedMessages badKvmTarget)}"
         ++
           lib.optional (!isExactFailure kvmMessage badNonRemote)
-            "remote.incusNestedKvm did not fail exactly once for a non-remote provider: ${toString (failedMessages badNonRemote)}";
+            "remote.incusNestedKvm did not fail exactly once for a non-remote provider: ${toString (failedMessages badNonRemote)}"
+        ++
+          lib.optional (!isExactFailure limitsMessage badLimitsTarget)
+            "remote.incusLimitsCpu did not fail exactly once for targetBackend=libvirt: ${toString (failedMessages badLimitsTarget)}";
     in
     {
       checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
@@ -124,7 +135,7 @@ top@{ ... }:
 
               grep -Fx '[remote]' "$default_config"
               grep -Fx 'target_backend = "incus"' "$default_config"
-              if grep -Eq '^incus_(security_nesting|nested_kvm)[[:space:]]*=' "$default_config"; then
+              if grep -Eq '^incus_(security_nesting|nested_kvm|limits_cpu|limits_memory_mb)[[:space:]]*=' "$default_config"; then
                 echo "default remote provider rendered an unrequested Incus capability" >&2
                 cat "$default_config" >&2
                 exit 1
@@ -136,6 +147,8 @@ top@{ ... }:
               nesting_line="$(grep -nFx 'incus_security_nesting = true' "$enabled_config" | cut -d: -f1)"
               kvm_line="$(grep -nFx 'incus_nested_kvm = true' "$enabled_config" | cut -d: -f1)"
               test "$nesting_line" -lt "$kvm_line"
+              grep -Fx 'incus_limits_cpu = 6' "$enabled_config"
+              grep -Fx 'incus_limits_memory_mb = 16384' "$enabled_config"
 
               # The module exposes only booleans that map to vm-harness's fixed
               # flags: never a caller-selected Incus key, path, type, or mode.

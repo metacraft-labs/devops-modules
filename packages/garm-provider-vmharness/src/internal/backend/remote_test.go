@@ -206,6 +206,57 @@ func TestRemoteCreateIncusCapabilityFlagOrderAndDeleteIsolation(t *testing.T) {
 	}
 }
 
+func TestRemoteCreateIncusResourceLimitsFollowCapabilities(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		cpus     int
+		memoryMB int
+		suffix   []string
+	}{
+		{name: "unset emits nothing", suffix: nil},
+		{name: "cpu only", cpus: 6, suffix: []string{"--cpus", "6"}},
+		{name: "memory only", memoryMB: 16384, suffix: []string{"--memory-mb", "16384"}},
+		{name: "both in fixed order", cpus: 6, memoryMB: 16384, suffix: []string{"--cpus", "6", "--memory-mb", "16384"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, fs, closeFn := newFakeBackend(t, "incus", 0)
+			defer closeFn()
+			b.IncusSecurityNesting = true
+			b.IncusLimitsCPU = tc.cpus
+			b.IncusLimitsMemoryMB = tc.memoryMB
+
+			if _, err := b.Create(context.Background(), CreateArgs{Name: "job-lim"}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			want := []string{"run", "--ephemeral", "--backend", "incus", "--baseline", "job-lim", "--incus-security-nesting"}
+			want = append(want, tc.suffix...)
+			want = append(want, "--keep", "--log-format", "json")
+			if !reflect.DeepEqual(fs.execArgv[0], want) {
+				t.Fatalf("create argv=%v want exact %v", fs.execArgv[0], want)
+			}
+		})
+	}
+}
+
+func TestRemoteNonIncusRecipesNeverReceiveIncusLimits(t *testing.T) {
+	for _, target := range []string{"noop", "libvirt", "hyperv", "tart-macos"} {
+		t.Run(target, func(t *testing.T) {
+			b, fs, closeFn := newFakeBackend(t, target, 0)
+			defer closeFn()
+			b.IncusLimitsCPU = 6
+			b.IncusLimitsMemoryMB = 16384
+			if _, err := b.Create(context.Background(), CreateArgs{Name: "job-other"}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			for _, a := range fs.execArgv[0] {
+				if a == "--cpus" || a == "--memory-mb" {
+					t.Fatalf("target %q received an Incus resource limit: %v", target, fs.execArgv[0])
+				}
+			}
+		})
+	}
+}
+
 func TestRemoteNonIncusRecipesNeverReceiveIncusCapabilities(t *testing.T) {
 	for _, target := range []string{"noop", "libvirt", "hyperv", "tart-macos"} {
 		t.Run(target, func(t *testing.T) {
