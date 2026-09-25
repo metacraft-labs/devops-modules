@@ -129,6 +129,24 @@ type RemoteConfig struct {
 	// and modes are deliberately not configurable.
 	// Default false preserves the pre-capability remote create argv byte-for-byte.
 	IncusNestedKvm bool `toml:"incus_nested_kvm"`
+
+	// IncusLimitsCPU, when > 0, caps every remote Incus per-job container at
+	// that many CPUs. It maps only to vm-harness's generic `--cpus <n>` flag,
+	// which the Incus ephemeral path turns into `limits.cpu = <n>` before the
+	// container's first start. 0 (default) emits nothing, preserving the
+	// create argv byte-for-byte. Older vm-harness daemons parse and ignore
+	// `--cpus` on this path, so enabling it never breaks a create.
+	IncusLimitsCPU int `toml:"incus_limits_cpu"`
+
+	// IncusLimitsMemoryMB, when > 0, caps every remote Incus per-job
+	// container's memory, via vm-harness `--memory-mb <n>` ⇒
+	// `limits.memory = <n>MiB`. Same rules as IncusLimitsCPU.
+	IncusLimitsMemoryMB int `toml:"incus_limits_memory_mb"`
+}
+
+// HasIncusLimits reports whether any per-job Incus resource cap is set.
+func (r *RemoteConfig) HasIncusLimits() bool {
+	return r.IncusLimitsCPU != 0 || r.IncusLimitsMemoryMB != 0
 }
 
 // GoldenImage maps a pool label/flavor to a concrete libvirt source.
@@ -440,6 +458,13 @@ func (c *Config) Validate() error {
 	if c.Remote != nil && (c.Remote.IncusSecurityNesting || c.Remote.IncusNestedKvm) &&
 		(c.Backend != BackendRemote || c.Remote.TargetBackend != string(BackendIncus)) {
 		return fmt.Errorf("remote Incus capabilities incus_security_nesting/incus_nested_kvm require backend %q with remote.target_backend %q", BackendRemote, BackendIncus)
+	}
+	if c.Remote != nil && (c.Remote.IncusLimitsCPU < 0 || c.Remote.IncusLimitsMemoryMB < 0) {
+		return fmt.Errorf("remote incus_limits_cpu/incus_limits_memory_mb must be >= 0")
+	}
+	if c.Remote != nil && c.Remote.HasIncusLimits() &&
+		(c.Backend != BackendRemote || c.Remote.TargetBackend != string(BackendIncus)) {
+		return fmt.Errorf("remote incus_limits_cpu/incus_limits_memory_mb require backend %q with remote.target_backend %q", BackendRemote, BackendIncus)
 	}
 	switch c.Backend {
 	case BackendLibvirt:

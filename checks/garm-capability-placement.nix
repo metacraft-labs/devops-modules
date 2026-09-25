@@ -30,6 +30,9 @@ top@{ ... }:
   #      DISTINCT priorities in candidate order (one host fills before the next).
   #  (5) The expansion is manifest-driven end to end: each expanded pool's tags
   #      are that host's derived label set (gpu pools carry `gpu`, hms does not).
+  #  (6) PER-HOST CAPS: `maxRunnersPerProvider` overrides the uniform cap on the
+  #      named host only, and a 0 cap reconciles that host's expansion DISABLED
+  #      (so a previously-live expansion stops taking jobs even with prune off).
   perSystem =
     {
       pkgs,
@@ -222,6 +225,24 @@ top@{ ... }:
                     osType = "linux";
                     maxRunners = 4;
                   };
+                  # Per-host caps: gpu001 keeps the uniform 3, hms is lowered
+                  # to 1, and gpu002 gets no capacity at all.
+                  percap = {
+                    requires = [
+                      "linux"
+                      "x64"
+                    ];
+                    balance = "spread";
+                    basePriority = 100;
+                    org = "metacraft-labs";
+                    credentials = "mcl-app";
+                    osType = "linux";
+                    maxRunners = 3;
+                    maxRunnersPerProvider = {
+                      hms = 1;
+                      gpu002 = 0;
+                    };
+                  };
                   # Same qualifying set, PACK balancer — descending priorities.
                   packed = {
                     requires = [
@@ -319,6 +340,19 @@ top@{ ... }:
                 f"generic job should be placeable on all three: {gen_hosts}"
             )
             print("[placement] gpu job -> GPU hosts only; generic job -> all three")
+
+            # --- (6) PER-HOST CAPS ------------------------------------------
+            def maxr(p):
+                return p.get("max_runners", p.get("maxRunners"))
+            pc = {h: pool(f"percap@{h}") for h in ("gpu001", "gpu002", "hms")}
+            assert maxr(pc["gpu001"]) == 3, f"gpu001 must keep the uniform cap: {pc['gpu001']}"
+            assert maxr(pc["hms"]) == 1, f"hms must take its per-host cap: {pc['hms']}"
+            assert pc["gpu001"].get("enabled") is True and pc["hms"].get("enabled") is True
+            # GARM omits `enabled` from the JSON when it is false.
+            assert not pc["gpu002"].get("enabled", False), (
+                f"a 0 per-host cap must reconcile the expansion DISABLED: {pc['gpu002']}"
+            )
+            print("[per-host] maxRunnersPerProvider: gpu001=3 hms=1 gpu002=disabled")
 
             print("[t_garm_capability_placement] PASS")
           '';

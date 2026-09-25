@@ -55,6 +55,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -78,6 +79,12 @@ type RemoteBackend struct {
 	// select arbitrary Incus configuration, device paths, or modes.
 	IncusSecurityNesting bool
 	IncusNestedKvm       bool
+	// IncusLimitsCPU / IncusLimitsMemoryMB are trusted provider-admin per-job
+	// resource caps for the remote Incus recipe (0 = unset). They map only to
+	// vm-harness's generic `--cpus` / `--memory-mb` flags, which the Incus
+	// ephemeral path applies as `limits.cpu` / `limits.memory` before start.
+	IncusLimitsCPU      int
+	IncusLimitsMemoryMB int
 }
 
 // remoteRecipe builds the create/delete argv for a specific target backend.
@@ -144,6 +151,14 @@ var ephemeralRecipe = remoteRecipe{
 			}
 			if backend.IncusNestedKvm {
 				argv = append(argv, "--incus-nested-kvm")
+			}
+			// Resource caps follow the capability grants. Unset (0) emits
+			// nothing, so the grants-only argv above is unchanged.
+			if backend.IncusLimitsCPU > 0 {
+				argv = append(argv, "--cpus", strconv.Itoa(backend.IncusLimitsCPU))
+			}
+			if backend.IncusLimitsMemoryMB > 0 {
+				argv = append(argv, "--memory-mb", strconv.Itoa(backend.IncusLimitsMemoryMB))
 			}
 		}
 		argv = append(argv, "--keep", "--log-format", "json")

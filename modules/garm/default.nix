@@ -265,6 +265,14 @@
         ''
         + optionalString p.remote.incusNestedKvm ''
           incus_nested_kvm = true
+        ''
+        # Per-job resource caps, likewise omitted at 0 so a provider that sets
+        # none keeps a byte-identical config.toml and create argv.
+        + optionalString (p.remote.incusLimitsCpu > 0) ''
+          incus_limits_cpu = ${toString p.remote.incusLimitsCpu}
+        ''
+        + optionalString (p.remote.incusLimitsMemoryMb > 0) ''
+          incus_limits_memory_mb = ${toString p.remote.incusLimitsMemoryMb}
         '';
       # RE3: the `garm-provider-aws` config.toml (config/config.go). It carries
       # ONLY the region, the subnet, and the credential TYPE — never a secret.
@@ -694,10 +702,23 @@
           aliasClasses = cp.aliasClasses;
           # (provider, manifestFile) candidates, in a STABLE order (the balancer
           # steps priorities down this list under `pack`).
-          candidates = map (pn: {
-            provider = pn;
-            manifestFile = providerManifestOf pn;
-          }) candidateNames;
+          #
+          # Each candidate carries its EFFECTIVE per-host cap
+          # (`maxRunnersPerProvider` over `maxRunners`); 0 renders the
+          # expansion disabled at the smallest cap GARM accepts.
+          candidates = map (
+            pn:
+            let
+              cap = cp.maxRunnersPerProvider.${pn} or cp.maxRunners;
+            in
+            {
+              provider = pn;
+              manifestFile = providerManifestOf pn;
+              maxRunners = if cap == 0 then 1 else cap;
+              minIdleRunners = if cap == 0 then 0 else cp.minIdleRunners;
+              enabled = cp.enabled && cap > 0;
+            }
+          ) candidateNames;
         }
       ) (lib.mapAttrs (n: cp: cp // { name = n; }) cfg.capabilityPools);
 
@@ -1344,9 +1365,9 @@
               pool_apply "$cpname@$prov" "$oid" "$prov" "$tags" \
                 "$(echo "$cp" | jq -r '.image')" "$(echo "$cp" | jq -r '.flavor')" \
                 "$(echo "$cp" | jq -r '.osType')" "$(echo "$cp" | jq -r '.osArch')" \
-                "$(echo "$cp" | jq -r '.minIdleRunners')" "$(echo "$cp" | jq -r '.maxRunners')" \
+                "$(echo "$cand" | jq -r '.minIdleRunners')" "$(echo "$cand" | jq -r '.maxRunners')" \
                 "$prio" "$(echo "$cp" | jq -r '.runnerBootstrapTimeout')" \
-                "$(echo "$cp" | jq -r '.enabled')" "$(echo "$cp" | jq -r '.runnerGroup // ""')" \
+                "$(echo "$cand" | jq -r '.enabled')" "$(echo "$cp" | jq -r '.runnerGroup // ""')" \
                 "{}" || true
               idx=$(( idx + 1 ))
             done
@@ -2349,6 +2370,37 @@
                       `/dev/kvm` to guest `/dev/kvm`, verifies exact mode 0666,
                       and opens it read-write. No path or mode is configurable.
                       Rejected for non-remote providers and non-Incus targets.
+                    '';
+                  };
+                  incusLimitsCpu = mkOption {
+                    type = types.ints.unsigned;
+                    default = 0;
+                    example = 6;
+                    description = ''
+                      Per-job CPU cap for a remote Incus provider. When > 0, the
+                      provider appends `--cpus <n>` to the remote
+                      `vm-harness run --ephemeral --backend incus`, which sets
+                      `limits.cpu = <n>` on the per-job container before its
+                      first start. A count is a dynamic cpuset pin, so the
+                      guest's `nproc` reports `<n>` and `make -j$(nproc)` /
+                      `nix build --cores 0` size themselves to the slot instead
+                      of to the whole host. 0 (default) sets nothing and keeps
+                      the create argv byte-identical. Older vm-harness daemons
+                      parse `--cpus` and ignore it on this path, so the flag is
+                      safe to roll out before the serve hosts are upgraded.
+                      Rejected for non-remote providers and non-Incus targets.
+                    '';
+                  };
+                  incusLimitsMemoryMb = mkOption {
+                    type = types.ints.unsigned;
+                    default = 0;
+                    example = 16384;
+                    description = ''
+                      Per-job memory cap (MiB) for a remote Incus provider. When
+                      > 0, the provider appends `--memory-mb <n>`, which sets
+                      `limits.memory = <n>MiB` on the per-job container before
+                      its first start. 0 (default) sets nothing. Same rollout
+                      and target rules as `incusLimitsCpu`.
                     '';
                   };
                 };
@@ -4034,7 +4086,31 @@
                   maxRunners = mkOption {
                     type = types.ints.positive;
                     default = 2;
-                    description = "Per-host concurrency cap for each expanded pool (`--max-runners`).";
+                    description = "Per-host concurrency cap for each expanded pool (`--max-runners`). `maxRunnersPerProvider` overrides it per host.";
+                  };
+                  maxRunnersPerProvider = mkOption {
+                    type = types.attrsOf types.ints.unsigned;
+                    default = { };
+                    example = {
+                      gpu001-incus = 1;
+                      gpu002-incus = 0;
+                    };
+                    description = ''
+                      Per-HOST override of `maxRunners`, keyed by candidate
+                      provider name. Hosts differ in cores, and a uniform cap
+                      over-subscribes the smaller ones; this lets one logical
+                      capabilityPool carry a different ceiling on each host it
+                      expands onto. A provider absent from the map keeps
+                      `maxRunners`.
+
+                      `0` means "no capacity on this host": the expansion is
+                      still reconciled, but DISABLED (`--enabled=false`,
+                      `--max-runners 1`, no idle floor), so GARM creates no new
+                      runner there while in-flight ones finish. It is reconciled
+                      rather than skipped on purpose: with `pruneUnmanaged` off
+                      a skipped expansion would keep its OLD, enabled cap
+                      forever. Every key must name a candidate provider.
+                    '';
                   };
                   minIdleRunners = mkOption {
                     type = types.ints.unsigned;
@@ -4291,6 +4367,24 @@
                 message = "services.garm.capabilityPools.${n}.providers: \"${prov}\" does not name a declared services.garm.providers.<name> (have: ${lib.concatStringsSep ", " (lib.attrNames cfg.providers)}).";
               }) cp.providers
             ) (lib.attrNames cfg.capabilityPools)
+            # Per-host caps: every key must be a candidate (a typo would
+            # otherwise silently leave that host at the uniform cap), and the
+            # warm floor must fit every host that has capacity.
+            ++ lib.concatMap (
+              n:
+              let
+                cp = cfg.capabilityPools.${n};
+                candidates =
+                  if cp.providers != [ ] then
+                    cp.providers
+                  else
+                    lib.attrNames (lib.filterAttrs (_: p: p.enable && p.manifestFile != null) cfg.providers);
+              in
+              lib.mapAttrsToList (prov: cap: {
+                assertion = lib.elem prov candidates && (cap == 0 || cp.minIdleRunners <= cap);
+                message = "services.garm.capabilityPools.${n}.maxRunnersPerProvider.${prov} = ${toString cap}: the key must name a candidate provider (have: ${lib.concatStringsSep ", " candidates}) and a non-zero cap must be >= minIdleRunners (${toString cp.minIdleRunners}).";
+              }) cp.maxRunnersPerProvider
+            ) (lib.attrNames cfg.capabilityPools)
             # W1: a balloon floor must sit strictly BELOW the ceiling it floors,
             # and only the libvirt backend renders a domain XML to put it in.
             # Both are eval-time failures rather than silent no-ops: the provider
@@ -4321,6 +4415,12 @@
             ++ lib.mapAttrsToList (n: p: {
               assertion = !p.remote.incusNestedKvm || (providerIsRemote p && p.remote.targetBackend == "incus");
               message = "services.garm.providers.${n}.remote.incusNestedKvm requires backend = \"remote\" and remote.targetBackend = \"incus\"; it maps only to vm-harness --incus-nested-kvm with the fixed /dev/kvm device contract.";
+            }) cfg.providers
+            ++ lib.mapAttrsToList (n: p: {
+              assertion =
+                (p.remote.incusLimitsCpu == 0 && p.remote.incusLimitsMemoryMb == 0)
+                || (providerIsRemote p && p.remote.targetBackend == "incus");
+              message = "services.garm.providers.${n}.remote.incusLimitsCpu/incusLimitsMemoryMb require backend = \"remote\" and remote.targetBackend = \"incus\"; they map only to vm-harness --cpus/--memory-mb on the Incus ephemeral path.";
             }) cfg.providers
             # Resource-guard (eval time): the sum over all scale sets of
             # maxRunners * (its provider's per-VM RAM) must fit the declared host

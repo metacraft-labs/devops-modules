@@ -62,6 +62,10 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 		(cfg.Backend != config.BackendRemote || cfg.Remote.TargetBackend != string(config.BackendIncus)) {
 		return nil, fmt.Errorf("remote Incus capabilities require backend %q with target backend %q", config.BackendRemote, config.BackendIncus)
 	}
+	if cfg.Remote != nil && cfg.Remote.HasIncusLimits() &&
+		(cfg.Backend != config.BackendRemote || cfg.Remote.TargetBackend != string(config.BackendIncus)) {
+		return nil, fmt.Errorf("remote Incus resource limits require backend %q with target backend %q", config.BackendRemote, config.BackendIncus)
+	}
 	var b backend.Backend
 	switch cfg.Backend {
 	case config.BackendLibvirt:
@@ -144,6 +148,8 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 			GuestOS:              cfg.Remote.GuestOS,
 			IncusSecurityNesting: cfg.Remote.IncusSecurityNesting,
 			IncusNestedKvm:       cfg.Remote.IncusNestedKvm,
+			IncusLimitsCPU:       cfg.Remote.IncusLimitsCPU,
+			IncusLimitsMemoryMB:  cfg.Remote.IncusLimitsMemoryMB,
 		}
 	default:
 		return nil, fmt.Errorf("unsupported backend %q", cfg.Backend)

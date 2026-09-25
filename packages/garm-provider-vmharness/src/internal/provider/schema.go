@@ -68,6 +68,18 @@ const configJSONSchema = `{
 					"type": "boolean",
 					"default": false,
 					"description": "Remote Incus only: append the fixed vm-harness --incus-nested-kvm grant, which maps only host /dev/kvm at guest /dev/kvm, verifies exact mode 0666, and opens it read-write. Device path and mode are not configurable. Default false preserves the existing remote create argv."
+				},
+				"incus_limits_cpu": {
+					"type": "integer",
+					"minimum": 0,
+					"default": 0,
+					"description": "Remote Incus only: per-job CPU cap, forwarded as vm-harness --cpus and applied as limits.cpu before the container starts. 0 sets no cap and preserves the existing remote create argv."
+				},
+				"incus_limits_memory_mb": {
+					"type": "integer",
+					"minimum": 0,
+					"default": 0,
+					"description": "Remote Incus only: per-job memory cap in MiB, forwarded as vm-harness --memory-mb and applied as limits.memory before the container starts. 0 sets no cap and preserves the existing remote create argv."
 				}
 			},
 			"additionalProperties": false

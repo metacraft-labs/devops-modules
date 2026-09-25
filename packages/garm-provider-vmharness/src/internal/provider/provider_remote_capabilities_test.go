@@ -40,6 +40,52 @@ func TestRemoteIncusCapabilitiesReachBackend(t *testing.T) {
 	}
 }
 
+func TestRemoteIncusResourceLimitsReachBackend(t *testing.T) {
+	p, err := NewWithConfig(&config.Config{
+		Backend: config.BackendRemote,
+		Remote: &config.RemoteConfig{
+			Endpoint:            "runner.example.test:8873",
+			TargetBackend:       "incus",
+			AuthToken:           "test-token",
+			GuestOS:             "linux",
+			IncusLimitsCPU:      6,
+			IncusLimitsMemoryMB: 16384,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, ok := p.backend.(*backend.RemoteBackend)
+	if !ok {
+		t.Fatalf("backend type=%T want *backend.RemoteBackend", p.backend)
+	}
+	if b.IncusLimitsCPU != 6 || b.IncusLimitsMemoryMB != 16384 {
+		t.Fatalf("remote Incus resource limits were not propagated: %+v", b)
+	}
+}
+
+func TestRemoteIncusResourceLimitsRejectNonIncusTargets(t *testing.T) {
+	for _, target := range []string{"libvirt", "noop"} {
+		t.Run(target, func(t *testing.T) {
+			cfg := &config.Config{
+				Backend: config.BackendRemote,
+				Remote: &config.RemoteConfig{
+					Endpoint:       "runner.example.test:8873",
+					TargetBackend:  target,
+					AuthToken:      "test-token",
+					IncusLimitsCPU: 6,
+				},
+			}
+			if _, err := NewWithConfig(cfg); err == nil {
+				t.Fatalf("provider construction accepted Incus resource limits for target %q", target)
+			}
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("config validation accepted Incus resource limits for target %q", target)
+			}
+		})
+	}
+}
+
 func TestRemoteIncusCapabilitiesRejectNonIncusConstruction(t *testing.T) {
 	for _, tc := range []struct {
 		name          string
@@ -150,8 +196,8 @@ func TestConfigSchemaPinsRemoteIncusCapabilityBoundary(t *testing.T) {
 	var schema struct {
 		Properties map[string]struct {
 			Properties map[string]struct {
-				Type    string `json:"type"`
-				Default *bool  `json:"default"`
+				Type    string          `json:"type"`
+				Default json.RawMessage `json:"default"`
 			} `json:"properties"`
 			AdditionalProperties json.RawMessage `json:"additionalProperties"`
 		} `json:"properties"`
@@ -172,6 +218,8 @@ func TestConfigSchemaPinsRemoteIncusCapabilityBoundary(t *testing.T) {
 		"auth_token_file",
 		"endpoint",
 		"guest_os",
+		"incus_limits_cpu",
+		"incus_limits_memory_mb",
 		"incus_nested_kvm",
 		"incus_security_nesting",
 		"request_timeout_sec",
@@ -190,8 +238,19 @@ func TestConfigSchemaPinsRemoteIncusCapabilityBoundary(t *testing.T) {
 		if !ok {
 			t.Fatalf("remote schema missing %q", key)
 		}
-		if prop.Type != "boolean" || prop.Default == nil || *prop.Default {
+		if prop.Type != "boolean" || string(prop.Default) != "false" {
 			t.Fatalf("remote schema %q=%+v want boolean default false", key, prop)
+		}
+	}
+	// The resource caps are integers that default to 0 (= no cap), so an
+	// operator who sets nothing keeps the pre-limits create argv.
+	for _, key := range []string{"incus_limits_cpu", "incus_limits_memory_mb"} {
+		prop, ok := remote.Properties[key]
+		if !ok {
+			t.Fatalf("remote schema missing %q", key)
+		}
+		if prop.Type != "integer" || string(prop.Default) != "0" {
+			t.Fatalf("remote schema %q=%+v want integer default 0", key, prop)
 		}
 	}
 }
