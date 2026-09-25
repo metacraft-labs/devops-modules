@@ -29,6 +29,23 @@ done
 [[ "$(jq '.resource.github_branch_protection.main.required_status_checks[0].contexts | length' <<<"$json")" -ge 1 ]] \
   || { echo "FAIL: expected required status checks"; fail=1; }
 
+# The policy's noBypass rule: classic protection binds admins by default, and
+# opting out needs a documented enforceAdminsException.
+[[ "$(jq '.resource.github_branch_protection.main.enforce_admins' <<<"$json")" == "true" ]] \
+  || { echo "FAIL: expected enforce_admins = true by default"; fail=1; }
+args='{
+  awsAccountId = "000000000000"; awsRegion = "us-east-1"; namePrefix = "example-prod";
+  githubOwner = "example-org"; githubRepo = "infra"; protectedBranch = "live";
+  reviewerTeam = { name = "infra"; slug = "infra"; description = "x"; initialMaintainer = "example-admin"; };
+  requiredStatusCheckContexts = [ ];
+}'
+bs() { nix eval --json --impure --expr "(import ${here}/../tf-bootstrap.nix (${args} // { $1 })).resource.github_branch_protection" 2>/dev/null; }
+if bs 'enforceAdmins = false;' >/dev/null; then
+  echo "FAIL: enforceAdmins = false without enforceAdminsException was accepted"; fail=1
+fi
+[[ "$(bs 'enforceAdmins = false; enforceAdminsException = "documented test exception for the gate";' | jq '.main.enforce_admins')" == "false" ]] \
+  || { echo "FAIL: a documented enforceAdminsException was not honoured"; fail=1; }
+
 # No company literals leak from the example.
 # The example must render only placeholder identifiers — flag any 12-digit AWS
 # account id other than the 000000000000 placeholder (no real value embedded here).

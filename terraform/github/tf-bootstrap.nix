@@ -20,11 +20,14 @@
   # `initialMaintainer` keeps its own resource address so existing state is
   # unaffected.
   reviewerTeam,
-  # Whether classic branch protection binds org/repo admins too. The Phase P
-  # model is "protect the mainline, but NOT enforce_admins" (admins keep the
-  # escape hatch; see mainline-protection.nix). Defaults to true only so that
-  # existing callers render unchanged; new callers should pass false.
+  # Whether classic branch protection binds org/repo admins too. The shared
+  # branch-protection policy's `noBypass` rule requires it: agents act under
+  # their operator's identity, so an admin escape hatch is one every agent
+  # holds (branching-policy.md "No bypass"; this reverses the earlier Phase P
+  # "protect the mainline, but NOT enforce_admins" model, 2026-09-25).
+  # Passing false requires `enforceAdminsException`, the documented reason.
   enforceAdmins ? true,
+  enforceAdminsException ? null,
   # During single-maintainer bootstrap, mandatory PR-review gates would block
   # every PR. Required checks stay enforced regardless; flip to false once the
   # reviewer team has at least two admins.
@@ -49,6 +52,10 @@ let
     BACKEND_CONFIG_FILE = backendConfigFile;
   };
 in
+assert
+  enforceAdmins
+  || (builtins.isString enforceAdminsException && builtins.stringLength enforceAdminsException >= 20)
+  || throw "tf-bootstrap: enforceAdmins = false without a documented `enforceAdminsException` — the branch-protection policy forbids admin bypass";
 {
   terraform = {
     required_version = ">= 1.8.0";

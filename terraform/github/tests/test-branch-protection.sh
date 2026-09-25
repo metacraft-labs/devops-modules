@@ -131,4 +131,12 @@ out4="$(render "$absentField")"
 check "absent requirePullRequest defaults to PR-only on a mainline, not on a deployment branch" \
   "(${pr_by_class}) as \$p | (\$p.dev == 0) and (\$p.staging == null)" "$out4"
 
+# The policy's noBypass rule: every ruleset this renderer emits is `active` and
+# carries NO bypass actors (agents act under their operator's identity, so an
+# operator's bypass is every agent's bypass).
+for o in "$out" "$out2" "$out3" "$out4"; do
+  check "every rendered ruleset is active with no bypass_actors" \
+    '[.[] | (.enforcement == "active") and ((.bypass_actors // []) == [])] | all' "$o"
+done
+
 exit "$fail"

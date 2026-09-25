@@ -144,6 +144,40 @@ map), these entries flow through `governance.nix` and any caller-side filter,
 such as an import-only adoption window. Tested offline by
 [`tests/test-mainline-protection.sh`](./tests/test-mainline-protection.sh).
 
+### No bypass (`noBypassPolicy`)
+
+The shared branch-protection policy forbids bypass (`noBypass` in
+`branch-protection-policy.json`; branching-policy.md, "No bypass"). Agents act
+under their operator's identity, so any bypass the operator holds — an
+`OrganizationAdmin` / `RepositoryRole` ruleset bypass actor, classic
+`enforce_admins = false`, or `pull_request_bypassers` — is a bypass every agent
+holds.
+
+- `mainline-protection.nix` renders `bypassActors = [ ]` and
+  `enforcement = "active"` by default. A non-empty `bypassActors` needs
+  `bypassException`, and a non-active enforcement needs `enforcementException`
+  (each the reason, at least 20 characters). Otherwise the evaluation throws.
+- `governance.nix` takes an opt-in `noBypassPolicy = { rulesetExceptions ? { };
+  branchProtectionExceptions ? { }; }`. When it is set, the render throws on
+  any rendered repository/organization ruleset with bypass actors or a
+  non-`active` enforcement, and on any classic branch protection with
+  `enforce_admins = false` or pull-request bypassers — unless its engine
+  resource key (`repository-ruleset:<repo>:<name>`,
+  `organization-ruleset:<name>`, `branch-protection:<repo>:<pattern>`) is listed
+  with a documented reason. An exception naming no rendered resource also
+  throws. The engine additionally exports
+  `github_governance_ruleset_bypass_actor_count`,
+  `github_governance_ruleset_non_active_count` and
+  `github_governance_branch_protection_admin_bypass_count` for `tofu test`
+  assertions. Tested by
+  [`tests/test-no-bypass-policy.sh`](./tests/test-no-bypass-policy.sh).
+- `tf-bootstrap.nix`: `enforceAdmins` defaults to `true`, and `false` needs
+  `enforceAdminsException`.
+
+A bypass that tooling genuinely needs, for example a release App that must write to
+a PR-only branch, is granted narrowly (`Integration` by App id) as a documented
+exception, never as an admin role.
+
 ## `tf-bootstrap.nix` — CI-enabling GitHub Layer-0 root
 
 The GitHub counterpart of the AWS `tf-bootstrap.nix`: a value-independent module
