@@ -53,11 +53,31 @@ mergeable into a Terranix root that also declares the `github` provider.
   force pushes and deletions (`non_fast_forward` / `deletion`) — this is the
   "every branch protected from force push" universal rule.
 - **One ruleset per applicable branch class** (matched by `repoClass`) that
-  gates on CI: `required_status_checks` with the repo's contexts, plus
-  `pull_request` review when the class requires it. Classes that require
-  neither (e.g. `agents`) emit no extra ruleset and rely on the baseline — so
-  `agents` is protected from force-push but does **not** gate on CI, matching
-  the branching policy.
+  gates on CI: `required_status_checks` with the repo's contexts, plus a
+  `pull_request` rule when the class is PR-only. Classes that require neither
+  (e.g. `agents`) emit no extra ruleset and rely on the baseline — so `agents`
+  is protected from force-push but does **not** gate on CI, matching the
+  branching policy.
+
+### The two pull-request fields are not interchangeable
+
+Both renderers here read them through the same
+[`branch-policy-lib.nix`](./branch-policy-lib.nix), so one policy file cannot
+render two different GitHub states:
+
+| Policy field               | Decides                                                                                                                                                                              |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `requirePullRequest`       | whether the branch is **PR-only** — i.e. whether a `pull_request` rule is emitted at all. Absent means `true` on a `role = "mainline"` class or a default branch, `false` elsewhere. |
+| `requirePullRequestReview` | the **required approval count only**. `false` yields `0`, which still leaves the PR gate in place.                                                                                   |
+
+Gating the rule on the approval field is wrong in both directions. Required
+approvals are being removed org-wide, so every class now carries
+`requirePullRequestReview = false`: gating on it drops the PR requirement from
+`stable`, `dev` and `live`, while deriving PR-only from a hand-maintained
+repository list instead imposes one on spec `latest`, which the policy and the
+operator both say accepts direct pushes. Tested offline by
+[`tests/test-branch-protection.sh`](./tests/test-branch-protection.sh), including
+the absent-value default and both ways the two fields can disagree.
 
 ### Validate offline
 
@@ -90,7 +110,7 @@ let
     repositories = inventory.repositories;
     overrides = { product = "dev"; };   # real mainline != inventory default branch
     excludeRepos = [ "some-fork" ];      # rebased onto upstream (force-push)
-    directPushRepos = [ "workspace" ];   # tooling pushes directly: no PR rule
+    directPushRepos = [ "workspace" ];   # OVERRIDE: loosen a PR-only class only
     visibilities = [ "public" ];         # GitHub Free: rulesets 403 on private
     enforcement = "evaluate";            # Enterprise: dry-run a cycle first
     requiredApprovingReviewCount = 0;    # null = derive from the policy class
@@ -103,10 +123,21 @@ in
 }
 ```
 
+`directPushRepos` is an **override of** the policy field, never a substitute for
+it. It exists for a repository whose class _is_ PR-only but that must accept
+tooling pushes under the invoking user's own identity, so it may only loosen.
+Naming a repository the policy had already made direct-push grants nothing, and
+because the partition reports caller-named entries first, such an entry otherwise
+looks exactly like one that is doing work — so it is listed in
+`redundantDirectPushRepos`, which a caller's coverage gate should assert is
+empty. A repository must not appear to get direct pushes merely because somebody
+remembered to list it.
+
 It also returns `protectedRepos`, `prOnlyRepos`, `directPushRepos` (named by the
 caller), `policyDirectPushRepos` (on a `requirePullRequest = false` class),
-`directPushClasses`, `mainlines` and `uncovered` (repo -> reason) for the
-caller's coverage report; the three repo lists partition `protectedRepos`. Unknown repo
+`directPushClasses`, `redundantDirectPushRepos`, `mainlines` and `uncovered`
+(repo -> reason) for the caller's coverage report; the three direct-push/PR-only
+repo lists partition `protectedRepos`. Unknown repo
 names in the corrections, and overrides naming a non-mainline branch, fail the
 evaluation. Unlike `branch-protection.nix` (raw resources for a hand-written
 map), these entries flow through `governance.nix` and any caller-side filter,

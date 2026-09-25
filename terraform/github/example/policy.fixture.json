@@ -1,12 +1,12 @@
 {
-  "_comment": "Representative fixture of the shared branch-protection policy for the example/tests. The real policy is maintained in metacraft-dev-guidelines/policies/branch-protection-policy.json and passed in by consumers.",
+  "_comment": "Representative fixture of the shared branch-protection policy for the example/tests. The real policy is maintained in metacraft-dev-guidelines/policies/branch-protection-policy.json and passed in by consumers. `role` and `requirePullRequest` are present on every class BECAUSE they are load-bearing: `requirePullRequest` decides whether a class is PR-only and `requirePullRequestReview` only sets the approval count, so a fixture that omits the former cannot exercise the distinction. `latest` is deliberately requirePullRequest=false with requireStatusChecks=true — the spec-mainline shape that must gate on CI without becoming PR-only.",
   "version": 1,
   "baseline": { "allowForcePush": false, "allowDeletion": false },
   "branchClasses": {
-    "stable": { "repoClass": "product", "requireStatusChecks": true, "requirePullRequestReview": true },
-    "dev": { "repoClass": "product", "requireStatusChecks": true, "requirePullRequestReview": true },
-    "agents": { "repoClass": "product", "requireStatusChecks": false, "requirePullRequestReview": false },
-    "latest": { "repoClass": "spec", "requireStatusChecks": true },
-    "live": { "repoClass": "infra", "requireStatusChecks": true }
+    "stable": { "repoClass": "product", "role": "default-release", "requireStatusChecks": true, "requirePullRequest": true, "requirePullRequestReview": true },
+    "dev": { "repoClass": "product", "role": "mainline", "requireStatusChecks": true, "requirePullRequest": true, "requirePullRequestReview": true },
+    "agents": { "repoClass": "product", "role": "integration", "requireStatusChecks": false, "requirePullRequest": false, "requirePullRequestReview": false },
+    "latest": { "repoClass": "spec", "role": "mainline", "requireStatusChecks": true, "requirePullRequest": false, "requirePullRequestReview": false },
+    "live": { "repoClass": "infra", "role": "mainline", "requireStatusChecks": true, "requirePullRequest": true }
   }
 }

@@ -111,6 +111,20 @@ check "coverage partitions: prOnly / caller direct-push / policy direct-push" \
   '((.prOnlyRepos | sort) == ["infra","product","public-dev","stale"]) and (.directPushRepos == ["manifests"]) and (.policyDirectPushRepos == ["specs"]) and (.directPushClasses == ["latest"]) and (((.prOnlyRepos + .directPushRepos + .policyDirectPushRepos) | sort) == (.protectedRepos | sort))' "$outLD"
 check "a non-mainline class with requirePullRequest=false (agents) is still never targeted" \
   '[.rulesets[].conditions.refNameInclude[0]] | all(. != "refs/heads/agents")' "$outLD"
+
+# `directPushRepos` is an OVERRIDE of the policy field, and a divergence between
+# the two must be visible. Here `manifests` is on `latest`, which this policy
+# already opts out of PR-only, so the entry grants nothing — the partition
+# reports it under `directPushRepos` (caller-named wins), which on its own is
+# indistinguishable from an override that is doing work. A repository must not
+# appear to get direct pushes because somebody remembered to list it.
+check "a directPushRepos entry the policy had already granted is reported as redundant" \
+  '.redundantDirectPushRepos == ["manifests"]' "$outLD"
+check "an override that actually loosens a PR-only class is NOT reported as redundant" \
+  '.redundantDirectPushRepos == []' "$out"
+check "nothing is reported redundant when the caller names no overrides" \
+  '(.redundantDirectPushRepos == []) and ((.policyDirectPushRepos | sort) == ["manifests","specs"])' \
+  "$(helper_eval 'excludeRepos = [ "fork" ]; overrides = { product = "dev"; stale = "live"; };' "$policyLatestDirect")"
 # Negative control: the opt-out is per CLASS. Flipping it on `live` instead must
 # move the `live` mainlines (infra, and stale via its override) — not specs — to
 # direct push — the flag is actually read per class,

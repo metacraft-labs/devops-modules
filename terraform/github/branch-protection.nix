@@ -34,6 +34,10 @@ let
     replaceStrings
     ;
 
+  # The one reading of the policy's two pull-request fields, shared with
+  # `mainline-protection.nix` so the two renderers cannot drift apart.
+  policyLib = import ./branch-policy-lib.nix { };
+
   # Sanitize a repo/branch identifier into a Terraform resource key.
   key =
     replaceStrings
@@ -112,9 +116,12 @@ in
                   required_check = map (ctx: { context = ctx; }) contexts;
                 };
               }
-              // optionalAttrs (cls.requirePullRequestReview or false) {
+              # `requirePullRequest` — NOT `requirePullRequestReview` — decides
+              # whether the branch is PR-only. The approval field only sets the
+              # count, which may legitimately be 0 on a PR-only branch.
+              // optionalAttrs (policyLib.requiresPullRequestNamed branchKey cls) {
                 pull_request = {
-                  required_approving_review_count = repoCfg.reviewCount or 1;
+                  required_approving_review_count = policyLib.approvalCount cls (repoCfg.reviewCount or 1);
                   dismiss_stale_reviews_on_push = true;
                   require_code_owner_review = false;
                 };

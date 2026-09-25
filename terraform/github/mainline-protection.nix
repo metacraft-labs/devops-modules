@@ -71,10 +71,17 @@
   #   `defaultBranch`. Attrset { <repoName> = "<mainlineBranch>"; }. The branch
   #   must itself be a policy mainline key.
   overrides ? { },
-  # directPushRepos: repositories whose mainline is protected from deletion and
-  #   force-push but NOT made PR-only, because legitimate tooling commits and
-  #   pushes to it directly under the invoking user's own identity (so no
+  # directPushRepos: a per-repository OVERRIDE of the policy, not the source of
+  #   truth for it. Whether a mainline is PR-only is decided by its branch
+  #   class's `requirePullRequest` (spec `latest` is not; product `dev` and infra
+  #   `live` are). This list names repositories whose class IS PR-only but which
+  #   must nevertheless accept direct pushes, because legitimate tooling commits
+  #   and pushes to the branch under the invoking user's own identity (so no
   #   narrower bypass actor exists). Each must be justified by the caller.
+  #
+  #   It can only LOOSEN the policy, and naming a repository whose class is
+  #   already not PR-only is rejected rather than ignored — see
+  #   `redundantDirectPush` below.
   directPushRepos ? [ ],
   # visibilities: repository visibilities the org's plan can carry rulesets on.
   #   GitHub Free refuses rulesets on private repositories (403) — such a caller
@@ -114,6 +121,10 @@ let
   branchClasses = policy.branchClasses;
   baseline = policy.baseline or { };
 
+  # The one reading of the policy's two pull-request fields, shared with
+  # `branch-protection.nix` so the two renderers cannot drift apart.
+  policyLib = import ./branch-policy-lib.nix { };
+
   # The mainline branch keys, straight from the policy: every branch class whose
   # role is "mainline" (for Metacraft: product `dev`, spec `latest`, infra
   # `live`). The attribute KEY is the concrete branch name.
@@ -123,15 +134,17 @@ let
   # `requirePullRequest`. Absent means true: backward compatible with policies
   # that predate the field, and a new mainline class is PR-only by default.
   # (`requirePullRequestReview` is separate: it only sets the approval count.)
+  #
+  # Read through `branch-policy-lib.nix`, the single reader shared with
+  # `branch-protection.nix`. The two renderers consume the same policy and must
+  # not disagree about what it says: this one honoured `requirePullRequest`
+  # while the other still gated its `pull_request` rule on the approval field,
+  # so the same class came out PR-only in one and not in the other. Every branch
+  # reaching here is in `mainlineKeys`, so the library's absent-value default
+  # (PR-only on a mainline or a default branch) is the `or true` this used to
+  # apply locally.
   classRequiresPullRequest =
-    branch:
-    let
-      v = branchClasses.${branch}.requirePullRequest or true;
-    in
-    assert
-      builtins.isBool v
-      || throw "mainline-protection: policy branch class `${branch}` has a non-boolean requirePullRequest";
-    v;
+    branch: policyLib.requiresPullRequestNamed branch (branchClasses.${branch} or { });
 
   # Mainline classes the policy opts out of PR-only (direct pushes accepted).
   directPushClasses = filter (k: !(classRequiresPullRequest k)) mainlineKeys;
@@ -164,14 +177,15 @@ let
   protectable = repo: uncoveredReason repo == null;
   covered = filter protectable repositories;
 
+  # The approval COUNT, which `requirePullRequestReview` governs and nothing
+  # else does. Zero is a normal answer on a PR-only branch: it drops the
+  # approval requirement while leaving the pull-request gate standing.
   reviewCountFor =
     branch:
     if requiredApprovingReviewCount != null then
       requiredApprovingReviewCount
-    else if (branchClasses.${branch}.requirePullRequestReview or false) then
-      1
     else
-      0;
+      policyLib.approvalCount (branchClasses.${branch} or { }) 1;
 
   mkRuleset =
     repo:
@@ -217,6 +231,35 @@ let
   unknown = filter (n: !(elem n inventoryNames)) (
     excludeRepos ++ directPushRepos ++ attrNames overrides
   );
+
+  # Divergence between the caller's list and the policy, named rather than left
+  # implicit: a `directPushRepos` entry for a repository whose mainline class is
+  # ALREADY not PR-only grants nothing, because the policy had granted the direct
+  # push. Left unremarked it reads as though the direct push depended on the
+  # list — the same shape as deriving PR-only from the list in the first place,
+  # which is how a repository came to get direct pushes only if someone
+  # remembered to add it. The partition outputs report such an entry under
+  # `directPushRepos` (caller-named wins), so on its own it is indistinguishable
+  # from an override that is doing work; this says which ones are not.
+  #
+  # A caller's coverage gate should assert this list is empty and delete what it
+  # names. It is reported rather than thrown because an entry that is merely
+  # redundant renders the correct ruleset — the misleading list is a maintenance
+  # defect, not an incorrect deployment.
+  repoByName = listToAttrs (
+    map (r: {
+      name = r.name;
+      value = r;
+    }) repositories
+  );
+  mainlineOfName = n: if hasAttr n repoByName then mainlineBranchFor repoByName.${n} else null;
+  redundantDirectPush = filter (
+    n:
+    let
+      branch = mainlineOfName n;
+    in
+    branch != null && elem branch mainlineKeys && !(classRequiresPullRequest branch)
+  ) directPushRepos;
 in
 assert
   unknown == [ ]
@@ -244,6 +287,10 @@ assert
   );
   # The mainline classes whose policy opts out of PR-only.
   inherit directPushClasses;
+  # `directPushRepos` entries the POLICY had already made direct-push: the
+  # override grants nothing and only makes the list look load-bearing. A caller's
+  # coverage gate should assert this is empty.
+  redundantDirectPushRepos = redundantDirectPush;
   mainlines = listToAttrs (
     map (r: {
       name = r.name;
