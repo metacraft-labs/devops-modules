@@ -51,5 +51,6 @@ rec {
   # class requires approvals, zero when it does not. `requirePullRequestReview
   # = false` means ZERO APPROVALS, not "no pull request" — a PR gate with a
   # count of 0 still forbids the direct push.
-  approvalCount = cls: whenRequired: if cls.requirePullRequestReview or false then whenRequired else 0;
+  approvalCount =
+    cls: whenRequired: if cls.requirePullRequestReview or false then whenRequired else 0;
 }
