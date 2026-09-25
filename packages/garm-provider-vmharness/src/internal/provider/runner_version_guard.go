@@ -26,9 +26,21 @@ package provider
 // The guard compares the version GARM OFFERS (derived from the tools entry it
 // hands us) with the version INSTALLED in the guest (read from
 // bin/Runner.Listener.deps.json, without executing the runner) and, on
-// mismatch, discards the cached runner so the template's own download branch
-// fires. When no offered version can be derived the guard is omitted entirely:
-// it must never be the reason a bootstrap fails.
+// mismatch (or an unreadable version):
+//
+//   - GARM upstream Windows: removes the whole runner dir, so upstream's own
+//     download branch fires (Windows has no dependency-install step);
+//   - GARM upstream Linux: downloads the offered runner and replaces bin/ and
+//     externals/ in place, so upstream continues down its cached-runner branch
+//     and does NOT run installdependencies.sh (apt) on every job whenever
+//     GitHub ships a runner newer than the golden's;
+//   - this provider's own templates: removes run.sh/run.cmd, bin/ and
+//     externals/, so their download branch fires and the extract overwrites.
+//
+// The match is exact, trading cache hit rate for correctness: while a runner
+// newer than the golden's exists, each job downloads it. When no offered
+// version can be derived the guard is omitted entirely: it must never be the
+// reason a bootstrap fails.
 
 import (
 	"bytes"
@@ -37,6 +49,7 @@ import (
 	"strings"
 
 	"github.com/cloudbase/garm-provider-common/cloudconfig"
+	"github.com/cloudbase/garm-provider-common/defaults"
 	commonParams "github.com/cloudbase/garm-provider-common/params"
 )
 
@@ -66,43 +79,102 @@ const (
 	upstreamLinuxGuardAnchor     = `if [ ! -d "$RUN_HOME" ];then`
 )
 
+// bashGuardMode selects what the POSIX-shell guard does on a version mismatch.
+type bashGuardMode int
+
+const (
+	// bashDiscardPayload removes run.sh, bin/ and externals/ (for templates whose
+	// download branch is keyed on run.sh), keeping other files such as .env.
+	bashDiscardPayload bashGuardMode = iota
+	// bashReplaceInPlace downloads the offered runner itself and replaces bin/
+	// and externals/ in place, keeping the runner home, so the enclosing
+	// template continues down its "cached runner" branch. Used for GARM
+	// upstream's Linux template, whose not-present branch would otherwise also
+	// run `installdependencies.sh` (apt, with retries) on every job whenever
+	// GitHub ships a runner newer than the golden's.
+	bashReplaceInPlace
+)
+
+// bashRunnerDownload is what bashReplaceInPlace needs to fetch the offered
+// runner (mirroring upstream's own download: same curl flags, optional
+// temp-token header) and whom to hand the result to.
+type bashRunnerDownload struct {
+	URL               string
+	TempDownloadToken string
+	SHA256Checksum    string
+	Owner             string // user:group for chown -R
+}
+
 // bashRunnerVersionGuard renders a POSIX-sh snippet (safe under `set -eu` and
 // `set -o pipefail`) that inspects the runner at the directory named by the
 // shell variable runHomeVar. statusFn/failFn are the enclosing template's
 // status and fatal-error functions (each takes one message argument; messages
 // avoid double quotes because some of those functions splice them into JSON
-// unescaped).
-//
-// discardWholeDir=true removes the entire runner dir (for templates whose
-// download branch is keyed on the directory existing); false removes only
-// run.sh, bin/ and externals/ (for templates keyed on run.sh), keeping other
-// files such as .env.
-func bashRunnerVersionGuard(offered, runHomeVar, statusFn, failFn string, discardWholeDir bool) string {
-	home := `"$` + runHomeVar + `"`
-	present := `[ -d ` + home + ` ]`
-	discard := `rm -rf ` + home + ` 2>/dev/null || sudo -n rm -rf ` + home + ` || ` + failFn + ` "failed to discard cached runner in $` + runHomeVar + `"`
-	if !discardWholeDir {
-		present = `[ -x "$` + runHomeVar + `/run.sh" ]`
-		paths := `"$` + runHomeVar + `/run.sh" "$` + runHomeVar + `/bin" "$` + runHomeVar + `/externals"`
-		discard = `rm -rf ` + paths + ` 2>/dev/null || sudo -n rm -rf ` + paths + ` || ` + failFn + ` "failed to discard cached runner in $` + runHomeVar + `"`
+// unescaped). dl is only used by bashReplaceInPlace.
+func bashRunnerVersionGuard(offered, runHomeVar, statusFn, failFn string, mode bashGuardMode, dl bashRunnerDownload) string {
+	h := `$` + runHomeVar
+	readVersion := func(indent string) string {
+		return indent + `GARM_CACHED_RUNNER_VERSION=""
+` + indent + `if [ -f "` + h + `/bin/Runner.Listener.deps.json" ]; then
+` + indent + `	GARM_CACHED_RUNNER_VERSION=$(sed -n 's|.*"Runner\.Listener/\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*|\1|p' "` + h + `/bin/Runner.Listener.deps.json" 2>/dev/null | head -n 1) || GARM_CACHED_RUNNER_VERSION=""
+` + indent + `fi
+`
+	}
+	var present, action, verb string
+	switch mode {
+	case bashReplaceInPlace:
+		present = `[ -d "` + h + `" ]`
+		verb = "replacing runner binaries in place"
+		header := `""`
+		if dl.TempDownloadToken != "" {
+			header = shellQuote("Authorization: Bearer " + dl.TempDownloadToken)
+		}
+		checksum := ""
+		if dl.SHA256Checksum != "" {
+			checksum = `	printf '%s  %s\n' ` + shellQuote(dl.SHA256Checksum) + ` "$GARM_RUNNER_ARCHIVE" | sha256sum -c - >/dev/null 2>&1 || { rm -f "$GARM_RUNNER_ARCHIVE"; ` + failFn + ` "runner $GARM_OFFERED_RUNNER_VERSION checksum mismatch"; }
+`
+		}
+		action = `	GARM_RUNNER_OWNER=` + shellQuote(dl.Owner) + `
+	GARM_RUNNER_ARCHIVE=$(mktemp "${TMPDIR:-/tmp}/garm-actions-runner.XXXXXX") || ` + failFn + ` "failed to create a temp file for runner $GARM_OFFERED_RUNNER_VERSION"
+	curl --retry 5 --retry-delay 5 --retry-connrefused --fail -sS -L -H ` + header + ` -o "$GARM_RUNNER_ARCHIVE" ` + shellQuote(dl.URL) + ` || { rm -f "$GARM_RUNNER_ARCHIVE"; ` + failFn + ` "failed to download runner $GARM_OFFERED_RUNNER_VERSION to replace the cached runner"; }
+` + checksum + `	rm -rf "` + h + `/bin" "` + h + `/externals" 2>/dev/null || sudo -n rm -rf "` + h + `/bin" "` + h + `/externals" || { rm -f "$GARM_RUNNER_ARCHIVE"; ` + failFn + ` "failed to remove stale runner binaries in ` + h + `"; }
+	tar xf "$GARM_RUNNER_ARCHIVE" -C "` + h + `"/ 2>/dev/null || sudo -n tar xf "$GARM_RUNNER_ARCHIVE" -C "` + h + `"/ || { rm -f "$GARM_RUNNER_ARCHIVE"; ` + failFn + ` "failed to extract runner $GARM_OFFERED_RUNNER_VERSION over ` + h + `"; }
+	rm -f "$GARM_RUNNER_ARCHIVE"
+	chown -R "$GARM_RUNNER_OWNER" "` + h + `" 2>/dev/null || sudo -n chown -R "$GARM_RUNNER_OWNER" "` + h + `" || ` + failFn + ` "failed to change owner of ` + h + ` to $GARM_RUNNER_OWNER"
+` + readVersion("	") + `	if [ "$GARM_CACHED_RUNNER_VERSION" != "$GARM_OFFERED_RUNNER_VERSION" ]; then
+		` + failFn + ` "runner archive installed version ${GARM_CACHED_RUNNER_VERSION:-unknown}, not the offered $GARM_OFFERED_RUNNER_VERSION"
+	fi
+`
+	default:
+		present = `[ -x "` + h + `/run.sh" ]`
+		verb = "discarding cached runner"
+		paths := `"` + h + `/run.sh" "` + h + `/bin" "` + h + `/externals"`
+		action = `	rm -rf ` + paths + ` 2>/dev/null || sudo -n rm -rf ` + paths + ` || ` + failFn + ` "failed to discard cached runner in ` + h + `"
+`
 	}
 	return `# garm-provider-vmharness: cached-runner version guard. GitHub rejects
 # deprecated runner releases, so a runner pre-staged in the image is only
 # reused when it is exactly the version GARM offers.
 GARM_OFFERED_RUNNER_VERSION=` + shellQuote(offered) + `
 if ` + present + `; then
-	GARM_CACHED_RUNNER_VERSION=""
-	if [ -f "$` + runHomeVar + `/bin/Runner.Listener.deps.json" ]; then
-		GARM_CACHED_RUNNER_VERSION=$(sed -n 's|.*"Runner\.Listener/\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*|\1|p' "$` + runHomeVar + `/bin/Runner.Listener.deps.json" 2>/dev/null | head -n 1) || GARM_CACHED_RUNNER_VERSION=""
-	fi
-	if [ "$GARM_CACHED_RUNNER_VERSION" != "$GARM_OFFERED_RUNNER_VERSION" ]; then
-		` + statusFn + ` "cached runner ${GARM_CACHED_RUNNER_VERSION:-unknown} in $` + runHomeVar + ` != offered $GARM_OFFERED_RUNNER_VERSION; discarding cached runner"
-		` + discard + `
-	else
+` + readVersion("	") + `	if [ "$GARM_CACHED_RUNNER_VERSION" != "$GARM_OFFERED_RUNNER_VERSION" ]; then
+		` + statusFn + ` "cached runner ${GARM_CACHED_RUNNER_VERSION:-unknown} in ` + h + ` != offered $GARM_OFFERED_RUNNER_VERSION; ` + verb + `"
+` + indentLines(action, "	") + `	else
 		echo "cached runner $GARM_CACHED_RUNNER_VERSION matches offered version"
 	fi
 fi
 `
+}
+
+func indentLines(text, indent string) string {
+	var b strings.Builder
+	for _, l := range strings.SplitAfter(text, "\n") {
+		if strings.TrimSpace(l) != "" {
+			b.WriteString(indent)
+		}
+		b.WriteString(l)
+	}
+	return b.String()
 }
 
 // powershellRunnerVersionGuard is the PowerShell counterpart of
@@ -163,7 +235,7 @@ func ownBashRunnerVersionGuard(tools commonParams.RunnerApplicationDownload) str
 	if offered == "" {
 		return ""
 	}
-	return bashRunnerVersionGuard(offered, "RUN_HOME", "status", "fail", false)
+	return bashRunnerVersionGuard(offered, "RUN_HOME", "status", "fail", bashDiscardPayload, bashRunnerDownload{})
 }
 
 func ownPowershellRunnerVersionGuard(tools commonParams.RunnerApplicationDownload) string {
@@ -244,7 +316,12 @@ func guardUpstreamRunnerInstallScript(bootstrapParams commonParams.BootstrapInst
 			true)
 		return injectBeforeAnchor(script, upstreamWindowsGuardAnchor, upstreamWindowsRunnerDirLine, snippet)
 	case commonParams.Linux:
-		snippet := bashRunnerVersionGuard(offered, "RUN_HOME", "sendStatus", "fail", true)
+		snippet := bashRunnerVersionGuard(offered, "RUN_HOME", "sendStatus", "fail", bashReplaceInPlace, bashRunnerDownload{
+			URL:               tools.GetDownloadURL(),
+			TempDownloadToken: tools.GetTempDownloadToken(),
+			SHA256Checksum:    tools.GetSHA256Checksum(),
+			Owner:             defaults.DefaultUser + ":" + defaults.DefaultUser,
+		})
 		return injectBeforeAnchor(script, upstreamLinuxGuardAnchor, "", snippet)
 	}
 	return script, nil

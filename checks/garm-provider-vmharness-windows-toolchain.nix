@@ -19,9 +19,11 @@
   #
   # The cached-runner version guard tests additionally EXECUTE the rendered
   # guard snippets against real directories: with bash/sh (always present in
-  # the build sandbox) and with pwsh, which is added here so the PowerShell
-  # guards of both Windows templates are gated too (the tests skip it only
-  # where pwsh is absent, eg an ad-hoc `go test` on a workstation).
+  # the build sandbox), with curl (the upstream-Linux guard downloads the
+  # offered runner itself; the test serves a local tarball over file://, so no
+  # network) and with pwsh, so the PowerShell guards of both Windows templates
+  # are gated too. The tests skip a tool only where it is absent, eg an ad-hoc
+  # `go test` on a workstation.
   perSystem =
     { self', pkgs, ... }:
     {
@@ -29,7 +31,10 @@
         self'.packages.garm-provider-vmharness.overrideAttrs
           (old: {
             doCheck = true;
-            nativeCheckInputs = (old.nativeCheckInputs or [ ]) ++ [ pkgs.powershell ];
+            nativeCheckInputs = (old.nativeCheckInputs or [ ]) ++ [
+              pkgs.curl
+              pkgs.powershell
+            ];
             checkPhase = ''
               runHook preCheck
               # pwsh needs a writable HOME for its module/telemetry caches.
