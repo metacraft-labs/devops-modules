@@ -158,7 +158,7 @@ holds.
   `bypassException`, and a non-active enforcement needs `enforcementException`
   (each the reason, at least 20 characters). Otherwise the evaluation throws.
 - `governance.nix` takes an opt-in `noBypassPolicy = { rulesetExceptions ? { };
-  branchProtectionExceptions ? { }; }`. When it is set, the render throws on
+branchProtectionExceptions ? { }; }`. When it is set, the render throws on
   any rendered repository/organization ruleset with bypass actors or a
   non-`active` enforcement, and on any classic branch protection with
   `enforce_admins = false` or pull-request bypassers — unless its engine
