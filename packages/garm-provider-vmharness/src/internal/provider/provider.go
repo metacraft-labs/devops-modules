@@ -327,6 +327,7 @@ command -v nix >/dev/null 2>&1 || fail "Nix is unavailable after installation"
 mkdir -p "$RUN_HOME"
 cd "$RUN_HOME"
 
+{{ .BashRunnerVersionGuard }}
 if [ ! -x ./run.sh ]; then
 	status "downloading tools from {{ .DownloadURL }}"
 	tmp_archive="$(mktemp "${TMPDIR:-/tmp}/actions-runner.XXXXXX")"
@@ -464,6 +465,7 @@ printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$RUNNER_USER" > "/etc/sudoers.d/90-garm-${
 chmod 0440 "/etc/sudoers.d/90-garm-${RUNNER_USER}"
 mkdir -p "$RUN_HOME"
 
+{{ .BashRunnerVersionGuard }}
 if [ ! -x "$RUN_HOME/run.sh" ]; then
 	status "downloading tools from {{ .DownloadURL }}"
 	tmp_archive="$(mktemp /tmp/actions-runner.XXXXXX)"
@@ -822,6 +824,7 @@ Set-Location $RunHome
 # cannot be solved by a workflow step.
 Initialize-RunnerToolchain
 
+{{ .PowershellRunnerVersionGuard }}
 if (-not (Test-Path (Join-Path $RunHome 'run.cmd'))) {
 	Send-Status -Status 'installing' -Message "downloading tools from {{ .DownloadURL }}"
 	$archive = Join-Path $env:TEMP {{ ps .FileName }}
@@ -889,6 +892,11 @@ type runnerInstallTemplateData struct {
 	GitHubRunnerGroup string
 	UseJITConfig      bool
 	EnableBootDebug   bool
+
+	// Cached-runner version guards (see runner_version_guard.go); empty when
+	// no offered runner version is derivable from the tools entry.
+	BashRunnerVersionGuard       string
+	PowershellRunnerVersionGuard string
 }
 
 func runnerInstallTemplateDataFrom(bootstrapParams commonParams.BootstrapInstance, tools commonParams.RunnerApplicationDownload, runnerName string) runnerInstallTemplateData {
@@ -906,6 +914,9 @@ func runnerInstallTemplateDataFrom(bootstrapParams commonParams.BootstrapInstanc
 		GitHubRunnerGroup: bootstrapParams.GitHubRunnerGroup,
 		UseJITConfig:      bootstrapParams.JitConfigEnabled,
 		EnableBootDebug:   bootstrapParams.UserDataOptions.EnableBootDebug,
+
+		BashRunnerVersionGuard:       ownBashRunnerVersionGuard(tools),
+		PowershellRunnerVersionGuard: ownPowershellRunnerVersionGuard(tools),
 	}
 }
 
@@ -975,7 +986,9 @@ func renderRunnerBootstrapForBackend(backendKind config.BackendKind, bootstrapPa
 	if err != nil {
 		return nil, err
 	}
-	return script, nil
+	// Upstream's default templates reuse any runner found at the runner home
+	// without checking its version; inject the cached-runner version guard.
+	return guardUpstreamRunnerInstallScript(bootstrapParams, tools, script)
 }
 
 func replaceURLInBytes(data []byte, oldURL, newURL string) []byte {

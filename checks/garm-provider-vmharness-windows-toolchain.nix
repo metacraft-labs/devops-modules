@@ -16,15 +16,26 @@
   # This mirrors `garm-macos-runner-install-wrapper.nix`, which already enables
   # `doCheck` on a sibling package for exactly this reason. The tests are pure
   # template rendering: no network, no daemon, no guest.
+  #
+  # The cached-runner version guard tests additionally EXECUTE the rendered
+  # guard snippets against real directories: with bash/sh (always present in
+  # the build sandbox) and with pwsh, which is added here so the PowerShell
+  # guards of both Windows templates are gated too (the tests skip it only
+  # where pwsh is absent, eg an ad-hoc `go test` on a workstation).
   perSystem =
-    { self', ... }:
+    { self', pkgs, ... }:
     {
       checks.t_garm_provider_vmharness_windows_toolchain =
         self'.packages.garm-provider-vmharness.overrideAttrs
-          (_old: {
+          (old: {
             doCheck = true;
+            nativeCheckInputs = (old.nativeCheckInputs or [ ]) ++ [ pkgs.powershell ];
             checkPhase = ''
               runHook preCheck
+              # pwsh needs a writable HOME for its module/telemetry caches.
+              export HOME="$TMPDIR/home"
+              export POWERSHELL_TELEMETRY_OPTOUT=1
+              mkdir -p "$HOME"
               go test ./internal/provider
               runHook postCheck
             '';
