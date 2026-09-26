@@ -65,6 +65,7 @@
     ./ci-build-batching.nix
     ./packages-ci-matrix.nix
     ./pre-commit.nix
+    ./git-hooks-reprobuild-handoff.nix
     ./secret-integration
     ./setup-nix-transfer-resilience.nix
     ./terraform-ci-matrix.nix

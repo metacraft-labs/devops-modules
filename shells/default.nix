@@ -62,25 +62,14 @@
             ++ config.pre-commit.settings.enabledPackages
             ++ [ config.pre-commit.settings.package ];
 
-          # Upstream's installationScript targets the CWD's git root, not this
-          # flake's, and replaces an existing config symlink without question.
-          # Guard it so entering this shell from another checkout cannot swap that
-          # repo's hooks. See lib/git-hooks-repo-guard.nix.
+          # The guarded, Reprobuild-aware installer every consumer uses; see
+          # `mcl.gitHooks.installationScript` in checks/pre-commit.nix.
           shellHook = ''
             export REPO_ROOT="$PWD"
             export PATH="$REPO_ROOT/packages/mcl-devops/build:$PATH"
             figlet -t "Metacraft Nixos Modules"
           ''
-          + ''
-            ${import ../lib/git-hooks-repo-guard.nix {
-              expectedFlakeNixHash = builtins.hashFile "sha256" (inputs.self + "/flake.nix");
-            }}
-            if _mcl_hooks_same_repo; then
-            ${config.pre-commit.installationScript}
-            else
-              _mcl_hooks_explain_skip
-            fi
-          '';
+          + config.mcl.gitHooks.installationScript;
         };
     };
 }
