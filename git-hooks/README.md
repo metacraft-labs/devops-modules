@@ -26,6 +26,27 @@ repo without an edit in any of them.
 `metacraft-dev-guidelines/policies/repo-requirements.md` § 4 requires layer 2 by
 name, for all three workspaces these modules serve.
 
+## Installing from a devShell
+
+Put `config.mcl.gitHooks.installationScript` in the devShell's `shellHook`, not
+upstream's `config.pre-commit.installationScript`:
+
+```nix
+shellHook = ''
+  # ... your own setup ...
+'' + config.mcl.gitHooks.installationScript;
+```
+
+It runs upstream's installer only when the shell is entered from the flake's own
+repository (`../lib/git-hooks-repo-guard.nix`), then hands the hook slots back
+to Reprobuild where a Reprobuild hook dispatcher is installed
+(`../lib/git-hooks-reprobuild-handoff.nix`): prek moves a dispatcher it finds to
+`<hook>.legacy`, and the handoff puts it back and chains prek's shim as
+`<hook>.repro-local`. It also writes `core.hooksPath` as an absolute path, since
+upstream's relative `.git/hooks` resolves to nothing in a linked worktree. In a
+repository without Reprobuild it changes nothing about how prek's hooks are
+installed or run.
+
 ## Two forms, and why both exist
 
 **Pre-commit configuration is generally managed outside flakes here, because

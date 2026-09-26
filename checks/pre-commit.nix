@@ -30,6 +30,7 @@ in
       self,
       config,
       lib,
+      flake-parts-lib,
       ...
     }:
     let
@@ -68,6 +69,39 @@ in
       # Declared, not achieved by omission. A reader of a consuming flake can
       # see the exception and ask why; there is no way to get the exception by
       # simply failing to mention the subject.
+      # THE INSTALLATION SCRIPT CONSUMERS PUT IN THEIR shellHook.
+      #
+      # Use `config.mcl.gitHooks.installationScript` (per-system), not
+      # upstream's `config.pre-commit.installationScript`. It is upstream's
+      # script plus the two things every consumer needs and none should
+      # re-implement:
+      #
+      #   * the same-repository guard (lib/git-hooks-repo-guard.nix), so
+      #     entering this shell from another checkout cannot swap that repo's
+      #     hooks;
+      #   * the Reprobuild handoff (lib/git-hooks-reprobuild-handoff.nix): prek
+      #     installs ITS shim in place of a Reprobuild hook dispatcher and moves
+      #     the dispatcher to `<hook>.legacy`, which leaves the pre-push
+      #     publication gate running only by accident. The handoff puts the
+      #     dispatcher back and chains prek's shim as `<hook>.repro-local` — and
+      #     makes upstream's relative `core.hooksPath` absolute, without which
+      #     Git runs no hooks at all in a linked worktree.
+      #
+      # Without Reprobuild in the repo the handoff finds no dispatcher and does
+      # nothing; prek's hooks install and run exactly as upstream leaves them.
+      options.perSystem = flake-parts-lib.mkPerSystemOption {
+        options.mcl.gitHooks.installationScript = lib.mkOption {
+          type = lib.types.str;
+          readOnly = true;
+          description = ''
+            Bash snippet for a devShell `shellHook`: installs the configured
+            git hooks (upstream git-hooks.nix) in THIS flake's repository only,
+            and hands the hook slots back to Reprobuild's dispatchers where
+            present. Prefer it to `pre-commit.installationScript`.
+          '';
+        };
+      };
+
       options.mcl.gitHooks = {
         committedBinaries = {
           maxKB = lib.mkOption {
@@ -154,6 +188,19 @@ in
         perSystem =
           { config, pkgs, ... }:
           {
+            mcl.gitHooks.installationScript = ''
+              ${repoGuard}
+              ${import ../lib/git-hooks-reprobuild-handoff.nix {
+                git = lib.getExe config.pre-commit.settings.gitPackage;
+              }}
+              if _mcl_hooks_same_repo; then
+              ${config.pre-commit.installationScript}
+                _mcl_hooks_reprobuild_handoff
+              else
+                _mcl_hooks_explain_skip
+              fi
+            '';
+
             devShells.pre-commit =
               let
                 inherit (config.pre-commit.settings) enabledPackages package configFile;
