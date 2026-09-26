@@ -129,6 +129,13 @@ let
           "iam:TagRole"
           "iam:UntagRole"
           "iam:UpdateAssumeRolePolicy"
+          # The AWS provider's aws_iam_role delete lists the role's instance
+          # profiles (and detaches it from each via RemoveRoleFromInstanceProfile,
+          # granted on the instance-profile statement below) before DeleteRole.
+          # Without it, destroying any managed role fails with AccessDenied.
+          # Kept last so the rendered order matches the policy already live in
+          # consumer accounts.
+          "iam:ListInstanceProfilesForRole"
         ];
         Resource = managedIamRoleArnPattern;
       }
