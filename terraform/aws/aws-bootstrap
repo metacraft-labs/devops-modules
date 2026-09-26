@@ -286,6 +286,7 @@ EOF
 
   require_action "iam:CreateRole" "$role_resource"
   require_action "iam:UpdateAssumeRolePolicy" "$role_resource"
+  require_action "iam:ListInstanceProfilesForRole" "$role_resource"
   require_action "iam:CreateInstanceProfile" "$profile_resource"
   require_action "iam:AddRoleToInstanceProfile" "$profile_resource"
   require_action "iam:CreateUser" "$user_resource"
