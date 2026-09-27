@@ -85,6 +85,15 @@ type RemoteBackend struct {
 	// ephemeral path applies as `limits.cpu` / `limits.memory` before start.
 	IncusLimitsCPU      int
 	IncusLimitsMemoryMB int
+	// LibvirtUEFILoader / LibvirtUEFINVRAMTemplate / LibvirtCPUs /
+	// LibvirtMemoryMB are trusted provider-admin settings for the remote
+	// libvirt recipe (empty/0 = unset). They map only to vm-harness's
+	// `--uefi-loader` / `--uefi-nvram-template` / `--cpus` / `--memory-mb`.
+	// The firmware paths name files on the REMOTE host.
+	LibvirtUEFILoader        string
+	LibvirtUEFINVRAMTemplate string
+	LibvirtCPUs              int
+	LibvirtMemoryMB          int
 }
 
 // remoteRecipe builds the create/delete argv for a specific target backend.
@@ -159,6 +168,22 @@ var ephemeralRecipe = remoteRecipe{
 			}
 			if backend.IncusLimitsMemoryMB > 0 {
 				argv = append(argv, "--memory-mb", strconv.Itoa(backend.IncusLimitsMemoryMB))
+			}
+		}
+		// Remote libvirt: UEFI firmware and per-job size. Unset emits nothing,
+		// so a libvirt provider that sets none keeps its argv byte-identical.
+		// Without the firmware pair a UEFI Windows golden never boots (SeaBIOS
+		// + qemu64), which is what left the hms Windows lane unregistered.
+		if backend.TargetBackend == "libvirt" {
+			if backend.LibvirtUEFILoader != "" {
+				argv = append(argv, "--uefi-loader", backend.LibvirtUEFILoader,
+					"--uefi-nvram-template", backend.LibvirtUEFINVRAMTemplate)
+			}
+			if backend.LibvirtCPUs > 0 {
+				argv = append(argv, "--cpus", strconv.Itoa(backend.LibvirtCPUs))
+			}
+			if backend.LibvirtMemoryMB > 0 {
+				argv = append(argv, "--memory-mb", strconv.Itoa(backend.LibvirtMemoryMB))
 			}
 		}
 		argv = append(argv, "--keep", "--log-format", "json")

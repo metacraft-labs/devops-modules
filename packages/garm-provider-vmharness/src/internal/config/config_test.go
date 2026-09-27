@@ -294,3 +294,49 @@ incus_limits_cpu = -1
 		t.Fatal("a negative incus_limits_cpu was accepted")
 	}
 }
+
+// TestRemoteLibvirtSettings pins the remote-libvirt keys at the TOML boundary:
+// they parse, the firmware pair must come together, negatives are rejected,
+// and they are refused on any target other than libvirt.
+func TestRemoteLibvirtSettings(t *testing.T) {
+	t.Setenv(DefaultAuthTokenEnv, "")
+	head := func(target string) string {
+		return "backend = \"remote\"\n[remote]\nendpoint = \"100.72.0.5:8873\"\ntarget_backend = \"" + target +
+			"\"\nauth_token_file = \"/run/creds/vmh\"\n"
+	}
+	full := "libvirt_uefi_loader = \"/run/libvirt/nix-ovmf/edk2-x86_64-code.fd\"\n" +
+		"libvirt_uefi_nvram_template = \"/run/libvirt/nix-ovmf/edk2-i386-vars.fd\"\n" +
+		"libvirt_cpus = 4\nlibvirt_memory_mb = 16384\n"
+
+	cfg, err := ParseBytes([]byte(head("libvirt") + full))
+	if err != nil {
+		t.Fatalf("well-formed remote libvirt settings rejected: %v", err)
+	}
+	r := cfg.Remote
+	if r.LibvirtUEFILoader != "/run/libvirt/nix-ovmf/edk2-x86_64-code.fd" ||
+		r.LibvirtUEFINVRAMTemplate != "/run/libvirt/nix-ovmf/edk2-i386-vars.fd" ||
+		r.LibvirtCPUs != 4 || r.LibvirtMemoryMB != 16384 {
+		t.Fatalf("remote libvirt settings not parsed: %+v", r)
+	}
+
+	plain, err := ParseBytes([]byte(head("libvirt")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.Remote.HasLibvirtSettings() {
+		t.Fatalf("absent keys must leave every libvirt setting unset: %+v", plain.Remote)
+	}
+
+	for name, body := range map[string]string{
+		"loader without template": head("libvirt") + "libvirt_uefi_loader = \"/x/code.fd\"\n",
+		"template without loader": head("libvirt") + "libvirt_uefi_nvram_template = \"/x/vars.fd\"\n",
+		"negative cpus":           head("libvirt") + "libvirt_cpus = -1\n",
+		"negative memory":         head("libvirt") + "libvirt_memory_mb = -1\n",
+		"incus target":            head("incus") + full,
+		"hyperv target":           head("hyperv") + "libvirt_cpus = 4\n",
+	} {
+		if _, err := ParseBytes([]byte(body)); err == nil {
+			t.Errorf("%s: accepted, want rejection", name)
+		}
+	}
+}

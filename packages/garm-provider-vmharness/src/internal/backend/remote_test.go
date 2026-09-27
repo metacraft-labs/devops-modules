@@ -551,3 +551,74 @@ func hasFlag(argv []string, flag string) bool {
 	}
 	return false
 }
+
+// The remote libvirt recipe: a UEFI Windows golden only boots when the OVMF
+// firmware pair reaches `run --ephemeral` (else SeaBIOS + qemu64 and the guest
+// hangs at the firmware), and the per-job size must be settable because the
+// ephemeral default is 2 vCPU / 1024 MiB. Unset emits nothing.
+func TestRemoteCreateLibvirtUEFIAndSize(t *testing.T) {
+	const code = "/run/libvirt/nix-ovmf/edk2-x86_64-code.fd"
+	const vars = "/run/libvirt/nix-ovmf/edk2-i386-vars.fd"
+	for _, tc := range []struct {
+		name          string
+		loader, nvram string
+		cpus, memMB   int
+		suffix        []string
+	}{
+		{name: "unset emits nothing", suffix: nil},
+		{name: "firmware only", loader: code, nvram: vars,
+			suffix: []string{"--uefi-loader", code, "--uefi-nvram-template", vars}},
+		{name: "size only", cpus: 4, memMB: 16384,
+			suffix: []string{"--cpus", "4", "--memory-mb", "16384"}},
+		{name: "all in fixed order", loader: code, nvram: vars, cpus: 4, memMB: 16384,
+			suffix: []string{"--uefi-loader", code, "--uefi-nvram-template", vars, "--cpus", "4", "--memory-mb", "16384"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, fs, closeFn := newFakeBackend(t, "libvirt", 0)
+			defer closeFn()
+			b.LibvirtUEFILoader = tc.loader
+			b.LibvirtUEFINVRAMTemplate = tc.nvram
+			b.LibvirtCPUs = tc.cpus
+			b.LibvirtMemoryMB = tc.memMB
+			if _, err := b.Create(context.Background(), CreateArgs{Name: "job-win", SourceImage: "/storage/iso/golden.qcow2"}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			want := []string{"run", "--ephemeral", "--backend", "libvirt", "--baseline", "job-win",
+				"--base-image", "/storage/iso/golden.qcow2", "--source-image", "/storage/iso/golden.qcow2"}
+			want = append(want, tc.suffix...)
+			want = append(want, "--keep", "--log-format", "json")
+			if !reflect.DeepEqual(fs.execArgv[0], want) {
+				t.Fatalf("create argv=%v want exact %v", fs.execArgv[0], want)
+			}
+			if err := b.Delete(context.Background(), "job-win"); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			wantDelete := []string{"ephemeral-destroy", "--backend", "libvirt", "--baseline", "job-win", "--log-format", "json"}
+			if !reflect.DeepEqual(fs.execArgv[1], wantDelete) {
+				t.Fatalf("delete argv=%v want %v", fs.execArgv[1], wantDelete)
+			}
+		})
+	}
+}
+
+func TestRemoteNonLibvirtRecipesNeverReceiveLibvirtSettings(t *testing.T) {
+	for _, target := range []string{"noop", "incus", "hyperv", "tart-macos"} {
+		t.Run(target, func(t *testing.T) {
+			b, fs, closeFn := newFakeBackend(t, target, 0)
+			defer closeFn()
+			b.LibvirtUEFILoader = "/x/code.fd"
+			b.LibvirtUEFINVRAMTemplate = "/x/vars.fd"
+			b.LibvirtCPUs = 4
+			b.LibvirtMemoryMB = 16384
+			if _, err := b.Create(context.Background(), CreateArgs{Name: "job-other"}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			for _, a := range fs.execArgv[0] {
+				switch a {
+				case "--uefi-loader", "--uefi-nvram-template", "--cpus", "--memory-mb":
+					t.Fatalf("target %q received a libvirt setting: %v", target, fs.execArgv[0])
+				}
+			}
+		})
+	}
+}
