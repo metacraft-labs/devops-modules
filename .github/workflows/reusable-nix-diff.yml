@@ -138,12 +138,25 @@ jobs:
             if git diff --cached --quiet; then
               echo "Base flake.lock already matches requested input overrides"
             else
-              git commit -m "ci: synthesize base flake input overrides"
+              # --no-verify: the consumer repo's pre-commit hooks are installed in the
+              # shared .git, and this worktree is a synthetic scratch tree that has no
+              # .pre-commit-config.yaml. Running publication hooks against it fails for
+              # a reason that has nothing to do with the change under test.
+              git commit --no-verify -m "ci: synthesize base flake input overrides"
             fi
           )
 
           git init --bare "$synthetic_origin"
-          git -C "$base_worktree" push "$synthetic_origin" "HEAD:refs/heads/${base_ref}"
+          # --no-verify, and this is the one that was actually breaking jobs.
+          # `$synthetic_origin` is a throwaway bare repo created on the line above, so
+          # running the consumer repo's pre-push hooks against it is meaningless by
+          # construction -- yet they fire, because the hooks live in the shared .git the
+          # worktree inherits. Observed on metacraft-labs/infra PR #1603, job
+          # 108490604119: `error: config file not found: .pre-commit-config.yaml` from
+          # prek, then `failed to push some refs`, and the whole nix-diff job exited 1
+          # having diffed nothing. The PR that hit it changed two workflow YAML files
+          # and could not have altered any closure.
+          git -C "$base_worktree" push --no-verify "$synthetic_origin" "HEAD:refs/heads/${base_ref}"
           git remote set-url origin "$synthetic_origin"
           echo "Prepared synthetic origin/${base_ref} for nix-diff input overrides: $override_inputs"
 
