@@ -142,6 +142,30 @@ type RemoteConfig struct {
 	// container's memory, via vm-harness `--memory-mb <n>` ⇒
 	// `limits.memory = <n>MiB`. Same rules as IncusLimitsCPU.
 	IncusLimitsMemoryMB int `toml:"incus_limits_memory_mb"`
+
+	// LibvirtUEFILoader / LibvirtUEFINVRAMTemplate are the OVMF code firmware
+	// and vars template, as paths ON THE REMOTE HOST, for a remote libvirt
+	// provider. They map only to vm-harness `--uefi-loader` /
+	// `--uefi-nvram-template` on `run --ephemeral --backend libvirt`. Without
+	// them the ephemeral domain boots SeaBIOS with the `qemu64` CPU model, which
+	// cannot start a UEFI Windows 11 golden: the guest sits at the firmware
+	// forever, never registers, and GARM reaps it at the bootstrap timeout. With
+	// a loader, vm-harness also switches the domain to `host-passthrough`. Both
+	// or neither; empty (default) keeps the create argv byte-identical.
+	LibvirtUEFILoader        string `toml:"libvirt_uefi_loader"`
+	LibvirtUEFINVRAMTemplate string `toml:"libvirt_uefi_nvram_template"`
+
+	// LibvirtCPUs / LibvirtMemoryMB size each remote libvirt per-job domain via
+	// vm-harness `--cpus` / `--memory-mb`. 0 (default) emits nothing and leaves
+	// vm-harness's ephemeral defaults (2 vCPU / 1024 MiB, too small for Windows).
+	LibvirtCPUs     int `toml:"libvirt_cpus"`
+	LibvirtMemoryMB int `toml:"libvirt_memory_mb"`
+}
+
+// HasLibvirtSettings reports whether any remote-libvirt per-job setting is set.
+func (r *RemoteConfig) HasLibvirtSettings() bool {
+	return r.LibvirtUEFILoader != "" || r.LibvirtUEFINVRAMTemplate != "" ||
+		r.LibvirtCPUs != 0 || r.LibvirtMemoryMB != 0
 }
 
 // HasIncusLimits reports whether any per-job Incus resource cap is set.
@@ -465,6 +489,16 @@ func (c *Config) Validate() error {
 	if c.Remote != nil && c.Remote.HasIncusLimits() &&
 		(c.Backend != BackendRemote || c.Remote.TargetBackend != string(BackendIncus)) {
 		return fmt.Errorf("remote incus_limits_cpu/incus_limits_memory_mb require backend %q with remote.target_backend %q", BackendRemote, BackendIncus)
+	}
+	if c.Remote != nil && (c.Remote.LibvirtCPUs < 0 || c.Remote.LibvirtMemoryMB < 0) {
+		return fmt.Errorf("remote libvirt_cpus/libvirt_memory_mb must be >= 0")
+	}
+	if c.Remote != nil && (c.Remote.LibvirtUEFILoader == "") != (c.Remote.LibvirtUEFINVRAMTemplate == "") {
+		return fmt.Errorf("remote libvirt_uefi_loader and libvirt_uefi_nvram_template must be set together")
+	}
+	if c.Remote != nil && c.Remote.HasLibvirtSettings() &&
+		(c.Backend != BackendRemote || c.Remote.TargetBackend != string(BackendLibvirt)) {
+		return fmt.Errorf("remote libvirt_* settings require backend %q with remote.target_backend %q", BackendRemote, BackendLibvirt)
 	}
 	switch c.Backend {
 	case BackendLibvirt:

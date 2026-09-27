@@ -66,6 +66,10 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 		(cfg.Backend != config.BackendRemote || cfg.Remote.TargetBackend != string(config.BackendIncus)) {
 		return nil, fmt.Errorf("remote Incus resource limits require backend %q with target backend %q", config.BackendRemote, config.BackendIncus)
 	}
+	if cfg.Remote != nil && cfg.Remote.HasLibvirtSettings() &&
+		(cfg.Backend != config.BackendRemote || cfg.Remote.TargetBackend != string(config.BackendLibvirt)) {
+		return nil, fmt.Errorf("remote libvirt settings require backend %q with target backend %q", config.BackendRemote, config.BackendLibvirt)
+	}
 	var b backend.Backend
 	switch cfg.Backend {
 	case config.BackendLibvirt:
@@ -144,12 +148,16 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 			Client: backend.NewServeClient(
 				cfg.Remote.Endpoint, token,
 				time.Duration(cfg.Remote.RequestTimeoutSec)*time.Second),
-			TargetBackend:        cfg.Remote.TargetBackend,
-			GuestOS:              cfg.Remote.GuestOS,
-			IncusSecurityNesting: cfg.Remote.IncusSecurityNesting,
-			IncusNestedKvm:       cfg.Remote.IncusNestedKvm,
-			IncusLimitsCPU:       cfg.Remote.IncusLimitsCPU,
-			IncusLimitsMemoryMB:  cfg.Remote.IncusLimitsMemoryMB,
+			TargetBackend:            cfg.Remote.TargetBackend,
+			GuestOS:                  cfg.Remote.GuestOS,
+			IncusSecurityNesting:     cfg.Remote.IncusSecurityNesting,
+			IncusNestedKvm:           cfg.Remote.IncusNestedKvm,
+			IncusLimitsCPU:           cfg.Remote.IncusLimitsCPU,
+			IncusLimitsMemoryMB:      cfg.Remote.IncusLimitsMemoryMB,
+			LibvirtUEFILoader:        cfg.Remote.LibvirtUEFILoader,
+			LibvirtUEFINVRAMTemplate: cfg.Remote.LibvirtUEFINVRAMTemplate,
+			LibvirtCPUs:              cfg.Remote.LibvirtCPUs,
+			LibvirtMemoryMB:          cfg.Remote.LibvirtMemoryMB,
 		}
 	default:
 		return nil, fmt.Errorf("unsupported backend %q", cfg.Backend)

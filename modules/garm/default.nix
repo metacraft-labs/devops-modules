@@ -273,6 +273,17 @@
         ''
         + optionalString (p.remote.incusLimitsMemoryMb > 0) ''
           incus_limits_memory_mb = ${toString p.remote.incusLimitsMemoryMb}
+        ''
+        # Remote libvirt firmware + per-job size, likewise omitted when unset.
+        + optionalString (p.remote.libvirtUefiLoader != null) ''
+          libvirt_uefi_loader = "${p.remote.libvirtUefiLoader}"
+          libvirt_uefi_nvram_template = "${p.remote.libvirtUefiNvramTemplate}"
+        ''
+        + optionalString (p.remote.libvirtCpus > 0) ''
+          libvirt_cpus = ${toString p.remote.libvirtCpus}
+        ''
+        + optionalString (p.remote.libvirtMemoryMb > 0) ''
+          libvirt_memory_mb = ${toString p.remote.libvirtMemoryMb}
         '';
       # RE3: the `garm-provider-aws` config.toml (config/config.go). It carries
       # ONLY the region, the subnet, and the credential TYPE — never a secret.
@@ -2403,6 +2414,53 @@
                       and target rules as `incusLimitsCpu`.
                     '';
                   };
+                  libvirtUefiLoader = mkOption {
+                    type = types.nullOr types.str;
+                    default = null;
+                    example = "/run/libvirt/nix-ovmf/edk2-x86_64-code.fd";
+                    description = ''
+                      OVMF code firmware, as a path ON THE REMOTE HOST, for a
+                      remote libvirt provider. Emitted as `--uefi-loader` (with
+                      `libvirtUefiNvramTemplate` as `--uefi-nvram-template`) on
+                      the remote `vm-harness run --ephemeral --backend libvirt`.
+                      Required for a UEFI golden such as Windows 11: without it
+                      the per-job domain boots SeaBIOS with the `qemu64` CPU and
+                      never reaches the OS. vm-harness also switches a UEFI
+                      domain to `host-passthrough`. null (default) emits nothing.
+                      Rejected for non-remote providers and non-libvirt targets.
+                    '';
+                  };
+                  libvirtUefiNvramTemplate = mkOption {
+                    type = types.nullOr types.str;
+                    default = null;
+                    example = "/run/libvirt/nix-ovmf/edk2-i386-vars.fd";
+                    description = ''
+                      OVMF vars template (remote-host path) copied into each
+                      per-job domain's writable nvram. Must be set together with
+                      `libvirtUefiLoader`.
+                    '';
+                  };
+                  libvirtCpus = mkOption {
+                    type = types.ints.unsigned;
+                    default = 0;
+                    example = 4;
+                    description = ''
+                      Per-job vCPUs for a remote libvirt provider, emitted as
+                      `--cpus <n>`. 0 (default) leaves vm-harness's ephemeral
+                      default (2). Rejected for non-libvirt targets.
+                    '';
+                  };
+                  libvirtMemoryMb = mkOption {
+                    type = types.ints.unsigned;
+                    default = 0;
+                    example = 16384;
+                    description = ''
+                      Per-job RAM (MiB) for a remote libvirt provider, emitted as
+                      `--memory-mb <n>`. 0 (default) leaves vm-harness's
+                      ephemeral default (1024 MiB, far too small for Windows).
+                      Rejected for non-libvirt targets.
+                    '';
+                  };
                 };
               };
             };
@@ -4421,6 +4479,21 @@
                 (p.remote.incusLimitsCpu == 0 && p.remote.incusLimitsMemoryMb == 0)
                 || (providerIsRemote p && p.remote.targetBackend == "incus");
               message = "services.garm.providers.${n}.remote.incusLimitsCpu/incusLimitsMemoryMb require backend = \"remote\" and remote.targetBackend = \"incus\"; they map only to vm-harness --cpus/--memory-mb on the Incus ephemeral path.";
+            }) cfg.providers
+            ++ lib.mapAttrsToList (n: p: {
+              assertion =
+                (
+                  p.remote.libvirtUefiLoader == null
+                  && p.remote.libvirtUefiNvramTemplate == null
+                  && p.remote.libvirtCpus == 0
+                  && p.remote.libvirtMemoryMb == 0
+                )
+                || (providerIsRemote p && p.remote.targetBackend == "libvirt");
+              message = "services.garm.providers.${n}.remote.libvirt* require backend = \"remote\" and remote.targetBackend = \"libvirt\"; they map only to vm-harness --uefi-loader/--uefi-nvram-template/--cpus/--memory-mb on the libvirt ephemeral path.";
+            }) cfg.providers
+            ++ lib.mapAttrsToList (n: p: {
+              assertion = (p.remote.libvirtUefiLoader == null) == (p.remote.libvirtUefiNvramTemplate == null);
+              message = "services.garm.providers.${n}.remote.libvirtUefiLoader and libvirtUefiNvramTemplate must be set together.";
             }) cfg.providers
             # Resource-guard (eval time): the sum over all scale sets of
             # maxRunners * (its provider's per-VM RAM) must fit the declared host
