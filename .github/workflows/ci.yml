@@ -42,7 +42,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout first to use locally defined actions
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: ./.github/setup-nix
@@ -68,7 +68,7 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout first to use locally defined actions
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7
 
       - name: Stage the devShell test fixture as the workspace flake
         run: |
@@ -138,7 +138,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout first to use locally defined actions
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7
 
       # On this runner Nix already exists, so the installer step is skipped and
       # only `Configure Nix` + the new verification run. A green step here is
@@ -180,7 +180,7 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout first to use locally defined actions
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: ./.github/setup-nix
@@ -249,7 +249,7 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout first to use locally defined actions
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7
 
       - name: Setup Nix
         uses: ./.github/setup-nix

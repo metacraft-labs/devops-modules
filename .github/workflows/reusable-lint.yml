@@ -137,7 +137,7 @@ jobs:
       LINT_HAS_STATIC_TOKEN: ${{ secrets.NIX_GITHUB_TOKEN != '' || secrets.GH_READ_METACRAFT_PRIVATE_REPOS != '' }}
       LINT_HAS_TOKEN_APP: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY != '' && (secrets.CI_TOKEN_PROVIDER_APP_ID != '' || vars.CI_TOKEN_PROVIDER_APP_ID != '') }}
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7
         with:
           fetch-depth: ${{ inputs.fetch-depth }}
 
