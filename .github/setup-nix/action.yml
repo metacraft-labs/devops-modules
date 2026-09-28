@@ -637,5 +637,19 @@ runs:
 
         direnv allow .
         echo "::group::Exporting Nix DevShell to GITHUB_ENV"
-        direnv export gha >> "$GITHUB_ENV"
+        # Dynamic loader search paths (LD_LIBRARY_PATH, LD_PRELOAD) must never be
+        # exported globally into GITHUB_ENV. On non-NixOS runners (e.g. Ubuntu GARM
+        # runners), host binaries (such as the Actions runner Node.js runtime)
+        # inherit these variables and attempt to load Nix store libraries compiled
+        # against newer glibc versions, causing immediate loader aborts:
+        # "version `GLIBC_...` not found (required by .../libstdc++.so.6)".
+        # Nix binaries use RPATH and do not need LD_LIBRARY_PATH.
+        direnv export gha | awk '
+          /^LD_LIBRARY_PATH=/ || /^LD_PRELOAD=/ { next }
+          /^LD_LIBRARY_PATH<</ { skip=1; sub(/^LD_LIBRARY_PATH<</, ""); delim=$0; next }
+          /^LD_PRELOAD<</ { skip=1; sub(/^LD_PRELOAD<</, ""); delim=$0; next }
+          skip && $0 == delim { skip=0; next }
+          skip { next }
+          { print }
+        ' >> "$GITHUB_ENV"
         echo "::endgroup::"
