@@ -118,6 +118,40 @@ buildGo126Module rec {
     # See upstream-patches/garm-instance-lifecycle-leaks/ and the gate
     # t_garm_instance_lifecycle.
     ./patches/fix-instance-lifecycle-leaks.patch
+    # Stranded queued jobs (central GARM, high-mem-server, 2026-09-28). The
+    # agent-harbor Windows pool (maxRunners 2) was full; GARM retried the
+    # third job every ~30 s until 11:57:56Z, then never looked at it again.
+    # The slots freed at 12:23Z and the job sat queued for 2.5 h until it was
+    # cancelled. GitHub sent no update for it in between (webhook delivery
+    # log), and the row stayed queued and unlocked in the DB.
+    #
+    # Cause: each pool manager keeps an in-memory copy of its queued jobs,
+    # fed by database-watcher notifications. At this pin the watcher
+    # delivered each notification from its own goroutine with a 1 s timeout
+    # into a 1-slot channel, so notifications could be DROPPED or arrive OUT
+    # OF ORDER. consumeQueuedJobs() locks a job, fails to place it, and
+    # unlocks it about 1 ms later. If the unlock notification is lost or
+    # overtaken by the lock's, the cache says "locked by us" while the DB
+    # says unlocked. The 10-minute retry then calls UnlockJob(), which is a
+    # silent no-op on an unlocked row and sends no notification, and the
+    # cache is trusted again: the job is skipped on every pass until GARM
+    # restarts. Pools depend on this cache; scale sets do not (GitHub
+    # re-offers their jobs), which is why only pools strand.
+    #
+    # Two patches:
+    #  1. backport-watcher-lossless-delivery: upstream's own fix for the
+    #     dropped/reordered notifications (cloudbase/garm f5d98947, 3e398635,
+    #     0d6acdea, 2026-09-01..08; ordered, unbounded per-consumer queue).
+    #     Drop it when the pin moves past 0d6acdea.
+    #  2. fix-job-cache-stale-lock: consumeQueuedJobs() writes its own
+    #     unlocks through to the cache, heals a cached "locked by us" once
+    #     the 10-minute retry has unlocked the row, and drops cached jobs the
+    #     DB no longer has (instead of erroring on them every pass). Upstream
+    #     HEAD still trusts the cache here, so this is proposed upstream.
+    # See upstream-patches/garm-job-cache-stale-lock/ and the gate
+    # t_garm_job_cache_self_heal.
+    ./patches/backport-watcher-lossless-delivery.patch
+    ./patches/fix-job-cache-stale-lock.patch
   ];
 
   # go-sqlite3 is a cgo module; the daemon needs cgo to link SQLite.
