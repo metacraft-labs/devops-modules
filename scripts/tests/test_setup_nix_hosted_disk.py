@@ -131,9 +131,11 @@ def validate(action: str, script: str, workflow: str) -> None:
     assert workflow.count(workflow_input) == 1, (
         "reusable Terraform reclamation must be an explicit boolean that defaults off"
     )
+    # Forced off while the Terraform lane override routes the job to a
+    # self-hosted runner (the reclamation fails closed there).
     propagation = (
         "          reclaim_hosted_runner_disk: "
-        "${{ inputs.reclaim_hosted_runner_disk }}\n"
+        "${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}\n"
     )
     assert workflow.count(propagation) == len(RELEVANT_JOBS), (
         "every Terraform job must pass the opt-in unchanged to Setup Nix"
@@ -149,6 +151,17 @@ def validate(action: str, script: str, workflow: str) -> None:
     assert "default: '[\"self-hosted\", \"Linux\", \"x86-64-v2\"]'" in workflow, (
         "the reusable workflow's self-hosted runner default changed"
     )
+    lane_runs_on = "    runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}\n"
+    assert workflow.count(lane_runs_on) == len(RELEVANT_JOBS), (
+        "every Terraform job must honour the TERRAFORM_LANE_RUNNER override"
+    )
+    assert "runs-on: ${{ fromJSON(inputs.runner) }}" not in workflow, (
+        "a Terraform job ignores the TERRAFORM_LANE_RUNNER override"
+    )
+    for job_name in RELEVANT_JOBS:
+        assert extract_job(workflow, job_name).count(lane_runs_on) == 1, (
+            f"{job_name}: must resolve runs-on through the lane override exactly once"
+        )
 
 
 def replace_once(text: str, old: str, new: str) -> str:
@@ -312,10 +325,32 @@ def test_hostile_mutations(action: str, script: str, workflow: str) -> None:
             replace_once(
                 workflow,
                 "          reclaim_hosted_runner_disk: "
-                "${{ inputs.reclaim_hosted_runner_disk }}\n",
+                "${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}\n",
                 "",
             ),
             "every Terraform job",
+        ),
+        "reclaim on the self-hosted Terraform lane": (
+            action,
+            script,
+            replace_once(
+                workflow,
+                "          reclaim_hosted_runner_disk: "
+                "${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}\n",
+                "          reclaim_hosted_runner_disk: "
+                "${{ inputs.reclaim_hosted_runner_disk }}\n",
+            ),
+            "every Terraform job",
+        ),
+        "one Terraform job ignores the lane override": (
+            action,
+            script,
+            replace_once(
+                workflow,
+                "    runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}\n",
+                "    runs-on: ${{ fromJSON(inputs.runner) }}\n",
+            ),
+            "TERRAFORM_LANE_RUNNER override",
         ),
         "enable reusable default": (
             action,
