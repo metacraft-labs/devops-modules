@@ -133,6 +133,23 @@ looks exactly like one that is doing work — so it is listed in
 empty. A repository must not appear to get direct pushes merely because somebody
 remembered to list it.
 
+**Merge queue.** A mainline whose policy class carries an enabled `mergeQueue`
+block (product `dev`/`stable`, infra `live`) can get a GitHub merge queue: the
+ruleset `merge_queue` rule, with the class's settings (merge method, grouping
+strategy, min/max group size, wait time, build concurrency, check timeout). It
+is opt-in per repository through `mergeQueueRepos`. This is the policy's rollout
+gate: a repository is listed only once every workflow that produces one of its
+mainline's required checks triggers on `merge_group`. Otherwise the queue waits
+for checks that never report, and the mainline freezes. `mergeQueueOverrides =
+{ <repo> = { mergeMethod = "REBASE"; }; }` adjusts settings per repository. The
+queue's merge method must be one the repository allows. The renderer rejects
+a queue on a class without one, on a repository that is not PR-only, an unknown
+key, and out-of-range values. The `mergeQueues` output reports each queued
+repository's settings, branch and the policy's `strictRequiredStatusChecks`
+(false). The caller drops "require branches to be up to date" on that branch in
+the same change, because the queue already tests every group against the
+latest mainline.
+
 It also returns `protectedRepos`, `prOnlyRepos`, `directPushRepos` (named by the
 caller), `policyDirectPushRepos` (on a `requirePullRequest = false` class),
 `directPushClasses`, `redundantDirectPushRepos`, `mainlines` and `uncovered`
