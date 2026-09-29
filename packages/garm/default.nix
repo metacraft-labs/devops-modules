@@ -152,6 +152,31 @@ buildGo126Module rec {
     # t_garm_job_cache_self_heal.
     ./patches/backport-watcher-lossless-delivery.patch
     ./patches/fix-job-cache-stale-lock.patch
+    # Busy runners and the runner cleanup loop (central GARM, high-mem-server,
+    # 2026-09-27..29). 63 pool runners were "reaped" in 2.5 days; 17 of them
+    # were mid-job. GitHub reported them offline (the listener session
+    # lapsed on a starved or partitioned host) but BUSY, and refused the
+    # removal with 422 ("invalid request" in the log). GARM did not destroy
+    # them — the jobs had already died of "lost communication", and every
+    # instance was removed after GitHub ended its job — but only GitHub's
+    # 422 stood in the way:
+    #  1. reapTimedOutRunners times a runner out from UpdatedAt, which is not
+    #     refreshed while a job runs, and never reads the forge's busy flag.
+    #     Now: a runner the forge reports busy is never reaped.
+    #  2. Each refusal returned from reapTimedOutRunners, so the rest of the
+    #     pass was skipped and runnerCleanup never ran the orphan sweep for
+    #     the entity, every pass, until the job ended. Now: per-runner
+    #     failures are collected; the orphan sweep always runs.
+    #  3. cleanupOrphanedProviderRunners force-marks pending_delete any
+    #     instance missing from ONE runner listing (the paginated API can drop
+    #     a runner that moves between pages), with no age check and without
+    #     asking the forge. Now: an ACTIVE instance goes through DeleteRunner,
+    #     so the forge answers first (422 while busy, not-found when gone).
+    #  4. cleanupOrphanedGithubRunners skips offline-but-busy runners.
+    # Cut against the tree with every patch above applied; keep it LAST.
+    # See upstream-patches/garm-busy-runner-reap/ and the gate
+    # t_garm_busy_runner_not_reaped.
+    ./patches/fix-busy-runner-reap.patch
   ];
 
   # go-sqlite3 is a cgo module; the daemon needs cgo to link SQLite.
