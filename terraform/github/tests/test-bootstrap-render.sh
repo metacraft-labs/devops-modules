@@ -29,6 +29,11 @@ done
 [[ "$(jq '.resource.github_branch_protection.main.required_status_checks[0].contexts | length' <<<"$json")" -ge 1 ]] \
   || { echo "FAIL: expected required status checks"; fail=1; }
 
+# The protected branch is a PR-gated mainline that lands merge commits only;
+# linear history would forbid them, leaving no allowed merge method.
+[[ "$(jq '.resource.github_branch_protection.main.required_linear_history' <<<"$json")" == "false" ]] \
+  || { echo "FAIL: expected required_linear_history = false (merge-only PR-gated mainline)"; fail=1; }
+
 # The policy's noBypass rule: classic protection binds admins by default, and
 # opting out needs a documented enforceAdminsException.
 [[ "$(jq '.resource.github_branch_protection.main.enforce_admins' <<<"$json")" == "true" ]] \

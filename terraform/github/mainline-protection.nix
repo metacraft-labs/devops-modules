@@ -271,6 +271,11 @@ let
       m == null
       || (builtins.isList m && m != [ ] && builtins.all (x: elem x mergeMethodNames) m)
       || throw "mainline-protection: policy class `${branch}` allowedMergeMethods ${builtins.toJSON m} is not a non-empty subset of merge/squash/rebase";
+    # Linear history forbids merge commits: a merge-only class that also
+    # requires it leaves no allowed method.
+    assert
+      !(m == [ "merge" ] && ((branchClasses.${branch} or { }).requiredLinearHistory or false))
+      || throw "mainline-protection: policy class `${branch}` is merge-only but sets requiredLinearHistory; linear history forbids merge commits";
     m;
 
   # The queue's merge method is fixed: MERGE, the one method that lands the
