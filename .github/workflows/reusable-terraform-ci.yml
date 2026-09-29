@@ -32,6 +32,21 @@ on:
         # default label array is retained deliberately; callers may override.
         # If the `x86-64-v2` capability label is retired, infra should repoint
         # this to the canonical persistent Linux class ([self-hosted, linux, nixos]).
+        #
+        # THE TERRAFORM LANE OVERRIDE. Every job below resolves `runs-on` as
+        # `fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner)`. `vars` in a
+        # called workflow is the CALLER repository's (then its org's), so an
+        # admitted repository opts into the lane by setting that repository
+        # variable to a JSON runs-on value (e.g. '"eph-linux-x64-terraform"'),
+        # with no edit to its terraform*.yml; unsetting it restores
+        # `inputs.runner`. It is a variable of its OWN on purpose: callers'
+        # own jobs must never read it, because a job a caller defines runs from
+        # `refs/pull/N/merge` on a PR and can never be admitted to the lane's
+        # workflow-restricted runner group; only jobs defined HERE (admitted by
+        # this file at the ref the caller pins) can. While the override is set
+        # `reclaim_hosted_runner_disk` is forced off: that step fails closed on
+        # any runner that is not GitHub-hosted. Fleet side: metacraft-labs/infra
+        # lib/infra-constants.nix `terraformLane`.
         description: 'JSON-encoded runner labels for the persistent self-hosted runner (infra exemption)'
         type: string
         required: false
@@ -237,7 +252,10 @@ jobs:
   # All modes run on the configured self-hosted runner labels.
   # ---------------------------------------------------------------------------
   offline-checks:
-    runs-on: ${{ fromJSON(inputs.runner) }}
+    # TERRAFORM LANE override: the CALLER repository's `TERRAFORM_LANE_RUNNER`
+    # variable (a JSON runs-on value), when set, replaces `inputs.runner`.
+    # See the `runner` input.
+    runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -320,7 +338,7 @@ jobs:
         uses: ./.mcl/reusable-terraform-ci/.github/setup-nix
         with:
           push-to-cache: false
-          reclaim_hosted_runner_disk: ${{ inputs.reclaim_hosted_runner_disk }}
+          reclaim_hosted_runner_disk: ${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
@@ -461,7 +479,10 @@ jobs:
       && github.event.pull_request.head.repo.full_name == github.repository
       && (inputs.credentials_env_name != '' || inputs.agenix_plan_secret_path != '' || inputs.aws_plan_role_arn != '')
     needs: offline-checks
-    runs-on: ${{ fromJSON(inputs.runner) }}
+    # TERRAFORM LANE override: the CALLER repository's `TERRAFORM_LANE_RUNNER`
+    # variable (a JSON runs-on value), when set, replaces `inputs.runner`.
+    # See the `runner` input.
+    runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -544,7 +565,7 @@ jobs:
         uses: ./.mcl/reusable-terraform-ci/.github/setup-nix
         with:
           push-to-cache: false
-          reclaim_hosted_runner_disk: ${{ inputs.reclaim_hosted_runner_disk }}
+          reclaim_hosted_runner_disk: ${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
@@ -1015,7 +1036,10 @@ jobs:
       inputs.mode == 'apply'
       && (inputs.credentials_env_name != '' || inputs.agenix_apply_secret_path != '' || inputs.aws_apply_role_arn != '')
     needs: offline-checks
-    runs-on: ${{ fromJSON(inputs.runner) }}
+    # TERRAFORM LANE override: the CALLER repository's `TERRAFORM_LANE_RUNNER`
+    # variable (a JSON runs-on value), when set, replaces `inputs.runner`.
+    # See the `runner` input.
+    runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}
     environment: ${{ inputs.environment_name }}
     steps:
       - name: Checkout
@@ -1099,7 +1123,7 @@ jobs:
         uses: ./.mcl/reusable-terraform-ci/.github/setup-nix
         with:
           push-to-cache: false
-          reclaim_hosted_runner_disk: ${{ inputs.reclaim_hosted_runner_disk }}
+          reclaim_hosted_runner_disk: ${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
@@ -1348,7 +1372,10 @@ jobs:
       inputs.mode == 'drift'
       && (inputs.credentials_env_name != '' || inputs.agenix_plan_secret_path != '' || inputs.aws_plan_role_arn != '' || inputs.aws_drift_role_arn != '')
     needs: offline-checks
-    runs-on: ${{ fromJSON(inputs.runner) }}
+    # TERRAFORM LANE override: the CALLER repository's `TERRAFORM_LANE_RUNNER`
+    # variable (a JSON runs-on value), when set, replaces `inputs.runner`.
+    # See the `runner` input.
+    runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1431,7 +1458,7 @@ jobs:
         uses: ./.mcl/reusable-terraform-ci/.github/setup-nix
         with:
           push-to-cache: false
-          reclaim_hosted_runner_disk: ${{ inputs.reclaim_hosted_runner_disk }}
+          reclaim_hosted_runner_disk: ${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
