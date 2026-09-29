@@ -139,6 +139,23 @@ for o in "$out" "$out2" "$out3" "$out4"; do
     '[.[] | (.enforcement == "active") and ((.bypass_actors // []) == [])] | all' "$o"
 done
 
+# A class overriding the baseline with allowDeletion = true (agents-to-dev-*,
+# deleted once landed) is carved out of the ~ALL deletion rule, keeps its
+# force-push block in its own ruleset, and only in repositories of its class.
+check "the baseline deletion rule excludes the deletable class, in product repos only" \
+  '[to_entries[] | select(.value.name == "baseline-protect-all-branches")] as $b
+   | ($b | map(select(.value.repository == "r-product"))[0].value.conditions.ref_name.exclude == ["refs/heads/agents-to-dev-*"])
+     and ($b | map(select(.value.repository != "r-product")) | all(.value.conditions.ref_name.exclude == []))' "$out"
+check "the deletable branches keep force-push protection but may be deleted" \
+  '[to_entries[] | select(.value.name == "baseline-protect-deletable-branches")]
+   | length == 1 and .[0].value.repository == "r-product"
+     and .[0].value.conditions.ref_name.include == ["refs/heads/agents-to-dev-*"]
+     and .[0].value.rules == {non_fast_forward: true}' "$out"
+check "the deletable class adds no class ruleset of its own (no checks, no PR gate)" \
+  '[to_entries[] | select(.value.name == "agents-to-dev-policy")] | length == 0' "$out"
+check "without a deletable class nothing is carved out" \
+  '[.[] | select(.name == "baseline-protect-deletable-branches")] | length == 0' "$(render "$absentField")"
+
 # PR-gated classes land merge commits only: the policy's `allowedMergeMethods`
 # becomes the pull_request rule's `allowed_merge_methods`.
 check "every PR-gated class allows exactly the merge method (stable/dev/live)" \
