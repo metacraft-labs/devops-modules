@@ -759,6 +759,21 @@ let
           required_review_thread_resolution = rules.pullRequest.requiredReviewThreadResolution;
         }
       ];
+    }
+    # A GitHub merge queue. Settings are the policy's camelCase `mergeQueue`
+    # keys (see mainline-protection.nix), mapped 1:1 onto the provider block.
+    // optionalAttrs (rules ? mergeQueue) {
+      merge_queue = [
+        {
+          merge_method = rules.mergeQueue.mergeMethod;
+          grouping_strategy = rules.mergeQueue.groupingStrategy;
+          min_entries_to_merge = rules.mergeQueue.minEntriesToMerge;
+          max_entries_to_merge = rules.mergeQueue.maxEntriesToMerge;
+          min_entries_to_merge_wait_minutes = rules.mergeQueue.minEntriesToMergeWaitMinutes;
+          max_entries_to_build = rules.mergeQueue.maxEntriesToBuild;
+          check_response_timeout_minutes = rules.mergeQueue.checkResponseTimeoutMinutes;
+        }
+      ];
     };
 
   rulesetConditions = cond: [

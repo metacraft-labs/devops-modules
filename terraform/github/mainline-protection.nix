@@ -47,6 +47,21 @@
 #     which accepts direct pushes) AND the caller did not name the repository in
 #     `directPushRepos`. A class with `requirePullRequest = false` still gets
 #     `deletion` + `nonFastForward`.
+#   * `mergeQueue`                   — a GitHub merge queue (the ruleset
+#     `merge_queue` rule), with the settings of the mainline class's policy
+#     `mergeQueue` block (merge method, grouping strategy, group size, wait time,
+#     build concurrency, check timeout). OPT-IN PER REPOSITORY via
+#     `mergeQueueRepos`, because the policy's rollout gate forbids rendering the
+#     queue before every workflow producing one of the branch's required checks
+#     triggers on `merge_group` — otherwise the queue waits forever for checks
+#     that never report, and the mainline freezes. Only a PR-only mainline can
+#     carry a queue (a queue gates pull requests). `mergeQueueOverrides` adjusts
+#     settings per repository, e.g. a `mergeMethod` the repository allows (the
+#     queue's method must be one of the repository's allowed merge methods).
+#     The policy's `strictRequiredStatusChecks = false` is reported per
+#     repository in `mergeQueues`: the queue tests every group against the
+#     latest mainline, so "require branches to be up to date" becomes redundant,
+#     and the caller drops it on the same branch in the same change.
 #   * NO `requiredStatusChecks`.     The engine's ruleset schema does not express
 #     them, and pinning a check context that does not exist yet makes every PR
 #     unmergeable. Concrete required checks are a later, per-repo layer.
@@ -113,6 +128,17 @@
   bypassActors ? [ ],
   # bypassException: the documented reason for a non-empty `bypassActors`.
   bypassException ? null,
+  # mergeQueueRepos: repositories whose mainline gets a merge queue, from its
+  #   policy class's `mergeQueue` block. The ROLLOUT GATE: list a repository only
+  #   once every workflow producing one of its mainline's required checks
+  #   triggers on `merge_group`. Each must be PR-only on a class whose policy
+  #   has `mergeQueue.enabled = true`; anything else is rejected.
+  mergeQueueRepos ? [ ],
+  # mergeQueueOverrides: per-repository adjustments of the policy's queue
+  #   settings, { <repoName> = { mergeMethod = "REBASE"; ... }; }, using the
+  #   policy's camelCase keys. Every named repository must be in
+  #   `mergeQueueRepos`.
+  mergeQueueOverrides ? { },
   # name: the ruleset name (also part of the engine's resource key).
   name ? "mainline-protect",
 }:
@@ -194,12 +220,87 @@ let
     else
       policyLib.approvalCount (branchClasses.${branch} or { }) 1;
 
+  # The merge-queue settings keys, as the policy spells them, mapped 1:1 onto
+  # the ruleset `merge_queue` rule by governance.nix.
+  mergeQueueKeys = [
+    "mergeMethod"
+    "groupingStrategy"
+    "minEntriesToMerge"
+    "maxEntriesToMerge"
+    "minEntriesToMergeWaitMinutes"
+    "maxEntriesToBuild"
+    "checkResponseTimeoutMinutes"
+  ];
+
+  # The policy class's queue block, or null when the class has none (or it is
+  # disabled): spec `latest`, `agents`, and other non-PR-gated classes.
+  classMergeQueue =
+    branch:
+    let
+      mq = (branchClasses.${branch} or { }).mergeQueue or null;
+    in
+    if mq != null && (mq.enabled or false) then mq else null;
+
+  # The rendered settings for one repository: the class's policy block, with
+  # the caller's per-repository overrides on top.
+  mergeQueueFor =
+    repo: branch:
+    let
+      base = classMergeQueue branch;
+      ov = mergeQueueOverrides.${repo} or { };
+      unknownKeys = filter (k: !(elem k mergeQueueKeys)) (attrNames ov);
+      merged = listToAttrs (
+        map (k: {
+          name = k;
+          value = ov.${k} or base.${k};
+        }) mergeQueueKeys
+      );
+      intIn =
+        k: lo: hi:
+        builtins.isInt merged.${k} && merged.${k} >= lo && merged.${k} <= hi;
+    in
+    assert
+      base != null
+      || throw "mainline-protection: mergeQueueRepos names ${repo}, but its mainline class `${branch}` has no enabled `mergeQueue` in the policy";
+    assert
+      unknownKeys == [ ]
+      || throw "mainline-protection: mergeQueueOverrides.${repo} has unknown keys: ${builtins.concatStringsSep ", " unknownKeys}";
+    assert
+      elem merged.mergeMethod [
+        "MERGE"
+        "SQUASH"
+        "REBASE"
+      ]
+      || throw "mainline-protection: ${repo} merge queue mergeMethod `${toString merged.mergeMethod}` is not MERGE/SQUASH/REBASE";
+    assert
+      elem merged.groupingStrategy [
+        "ALLGREEN"
+        "HEADGREEN"
+      ]
+      || throw "mainline-protection: ${repo} merge queue groupingStrategy `${toString merged.groupingStrategy}` is not ALLGREEN/HEADGREEN";
+    assert
+      (
+        intIn "minEntriesToMerge" 0 100
+        && intIn "maxEntriesToMerge" 0 100
+        && intIn "maxEntriesToBuild" 0 100
+        && intIn "minEntriesToMergeWaitMinutes" 0 360
+        && intIn "checkResponseTimeoutMinutes" 1 360
+        && merged.minEntriesToMerge <= merged.maxEntriesToMerge
+      )
+      || throw "mainline-protection: ${repo} merge queue settings out of range: ${builtins.toJSON merged}";
+    merged;
+
   mkRuleset =
     repo:
     let
       branch = mainlineBranchFor repo;
       prOnly = !(elem repo.name directPushRepos) && classRequiresPullRequest branch;
+      queued = elem repo.name mergeQueueRepos;
     in
+    assert
+      !queued
+      || prOnly
+      || throw "mainline-protection: mergeQueueRepos names ${repo.name}, whose mainline is not PR-only; a merge queue gates pull requests";
     assert
       (elem branch mainlineKeys)
       || throw "mainline-protection: override for ${repo.name} names `${branch}`, which is not a policy mainline branch";
@@ -229,15 +330,18 @@ let
           }
         else
           { }
-      );
+      )
+      // (if queued then { mergeQueue = mergeQueueFor repo.name branch; } else { });
     };
 
   # Guard against typos in the caller's corrections: every name they list must
   # be a repository in the inventory, or the correction silently does nothing.
   inventoryNames = map (r: r.name) repositories;
   unknown = filter (n: !(elem n inventoryNames)) (
-    excludeRepos ++ directPushRepos ++ attrNames overrides
+    excludeRepos ++ directPushRepos ++ attrNames overrides ++ mergeQueueRepos
   );
+  # Overrides for a repository that gets no queue would silently do nothing.
+  strayQueueOverrides = filter (n: !(elem n mergeQueueRepos)) (attrNames mergeQueueOverrides);
 
   # Divergence between the caller's list and the policy, named rather than left
   # implicit: a `directPushRepos` entry for a repository whose mainline class is
@@ -272,7 +376,10 @@ let
 in
 assert
   unknown == [ ]
-  || throw "mainline-protection: unknown repositories in excludeRepos/directPushRepos/overrides: ${builtins.concatStringsSep ", " unknown}";
+  || throw "mainline-protection: unknown repositories in excludeRepos/directPushRepos/overrides/mergeQueueRepos: ${builtins.concatStringsSep ", " unknown}";
+assert
+  strayQueueOverrides == [ ]
+  || throw "mainline-protection: mergeQueueOverrides names repositories not in mergeQueueRepos: ${builtins.concatStringsSep ", " strayQueueOverrides}";
 assert
   bypassActors == [ ]
   || documented bypassException
@@ -308,6 +415,20 @@ assert
   # override grants nothing and only makes the list look load-bearing. A caller's
   # coverage gate should assert this is empty.
   redundantDirectPushRepos = redundantDirectPush;
+  # Repositories whose mainline ruleset carries a merge queue, with the
+  # rendered settings plus the policy's `strictRequiredStatusChecks` (false:
+  # the caller drops "require branches to be up to date" on that branch, in
+  # the same change that enables the queue).
+  mergeQueues = listToAttrs (
+    map (r: {
+      name = r.name;
+      value = mergeQueueFor r.name (mainlineBranchFor r) // {
+        branch = mainlineBranchFor r;
+        strictRequiredStatusChecks =
+          (classMergeQueue (mainlineBranchFor r)).strictRequiredStatusChecks or false;
+      };
+    }) (filter (r: elem r.name mergeQueueRepos) covered)
+  );
   mainlines = listToAttrs (
     map (r: {
       name = r.name;

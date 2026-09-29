@@ -249,4 +249,78 @@ renderedLD="$(nix eval --json --impure --expr "
 check "rendered requirePullRequest=false ruleset: deletion + non_fast_forward, no pull_request" \
   '[.resource.github_repository_ruleset[] | select(.repository == "specs")][0].rules[0] | (has("pull_request") | not) and (.deletion == true) and (.non_fast_forward == true)' "$renderedLD"
 
+# ── merge queue: opt-in per repository, settings from the policy class ───────
+# The policy shape of 2026-09-29: PR-gated mainlines (dev, live) carry an
+# enabled `mergeQueue`; spec `latest` has none.
+policyMQ='{
+  baseline = { allowForcePush = false; allowDeletion = false; };
+  branchClasses = {
+    stable = { repoClass = "product"; role = "default-release"; requirePullRequest = true; };
+    dev = { repoClass = "product"; role = "mainline"; requirePullRequest = true; requirePullRequestReview = false;
+      mergeQueue = { enabled = true; mergeMethod = "MERGE"; groupingStrategy = "ALLGREEN"; minEntriesToMerge = 1; maxEntriesToMerge = 5; minEntriesToMergeWaitMinutes = 5; maxEntriesToBuild = 2; checkResponseTimeoutMinutes = 360; strictRequiredStatusChecks = false; }; };
+    agents = { repoClass = "product"; role = "integration"; requirePullRequest = false; };
+    latest = { repoClass = "spec"; role = "mainline"; requirePullRequest = false; };
+    live = { repoClass = "infra"; role = "mainline"; requirePullRequest = true;
+      mergeQueue = { enabled = false; mergeMethod = "MERGE"; groupingStrategy = "ALLGREEN"; minEntriesToMerge = 1; maxEntriesToMerge = 5; minEntriesToMergeWaitMinutes = 5; maxEntriesToBuild = 2; checkResponseTimeoutMinutes = 360; strictRequiredStatusChecks = false; }; };
+  };
+}'
+mqArgs='excludeRepos = [ "fork" ]; overrides = { product = "dev"; };'
+outNoMQ="$(helper_eval "$mqArgs" "$policyMQ")"
+check "a policy mergeQueue alone renders NO queue (the rollout gate is per repository)" \
+  '([.rulesets[].rules | has("mergeQueue")] | any | not) and (.mergeQueues == {})' "$outNoMQ"
+outMQ="$(helper_eval "$mqArgs mergeQueueRepos = [ \"product\" \"public-dev\" ]; mergeQueueOverrides = { product = { mergeMethod = \"REBASE\"; }; };" "$policyMQ")"
+check "opted-in repositories get the policy's queue settings" \
+  '(.rulesets[] | select(.repository == "public-dev") | .rules.mergeQueue) == {mergeMethod: "MERGE", groupingStrategy: "ALLGREEN", minEntriesToMerge: 1, maxEntriesToMerge: 5, minEntriesToMergeWaitMinutes: 5, maxEntriesToBuild: 2, checkResponseTimeoutMinutes: 360}' "$outMQ"
+check "a per-repository override changes only that setting on that repository" \
+  '(.rulesets[] | select(.repository == "product") | .rules.mergeQueue) as $q | $q.mergeMethod == "REBASE" and $q.maxEntriesToBuild == 2 and $q.checkResponseTimeoutMinutes == 360' "$outMQ"
+check "repositories not opted in carry no queue" \
+  '[.rulesets[] | select(.repository != "product" and .repository != "public-dev") | .rules | has("mergeQueue")] | any | not' "$outMQ"
+check "mergeQueues reports settings, branch and strictRequiredStatusChecks=false" \
+  '(.mergeQueues | keys) == ["product","public-dev"] and .mergeQueues.product.branch == "dev" and .mergeQueues.product.strictRequiredStatusChecks == false and .mergeQueues.product.mergeMethod == "REBASE"' "$outMQ"
+for bad in \
+  'mergeQueueRepos = [ "infra" ];|a class whose mergeQueue is disabled' \
+  'mergeQueueRepos = [ "specs" ];|a class with no mergeQueue (spec latest)' \
+  'mergeQueueRepos = [ "product" ]; directPushRepos = [ "product" ];|a direct-push (not PR-only) repository' \
+  'mergeQueueRepos = [ "no-such-repo" ];|an unknown repository' \
+  'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { public-dev = { mergeMethod = "REBASE"; }; };|an override for a repository without a queue' \
+  'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { product = { mergeMethd = "REBASE"; }; };|an override with an unknown key' \
+  'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { product = { mergeMethod = "FASTFORWARD"; }; };|an invalid merge method' \
+  'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { product = { checkResponseTimeoutMinutes = 720; }; };|a check timeout beyond GitHub'"'"'s 360 minutes' \
+  'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { product = { minEntriesToMerge = 6; }; };|a minimum group larger than the maximum'; do
+  expr="${bad%%|*}"; what="${bad#*|}"
+  if helper_eval "$mqArgs $expr" "$policyMQ" 2>/dev/null | jq -e '.rulesets | length' >/dev/null 2>&1; then
+    echo "FAIL: a merge queue for $what was accepted"
+    fail=1
+  else
+    echo "ok: a merge queue for $what is rejected"
+  fi
+done
+renderedMQ="$(nix eval --json --impure --expr "
+  let m = import ${helper} ({ policy = ${policyMQ}; repositories = ${repos}; } // { ${mqArgs} mergeQueueRepos = [ \"product\" ]; mergeQueueOverrides = { product = { mergeMethod = \"REBASE\"; }; }; });
+  in import ${engine} {
+    awsAccountId = \"000000000000\";
+    awsRegion = \"us-east-1\";
+    githubOwner = \"example-org\";
+    githubBootstrapStateKey = \"x.tfstate\";
+    manifest.secrets = [ ];
+    governance = {
+      snapshot.source = \"fixture\";
+      organization.actionsPermissions = { enabledRepositories = \"all\"; allowedActions = \"all\"; shaPinningRequired = false; };
+      repositories = [ ];
+      memberships = [ ];
+      teamRepositories = [ ];
+      outsideCollaborators = [ ];
+      branchProtections = [ ];
+      repositoryEnvironments = [ ];
+      actionsRepositoryPermissions = [ ];
+      actionsVariables = [ ];
+      issueLabels = [ ];
+      repositoryRulesets = m.rulesets;
+      deferredResources = [ ];
+    };
+  }
+")"
+check "engine renders the provider merge_queue block, snake_case, on the queued ruleset only" \
+  '([.resource.github_repository_ruleset[] | select(.repository == "product")][0].rules[0].merge_queue == [{merge_method: "REBASE", grouping_strategy: "ALLGREEN", min_entries_to_merge: 1, max_entries_to_merge: 5, min_entries_to_merge_wait_minutes: 5, max_entries_to_build: 2, check_response_timeout_minutes: 360}]) and ([.resource.github_repository_ruleset[] | select(.repository != "product") | .rules[0] | has("merge_queue")] | any | not)' "$renderedMQ"
+
 exit "$fail"
