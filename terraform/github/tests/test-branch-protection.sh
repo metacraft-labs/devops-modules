@@ -139,4 +139,12 @@ for o in "$out" "$out2" "$out3" "$out4"; do
     '[.[] | (.enforcement == "active") and ((.bypass_actors // []) == [])] | all' "$o"
 done
 
+# PR-gated classes land merge commits only: the policy's `allowedMergeMethods`
+# becomes the pull_request rule's `allowed_merge_methods`.
+check "every PR-gated class allows exactly the merge method (stable/dev/live)" \
+  '[to_entries[] | select(.value.rules | has("pull_request")) | {k: .value.name, m: .value.rules.pull_request.allowed_merge_methods}]
+   | (map(.k) | sort) == ["dev-policy","live-policy","stable-policy"] and all(.m == ["merge"])' "$out"
+check "a class without allowedMergeMethods renders none (GitHub default)" \
+  '[.[] | .rules.pull_request // {} | has("allowed_merge_methods")] | any | not' "$(render "$absentField")"
+
 exit "$fail"

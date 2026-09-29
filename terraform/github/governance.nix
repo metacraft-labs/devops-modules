@@ -751,13 +751,20 @@ let
     // optionalAttrs (rules ? requiredSignatures) { required_signatures = rules.requiredSignatures; }
     // optionalAttrs (rules ? pullRequest) {
       pull_request = [
-        {
-          required_approving_review_count = rules.pullRequest.requiredApprovingReviewCount;
-          dismiss_stale_reviews_on_push = rules.pullRequest.dismissStaleReviewsOnPush;
-          require_code_owner_review = rules.pullRequest.requireCodeOwnerReview;
-          require_last_push_approval = rules.pullRequest.requireLastPushApproval;
-          required_review_thread_resolution = rules.pullRequest.requiredReviewThreadResolution;
-        }
+        (
+          {
+            required_approving_review_count = rules.pullRequest.requiredApprovingReviewCount;
+            dismiss_stale_reviews_on_push = rules.pullRequest.dismissStaleReviewsOnPush;
+            require_code_owner_review = rules.pullRequest.requireCodeOwnerReview;
+            require_last_push_approval = rules.pullRequest.requireLastPushApproval;
+            required_review_thread_resolution = rules.pullRequest.requiredReviewThreadResolution;
+          }
+          # The merge methods a pull request may land with (policy class
+          # `allowedMergeMethods`). Absent = GitHub's default, all three.
+          // optionalAttrs (rules.pullRequest ? allowedMergeMethods) {
+            allowed_merge_methods = rules.pullRequest.allowedMergeMethods;
+          }
+        )
       ];
     }
     # A GitHub merge queue. Settings are the policy's camelCase `mergeQueue`
