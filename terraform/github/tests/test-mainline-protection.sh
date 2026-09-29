@@ -383,6 +383,12 @@ if helper_eval "$ammArgs" "${policyAMM//allowedMergeMethods = \[ \"merge\" \]/al
 else
   echo "ok: a MERGE queue on a class that forbids merge commits is rejected"
 fi
+if helper_eval "$ammArgs" "${policyAMM//allowedMergeMethods = \[ \"merge\" \]/allowedMergeMethods = [ \"merge\" ]; requiredLinearHistory = true}" 2>/dev/null | jq -e '.rulesets | length' >/dev/null 2>&1; then
+  echo "FAIL: a merge-only class that also requires linear history was accepted"
+  fail=1
+else
+  echo "ok: a merge-only class that also requires linear history is rejected"
+fi
 renderedAMM="$(nix eval --json --impure --expr "
   let m = import ${helper} ({ policy = ${policyAMM}; repositories = ${repos}; } // { ${ammArgs} });
   in import ${engine} {
