@@ -144,8 +144,18 @@
   #   policy class's `mergeQueue` block. The ROLLOUT GATE: list a repository only
   #   once every workflow producing one of its mainline's required checks
   #   triggers on `merge_group`. Each must be PR-only on a class whose policy
-  #   has `mergeQueue.enabled = true`; anything else is rejected.
+  #   has a `mergeQueue` block. The block must be `enabled = true`, or, where
+  #   the policy makes the queue optional and off (`enabled = false`: the
+  #   Metacraft policy since 2026-09-30), the repository needs a documented
+  #   reason in `mergeQueueOptIns`. Anything else is rejected.
   mergeQueueRepos ? [ ],
+  # mergeQueueOptIns: { <repoName> = "<reason>"; } — the justification for
+  #   queueing a repository whose class queue is optional and disabled
+  #   (branching-policy.md: a queue only for genuinely many independent pull
+  #   requests; the agents -> agents-to-dev -> dev model sends about one per
+  #   promotion). Each reason must be >= 20 characters, and every entry must be
+  #   in `mergeQueueRepos`.
+  mergeQueueOptIns ? { },
   # mergeQueueOverrides: per-repository adjustments of the policy's queue
   #   settings, { <repoName> = { maxEntriesToBuild = 1; ... }; }, using the
   #   policy's camelCase keys. Every named repository must be in
@@ -245,14 +255,13 @@ let
     "checkResponseTimeoutMinutes"
   ];
 
-  # The policy class's queue block, or null when the class has none (or it is
-  # disabled): spec `latest`, `agents`, and other non-PR-gated classes.
-  classMergeQueue =
-    branch:
-    let
-      mq = (branchClasses.${branch} or { }).mergeQueue or null;
-    in
-    if mq != null && (mq.enabled or false) then mq else null;
+  # The policy class's queue block, or null when the class has none: spec
+  # `latest`, `agents`, and other non-PR-gated classes. A block with
+  # `enabled = false` is an optional queue, off by default: it is returned
+  # (its settings are what an opt-in gets), and `mergeQueueFor` requires the
+  # documented opt-in.
+  classMergeQueue = branch: (branchClasses.${branch} or { }).mergeQueue or null;
+  classMergeQueueEnabled = branch: (classMergeQueue branch).enabled or false;
 
   # The class's allowed pull-request merge methods, or null when the class
   # does not restrict them (GitHub's default: all three). Validated here, so a
@@ -304,7 +313,11 @@ let
     in
     assert
       base != null
-      || throw "mainline-protection: mergeQueueRepos names ${repo}, but its mainline class `${branch}` has no enabled `mergeQueue` in the policy";
+      || throw "mainline-protection: mergeQueueRepos names ${repo}, but its mainline class `${branch}` has no `mergeQueue` in the policy";
+    assert
+      classMergeQueueEnabled branch
+      || documented (mergeQueueOptIns.${repo} or null)
+      || throw "mainline-protection: mergeQueueRepos names ${repo}, but the `${branch}` class's merge queue is optional and disabled in the policy; an opt-in needs a documented reason in mergeQueueOptIns.${repo} (>= 20 characters)";
     assert
       unknownKeys == [ ]
       || throw "mainline-protection: mergeQueueOverrides.${repo} has unknown or non-overridable keys: ${builtins.concatStringsSep ", " unknownKeys} (the queue's mergeMethod is always MERGE)";
@@ -390,7 +403,9 @@ let
     excludeRepos ++ directPushRepos ++ attrNames overrides ++ mergeQueueRepos
   );
   # Overrides for a repository that gets no queue would silently do nothing.
-  strayQueueOverrides = filter (n: !(elem n mergeQueueRepos)) (attrNames mergeQueueOverrides);
+  strayQueueOverrides = filter (n: !(elem n mergeQueueRepos)) (
+    attrNames mergeQueueOverrides ++ attrNames mergeQueueOptIns
+  );
 
   # Divergence between the caller's list and the policy, named rather than left
   # implicit: a `directPushRepos` entry for a repository whose mainline class is
@@ -428,7 +443,7 @@ assert
   || throw "mainline-protection: unknown repositories in excludeRepos/directPushRepos/overrides/mergeQueueRepos: ${builtins.concatStringsSep ", " unknown}";
 assert
   strayQueueOverrides == [ ]
-  || throw "mainline-protection: mergeQueueOverrides names repositories not in mergeQueueRepos: ${builtins.concatStringsSep ", " strayQueueOverrides}";
+  || throw "mainline-protection: mergeQueueOverrides/mergeQueueOptIns name repositories not in mergeQueueRepos: ${builtins.concatStringsSep ", " strayQueueOverrides}";
 assert
   bypassActors == [ ]
   || documented bypassException
