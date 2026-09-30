@@ -2281,17 +2281,17 @@
     "io-mon-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1790438305,
-        "narHash": "sha256-v9VWYux2vUqQP0jM9t4XavF/VWCUoRZgQBwQWc2eA6Y=",
+        "lastModified": 1790717585,
+        "narHash": "sha256-bLG7RtdIseK8D4qrD+4PkOuIE2rUy8ou0I1ppBVPH4U=",
         "owner": "metacraft-labs",
         "repo": "io-mon",
-        "rev": "a3edfabb36cf8909bacbe3cf52ab96adf8879158",
+        "rev": "07cc4afc823a7c631d9ef9fdf4522f4d219c46a8",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "io-mon",
-        "rev": "a3edfabb36cf8909bacbe3cf52ab96adf8879158",
+        "rev": "07cc4afc823a7c631d9ef9fdf4522f4d219c46a8",
         "type": "github"
       }
     },
@@ -4305,17 +4305,17 @@
         "runquota-src": "runquota-src"
       },
       "locked": {
-        "lastModified": 1790565831,
-        "narHash": "sha256-LL7AWc6vR4BSVaXcmtfmMip18+Mf80BASGyIuckPx98=",
+        "lastModified": 1790790315,
+        "narHash": "sha256-hcQU9OjBg6oZMN2ITBmIDeltomGVbSz5h8hzCcn672I=",
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "b479284222012076e97e7a1008f852fbf33f6028",
+        "rev": "55219d924d40c30bd20889749b171c2086d6790b",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "b479284222012076e97e7a1008f852fbf33f6028",
+        "rev": "55219d924d40c30bd20889749b171c2086d6790b",
         "type": "github"
       }
     },
