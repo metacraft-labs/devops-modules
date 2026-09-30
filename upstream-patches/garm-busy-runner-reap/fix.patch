@@ -1,0 +1,509 @@
+From aea09525db15e8f2edfb02e82830dd26f8937613 Mon Sep 17 00:00:00 2001
+From: Zahary Karadjov <zaharyk@gmail.com>
+Date: Tue, 29 Sep 2026 15:02:41 +0300
+Subject: [PATCH] Never reap a runner the forge reports busy
+
+A pool runner that is executing a job can be reported "offline" by
+GitHub while it is still busy: its listener session lapses when the
+host is starved or briefly partitioned, but the job carries on. The
+runner cleanup loop does not read the busy flag at all.
+
+- reapTimedOutRunners() times a runner out from the instance's
+  UpdatedAt, which is not refreshed while a job runs, so every job that
+  outlives runner_bootstrap_timeout is exposed. An offline-but-busy
+  runner is handed to DeleteRunner(), and the forge's own 422 ("still
+  running a job") is the only thing standing between it and the job.
+  The refusal is then returned as an error, which ends the pass:
+  the remaining instances are not looked at and runnerCleanup() skips
+  cleanupOrphanedRunners() for the entity, on every pass, until the
+  job ends.
+- cleanupOrphanedProviderRunners() marks pending_delete, with no age
+  check and without asking the forge, any instance whose name is
+  missing from one listing of the forge's runners. The paginated list
+  can drop a runner that moves between pages mid-listing, so a busy
+  runner can lose its instance under a running job.
+- cleanupOrphanedGithubRunners() treats an offline-but-busy runner as
+  an orphan candidate; the forge refuses the removal and the error
+  fails the whole sweep.
+
+This change carries the forge's busy flag in forgeRunner (both the
+REST listing and the scale set API report it) and:
+
+- reapTimedOutRunners() skips a runner the forge reports busy, and
+  keeps going when one DeleteRunner() fails, reporting all failures at
+  the end;
+- runnerCleanup() runs the orphan sweep even when the reap reported
+  errors;
+- cleanupOrphanedProviderRunners() retires an ACTIVE instance that is
+  missing from the listing through DeleteRunner(), so the forge is
+  asked first (422 while busy, "not found" when really gone);
+- cleanupOrphanedGithubRunners() skips offline-but-busy runners.
+
+runner/pool/busy_runner_reap_test.go drives runnerCleanup() and
+cleanupOrphanedProviderRunners() against the real SQLite store with a
+mocked forge client. Three tests reproduce the defects and fail without
+this change; two controls (an idle timed-out runner is still reaped, an
+active runner the forge no longer has is still retired) pass with and
+without it.
+
+Signed-off-by: Zahary Karadjov <zaharyk@gmail.com>
+---
+ runner/pool/busy_runner_reap_test.go | 288 +++++++++++++++++++++++++++
+ runner/pool/common.go                |   5 +
+ runner/pool/pool.go                  |  65 +++++-
+ runner/pool/util.go                  |   2 +
+ 4 files changed, 354 insertions(+), 6 deletions(-)
+ create mode 100644 runner/pool/busy_runner_reap_test.go
+
+diff --git a/runner/pool/busy_runner_reap_test.go b/runner/pool/busy_runner_reap_test.go
+new file mode 100644
+index 00000000..069439c5
+--- /dev/null
++++ b/runner/pool/busy_runner_reap_test.go
+@@ -0,0 +1,288 @@
++// Copyright 2026 Cloudbase Solutions SRL
++//
++//    Licensed under the Apache License, Version 2.0 (the "License"); you may
++//    not use this file except in compliance with the License. You may obtain
++//    a copy of the License at
++//
++//         http://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++//    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++//    License for the specific language governing permissions and limitations
++//    under the License.
++
++//go:build testing
++
++// Tests for the runner cleanup loop's handling of busy runners: GARM must
++// never retire a runner the forge reports busy, and one runner the forge will
++// not release must not stop the rest of the cleanup pass.
++//
++// runnerCleanup() and cleanupOrphanedProviderRunners() are called directly,
++// against the real SQLite store. The runner list is produced by
++// listRunnersWithPagination() from the forge client's answer, so the busy
++// flag travels the same path it does in production.
++//
++// The forge client and the provider are mocks: the properties are about what
++// GARM does with the forge's answers ("offline but busy", 422 "still running
++// a job", "not found"), which a real forge cannot be made to give on demand.
++// The provider must never be asked to delete anything here.
++package pool
++
++import (
++	"context"
++	"database/sql"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/google/go-github/v84/github"
++	"github.com/stretchr/testify/mock"
++	"github.com/stretchr/testify/suite"
++
++	runnerErrors "github.com/cloudbase/garm-provider-common/errors"
++	commonParams "github.com/cloudbase/garm-provider-common/params"
++	"github.com/cloudbase/garm/cache"
++	"github.com/cloudbase/garm/config"
++	"github.com/cloudbase/garm/database"
++	dbCommon "github.com/cloudbase/garm/database/common"
++	garmTesting "github.com/cloudbase/garm/internal/testing"
++	"github.com/cloudbase/garm/locking"
++	"github.com/cloudbase/garm/params"
++	"github.com/cloudbase/garm/runner/common"
++	runnerCommonMocks "github.com/cloudbase/garm/runner/common/mocks"
++)
++
++func init() {
++	// The pool manager takes per-instance locks; register the in-process
++	// locker GARM itself uses. RegisterLocker refuses a second registration,
++	// so this is safe next to any other test file that does the same.
++	lock, err := locking.NewLocalLocker(context.Background(), nil)
++	if err != nil {
++		panic(err)
++	}
++	_ = locking.RegisterLocker(lock)
++}
++
++type BusyRunnerReapSuite struct {
++	suite.Suite
++
++	dbCfg    config.Database
++	store    dbCommon.Store
++	adminCtx context.Context
++	pool     params.Pool
++	mgr      *basePoolManager
++	provider *runnerCommonMocks.Provider
++	ghcli    *runnerCommonMocks.GithubClient
++}
++
++func (s *BusyRunnerReapSuite) SetupTest() {
++	s.dbCfg = garmTesting.GetTestSqliteDBConfig(s.T())
++	db, err := database.NewDatabase(context.Background(), s.dbCfg)
++	s.Require().NoError(err)
++	s.store = db
++	s.adminCtx = garmTesting.ImpersonateAdminContext(context.Background(), db, s.T())
++
++	endpoint := garmTesting.CreateDefaultGithubEndpoint(s.adminCtx, db, s.T())
++	creds := garmTesting.CreateTestGithubCredentials(s.adminCtx, "busy-reap-creds", db, s.T(), endpoint)
++	org, err := db.CreateOrganization(s.adminCtx, "test-org", creds, "secret",
++		params.PoolBalancerTypeRoundRobin, false)
++	s.Require().NoError(err)
++	entity, err := org.GetEntity()
++	s.Require().NoError(err)
++
++	s.pool, err = db.CreateEntityPool(s.adminCtx, entity, params.CreatePoolParams{
++		ProviderName:           "test-provider",
++		MaxRunners:             4,
++		Image:                  "runner",
++		Flavor:                 "default",
++		OSType:                 "linux",
++		OSArch:                 "amd64",
++		Tags:                   []string{"self-hosted", "linux", "x64"},
++		Enabled:                true,
++		RunnerBootstrapTimeout: 20,
++	})
++	s.Require().NoError(err)
++	cache.SetEntity(entity)
++	cache.SetEntityPool(entity.ID, s.pool)
++
++	controllerInfo, err := db.InitController()
++	s.Require().NoError(err)
++	backoff, err := locking.NewInstanceDeleteBackoff(context.Background())
++	s.Require().NoError(err)
++
++	s.provider = runnerCommonMocks.NewProvider(s.T())
++	s.ghcli = runnerCommonMocks.NewGithubClient(s.T())
++	s.mgr = &basePoolManager{
++		ctx:              s.adminCtx,
++		consumerID:       "busy-reap-consumer",
++		entity:           entity,
++		store:            db,
++		controllerInfo:   controllerInfo,
++		providers:        map[string]common.Provider{"test-provider": s.provider},
++		jobs:             make(map[int64]params.Job),
++		checkedJobs:      make(map[int64]time.Time),
++		quit:             make(chan struct{}),
++		consumer:         &garmTesting.MockConsumer{},
++		wg:               &sync.WaitGroup{},
++		backoff:          backoff,
++		ghcli:            s.ghcli,
++		managerIsRunning: true,
++		// scaleSetClient stays nil: GetGithubRunners() then lists through
++		// listRunnersWithPagination(), i.e. through the mocked forge client.
++	}
++}
++
++// newInstance creates a running instance whose runner registered with the
++// forge as agentID, in the given runner status.
++func (s *BusyRunnerReapSuite) newInstance(name string, agentID int64, rs params.RunnerStatus) {
++	_, err := s.store.CreateInstance(s.adminCtx, s.pool.ID, params.CreateInstanceParams{
++		Name:         name,
++		OSType:       "linux",
++		OSArch:       "amd64",
++		Status:       commonParams.InstanceRunning,
++		RunnerStatus: rs,
++		AgentID:      agentID,
++	})
++	s.Require().NoError(err)
++}
++
++// age backdates updated_at, which is the clock reapTimedOutRunners reads.
++// Nothing refreshes it while a job runs, so a job that started more than the
++// bootstrap timeout ago looks exactly like this.
++func (s *BusyRunnerReapSuite) age(name string, by time.Duration) {
++	conn, err := sql.Open("sqlite3", s.dbCfg.SQLite.DBFile)
++	s.Require().NoError(err)
++	defer conn.Close()
++	res, err := conn.Exec("UPDATE instances SET updated_at = ? WHERE name = ?", time.Now().Add(-by), name)
++	s.Require().NoError(err)
++	n, err := res.RowsAffected()
++	s.Require().NoError(err)
++	s.Require().EqualValues(1, n)
++}
++
++func (s *BusyRunnerReapSuite) status(name string) commonParams.InstanceStatus {
++	inst, err := s.store.GetInstance(s.adminCtx, name)
++	s.Require().NoError(err)
++	return inst.Status
++}
++
++// forgeRunner builds the forge's view of one runner managed by this controller.
++func (s *BusyRunnerReapSuite) ghRunner(id int64, name, status string, busy bool) *github.Runner {
++	return &github.Runner{
++		ID:     github.Ptr(id),
++		Name:   github.Ptr(name),
++		Status: github.Ptr(status),
++		Busy:   github.Ptr(busy),
++		Labels: []*github.RunnerLabels{
++			{Name: github.Ptr(controllerLabelPrefix + ":" + s.mgr.controllerInfo.ControllerID.String())},
++		},
++	}
++}
++
++func (s *BusyRunnerReapSuite) forgeLists(runners ...*github.Runner) {
++	s.ghcli.On("ListEntityRunners", mock.Anything, mock.Anything).
++		Return(&github.Runners{TotalCount: len(runners), Runners: runners}, &github.Response{}, nil)
++}
++
++// ---------------------------------------------------------------------------
++// A job that started a minute after the runner came up has run for 24
++// minutes (past the 20 minute bootstrap timeout); the forge reports the
++// runner offline but busy. It must not be reaped.
++// ---------------------------------------------------------------------------
++
++func (s *BusyRunnerReapSuite) TestBusyRunnerPastBootstrapTimeoutIsNotReaped() {
++	s.newInstance("garm-busy", 10274, params.RunnerActive)
++	s.age("garm-busy", 24*time.Minute)
++	s.forgeLists(s.ghRunner(10274, "garm-busy", "offline", true))
++	// What GitHub answers for a busy runner. GARM must not even ask.
++	s.ghcli.On("RemoveEntityRunner", mock.Anything, int64(10274)).Return(runnerErrors.ErrBadRequest).Maybe()
++
++	err := s.mgr.runnerCleanup()
++
++	s.ghcli.AssertNotCalled(s.T(), "RemoveEntityRunner", mock.Anything, int64(10274))
++	s.NoError(err, "a busy runner is not an error condition for the cleanup pass")
++	s.Equal(commonParams.InstanceRunning, s.status("garm-busy"))
++}
++
++// ---------------------------------------------------------------------------
++// A runner the forge refuses to release stopped the whole pass:
++// reapTimedOutRunners returned on the first failure and runnerCleanup then
++// skipped cleanupOrphanedRunners for the entity. The orphan here is a runner
++// the forge still lists (offline, idle) that GARM has no record of; only the
++// orphan sweep removes it.
++// ---------------------------------------------------------------------------
++
++func (s *BusyRunnerReapSuite) TestRefusedReapDoesNotSkipOrphanSweep() {
++	s.newInstance("garm-stuck", 5001, params.RunnerIdle)
++	s.age("garm-stuck", 30*time.Minute)
++	s.forgeLists(
++		s.ghRunner(5001, "garm-stuck", "offline", false),
++		s.ghRunner(5002, "garm-orphan", "offline", false),
++	)
++	// The forge fails this one removal (any reason other than "not found").
++	s.ghcli.On("RemoveEntityRunner", mock.Anything, int64(5001)).Return(runnerErrors.ErrBadRequest)
++	s.ghcli.On("RemoveEntityRunner", mock.Anything, int64(5002)).Return(nil).Maybe()
++	// The orphan sweep also looks at garm-stuck (offline in the forge, a
++	// record in the DB) and asks the provider about it; the provider still
++	// has it running, so the sweep leaves it alone.
++	s.provider.On("ListInstances", mock.Anything, s.pool.ID, mock.Anything).
++		Return([]commonParams.ProviderInstance{{Name: "garm-stuck", Status: commonParams.InstanceRunning}}, nil).Maybe()
++
++	err := s.mgr.runnerCleanup()
++
++	s.Error(err, "the refused removal is still reported")
++	s.ghcli.AssertCalled(s.T(), "RemoveEntityRunner", mock.Anything, int64(5002))
++	s.Equal(commonParams.InstanceRunning, s.status("garm-stuck"),
++		"a refused removal leaves the instance alone")
++}
++
++// ---------------------------------------------------------------------------
++// cleanupOrphanedProviderRunners must not destroy an ACTIVE instance on
++// the strength of one forge listing that does not contain it, without asking
++// the forge. The forge here still has the runner
++// and is running a job on it (422 on removal).
++// ---------------------------------------------------------------------------
++
++func (s *BusyRunnerReapSuite) TestActiveRunnerMissingFromOneListingIsNotDestroyed() {
++	s.newInstance("garm-unlisted", 7001, params.RunnerActive)
++	s.ghcli.On("RemoveEntityRunner", mock.Anything, int64(7001)).Return(runnerErrors.ErrBadRequest).Maybe()
++
++	s.Require().NoError(s.mgr.cleanupOrphanedProviderRunners(nil))
++
++	s.Equal(commonParams.InstanceRunning, s.status("garm-unlisted"),
++		"an instance whose runner the forge will not release must not be marked for deletion")
++}
++
++// ---------------------------------------------------------------------------
++// Runners that really are finished or gone must still be retired.
++// ---------------------------------------------------------------------------
++
++// A runner that never picked up a job (offline, idle) past the bootstrap
++// timeout is still reaped.
++func (s *BusyRunnerReapSuite) TestIdleOfflineRunnerPastTimeoutIsReaped() {
++	s.newInstance("garm-dead", 6001, params.RunnerIdle)
++	s.age("garm-dead", 25*time.Minute)
++	s.forgeLists(s.ghRunner(6001, "garm-dead", "offline", false))
++	s.ghcli.On("RemoveEntityRunner", mock.Anything, int64(6001)).Return(nil)
++
++	s.Require().NoError(s.mgr.runnerCleanup())
++
++	s.ghcli.AssertCalled(s.T(), "RemoveEntityRunner", mock.Anything, int64(6001))
++	s.Equal(commonParams.InstancePendingDelete, s.status("garm-dead"))
++}
++
++// An active runner the forge no longer has (its job finished while GARM
++// missed the completed webhook) is still retired by the orphan sweep.
++func (s *BusyRunnerReapSuite) TestActiveRunnerGoneFromForgeIsRetired() {
++	s.newInstance("garm-finished", 8001, params.RunnerActive)
++	s.ghcli.On("RemoveEntityRunner", mock.Anything, int64(8001)).Return(runnerErrors.ErrNotFound).Maybe()
++
++	s.Require().NoError(s.mgr.cleanupOrphanedProviderRunners(nil))
++
++	s.Equal(commonParams.InstancePendingDelete, s.status("garm-finished"))
++}
++
++func TestBusyRunnerReapSuite(t *testing.T) {
++	suite.Run(t, new(BusyRunnerReapSuite))
++}
+diff --git a/runner/pool/common.go b/runner/pool/common.go
+index a41e034d..98760778 100644
+--- a/runner/pool/common.go
++++ b/runner/pool/common.go
+@@ -25,4 +25,9 @@ type forgeRunner struct {
+ 	Name   string         `json:"name,omitempty"`
+ 	Status string         `json:"status,omitempty"`
+ 	Labels []RunnerLabels `json:"labels,omitempty"`
++	// Busy is the forge's own "this runner is executing a job" flag. It is
++	// independent of Status: a runner running a job can be reported
++	// "offline" (its listener session lapsed) while still busy, and GitHub
++	// refuses to remove a busy runner. Nothing may reap a busy runner.
++	Busy bool `json:"busy,omitempty"`
+ }
+diff --git a/runner/pool/pool.go b/runner/pool/pool.go
+index c02d17b9..4f430e7f 100644
+--- a/runner/pool/pool.go
++++ b/runner/pool/pool.go
+@@ -716,7 +716,23 @@ func (r *basePoolManager) cleanupOrphanedProviderRunners(runners []forgeRunner)
+ 			}
+ 		}
+ 
+-		if ok := runnerNames[instance.Name]; !ok {
++		if ok := runnerNames[instance.Name]; !ok && instance.RunnerStatus == params.RunnerActive && instance.AgentID != 0 {
++			// GARM recorded this runner as running a job, and it is missing
++			// from ONE listing of the forge's runners. A listing is not proof
++			// the runner is gone: the paginated API can drop a runner that
++			// moves between pages mid-listing, and the scale set API is
++			// undocumented. Marking it pending_delete directly would destroy
++			// the instance under a running job without the forge ever being
++			// asked. Ask it: DeleteRunner removes the runner from the forge
++			// first, which the forge refuses (422) while the runner is busy,
++			// and treats "not found" as gone. Only then is it marked for
++			// deletion.
++			if err := r.DeleteRunner(instance, false, false); err != nil {
++				slog.With(slog.Any("error", err)).WarnContext(
++					r.ctx, "active runner is missing from the forge's runner list but the forge did not release it; not deleting",
++					"runner_name", instance.Name)
++			}
++		} else if !ok {
+ 			// Set pending_delete on DB field. Allow consolidate() to remove it.
+ 			// We set force to true here. If we're recovering after a restart, the instance lock
+ 			// we attempt to acquire above, will succed. If it does and we get here, we need to
+@@ -752,6 +768,7 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+ 		runnersByName[run.Name] = run
+ 	}
+ 
++	var reapErrs []error
+ 	for _, instance := range dbInstances {
+ 		if instance.ScaleSetID != 0 {
+ 			// ignore scale set instances.
+@@ -783,19 +800,43 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+ 		//   * The runner managed to join github, but the setup process failed later and the runner
+ 		//     never started on the instance.
+ 		//   * A JIT config was created, but the runner never joined github.
+-		if runner, ok := runnersByName[instance.Name]; !ok || runner.Status == "offline" {
++		runner, ok := runnersByName[instance.Name]
++		if ok && runner.Busy {
++			// The forge says this runner is executing a job. None of the
++			// three cases above can be true of it, whatever its Status says:
++			// a runner that is mid-job can be reported "offline" when its
++			// listener session lapses (a starved or briefly partitioned
++			// host), and UpdatedAt is not refreshed while a job runs, so
++			// every job longer than the bootstrap timeout is exposed to this
++			// check. The job's own completion (webhook) or a later pass, once
++			// the forge clears Busy, retires the runner.
++			slog.InfoContext(
++				r.ctx, "not reaping runner: forge reports it busy",
++				"runner_name", instance.Name,
++				"forge_status", runner.Status,
++				"runner_status", instance.RunnerStatus)
++			continue
++		}
++		if !ok || runner.Status == "offline" {
+ 			slog.InfoContext(
+ 				r.ctx, "reaping timed-out/failed runner",
+ 				"runner_name", instance.Name)
+ 			if err := r.DeleteRunner(instance, false, false); err != nil {
++				// One runner the forge will not let go of (it answers 422
++				// for a runner that is running a job) must not stop the
++				// pass: keep reaping the rest, and report at the end.
+ 				slog.With(slog.Any("error", err)).ErrorContext(
+ 					r.ctx, "failed to update runner status",
+ 					"runner_name", instance.Name)
+-				return fmt.Errorf("error updating runner: %w", err)
++				reapErrs = append(reapErrs, fmt.Errorf("runner %s: %w", instance.Name, err))
++				continue
+ 			}
+ 			r.recordLifecycleEvent(pool, metrics.OutcomeBootstrapTimeout)
+ 		}
+ 	}
++	if len(reapErrs) > 0 {
++		return fmt.Errorf("error reaping %d runner(s): %w", len(reapErrs), errors.Join(reapErrs...))
++	}
+ 	return nil
+ }
+ 
+@@ -820,6 +861,15 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
+ 			// Runner is online. Ignore it.
+ 			continue
+ 		}
++		if runner.Busy {
++			// Offline but executing a job: its listener session lapsed, the
++			// job has not. The forge would refuse the removal (422) and fail
++			// this whole sweep with it; leave it until the job ends.
++			slog.DebugContext(
++				r.ctx, "runner is offline but busy; not treating it as orphaned",
++				"runner_name", runner.Name)
++			continue
++		}
+ 
+ 		dbInstance, err := r.store.GetInstance(r.ctx, runner.Name)
+ 		if err != nil {
+@@ -1904,15 +1954,18 @@ func (r *basePoolManager) runnerCleanup() (err error) {
+ 		return fmt.Errorf("failed to fetch github runners: %w", err)
+ 	}
+ 
++	// The two sweeps are independent: a reap error (one runner the forge
++	// would not release) must not skip the orphan sweep for the whole entity.
++	var errs []error
+ 	if err := r.reapTimedOutRunners(runners); err != nil {
+-		return fmt.Errorf("failed to reap timed out runners: %w", err)
++		errs = append(errs, fmt.Errorf("failed to reap timed out runners: %w", err))
+ 	}
+ 
+ 	if err := r.cleanupOrphanedRunners(runners); err != nil {
+-		return fmt.Errorf("failed to cleanup orphaned runners: %w", err)
++		errs = append(errs, fmt.Errorf("failed to cleanup orphaned runners: %w", err))
+ 	}
+ 
+-	return nil
++	return errors.Join(errs...)
+ }
+ 
+ func (r *basePoolManager) cleanupOrphanedRunners(runners []forgeRunner) error {
+diff --git a/runner/pool/util.go b/runner/pool/util.go
+index eef79a6c..6fe5e7bd 100644
+--- a/runner/pool/util.go
++++ b/runner/pool/util.go
+@@ -223,6 +223,7 @@ func (r *basePoolManager) listRunnersWithPagination() ([]forgeRunner, error) {
+ 			ID:     val.GetID(),
+ 			Name:   val.GetName(),
+ 			Status: val.GetStatus(),
++			Busy:   val.GetBusy(),
+ 			Labels: make([]RunnerLabels, len(val.Labels)),
+ 		}
+ 		for labelIdx, label := range val.Labels {
+@@ -257,6 +258,7 @@ func (r *basePoolManager) listRunnersWithScaleSetAPI() ([]forgeRunner, error) {
+ 			Name:   runner.Name,
+ 			ID:     runner.ID,
+ 			Status: string(runner.GetStatus()),
++			Busy:   runner.Busy,
+ 			Labels: make([]RunnerLabels, len(runner.Labels)),
+ 		}
+ 		for labelIDX, label := range runner.Labels {
+-- 
+2.53.0
+
