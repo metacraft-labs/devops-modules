@@ -163,7 +163,14 @@ assert
       allows_deletions = false;
       allows_force_pushes = false;
       require_conversation_resolution = true;
-      required_linear_history = true;
+      # NOT linear history. The protected branch is a PR-gated mainline
+      # (infra `live`), where the branch-protection policy allows merge commits
+      # only (branching-policy.md, "Repository Merge-Method Settings"): squash
+      # and rebase are forbidden because they land something other than the
+      # reviewed commits. Linear history forbids merge commits, so the
+      # combination would leave no allowed method and every pull request
+      # unmergeable.
+      required_linear_history = false;
 
       required_status_checks = [
         {

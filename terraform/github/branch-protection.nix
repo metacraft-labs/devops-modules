@@ -124,6 +124,11 @@ in
                   required_approving_review_count = policyLib.approvalCount cls (repoCfg.reviewCount or 1);
                   dismiss_stale_reviews_on_push = true;
                   require_code_owner_review = false;
+                }
+                # The class's allowed merge methods (Metacraft policy: merge
+                # commits only on PR-gated classes). Absent = all three.
+                // optionalAttrs (cls ? allowedMergeMethods) {
+                  allowed_merge_methods = cls.allowedMergeMethods;
                 };
               };
           in

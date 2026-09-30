@@ -131,9 +131,11 @@ def validate(action: str, script: str, workflow: str) -> None:
     assert workflow.count(workflow_input) == 1, (
         "reusable Terraform reclamation must be an explicit boolean that defaults off"
     )
+    # Forced off while the Terraform lane override routes the job to a
+    # self-hosted runner (the reclamation fails closed there).
     propagation = (
         "          reclaim_hosted_runner_disk: "
-        "${{ inputs.reclaim_hosted_runner_disk }}\n"
+        "${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}\n"
     )
     assert workflow.count(propagation) == len(RELEVANT_JOBS), (
         "every Terraform job must pass the opt-in unchanged to Setup Nix"
@@ -149,6 +151,53 @@ def validate(action: str, script: str, workflow: str) -> None:
     assert "default: '[\"self-hosted\", \"Linux\", \"x86-64-v2\"]'" in workflow, (
         "the reusable workflow's self-hosted runner default changed"
     )
+    lane_runs_on = "    runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}\n"
+    assert workflow.count(lane_runs_on) == len(RELEVANT_JOBS), (
+        "every Terraform job must honour the TERRAFORM_LANE_RUNNER override"
+    )
+    assert "runs-on: ${{ fromJSON(inputs.runner) }}" not in workflow, (
+        "a Terraform job ignores the TERRAFORM_LANE_RUNNER override"
+    )
+    # The dev-shell override: every `nix develop` and every `--inputs-from`
+    # follows TF_DEVSHELL_FLAKE, which each job derives from the caller's
+    # TERRAFORM_DEVSHELL_FLAKE variable (unset = the repository root flake).
+    devshell_env = "      TF_DEVSHELL_FLAKE_REQUESTED: ${{ vars.TERRAFORM_DEVSHELL_FLAKE }}\n"
+    resolve = (
+        '          if [ -f "$dir/flake.nix" ]; then\n'
+        '            echo "TF_DEVSHELL_FLAKE=$dir" >> "$GITHUB_ENV"\n'
+    )
+    for job_name in RELEVANT_JOBS:
+        job = extract_job(workflow, job_name)
+        assert job.count(devshell_env) == 1, (
+            f"{job_name}: must request the dev shell from TERRAFORM_DEVSHELL_FLAKE exactly once"
+        )
+        # Only the resolve step may set TF_DEVSHELL_FLAKE, and only for a flake
+        # that exists in the checkout (older checkouts fall back).
+        assert job.count(resolve) == 1, (
+            f"{job_name}: TF_DEVSHELL_FLAKE must be exported only when the flake exists"
+        )
+        assert job.index("- name: Resolve the Terraform dev shell") < job.index("nix develop"), (
+            f"{job_name}: the dev shell must be resolved before the first nix develop"
+        )
+    assert "      TF_DEVSHELL_FLAKE:" not in workflow, (
+        "a job-level TF_DEVSHELL_FLAKE would compete with the resolve step's GITHUB_ENV export"
+    )
+    assert workflow.count("nix develop ") == workflow.count(
+        'nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} '
+    ), "a `nix develop` ignores the TERRAFORM_DEVSHELL_FLAKE override"
+    # The Terranix step's nixpkgs lookup follows the dev shell too. (The policy
+    # steps' `nix shell --inputs-from "$GITHUB_WORKSPACE"` deliberately stay on
+    # the repository flake; test_reusable_terraform_source_identity pins them.)
+    assert "--inputs-from . " not in workflow, (
+        "the Terranix nixpkgs lookup ignores the TERRAFORM_DEVSHELL_FLAKE override"
+    )
+    assert workflow.count('--inputs-from "${TF_DEVSHELL_FLAKE:-.}"') == len(RELEVANT_JOBS), (
+        "every Terranix nixpkgs lookup must follow TF_DEVSHELL_FLAKE"
+    )
+    for job_name in RELEVANT_JOBS:
+        assert extract_job(workflow, job_name).count(lane_runs_on) == 1, (
+            f"{job_name}: must resolve runs-on through the lane override exactly once"
+        )
 
 
 def replace_once(text: str, old: str, new: str) -> str:
@@ -312,10 +361,52 @@ def test_hostile_mutations(action: str, script: str, workflow: str) -> None:
             replace_once(
                 workflow,
                 "          reclaim_hosted_runner_disk: "
-                "${{ inputs.reclaim_hosted_runner_disk }}\n",
+                "${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}\n",
                 "",
             ),
             "every Terraform job",
+        ),
+        "reclaim on the self-hosted Terraform lane": (
+            action,
+            script,
+            replace_once(
+                workflow,
+                "          reclaim_hosted_runner_disk: "
+                "${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}\n",
+                "          reclaim_hosted_runner_disk: "
+                "${{ inputs.reclaim_hosted_runner_disk }}\n",
+            ),
+            "every Terraform job",
+        ),
+        "dev shell exported without checking the checkout": (
+            action,
+            script,
+            replace_once(
+                workflow,
+                '          if [ -f "$dir/flake.nix" ]; then\n',
+                "          if true; then\n",
+            ),
+            "exported only when the flake exists",
+        ),
+        "one nix develop ignores the dev-shell override": (
+            action,
+            script,
+            replace_once(
+                workflow,
+                'nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} ',
+                "nix develop ",
+            ),
+            "TERRAFORM_DEVSHELL_FLAKE override",
+        ),
+        "one Terraform job ignores the lane override": (
+            action,
+            script,
+            replace_once(
+                workflow,
+                "    runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}\n",
+                "    runs-on: ${{ fromJSON(inputs.runner) }}\n",
+            ),
+            "TERRAFORM_LANE_RUNNER override",
         ),
         "enable reusable default": (
             action,

@@ -268,23 +268,24 @@ mqArgs='excludeRepos = [ "fork" ]; overrides = { product = "dev"; };'
 outNoMQ="$(helper_eval "$mqArgs" "$policyMQ")"
 check "a policy mergeQueue alone renders NO queue (the rollout gate is per repository)" \
   '([.rulesets[].rules | has("mergeQueue")] | any | not) and (.mergeQueues == {})' "$outNoMQ"
-outMQ="$(helper_eval "$mqArgs mergeQueueRepos = [ \"product\" \"public-dev\" ]; mergeQueueOverrides = { product = { mergeMethod = \"REBASE\"; }; };" "$policyMQ")"
+outMQ="$(helper_eval "$mqArgs mergeQueueRepos = [ \"product\" \"public-dev\" ]; mergeQueueOverrides = { product = { maxEntriesToBuild = 1; }; };" "$policyMQ")"
 check "opted-in repositories get the policy's queue settings" \
   '(.rulesets[] | select(.repository == "public-dev") | .rules.mergeQueue) == {mergeMethod: "MERGE", groupingStrategy: "ALLGREEN", minEntriesToMerge: 1, maxEntriesToMerge: 5, minEntriesToMergeWaitMinutes: 5, maxEntriesToBuild: 2, checkResponseTimeoutMinutes: 360}' "$outMQ"
 check "a per-repository override changes only that setting on that repository" \
-  '(.rulesets[] | select(.repository == "product") | .rules.mergeQueue) as $q | $q.mergeMethod == "REBASE" and $q.maxEntriesToBuild == 2 and $q.checkResponseTimeoutMinutes == 360' "$outMQ"
+  '(.rulesets[] | select(.repository == "product") | .rules.mergeQueue) as $q | $q.mergeMethod == "MERGE" and $q.maxEntriesToBuild == 1 and $q.maxEntriesToMerge == 5 and $q.checkResponseTimeoutMinutes == 360' "$outMQ"
 check "repositories not opted in carry no queue" \
   '[.rulesets[] | select(.repository != "product" and .repository != "public-dev") | .rules | has("mergeQueue")] | any | not' "$outMQ"
 check "mergeQueues reports settings, branch and strictRequiredStatusChecks=false" \
-  '(.mergeQueues | keys) == ["product","public-dev"] and .mergeQueues.product.branch == "dev" and .mergeQueues.product.strictRequiredStatusChecks == false and .mergeQueues.product.mergeMethod == "REBASE"' "$outMQ"
+  '(.mergeQueues | keys) == ["product","public-dev"] and .mergeQueues.product.branch == "dev" and .mergeQueues.product.strictRequiredStatusChecks == false and .mergeQueues.product.mergeMethod == "MERGE"' "$outMQ"
 for bad in \
   'mergeQueueRepos = [ "infra" ];|a class whose mergeQueue is disabled' \
   'mergeQueueRepos = [ "specs" ];|a class with no mergeQueue (spec latest)' \
   'mergeQueueRepos = [ "product" ]; directPushRepos = [ "product" ];|a direct-push (not PR-only) repository' \
   'mergeQueueRepos = [ "no-such-repo" ];|an unknown repository' \
-  'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { public-dev = { mergeMethod = "REBASE"; }; };|an override for a repository without a queue' \
+  'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { public-dev = { maxEntriesToBuild = 1; }; };|an override for a repository without a queue' \
+  'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { product = { mergeMethod = "REBASE"; }; };|a REBASE merge-method override (the method is not overridable)' \
+  'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { product = { mergeMethod = "MERGE"; }; };|any merge-method override, even MERGE' \
   'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { product = { mergeMethd = "REBASE"; }; };|an override with an unknown key' \
-  'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { product = { mergeMethod = "FASTFORWARD"; }; };|an invalid merge method' \
   'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { product = { checkResponseTimeoutMinutes = 720; }; };|a check timeout beyond GitHub'"'"'s 360 minutes' \
   'mergeQueueRepos = [ "product" ]; mergeQueueOverrides = { product = { minEntriesToMerge = 6; }; };|a minimum group larger than the maximum'; do
   expr="${bad%%|*}"; what="${bad#*|}"
@@ -296,7 +297,7 @@ for bad in \
   fi
 done
 renderedMQ="$(nix eval --json --impure --expr "
-  let m = import ${helper} ({ policy = ${policyMQ}; repositories = ${repos}; } // { ${mqArgs} mergeQueueRepos = [ \"product\" ]; mergeQueueOverrides = { product = { mergeMethod = \"REBASE\"; }; }; });
+  let m = import ${helper} ({ policy = ${policyMQ}; repositories = ${repos}; } // { ${mqArgs} mergeQueueRepos = [ \"product\" ]; });
   in import ${engine} {
     awsAccountId = \"000000000000\";
     awsRegion = \"us-east-1\";
@@ -321,6 +322,101 @@ renderedMQ="$(nix eval --json --impure --expr "
   }
 ")"
 check "engine renders the provider merge_queue block, snake_case, on the queued ruleset only" \
-  '([.resource.github_repository_ruleset[] | select(.repository == "product")][0].rules[0].merge_queue == [{merge_method: "REBASE", grouping_strategy: "ALLGREEN", min_entries_to_merge: 1, max_entries_to_merge: 5, min_entries_to_merge_wait_minutes: 5, max_entries_to_build: 2, check_response_timeout_minutes: 360}]) and ([.resource.github_repository_ruleset[] | select(.repository != "product") | .rules[0] | has("merge_queue")] | any | not)' "$renderedMQ"
+  '([.resource.github_repository_ruleset[] | select(.repository == "product")][0].rules[0].merge_queue == [{merge_method: "MERGE", grouping_strategy: "ALLGREEN", min_entries_to_merge: 1, max_entries_to_merge: 5, min_entries_to_merge_wait_minutes: 5, max_entries_to_build: 2, check_response_timeout_minutes: 360}]) and ([.resource.github_repository_ruleset[] | select(.repository != "product") | .rules[0] | has("merge_queue")] | any | not)' "$renderedMQ"
+
+# A policy class whose queue method is not MERGE is refused, even without an
+# override: SQUASH collapses and REBASE rewrites the reviewed commits.
+policyMQSquash="${policyMQ/mergeMethod = \"MERGE\"; groupingStrategy = \"ALLGREEN\"; minEntriesToMerge = 1; maxEntriesToMerge = 5; minEntriesToMergeWaitMinutes = 5; maxEntriesToBuild = 2; checkResponseTimeoutMinutes = 360; strictRequiredStatusChecks = false; }; };
+    agents/mergeMethod = \"SQUASH\"; groupingStrategy = \"ALLGREEN\"; minEntriesToMerge = 1; maxEntriesToMerge = 5; minEntriesToMergeWaitMinutes = 5; maxEntriesToBuild = 2; checkResponseTimeoutMinutes = 360; strictRequiredStatusChecks = false; }; };
+    agents}"
+if [[ "$policyMQSquash" == "$policyMQ" ]]; then
+  echo "FAIL: test setup: could not derive the SQUASH policy fixture"
+  fail=1
+elif helper_eval "$mqArgs mergeQueueRepos = [ \"product\" ];" "$policyMQSquash" 2>/dev/null | jq -e '.rulesets | length' >/dev/null 2>&1; then
+  echo "FAIL: a policy queue method of SQUASH was accepted"
+  fail=1
+else
+  echo "ok: a policy queue method other than MERGE is rejected"
+fi
+
+# ── allowed merge methods: PR-gated classes land merge commits only ──────────
+# The policy shape of 2026-09-30: every PR-gated class carries
+# `allowedMergeMethods = [ "merge" ]`; spec `latest` (direct push) does not.
+policyAMM='{
+  baseline = { allowForcePush = false; allowDeletion = false; };
+  branchClasses = {
+    stable = { repoClass = "product"; role = "default-release"; requirePullRequest = true; allowedMergeMethods = [ "merge" ]; };
+    dev = { repoClass = "product"; role = "mainline"; requirePullRequest = true; requirePullRequestReview = false; allowedMergeMethods = [ "merge" ];
+      mergeQueue = { enabled = true; mergeMethod = "MERGE"; groupingStrategy = "ALLGREEN"; minEntriesToMerge = 1; maxEntriesToMerge = 5; minEntriesToMergeWaitMinutes = 5; maxEntriesToBuild = 2; checkResponseTimeoutMinutes = 360; strictRequiredStatusChecks = false; }; };
+    agents = { repoClass = "product"; role = "integration"; requirePullRequest = false; };
+    latest = { repoClass = "spec"; role = "mainline"; requirePullRequest = false; };
+    live = { repoClass = "infra"; role = "mainline"; requirePullRequest = true; allowedMergeMethods = [ "merge" ]; };
+  };
+}'
+ammArgs='excludeRepos = [ "fork" ]; overrides = { product = "dev"; }; directPushRepos = [ "public-dev" ]; mergeQueueRepos = [ "product" ];'
+outAMM="$(helper_eval "$ammArgs" "$policyAMM")"
+check "every PR-gated ruleset allows exactly the merge method" \
+  '[.rulesets[] | select(.rules.pullRequest != null) | .rules.pullRequest.allowedMergeMethods] as $m | ($m | length) == 2 and ($m | all(. == ["merge"]))' "$outAMM"
+check "direct-push rulesets carry no pull_request rule, hence no merge methods" \
+  '[.rulesets[] | select(.repository == "specs" or .repository == "manifests" or .repository == "public-dev") | .rules | has("pullRequest")] | any | not' "$outAMM"
+check "repositoryMergeSettings: merge-only settings for exactly the PR-only repositories" \
+  '(.repositoryMergeSettings | keys) == (.prOnlyRepos | sort) and ([.repositoryMergeSettings[]] | all(. == {allowMergeCommit: true, allowSquashMerge: false, allowRebaseMerge: false}))' "$outAMM"
+check "the queue on a merge-only class merges with MERGE" \
+  '.mergeQueues.product.mergeMethod == "MERGE"' "$outAMM"
+check "a policy without allowedMergeMethods renders none and derives no repository settings" \
+  '([.rulesets[].rules.pullRequest // {} | has("allowedMergeMethods")] | any | not) and (.repositoryMergeSettings == {})' "$(helper_eval "$args")"
+for bad in \
+  '[ ]|an empty list' \
+  '[ "merge" "fastforward" ]|an unknown method' \
+  '"merge"|a string instead of a list'; do
+  val="${bad%%|*}"; what="${bad#*|}"
+  if helper_eval "$ammArgs" "${policyAMM//allowedMergeMethods = \[ \"merge\" \]/allowedMergeMethods = $val}" 2>/dev/null | jq -e '.rulesets | length' >/dev/null 2>&1; then
+    echo "FAIL: allowedMergeMethods as $what was accepted"
+    fail=1
+  else
+    echo "ok: allowedMergeMethods as $what is rejected"
+  fi
+done
+if helper_eval "$ammArgs" "${policyAMM//allowedMergeMethods = \[ \"merge\" \]/allowedMergeMethods = [ \"squash\" ]}" 2>/dev/null | jq -e '.rulesets | length' >/dev/null 2>&1; then
+  echo "FAIL: a MERGE queue on a class that forbids merge commits was accepted"
+  fail=1
+else
+  echo "ok: a MERGE queue on a class that forbids merge commits is rejected"
+fi
+if helper_eval "$ammArgs" "${policyAMM//allowedMergeMethods = \[ \"merge\" \]/allowedMergeMethods = [ \"merge\" ]; requiredLinearHistory = true}" 2>/dev/null | jq -e '.rulesets | length' >/dev/null 2>&1; then
+  echo "FAIL: a merge-only class that also requires linear history was accepted"
+  fail=1
+else
+  echo "ok: a merge-only class that also requires linear history is rejected"
+fi
+renderedAMM="$(nix eval --json --impure --expr "
+  let m = import ${helper} ({ policy = ${policyAMM}; repositories = ${repos}; } // { ${ammArgs} });
+  in import ${engine} {
+    awsAccountId = \"000000000000\";
+    awsRegion = \"us-east-1\";
+    githubOwner = \"example-org\";
+    githubBootstrapStateKey = \"x.tfstate\";
+    manifest.secrets = [ ];
+    governance = {
+      snapshot.source = \"fixture\";
+      organization.actionsPermissions = { enabledRepositories = \"all\"; allowedActions = \"all\"; shaPinningRequired = false; };
+      repositories = [ ];
+      memberships = [ ];
+      teamRepositories = [ ];
+      outsideCollaborators = [ ];
+      branchProtections = [ ];
+      repositoryEnvironments = [ ];
+      actionsRepositoryPermissions = [ ];
+      actionsVariables = [ ];
+      issueLabels = [ ];
+      repositoryRulesets = m.rulesets;
+      deferredResources = [ ];
+    };
+  }
+")"
+check "engine renders allowed_merge_methods = [merge] on every PR-gated pull_request rule" \
+  '[.resource.github_repository_ruleset[] | .rules[0].pull_request // empty | .[0].allowed_merge_methods] as $m | ($m | length) == 2 and ($m | all(. == ["merge"]))' "$renderedAMM"
+check "engine renders the queued ruleset with merge_method MERGE" \
+  '[.resource.github_repository_ruleset[] | select(.repository == "product")][0].rules[0].merge_queue[0].merge_method == "MERGE"' "$renderedAMM"
 
 exit "$fail"

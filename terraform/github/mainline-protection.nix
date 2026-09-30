@@ -47,6 +47,16 @@
 #     which accepts direct pushes) AND the caller did not name the repository in
 #     `directPushRepos`. A class with `requirePullRequest = false` still gets
 #     `deletion` + `nonFastForward`.
+#   * `pullRequest.allowedMergeMethods` — the class's `allowedMergeMethods`
+#     (Metacraft policy: `[ "merge" ]` on every PR-gated class), rendered as the
+#     rule's `allowed_merge_methods`. Squash collapses the reviewed series and
+#     rebase rewrites every SHA, so a PR-gated mainline lands merge commits only
+#     (branching-policy.md, "Repository Merge-Method Settings"). A ruleset that
+#     allows only merge commits on a repository whose settings disable them
+#     leaves NO allowed method, so the helper also returns
+#     `repositoryMergeSettings` (allow_merge_commit / allow_squash_merge /
+#     allow_rebase_merge derived from the same field) for every PR-only covered
+#     repository. The caller applies it to its `repositories` in the same change.
 #   * `mergeQueue`                   — a GitHub merge queue (the ruleset
 #     `merge_queue` rule), with the settings of the mainline class's policy
 #     `mergeQueue` block (merge method, grouping strategy, group size, wait time,
@@ -56,8 +66,10 @@
 #     triggers on `merge_group` — otherwise the queue waits forever for checks
 #     that never report, and the mainline freezes. Only a PR-only mainline can
 #     carry a queue (a queue gates pull requests). `mergeQueueOverrides` adjusts
-#     settings per repository, e.g. a `mergeMethod` the repository allows (the
-#     queue's method must be one of the repository's allowed merge methods).
+#     settings per repository, EXCEPT the merge method: the queue's method is
+#     always `MERGE` (the queue pushes the merge commit it tested; SQUASH and
+#     REBASE land something else), and it must be one of the class's
+#     `allowedMergeMethods`. A `mergeMethod` override is rejected.
 #     The policy's `strictRequiredStatusChecks = false` is reported per
 #     repository in `mergeQueues`: the queue tests every group against the
 #     latest mainline, so "require branches to be up to date" becomes redundant,
@@ -135,9 +147,10 @@
   #   has `mergeQueue.enabled = true`; anything else is rejected.
   mergeQueueRepos ? [ ],
   # mergeQueueOverrides: per-repository adjustments of the policy's queue
-  #   settings, { <repoName> = { mergeMethod = "REBASE"; ... }; }, using the
+  #   settings, { <repoName> = { maxEntriesToBuild = 1; ... }; }, using the
   #   policy's camelCase keys. Every named repository must be in
-  #   `mergeQueueRepos`.
+  #   `mergeQueueRepos`. `mergeMethod` is NOT overridable: the queue always
+  #   merges with MERGE (branching-policy.md, "Repository Merge-Method Settings").
   mergeQueueOverrides ? { },
   # name: the ruleset name (also part of the engine's resource key).
   name ? "mainline-protect",
@@ -241,6 +254,35 @@ let
     in
     if mq != null && (mq.enabled or false) then mq else null;
 
+  # The class's allowed pull-request merge methods, or null when the class
+  # does not restrict them (GitHub's default: all three). Validated here, so a
+  # typo in the policy fails the render instead of reaching the API.
+  mergeMethodNames = [
+    "merge"
+    "squash"
+    "rebase"
+  ];
+  classAllowedMergeMethods =
+    branch:
+    let
+      m = (branchClasses.${branch} or { }).allowedMergeMethods or null;
+    in
+    assert
+      m == null
+      || (builtins.isList m && m != [ ] && builtins.all (x: elem x mergeMethodNames) m)
+      || throw "mainline-protection: policy class `${branch}` allowedMergeMethods ${builtins.toJSON m} is not a non-empty subset of merge/squash/rebase";
+    # Linear history forbids merge commits: a merge-only class that also
+    # requires it leaves no allowed method.
+    assert
+      !(m == [ "merge" ] && ((branchClasses.${branch} or { }).requiredLinearHistory or false))
+      || throw "mainline-protection: policy class `${branch}` is merge-only but sets requiredLinearHistory; linear history forbids merge commits";
+    m;
+
+  # The queue's merge method is fixed: MERGE, the one method that lands the
+  # merge commit the queue tested with the reviewed commits unchanged beneath
+  # it. Not in the overridable keys (an override is an unknown key).
+  overridableMergeQueueKeys = filter (k: k != "mergeMethod") mergeQueueKeys;
+
   # The rendered settings for one repository: the class's policy block, with
   # the caller's per-repository overrides on top.
   mergeQueueFor =
@@ -248,7 +290,8 @@ let
     let
       base = classMergeQueue branch;
       ov = mergeQueueOverrides.${repo} or { };
-      unknownKeys = filter (k: !(elem k mergeQueueKeys)) (attrNames ov);
+      unknownKeys = filter (k: !(elem k overridableMergeQueueKeys)) (attrNames ov);
+      allowed = classAllowedMergeMethods branch;
       merged = listToAttrs (
         map (k: {
           name = k;
@@ -264,14 +307,14 @@ let
       || throw "mainline-protection: mergeQueueRepos names ${repo}, but its mainline class `${branch}` has no enabled `mergeQueue` in the policy";
     assert
       unknownKeys == [ ]
-      || throw "mainline-protection: mergeQueueOverrides.${repo} has unknown keys: ${builtins.concatStringsSep ", " unknownKeys}";
+      || throw "mainline-protection: mergeQueueOverrides.${repo} has unknown or non-overridable keys: ${builtins.concatStringsSep ", " unknownKeys} (the queue's mergeMethod is always MERGE)";
     assert
-      elem merged.mergeMethod [
-        "MERGE"
-        "SQUASH"
-        "REBASE"
-      ]
-      || throw "mainline-protection: ${repo} merge queue mergeMethod `${toString merged.mergeMethod}` is not MERGE/SQUASH/REBASE";
+      merged.mergeMethod == "MERGE"
+      || throw "mainline-protection: ${repo} merge queue mergeMethod `${toString merged.mergeMethod}` is not MERGE; squash collapses and rebase rewrites the reviewed commits (branching-policy.md, \"Repository Merge-Method Settings\")";
+    assert
+      allowed == null
+      || elem "merge" allowed
+      || throw "mainline-protection: ${repo} merge queue merges with MERGE, but class `${branch}` allowedMergeMethods ${builtins.toJSON allowed} does not include merge";
     assert
       elem merged.groupingStrategy [
         "ALLGREEN"
@@ -326,7 +369,13 @@ let
               requireCodeOwnerReview = false;
               requireLastPushApproval = false;
               requiredReviewThreadResolution = false;
-            };
+            }
+            // (
+              let
+                allowed = classAllowedMergeMethods branch;
+              in
+              if allowed == null then { } else { allowedMergeMethods = allowed; }
+            );
           }
         else
           { }
@@ -415,6 +464,36 @@ assert
   # override grants nothing and only makes the list look load-bearing. A caller's
   # coverage gate should assert this is empty.
   redundantDirectPushRepos = redundantDirectPush;
+  # Repository merge-method settings for every PR-only covered repository whose
+  # mainline class restricts `allowedMergeMethods`, in the engine's repository
+  # schema: { <repo> = { allowMergeCommit; allowSquashMerge; allowRebaseMerge; }; }.
+  # The ruleset alone is not enough: a ruleset allowing only merge commits on a
+  # repository whose settings disable them leaves no allowed method, and every
+  # pull request becomes unmergeable. The caller merges these into its
+  # `repositories` in the same change that lands the rulesets.
+  repositoryMergeSettings = listToAttrs (
+    map
+      (r: {
+        name = r.name;
+        value =
+          let
+            allowed = classAllowedMergeMethods (mainlineBranchFor r);
+          in
+          {
+            allowMergeCommit = elem "merge" allowed;
+            allowSquashMerge = elem "squash" allowed;
+            allowRebaseMerge = elem "rebase" allowed;
+          };
+      })
+      (
+        filter (
+          r:
+          !(elem r.name directPushRepos)
+          && classRequiresPullRequest (mainlineBranchFor r)
+          && classAllowedMergeMethods (mainlineBranchFor r) != null
+        ) covered
+      )
+  );
   # Repositories whose mainline ruleset carries a merge queue, with the
   # rendered settings plus the policy's `strictRequiredStatusChecks` (false:
   # the caller drops "require branches to be up to date" on that branch, in

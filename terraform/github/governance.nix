@@ -751,13 +751,20 @@ let
     // optionalAttrs (rules ? requiredSignatures) { required_signatures = rules.requiredSignatures; }
     // optionalAttrs (rules ? pullRequest) {
       pull_request = [
-        {
-          required_approving_review_count = rules.pullRequest.requiredApprovingReviewCount;
-          dismiss_stale_reviews_on_push = rules.pullRequest.dismissStaleReviewsOnPush;
-          require_code_owner_review = rules.pullRequest.requireCodeOwnerReview;
-          require_last_push_approval = rules.pullRequest.requireLastPushApproval;
-          required_review_thread_resolution = rules.pullRequest.requiredReviewThreadResolution;
-        }
+        (
+          {
+            required_approving_review_count = rules.pullRequest.requiredApprovingReviewCount;
+            dismiss_stale_reviews_on_push = rules.pullRequest.dismissStaleReviewsOnPush;
+            require_code_owner_review = rules.pullRequest.requireCodeOwnerReview;
+            require_last_push_approval = rules.pullRequest.requireLastPushApproval;
+            required_review_thread_resolution = rules.pullRequest.requiredReviewThreadResolution;
+          }
+          # The merge methods a pull request may land with (policy class
+          # `allowedMergeMethods`). Absent = GitHub's default, all three.
+          // optionalAttrs (rules.pullRequest ? allowedMergeMethods) {
+            allowed_merge_methods = rules.pullRequest.allowedMergeMethods;
+          }
+        )
       ];
     }
     # A GitHub merge queue. Settings are the policy's camelCase `mergeQueue`
@@ -980,9 +987,138 @@ let
         stale rsEx ++ stale bpEx
       );
 
+  # --- the merge-method consistency gate ---
+  #
+  # A ruleset that restricts `allowedMergeMethods` (the branch-protection
+  # policy: merge commits only on PR-gated mainlines) can combine with other
+  # settings into a branch that NOTHING can be merged into, and GitHub accepts
+  # every piece on its own. The render refuses these combinations:
+  #
+  #   * the repository settings disable every method the ruleset allows
+  #     (e.g. a merge-only ruleset on a rebase-only repository);
+  #   * a merge-only ruleset on a branch that also requires linear history,
+  #     from a ruleset or a classic protection (linear history forbids merge
+  #     commits);
+  #   * a merge queue whose method the ruleset or the repository does not allow.
+  #
+  # Only rulesets that carry `allowedMergeMethods` are checked, so a model that
+  # does not restrict merge methods renders exactly as before.
+  repositoryByName = listToAttrs (
+    map (r: {
+      name = r.name;
+      value = r;
+    }) governance.repositories
+  );
+  # The merge methods a repository's settings allow (GitHub defaults: all on).
+  repositoryMergeMethods =
+    name:
+    let
+      r = repositoryByName.${name} or { };
+    in
+    filter (m: m != null) [
+      (if r.allowMergeCommit or true then "merge" else null)
+      (if r.allowSquashMerge or true then "squash" else null)
+      (if r.allowRebaseMerge or true then "rebase" else null)
+    ];
+  # A ruleset include pattern, resolved against one repository: the concrete
+  # branch names it can match, or "*" for "every branch".
+  rulesetBranches =
+    repository: include:
+    if include == "~ALL" then
+      "*"
+    else if include == "~DEFAULT_BRANCH" then
+      (repositoryByName.${repository} or { }).defaultBranch or null
+    else if builtins.substring 0 11 include == "refs/heads/" then
+      builtins.substring 11 (builtins.stringLength include) include
+    else
+      include;
+  # fnmatch-style match of a branch against a classic pattern or a ruleset
+  # include (enough for the shapes in use: literals, `*`, `**`).
+  globMatches =
+    pattern: branch:
+    pattern == "*"
+    || pattern == branch
+    ||
+      # replaceStrings tries its patterns in order at each position, so `**`
+      # is consumed before `*`.
+      builtins.match (builtins.replaceStrings [ "." "**" "*" ] [ "\\." ".*" "[^/]*" ] pattern) branch
+      != null;
+  liveRulesets = filter (rs: rs.enforcement != "disabled") (governance.repositoryRulesets or [ ]);
+  mergeRestrictedTargets = concatMap (
+    rs:
+    if (rs.rules.pullRequest or { }) ? allowedMergeMethods then
+      map (inc: {
+        inherit rs;
+        branch = rulesetBranches rs.repository inc;
+      }) rs.conditions.refNameInclude
+    else
+      [ ]
+  ) liveRulesets;
+  mergeMethodViolations = concatMap (
+    t:
+    let
+      rs = t.rs;
+      key = "repository-ruleset:${rs.repository}:${rs.name}";
+      allowed = rs.rules.pullRequest.allowedMergeMethods;
+      usable = filter (m: elem m (repositoryMergeMethods rs.repository)) allowed;
+      mergeOnly = allowed == [ "merge" ];
+      onBranch = pattern: t.branch != null && (t.branch == "*" || globMatches pattern t.branch);
+      linearRulesets = filter (
+        other:
+        other.repository == rs.repository
+        && (other.rules.requiredLinearHistory or false)
+        && builtins.any (
+          inc: onBranch (rulesetBranches other.repository inc)
+        ) other.conditions.refNameInclude
+      ) liveRulesets;
+      linearClassic = filter (
+        bp: bp.repository == rs.repository && (bp.requiredLinearHistory or false) && onBranch bp.pattern
+      ) governance.branchProtections;
+      queueMethod =
+        if rs.rules ? mergeQueue then
+          {
+            MERGE = "merge";
+            SQUASH = "squash";
+            REBASE = "rebase";
+          }
+          .${rs.rules.mergeQueue.mergeMethod} or rs.rules.mergeQueue.mergeMethod
+        else
+          null;
+    in
+    (
+      if usable == [ ] then
+        [
+          "${key}: allows ${builtins.toJSON allowed}, but the repository settings allow ${builtins.toJSON (repositoryMergeMethods rs.repository)}; no pull request could be merged"
+        ]
+      else
+        [ ]
+    )
+    ++ (
+      if mergeOnly then
+        map (
+          o: "${key}: merge-only, but ruleset `${o.name}` requires linear history on the same branch"
+        ) linearRulesets
+        ++ map (
+          bp: "${key}: merge-only, but classic protection `${bp.pattern}` requires linear history"
+        ) linearClassic
+      else
+        [ ]
+    )
+    ++ (
+      if queueMethod != null && !(elem queueMethod usable) then
+        [
+          "${key}: the merge queue merges with ${rs.rules.mergeQueue.mergeMethod}, which the ruleset and repository do not both allow"
+        ]
+      else
+        [ ]
+    )
+  ) mergeRestrictedTargets;
+
   checkedResources =
     if noBypassViolations != [ ] then
       throw "governance: the no-bypass branch-protection policy is violated:\n  - ${concatStringsSep "\n  - " noBypassViolations}"
+    else if mergeMethodViolations != [ ] then
+      throw "governance: merge-method settings leave pull requests unmergeable:\n  - ${concatStringsSep "\n  - " mergeMethodViolations}"
     else
       resources;
 

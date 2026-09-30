@@ -141,10 +141,28 @@ is opt-in per repository through `mergeQueueRepos`. This is the policy's rollout
 gate: a repository is listed only once every workflow that produces one of its
 mainline's required checks triggers on `merge_group`. Otherwise the queue waits
 for checks that never report, and the mainline freezes. `mergeQueueOverrides =
-{ <repo> = { mergeMethod = "REBASE"; }; }` adjusts settings per repository. The
-queue's merge method must be one the repository allows. The renderer rejects
-a queue on a class without one, on a repository that is not PR-only, an unknown
-key, and out-of-range values. The `mergeQueues` output reports each queued
+{ <repo> = { maxEntriesToBuild = 1; }; }` adjusts settings per repository,
+except the merge method: the queue always merges with `MERGE`, the one method
+that lands the merge commit it tested with the reviewed commits unchanged. The
+renderer rejects a queue on a class without one, on a repository that is not
+PR-only, a `mergeMethod` override (or a policy method other than `MERGE`), an
+unknown key, and out-of-range values.
+
+**Allowed merge methods.** A PR-gated class's `allowedMergeMethods` (the
+Metacraft policy: `["merge"]` on `stable`, `dev` and `live`) is rendered as the
+`pull_request` rule's `allowed_merge_methods`, by this helper and by
+`branch-protection.nix`. Squash collapses the reviewed series and rebase
+rewrites every SHA, so neither may land on a PR-gated mainline
+(branching-policy.md, "Repository Merge-Method Settings"). A ruleset that allows
+only merge commits on a repository whose settings disable them leaves no
+allowed method at all, so the helper also returns `repositoryMergeSettings`,
+`{ <repo> = { allowMergeCommit; allowSquashMerge; allowRebaseMerge; }; }` for
+every PR-only covered repository, derived from the same field. The caller
+merges it into its `repositories` in the same change:
+
+```nix
+repositories = map (r: r // (mainline.repositoryMergeSettings.${r.name} or { })) inventory.repositories;
+``` The `mergeQueues` output reports each queued
 repository's settings, branch and the policy's `strictRequiredStatusChecks`
 (false). The caller drops "require branches to be up to date" on that branch in
 the same change, because the queue already tests every group against the
