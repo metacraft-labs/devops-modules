@@ -35,6 +35,7 @@
     ./garm-stale-scaleset-job-reaped.nix
     ./garm-job-cache-self-heal.nix
     ./garm-busy-runner-not-reaped.nix
+    ./garm-deleting-capacity.nix
     ./garm-instance-lifecycle.nix
     ./garm-macos-pools-supported.nix
     ./garm-incus-runner-host.nix

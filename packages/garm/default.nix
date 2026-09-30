@@ -177,6 +177,25 @@ buildGo126Module rec {
     # See upstream-patches/garm-busy-runner-reap/ and the gate
     # t_garm_busy_runner_not_reaped.
     ./patches/fix-busy-runner-reap.patch
+    # Stuck deletes consumed pool capacity (central GARM, high-mem-server,
+    # 2026-09-30). incus deletes failed for hours with `zfs destroy: dataset
+    # is busy` (a nix build pinned the stopped containers' rootfs; fixed in
+    # infra), and the rows sat in deleting/pending_delete. GARM counts EVERY
+    # row against MaxRunners in three places: the pool manager's
+    # addRunnerToPool (PoolInstanceCount) and ensureIdleRunnersForOnePool,
+    # the database's own transactional check in CreateInstance, and the
+    # scale-set worker's runnerCount (len(w.runners)). So a pool whose deletes
+    # stall has no runners left. That also blocked the Terraform lane.
+    # Now: an instance on the deletion lane does not hold a slot, up to
+    # MaxRunners of them (internal/capacity.Occupied). The bound keeps a
+    # provider whose deletes never succeed at <= 2 x MaxRunners on the host.
+    # A deleting row with runner status `pending` is also no longer counted
+    # as an idle runner for min-idle, and scale-set scale-down acts on live
+    # runners only. Cut against the tree with every patch above applied; keep
+    # it LAST. Gates: internal/capacity tests and
+    # TestPoolStressTestSuite/TestStuckDeletesDoNotConsumePoolCapacity (real
+    # sqlite store), run by the package's checkPhase below.
+    ./patches/fix-deleting-instances-hold-capacity.patch
   ];
 
   # go-sqlite3 is a cgo module; the daemon needs cgo to link SQLite.
