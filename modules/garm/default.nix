@@ -73,6 +73,11 @@
         { config, ... }: config.packages.garm-provider-vmharness
       );
 
+      # Sovereign-CI-Fleet AH3: the agent-harbor provider's default package.
+      defaultAgentharborPackage = withSystem pkgs.stdenv.hostPlatform.system (
+        { config, ... }: config.packages.garm-provider-agentharbor
+      );
+
       stateDir = cfg.stateDir;
       dbFile = "${stateDir}/garm.sqlite";
       renderedConfig = "${stateDir}/config.toml";
@@ -140,6 +145,18 @@
       # credentials, which the infra layer supplies via the forwarded env chain
       # (role/IMDS/EnvironmentFile) so no secret ever enters the Nix store.
       providerIsAws = p: p.backend == "aws";
+      # Sovereign-CI-Fleet AH3: the agent-harbor backend. `garm-provider-agentharbor`
+      # is a thin REST client of an agent-harbor server's direct sandbox-launch
+      # endpoints (the runner runs as an ah sandbox job ON THAT SERVER'S HOST),
+      # so like `remote`/`aws` it needs no local hypervisor tooling and relaxes
+      # nothing in the systemd sandbox. Its API credential is staged exactly
+      # like the remote serve token: LoadCredential -> a stable 0600 path.
+      providerIsAgentharbor = p: p.backend == "agentharbor";
+      ahTokenCredName = name: "ah-token-${name}";
+      stagedAhTokenPath = name: "${stateDir}/ah-token-${sanitizeName name}";
+      enabledAgentharborTokenProviders = lib.filterAttrs (
+        _: p: providerIsAgentharbor p && p.agentharbor.authTokenFile != null
+      ) enabledProviders;
       providerIsVMHarnessRun =
         p:
         builtins.elem p.backend [
@@ -165,6 +182,17 @@
         # supplied by the infra layer (systemd EnvironmentFile / LoadCredential /
         # IMDS role), so no AWS secret is ever baked into the store.
         ++ lib.optionals (providerIsAws p) p.aws.forwardEnv
+        # AH3: the API credential's env var (only when it is not file-staged)
+        # plus the TLS CA-bundle vars for an https endpoint.
+        ++ lib.optionals (providerIsAgentharbor p) (
+          [
+            "SSL_CERT_FILE"
+            "SSL_CERT_DIR"
+          ]
+          ++ lib.optional (
+            p.agentharbor.authTokenFile == null && p.agentharbor.authScheme != "none"
+          ) p.agentharbor.authTokenEnv
+        )
         ++ lib.optionals (providerIsVMHarnessRun p) [
           "MCL_RUNNER_SHARED_NIX_STORE"
           "MCL_RUNNER_SHARED_REPRO_STORE"
@@ -303,6 +331,53 @@
         [credentials]
         credential_type = "${p.aws.credentialType}"
       '';
+      # AH3: the `garm-provider-agentharbor` config.toml
+      # (garm-provider-vmharness/src/internal/agentharbor/config.go). NO secret:
+      # the API credential is read from the staged file or a forwarded env var.
+      mkAgentharborKeys =
+        name: p:
+        let
+          a = p.agentharbor;
+          sb = a.sandbox;
+          optBool = k: v: optionalString (v != null) "${k} = ${lib.boolToString v}\n";
+          optStr = k: v: optionalString (v != "") "${k} = \"${tomlStr v}\"\n";
+        in
+        ''
+          endpoint = "${tomlStr a.endpoint}"
+          auth_scheme = "${a.authScheme}"
+          auth_token_env = "${a.authTokenEnv}"
+          substrate = "${a.substrate}"
+          ttl_seconds = ${toString a.ttlSeconds}
+          request_timeout_sec = ${toString a.requestTimeoutSec}
+        ''
+        + optionalString (a.authTokenFile != null) ''
+          auth_token_file = "${stagedAhTokenPath name}"
+        ''
+        + optStr "runner_template" a.runnerTemplate
+        + optStr "ca_cert_file" (if a.caCertFile == null then "" else toString a.caCertFile)
+        + optStr "guest_metadata_url" (if p.guestMetadataURL == null then "" else p.guestMetadataURL)
+        + optStr "guest_callback_url" (if p.guestCallbackURL == null then "" else p.guestCallbackURL)
+        + optionalString (a.idleTimeoutSeconds > 0) ''
+          idle_timeout_seconds = ${toString a.idleTimeoutSeconds}
+        ''
+        + optionalString (a.env != { }) (
+          "\n[env]\n" + lib.concatStrings (lib.mapAttrsToList (k: v: "${k} = \"${tomlStr v}\"\n") a.env)
+        )
+        + "\n[sandbox]\n"
+        + optBool "allow_network" sb.allowNetwork
+        + optBool "allow_containers" sb.allowContainers
+        + optBool "allow_kvm" sb.allowKvm
+        + optStr "memory_max" sb.memoryMax
+        + optStr "memory_high" sb.memoryHigh
+        + optionalString (sb.pidsMax > 0) "pids_max = ${toString sb.pidsMax}\n"
+        + optStr "cpu_max" sb.cpuMax
+        + optStr "tmpfs_size" sb.tmpfsSize
+        + optionalString (a.capabilities.publicKey != "") ''
+
+          [capabilities]
+          key_id = "${a.capabilities.keyId}"
+          public_key = "${a.capabilities.publicKey}"
+        '';
       mkProviderConfigText =
         name: p:
         ''
@@ -313,6 +388,8 @@
             mkRemoteKeys name p
           else if providerIsAws p then
             mkAwsKeys p
+          else if providerIsAgentharbor p then
+            mkAgentharborKeys name p
           else if providerIsIncus p then
             mkIncusKeys p
           else if providerIsVMHarnessRun p then
@@ -320,6 +397,8 @@
           else
             mkLibvirtKeys p
         )
+        # The golden-image map is a vm-harness concept; the agent-harbor
+        # provider has none (and rejects unknown keys), so it is not rendered.
         + lib.concatStrings (
           lib.mapAttrsToList (image: spec: ''
 
@@ -327,7 +406,7 @@
             source_image = "${tomlStr spec.sourceImage}"
             os_name = "${tomlStr spec.osName}"
             os_version = "${tomlStr spec.osVersion}"
-          '') p.images
+          '') (if providerIsAgentharbor p then { } else p.images)
         );
       mkProviderConfigFile =
         name: p: pkgs.writeText "garm-provider-${sanitizeName name}.toml" (mkProviderConfigText name p);
@@ -344,6 +423,8 @@
             "remote ephemeral runners via a vm-harness serve daemon (${p.remote.targetBackend})"
           else if providerIsAws p then
             "AWS EC2 burst ephemeral runners (garm-provider-aws, region ${p.aws.region})"
+          else if providerIsAgentharbor p then
+            "agent-harbor sandbox-job ephemeral runners (garm-provider-agentharbor, substrate ${p.agentharbor.substrate})"
           else if providerIsIncus p then
             "incus Linux container ephemeral runners via vm-harness"
           else
@@ -488,6 +569,22 @@
         '') enabledRemoteTokenProviders
       );
 
+      # AH3: stage each agent-harbor provider's API credential the same way.
+      # Interpolated directly after stageServeTokens (no separator) so a host
+      # without an agentharbor provider keeps a byte-identical render script,
+      # and hence no garm.service restart on deploy.
+      stageAhTokens = lib.concatStrings (
+        lib.mapAttrsToList (name: _p: ''
+          if [ -n "$cred_dir" ] && [ -f "$cred_dir/${ahTokenCredName name}" ]; then
+            install -m 0600 /dev/null "${stagedAhTokenPath name}"
+            tr -d '[:space:]' < "$cred_dir/${ahTokenCredName name}" > "${stagedAhTokenPath name}"
+          else
+            echo "garm-render-config: services.garm.providers.${name}.backend = \"agentharbor\" sets agentharbor.authTokenFile but the credential '${ahTokenCredName name}' was not staged" >&2
+            exit 1
+          fi
+        '') enabledAgentharborTokenProviders
+      );
+
       # First-run/refresh renderer. Resolves the two secrets, then substitutes
       # them into the template to produce the runtime config under $STATE_DIR.
       #
@@ -545,7 +642,7 @@
           ${stageGithubPems}
 
           # RB2: stage the remote providers' serve bearer tokens (central GARM).
-          ${stageServeTokens}
+          ${stageServeTokens}${stageAhTokens}
 
           tmp="$(mktemp "${renderedConfig}.XXXXXX")"
           sed \
@@ -1788,7 +1885,7 @@
       # One named instance per `services.garm.providers.<name>`; the attr name is
       # the GARM `[[provider]].name` referenced by scale sets.
       providerModule =
-        { ... }:
+        { config, ... }:
         {
           options = {
             enable = mkOption {
@@ -1804,9 +1901,10 @@
 
             package = mkOption {
               type = types.package;
-              default = defaultVmharnessPackage;
-              defaultText = lib.literalMD "this flake's `garm-provider-vmharness` package";
-              description = "Package providing the `garm-provider-vmharness` binary.";
+              default =
+                if config.backend == "agentharbor" then defaultAgentharborPackage else defaultVmharnessPackage;
+              defaultText = lib.literalMD "this flake's `garm-provider-agentharbor` package for `backend = \"agentharbor\"`, else `garm-provider-vmharness`";
+              description = "Package providing the provider binary (`garm-provider-vmharness`, or `garm-provider-agentharbor` for the agentharbor backend).";
             };
 
             backend = mkOption {
@@ -1819,6 +1917,7 @@
                 "qemu-windows-arm"
                 "remote"
                 "aws"
+                "agentharbor"
               ];
               default = "libvirt";
               description = ''
@@ -2575,6 +2674,201 @@
                       plus the TLS CA-bundle vars the SDK needs to reach the EC2
                       API. Override to narrow or extend it.
                     '';
+                  };
+                };
+              };
+            };
+
+            # ----- AH3 agent-harbor backend ------------------------------------
+            # Consulted only when `backend = "agentharbor"`. COMPANY-AGNOSTIC:
+            # the endpoint, the credential SOURCE and the pinned manifest key are
+            # supplied by the infra layer; nothing here names a Metacraft host.
+            agentharbor = mkOption {
+              default = { };
+              description = ''
+                agent-harbor backend configuration (Sovereign-CI-Fleet AH3). Only
+                used when `backend = "agentharbor"`, in which case the provider is
+                `garm-provider-agentharbor`: each GARM instance is one ephemeral
+                sandbox job launched through an agent-harbor server's REST
+                direct-sandbox-launch endpoints (agent-harbor
+                `specs/REST-Service/Direct-Sandbox-Launch.md`). The runner runs on
+                THAT server's host; this controller only needs network reach to
+                `endpoint`.
+              '';
+              type = types.submodule {
+                options = {
+                  endpoint = mkOption {
+                    type = types.str;
+                    default = "";
+                    example = "https://ah-ci-01.example.net:8443";
+                    description = "agent-harbor REST service base URL (`/api/v1` is appended). Required.";
+                  };
+                  authScheme = mkOption {
+                    type = types.enum [
+                      "apikey"
+                      "bearer"
+                      "none"
+                    ];
+                    default = "apikey";
+                    description = ''
+                      `Authorization` scheme: `ApiKey <token>`, `Bearer <jwt>`, or
+                      none (only for a loopback per-user daemon without auth — the
+                      spec requires auth on any endpoint reachable beyond loopback).
+                      The credential's principal needs the owner/operator/admin role
+                      to launch and destroy jobs.
+                    '';
+                  };
+                  authTokenFile = mkOption {
+                    type = types.nullOr types.path;
+                    default = null;
+                    example = "/run/agenix/garm/ah-api-key";
+                    description = ''
+                      File holding the API credential (e.g. an agenix secret). Staged
+                      via systemd `LoadCredential` to a stable 0600 path under the
+                      GARM state dir; it never enters the Nix store. When null the
+                      provider reads the env var named by `authTokenEnv`, which this
+                      module forwards to the provider process.
+                    '';
+                  };
+                  authTokenEnv = mkOption {
+                    type = types.str;
+                    default = "AH_API_TOKEN";
+                    description = "Environment variable carrying the credential when `authTokenFile` is null.";
+                  };
+                  caCertFile = mkOption {
+                    type = types.nullOr types.path;
+                    default = null;
+                    description = "Optional CA bundle pinning an https `endpoint`.";
+                  };
+                  substrate = mkOption {
+                    type = types.enum [
+                      "local-sandbox"
+                      "vm"
+                      "cloud-vm"
+                    ];
+                    default = "local-sandbox";
+                    description = ''
+                      Where jobs run. `local-sandbox` is an `ah agent sandbox` on the
+                      server's host (the AH7 runner class); `vm`/`cloud-vm` answer
+                      `501 substrate-unavailable` until agent-harbor wires AH1/AH6.
+                    '';
+                  };
+                  runnerTemplate = mkOption {
+                    type = types.enum [
+                      ""
+                      "sandbox"
+                      "upstream"
+                    ];
+                    default = "";
+                    description = ''
+                      Runner-install script handed to the job on stdin. `sandbox`
+                      (the default for local-sandbox) is rootless: it installs the
+                      runner inside the job's per-job workspace, so the host must
+                      already provide the runner's native dependencies and an FHS
+                      `/bin/bash` (the actions/runner scripts hard-code it). `upstream`
+                      is GARM's own template and needs root in a full guest (the
+                      default for vm/cloud-vm). Empty picks the substrate default.
+                    '';
+                  };
+                  ttlSeconds = mkOption {
+                    type = types.ints.positive;
+                    default = 21600;
+                    description = ''
+                      Absolute job lifetime sent with EVERY launch (spec R3); the
+                      server destroys the job at `expiresAt` regardless of GARM.
+                      Must not exceed the server's `maxTtlSeconds` (else `422`).
+                    '';
+                  };
+                  idleTimeoutSeconds = mkOption {
+                    type = types.ints.unsigned;
+                    default = 0;
+                    description = "Destroy a job after this long without output (0 = off). An idle runner waiting for a job produces no output, so keep this well above the pool's idle time.";
+                  };
+                  requestTimeoutSec = mkOption {
+                    type = types.ints.positive;
+                    default = 300;
+                    description = "Per-request timeout. A launch returns once the substrate spawned the job, so size this for a VM boot on vm substrates.";
+                  };
+                  env = mkOption {
+                    type = types.attrsOf types.str;
+                    default = { };
+                    description = "NON-SECRET environment added to every job (the server passes only an allow-listed base plus this).";
+                  };
+                  sandbox = mkOption {
+                    default = { };
+                    description = "Sandbox options for local-sandbox jobs (the non-interactive subset of `ah agent sandbox`). Unset values keep the server default.";
+                    type = types.submodule {
+                      options = {
+                        allowNetwork = mkOption {
+                          type = types.nullOr types.bool;
+                          default = true;
+                          description = "`--allow-network`. A runner must reach GitHub and the GARM metadata URL.";
+                        };
+                        allowContainers = mkOption {
+                          type = types.nullOr types.bool;
+                          default = null;
+                          description = "`--allow-containers`.";
+                        };
+                        allowKvm = mkOption {
+                          type = types.nullOr types.bool;
+                          default = null;
+                          description = "`--allow-kvm`.";
+                        };
+                        memoryMax = mkOption {
+                          type = types.str;
+                          default = "";
+                          example = "8G";
+                          description = "`--memory-max`.";
+                        };
+                        memoryHigh = mkOption {
+                          type = types.str;
+                          default = "";
+                          description = "`--memory-high`.";
+                        };
+                        pidsMax = mkOption {
+                          type = types.ints.unsigned;
+                          default = 0;
+                          description = "`--pids-max` (0 = server default).";
+                        };
+                        cpuMax = mkOption {
+                          type = types.str;
+                          default = "";
+                          example = "400000 100000";
+                          description = "`--cpu-max`.";
+                        };
+                        tmpfsSize = mkOption {
+                          type = types.str;
+                          default = "";
+                          description = "`--tmpfs-size`.";
+                        };
+                      };
+                    };
+                  };
+                  capabilities = mkOption {
+                    default = { };
+                    description = ''
+                      The host's pinned capability-manifest key. When `publicKey` is
+                      set the provider fetches the host's Ed25519-signed manifest
+                      before every launch and refuses the launch unless it verifies
+                      against this key, is unexpired, offers `substrate`, and derives
+                      every `ah-*` label the pool advertises. Leave empty only for a
+                      host you trust by other means.
+                    '';
+                    type = types.submodule {
+                      options = {
+                        keyId = mkOption {
+                          type = types.str;
+                          default = "";
+                          example = "ahcap-3f1c9a0b7d2e4c51";
+                          description = "Expected `keyId` (`ahcap-` + 16 hex).";
+                        };
+                        publicKey = mkOption {
+                          type = types.str;
+                          default = "";
+                          description = "base64url 32-byte Ed25519 public key. Public; safe in the store.";
+                        };
+                      };
+                    };
                   };
                 };
               };
@@ -4263,7 +4557,11 @@
             # its bearer token from a file (the central GARM topology).
             ++ lib.mapAttrsToList (
               name: p: "${serveTokenCredName name}:${toString p.remote.authTokenFile}"
-            ) enabledRemoteTokenProviders;
+            ) enabledRemoteTokenProviders
+            # AH3: one API credential per agent-harbor provider with a token file.
+            ++ lib.mapAttrsToList (
+              name: p: "${ahTokenCredName name}:${toString p.agentharbor.authTokenFile}"
+            ) enabledAgentharborTokenProviders;
 
           # The bare on-disk SOURCE paths behind `loadCredential` (the `path`
           # halves, without the `id:` prefixes). On the real hosts the App-PEM
@@ -4296,7 +4594,8 @@
             )
             # RB2: the serve-token source paths, asserted present (AssertPathExists)
             # so a genuinely missing token is a legible failure one phase earlier.
-            ++ lib.mapAttrsToList (_: p: toString p.remote.authTokenFile) enabledRemoteTokenProviders;
+            ++ lib.mapAttrsToList (_: p: toString p.remote.authTokenFile) enabledRemoteTokenProviders
+            ++ lib.mapAttrsToList (_: p: toString p.agentharbor.authTokenFile) enabledAgentharborTokenProviders;
 
           # The dedicated-user base (shared by both provider postures).
           userBaseServiceConfig = {
@@ -4461,6 +4760,23 @@
             ++ lib.mapAttrsToList (n: p: {
               assertion = !(providerIsRemote p) || p.remote.endpoint != "";
               message = "services.garm.providers.${n}: backend = \"remote\" requires remote.endpoint (host:port of the vm-harness serve daemon).";
+            }) cfg.providers
+            # AH3: an agent-harbor provider needs an endpoint, may pin a key id
+            # only together with its key, and has no golden-image map.
+            ++ lib.mapAttrsToList (n: p: {
+              assertion = !(providerIsAgentharbor p) || p.agentharbor.endpoint != "";
+              message = "services.garm.providers.${n}: backend = \"agentharbor\" requires agentharbor.endpoint (the agent-harbor REST base URL).";
+            }) cfg.providers
+            ++ lib.mapAttrsToList (n: p: {
+              assertion =
+                !(providerIsAgentharbor p)
+                || p.agentharbor.capabilities.keyId == ""
+                || p.agentharbor.capabilities.publicKey != "";
+              message = "services.garm.providers.${n}: agentharbor.capabilities.keyId is set without publicKey; a key id alone cannot verify the host's manifest.";
+            }) cfg.providers
+            ++ lib.mapAttrsToList (n: p: {
+              assertion = !(providerIsAgentharbor p) || p.images == { };
+              message = "services.garm.providers.${n}: backend = \"agentharbor\" has no golden-image map; remove providers.${n}.images.";
             }) cfg.providers
             # Remote Incus capability grants are deliberately narrow and
             # provider-admin controlled. Refuse configurations whose target

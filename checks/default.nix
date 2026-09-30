@@ -50,6 +50,7 @@
     ./garm-central-recovery.nix
     ./garm-provider-vmharness-protocol.nix
     ./garm-provider-vmharness-windows-toolchain.nix
+    ./garm-provider-agentharbor.nix
     ./vmharness-image-is-honoured.nix
     ./vmharness-serve-linux-deploy.nix
     ./vmharness-serve-inventory-textfile.nix
