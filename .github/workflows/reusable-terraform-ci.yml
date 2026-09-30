@@ -256,6 +256,13 @@ jobs:
     # variable (a JSON runs-on value), when set, replaces `inputs.runner`.
     # See the `runner` input.
     runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}
+    env:
+      # TERRAFORM DEV SHELL override: when the CALLER repository's
+      # TERRAFORM_DEVSHELL_FLAKE variable names a flake directory (repo-relative,
+      # e.g. `shells/terraform`), every dev-shell and inputs-from call below
+      # uses that flake instead of the repository root flake. See the `runner`
+      # input for why these overrides are repository variables.
+      TF_DEVSHELL_FLAKE: ${{ vars.TERRAFORM_DEVSHELL_FLAKE != '' && format('{0}/{1}', github.workspace, vars.TERRAFORM_DEVSHELL_FLAKE) || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -363,21 +370,21 @@ jobs:
         if: inputs.terranix
         run: |
           cd ${{ inputs.working_directory }}
-          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from . --accept-flake-config)
-          nix develop --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
+          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from "${TF_DEVSHELL_FLAKE:-.}" --accept-flake-config)
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
 
       - name: Format check
-        run: nix develop --accept-flake-config --command tofu fmt -check -recursive ${{ inputs.working_directory }}/
+        run: nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command tofu fmt -check -recursive ${{ inputs.working_directory }}/
 
       - name: Init (offline)
         run: |
           cd ${{ inputs.working_directory }}
-          nix develop --accept-flake-config --command tofu init -backend=false
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command tofu init -backend=false
 
       - name: Validate
         run: |
           cd ${{ inputs.working_directory }}
-          nix develop --accept-flake-config --command tofu validate
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command tofu validate
 
       - name: Denylist check
         run: |
@@ -457,17 +464,17 @@ jobs:
         if: hashFiles(format('{0}/.tflint.hcl', inputs.working_directory)) != ''
         run: |
           cd ${{ inputs.working_directory }}
-          nix develop --accept-flake-config --command tflint --init
-          nix develop --accept-flake-config --command tflint
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command tflint --init
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command tflint
 
       - name: Checkov
         if: inputs.enable_checkov
-        run: nix develop --accept-flake-config --command checkov -d ${{ inputs.working_directory }}/
+        run: nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command checkov -d ${{ inputs.working_directory }}/
 
       - name: Unit tests
         run: |
           cd ${{ inputs.working_directory }}
-          nix develop --accept-flake-config --command tofu test
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command tofu test
 
   # ---------------------------------------------------------------------------
   # Job 2: Credentialed plan (PR mode only, same-repo PRs only)
@@ -483,6 +490,13 @@ jobs:
     # variable (a JSON runs-on value), when set, replaces `inputs.runner`.
     # See the `runner` input.
     runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}
+    env:
+      # TERRAFORM DEV SHELL override: when the CALLER repository's
+      # TERRAFORM_DEVSHELL_FLAKE variable names a flake directory (repo-relative,
+      # e.g. `shells/terraform`), every dev-shell and inputs-from call below
+      # uses that flake instead of the repository root flake. See the `runner`
+      # input for why these overrides are repository variables.
+      TF_DEVSHELL_FLAKE: ${{ vars.TERRAFORM_DEVSHELL_FLAKE != '' && format('{0}/{1}', github.workspace, vars.TERRAFORM_DEVSHELL_FLAKE) || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -598,7 +612,7 @@ jobs:
             exit 1
           fi
 
-          nix develop --accept-flake-config --command bash -euo pipefail -c \
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c \
             "age -d -i \"\$1\" \"\$2\" > \"\$3\"" \
             bash "$RUNNER_TEMP/ci-key" "$AGENIX_SECRET_PATH" "$token_file" >/dev/null
 
@@ -658,8 +672,8 @@ jobs:
         if: inputs.terranix
         run: |
           cd ${{ inputs.working_directory }}
-          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from . --accept-flake-config)
-          nix develop --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
+          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from "${TF_DEVSHELL_FLAKE:-.}" --accept-flake-config)
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
 
       # A github provider without a credential does not fail: it falls back to
       # anonymous access (60 requests/hour) and sleeps until each rate-limit
@@ -705,7 +719,7 @@ jobs:
             backend_args+=("-backend-config=$(realpath --relative-to="$PWD" "$backend_path")")
           done < <(printf '%s\n' "$backend_config_files" | tr ',' '\n')
 
-          tofu_bin="$(nix develop --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
+          tofu_bin="$(nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
           run_tofu() {
             env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
           }
@@ -1040,6 +1054,13 @@ jobs:
     # variable (a JSON runs-on value), when set, replaces `inputs.runner`.
     # See the `runner` input.
     runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}
+    env:
+      # TERRAFORM DEV SHELL override: when the CALLER repository's
+      # TERRAFORM_DEVSHELL_FLAKE variable names a flake directory (repo-relative,
+      # e.g. `shells/terraform`), every dev-shell and inputs-from call below
+      # uses that flake instead of the repository root flake. See the `runner`
+      # input for why these overrides are repository variables.
+      TF_DEVSHELL_FLAKE: ${{ vars.TERRAFORM_DEVSHELL_FLAKE != '' && format('{0}/{1}', github.workspace, vars.TERRAFORM_DEVSHELL_FLAKE) || '' }}
     environment: ${{ inputs.environment_name }}
     steps:
       - name: Checkout
@@ -1163,7 +1184,7 @@ jobs:
             exit 1
           fi
 
-          nix develop --accept-flake-config --command bash -euo pipefail -c \
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c \
             "age -d -i \"\$1\" \"\$2\" > \"\$3\"" \
             bash "$RUNNER_TEMP/ci-key" "$AGENIX_SECRET_PATH" "$token_file" >/dev/null
 
@@ -1212,8 +1233,8 @@ jobs:
         if: inputs.terranix
         run: |
           cd ${{ inputs.working_directory }}
-          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from . --accept-flake-config)
-          nix develop --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
+          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from "${TF_DEVSHELL_FLAKE:-.}" --accept-flake-config)
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
 
       # A github provider without a credential does not fail: it falls back to
       # anonymous access (60 requests/hour) and sleeps until each rate-limit
@@ -1263,7 +1284,7 @@ jobs:
             backend_args+=("-backend-config=$(realpath --relative-to="$PWD" "$backend_path")")
           done < <(printf '%s\n' "$backend_config_files" | tr ',' '\n')
 
-          tofu_bin="$(nix develop --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
+          tofu_bin="$(nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
           run_tofu() {
             env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
           }
@@ -1376,6 +1397,13 @@ jobs:
     # variable (a JSON runs-on value), when set, replaces `inputs.runner`.
     # See the `runner` input.
     runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}
+    env:
+      # TERRAFORM DEV SHELL override: when the CALLER repository's
+      # TERRAFORM_DEVSHELL_FLAKE variable names a flake directory (repo-relative,
+      # e.g. `shells/terraform`), every dev-shell and inputs-from call below
+      # uses that flake instead of the repository root flake. See the `runner`
+      # input for why these overrides are repository variables.
+      TF_DEVSHELL_FLAKE: ${{ vars.TERRAFORM_DEVSHELL_FLAKE != '' && format('{0}/{1}', github.workspace, vars.TERRAFORM_DEVSHELL_FLAKE) || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1491,7 +1519,7 @@ jobs:
             exit 1
           fi
 
-          nix develop --accept-flake-config --command bash -euo pipefail -c \
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c \
             "age -d -i \"\$1\" \"\$2\" > \"\$3\"" \
             bash "$RUNNER_TEMP/ci-key" "$AGENIX_SECRET_PATH" "$token_file" >/dev/null
 
@@ -1540,8 +1568,8 @@ jobs:
         if: inputs.terranix
         run: |
           cd ${{ inputs.working_directory }}
-          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from . --accept-flake-config)
-          nix develop --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
+          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from "${TF_DEVSHELL_FLAKE:-.}" --accept-flake-config)
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
 
       # A github provider without a credential does not fail: it falls back to
       # anonymous access (60 requests/hour) and sleeps until each rate-limit
@@ -1582,7 +1610,7 @@ jobs:
             backend_args+=("-backend-config=$(realpath --relative-to="$PWD" "$backend_path")")
           done < <(printf '%s\n' "$backend_config_files" | tr ',' '\n')
 
-          tofu_bin="$(nix develop --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
+          tofu_bin="$(nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
           env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" init -input=false "${backend_args[@]}"
 
       - name: Detect drift
@@ -1592,7 +1620,7 @@ jobs:
           set -euo pipefail
 
           cd ${{ inputs.working_directory }}
-          tofu_bin="$(nix develop --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
+          tofu_bin="$(nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
           run_tofu() {
             env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
           }

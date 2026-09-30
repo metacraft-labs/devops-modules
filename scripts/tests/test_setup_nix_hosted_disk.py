@@ -158,6 +158,29 @@ def validate(action: str, script: str, workflow: str) -> None:
     assert "runs-on: ${{ fromJSON(inputs.runner) }}" not in workflow, (
         "a Terraform job ignores the TERRAFORM_LANE_RUNNER override"
     )
+    # The dev-shell override: every `nix develop` and every `--inputs-from`
+    # follows TF_DEVSHELL_FLAKE, which each job derives from the caller's
+    # TERRAFORM_DEVSHELL_FLAKE variable (unset = the repository root flake).
+    devshell_env = (
+        "      TF_DEVSHELL_FLAKE: ${{ vars.TERRAFORM_DEVSHELL_FLAKE != '' && "
+        "format('{0}/{1}', github.workspace, vars.TERRAFORM_DEVSHELL_FLAKE) || '' }}\n"
+    )
+    for job_name in RELEVANT_JOBS:
+        assert extract_job(workflow, job_name).count(devshell_env) == 1, (
+            f"{job_name}: must derive TF_DEVSHELL_FLAKE from TERRAFORM_DEVSHELL_FLAKE exactly once"
+        )
+    assert workflow.count("nix develop ") == workflow.count(
+        'nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} '
+    ), "a `nix develop` ignores the TERRAFORM_DEVSHELL_FLAKE override"
+    # The Terranix step's nixpkgs lookup follows the dev shell too. (The policy
+    # steps' `nix shell --inputs-from "$GITHUB_WORKSPACE"` deliberately stay on
+    # the repository flake; test_reusable_terraform_source_identity pins them.)
+    assert "--inputs-from . " not in workflow, (
+        "the Terranix nixpkgs lookup ignores the TERRAFORM_DEVSHELL_FLAKE override"
+    )
+    assert workflow.count('--inputs-from "${TF_DEVSHELL_FLAKE:-.}"') == len(RELEVANT_JOBS), (
+        "every Terranix nixpkgs lookup must follow TF_DEVSHELL_FLAKE"
+    )
     for job_name in RELEVANT_JOBS:
         assert extract_job(workflow, job_name).count(lane_runs_on) == 1, (
             f"{job_name}: must resolve runs-on through the lane override exactly once"
@@ -341,6 +364,16 @@ def test_hostile_mutations(action: str, script: str, workflow: str) -> None:
                 "${{ inputs.reclaim_hosted_runner_disk }}\n",
             ),
             "every Terraform job",
+        ),
+        "one nix develop ignores the dev-shell override": (
+            action,
+            script,
+            replace_once(
+                workflow,
+                'nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} ',
+                "nix develop ",
+            ),
+            "TERRAFORM_DEVSHELL_FLAKE override",
         ),
         "one Terraform job ignores the lane override": (
             action,
