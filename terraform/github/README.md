@@ -213,6 +213,66 @@ A bypass that tooling genuinely needs, for example a release App that must write
 a PR-only branch, is granted narrowly (`Integration` by App id) as a documented
 exception, never as an admin role.
 
+## `forbidden-branches.nix` — rulesets for branches a repository class may not have
+
+A policy branch class may carry `forbiddenBranches`: branch names or fnmatch
+patterns that may not exist in a repository of that class. The Metacraft
+policy forbids `agents` and `agents-to-dev-*` on spec `latest`, infra `live`
+and `product-fork`, because only product repositories have an agent landing
+branch. This helper renders one `forbidden-branches` repository ruleset per
+repository in scope, as entries in the engine's `repositoryRulesets` schema:
+
+- `target = "branch"`, `refNameInclude` = the class's list as `refs/heads/<name>`;
+- rules `creation`, `update` and `nonFastForward`, and **no** `deletion`, so a
+  stray branch can still be removed (the same shape as a `no-main-branch`
+  ruleset). A creation restriction does not delete an existing branch;
+- `enforcement = "active"`, `bypassActors = [ ]`. A deviation needs
+  `enforcementException` / `bypassException` (at least 20 characters), as in
+  `mainline-protection.nix`.
+
+Repositories on a policy mainline are **derived** from the `mainlines` output of
+`mainline-protection.nix`, so class derivation lives in one place. Product
+`dev` forbids nothing, so product repositories are never in scope.
+Product-adapted forks are **listed** in `forkRepos` with their product branch,
+because a fork's product branch is not a policy mainline and cannot be derived.
+
+```nix
+let
+  mainline = import "${devops-modules}/terraform/github/mainline-protection.nix" { ... };
+  forbidden = import "${devops-modules}/terraform/github/forbidden-branches.nix" {
+    inherit policy;
+    repositories = inventory.repositories;
+    mainlines = mainline.mainlines;
+    excludeRepos = [ "some-fork" ];            # the SAME list mainline-protection gets
+    forkRepos = { nim = "codetracer"; };       # fork -> product branch (= its default branch)
+  };
+in
+{
+  governance = inventory // {
+    repositoryRulesets = inventory.repositoryRulesets ++ mainline.rulesets ++ forbidden.rulesets;
+  };
+}
+```
+
+It returns `rulesets`, `coveredRepos` (sorted), `byRepo`
+(`{ <repo> = { class; branch; source = "mainline" | "fork"; forbidden; }; }`)
+and `forbiddenByClass`. A policy with no `forbiddenBranches` renders nothing.
+The evaluation throws, each case with its own message, on a forbidden entry that
+matches a policy mainline, a branch class of the same `repoClass` as the
+forbidding class (so `agents` cannot be forbidden on a product repository), or
+the repository's own mainline or product branch. It also throws on a malformed
+`forbiddenBranches`, and on a `forkRepos` entry that is unknown, archived,
+excluded, already derived through `mainlines`, on a policy mainline, or whose
+product branch is not its default branch. Undocumented bypass and non-active
+enforcement throw too. The helper imports nothing, so a governance root can
+vendor it verbatim. Tested offline, with the real helper, `mainline-protection.nix`
+and engine and one named mutation per throw, by
+[`tests/test-forbidden-branches.sh`](./tests/test-forbidden-branches.sh):
+
+```bash
+bash terraform/github/tests/test-forbidden-branches.sh
+```
+
 ## `tf-bootstrap.nix` — CI-enabling GitHub Layer-0 root
 
 The GitHub counterpart of the AWS `tf-bootstrap.nix`: a value-independent module
