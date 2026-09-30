@@ -161,14 +161,27 @@ def validate(action: str, script: str, workflow: str) -> None:
     # The dev-shell override: every `nix develop` and every `--inputs-from`
     # follows TF_DEVSHELL_FLAKE, which each job derives from the caller's
     # TERRAFORM_DEVSHELL_FLAKE variable (unset = the repository root flake).
-    devshell_env = (
-        "      TF_DEVSHELL_FLAKE: ${{ vars.TERRAFORM_DEVSHELL_FLAKE != '' && "
-        "format('{0}/{1}', github.workspace, vars.TERRAFORM_DEVSHELL_FLAKE) || '' }}\n"
+    devshell_env = "      TF_DEVSHELL_FLAKE_REQUESTED: ${{ vars.TERRAFORM_DEVSHELL_FLAKE }}\n"
+    resolve = (
+        '          if [ -f "$dir/flake.nix" ]; then\n'
+        '            echo "TF_DEVSHELL_FLAKE=$dir" >> "$GITHUB_ENV"\n'
     )
     for job_name in RELEVANT_JOBS:
-        assert extract_job(workflow, job_name).count(devshell_env) == 1, (
-            f"{job_name}: must derive TF_DEVSHELL_FLAKE from TERRAFORM_DEVSHELL_FLAKE exactly once"
+        job = extract_job(workflow, job_name)
+        assert job.count(devshell_env) == 1, (
+            f"{job_name}: must request the dev shell from TERRAFORM_DEVSHELL_FLAKE exactly once"
         )
+        # Only the resolve step may set TF_DEVSHELL_FLAKE, and only for a flake
+        # that exists in the checkout (older checkouts fall back).
+        assert job.count(resolve) == 1, (
+            f"{job_name}: TF_DEVSHELL_FLAKE must be exported only when the flake exists"
+        )
+        assert job.index("- name: Resolve the Terraform dev shell") < job.index("nix develop"), (
+            f"{job_name}: the dev shell must be resolved before the first nix develop"
+        )
+    assert "      TF_DEVSHELL_FLAKE:" not in workflow, (
+        "a job-level TF_DEVSHELL_FLAKE would compete with the resolve step's GITHUB_ENV export"
+    )
     assert workflow.count("nix develop ") == workflow.count(
         'nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} '
     ), "a `nix develop` ignores the TERRAFORM_DEVSHELL_FLAKE override"
@@ -364,6 +377,16 @@ def test_hostile_mutations(action: str, script: str, workflow: str) -> None:
                 "${{ inputs.reclaim_hosted_runner_disk }}\n",
             ),
             "every Terraform job",
+        ),
+        "dev shell exported without checking the checkout": (
+            action,
+            script,
+            replace_once(
+                workflow,
+                '          if [ -f "$dir/flake.nix" ]; then\n',
+                "          if true; then\n",
+            ),
+            "exported only when the flake exists",
         ),
         "one nix develop ignores the dev-shell override": (
             action,

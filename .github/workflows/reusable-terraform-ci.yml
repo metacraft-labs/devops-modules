@@ -260,9 +260,10 @@ jobs:
       # TERRAFORM DEV SHELL override: when the CALLER repository's
       # TERRAFORM_DEVSHELL_FLAKE variable names a flake directory (repo-relative,
       # e.g. `shells/terraform`), every dev-shell and inputs-from call below
-      # uses that flake instead of the repository root flake. See the `runner`
-      # input for why these overrides are repository variables.
-      TF_DEVSHELL_FLAKE: ${{ vars.TERRAFORM_DEVSHELL_FLAKE != '' && format('{0}/{1}', github.workspace, vars.TERRAFORM_DEVSHELL_FLAKE) || '' }}
+      # uses that flake instead of the repository root flake, once the
+      # "Resolve the Terraform dev shell" step has found it in the checkout.
+      # See the `runner` input for why these overrides are repository variables.
+      TF_DEVSHELL_FLAKE_REQUESTED: ${{ vars.TERRAFORM_DEVSHELL_FLAKE }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -354,6 +355,22 @@ jobs:
           attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           substituter-preflight: ${{ inputs.substituter_preflight }}
           fallback: ${{ inputs.nix_fallback }}
+
+      - name: Resolve the Terraform dev shell
+        # TERRAFORM_DEVSHELL_FLAKE names a flake directory in the CALLER's
+        # checkout. A checkout that predates that directory (an older PR branch,
+        # or a re-run of an older commit) must not fail every Nix step, so it
+        # falls back to the repository flake. Only this step sets
+        # TF_DEVSHELL_FLAKE (no job-level value competes with GITHUB_ENV).
+        if: env.TF_DEVSHELL_FLAKE_REQUESTED != ''
+        run: |
+          dir="$GITHUB_WORKSPACE/$TF_DEVSHELL_FLAKE_REQUESTED"
+          if [ -f "$dir/flake.nix" ]; then
+            echo "TF_DEVSHELL_FLAKE=$dir" >> "$GITHUB_ENV"
+            echo "Terraform dev shell: $TF_DEVSHELL_FLAKE_REQUESTED"
+          else
+            echo "::notice::TERRAFORM_DEVSHELL_FLAKE=$TF_DEVSHELL_FLAKE_REQUESTED is not in this checkout; using the repository flake"
+          fi
 
       - name: Lockfile check
         run: |
@@ -494,9 +511,10 @@ jobs:
       # TERRAFORM DEV SHELL override: when the CALLER repository's
       # TERRAFORM_DEVSHELL_FLAKE variable names a flake directory (repo-relative,
       # e.g. `shells/terraform`), every dev-shell and inputs-from call below
-      # uses that flake instead of the repository root flake. See the `runner`
-      # input for why these overrides are repository variables.
-      TF_DEVSHELL_FLAKE: ${{ vars.TERRAFORM_DEVSHELL_FLAKE != '' && format('{0}/{1}', github.workspace, vars.TERRAFORM_DEVSHELL_FLAKE) || '' }}
+      # uses that flake instead of the repository root flake, once the
+      # "Resolve the Terraform dev shell" step has found it in the checkout.
+      # See the `runner` input for why these overrides are repository variables.
+      TF_DEVSHELL_FLAKE_REQUESTED: ${{ vars.TERRAFORM_DEVSHELL_FLAKE }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -588,6 +606,22 @@ jobs:
           attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           substituter-preflight: ${{ inputs.substituter_preflight }}
           fallback: ${{ inputs.nix_fallback }}
+
+      - name: Resolve the Terraform dev shell
+        # TERRAFORM_DEVSHELL_FLAKE names a flake directory in the CALLER's
+        # checkout. A checkout that predates that directory (an older PR branch,
+        # or a re-run of an older commit) must not fail every Nix step, so it
+        # falls back to the repository flake. Only this step sets
+        # TF_DEVSHELL_FLAKE (no job-level value competes with GITHUB_ENV).
+        if: env.TF_DEVSHELL_FLAKE_REQUESTED != ''
+        run: |
+          dir="$GITHUB_WORKSPACE/$TF_DEVSHELL_FLAKE_REQUESTED"
+          if [ -f "$dir/flake.nix" ]; then
+            echo "TF_DEVSHELL_FLAKE=$dir" >> "$GITHUB_ENV"
+            echo "Terraform dev shell: $TF_DEVSHELL_FLAKE_REQUESTED"
+          else
+            echo "::notice::TERRAFORM_DEVSHELL_FLAKE=$TF_DEVSHELL_FLAKE_REQUESTED is not in this checkout; using the repository flake"
+          fi
 
       - name: Decrypt provider credentials
         if: inputs.agenix_plan_secret_path != ''
@@ -1058,9 +1092,10 @@ jobs:
       # TERRAFORM DEV SHELL override: when the CALLER repository's
       # TERRAFORM_DEVSHELL_FLAKE variable names a flake directory (repo-relative,
       # e.g. `shells/terraform`), every dev-shell and inputs-from call below
-      # uses that flake instead of the repository root flake. See the `runner`
-      # input for why these overrides are repository variables.
-      TF_DEVSHELL_FLAKE: ${{ vars.TERRAFORM_DEVSHELL_FLAKE != '' && format('{0}/{1}', github.workspace, vars.TERRAFORM_DEVSHELL_FLAKE) || '' }}
+      # uses that flake instead of the repository root flake, once the
+      # "Resolve the Terraform dev shell" step has found it in the checkout.
+      # See the `runner` input for why these overrides are repository variables.
+      TF_DEVSHELL_FLAKE_REQUESTED: ${{ vars.TERRAFORM_DEVSHELL_FLAKE }}
     environment: ${{ inputs.environment_name }}
     steps:
       - name: Checkout
@@ -1153,6 +1188,22 @@ jobs:
           attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           substituter-preflight: ${{ inputs.substituter_preflight }}
           fallback: ${{ inputs.nix_fallback }}
+
+      - name: Resolve the Terraform dev shell
+        # TERRAFORM_DEVSHELL_FLAKE names a flake directory in the CALLER's
+        # checkout. A checkout that predates that directory (an older PR branch,
+        # or a re-run of an older commit) must not fail every Nix step, so it
+        # falls back to the repository flake. Only this step sets
+        # TF_DEVSHELL_FLAKE (no job-level value competes with GITHUB_ENV).
+        if: env.TF_DEVSHELL_FLAKE_REQUESTED != ''
+        run: |
+          dir="$GITHUB_WORKSPACE/$TF_DEVSHELL_FLAKE_REQUESTED"
+          if [ -f "$dir/flake.nix" ]; then
+            echo "TF_DEVSHELL_FLAKE=$dir" >> "$GITHUB_ENV"
+            echo "Terraform dev shell: $TF_DEVSHELL_FLAKE_REQUESTED"
+          else
+            echo "::notice::TERRAFORM_DEVSHELL_FLAKE=$TF_DEVSHELL_FLAKE_REQUESTED is not in this checkout; using the repository flake"
+          fi
 
       - name: Lockfile existence gate
         run: |
@@ -1401,9 +1452,10 @@ jobs:
       # TERRAFORM DEV SHELL override: when the CALLER repository's
       # TERRAFORM_DEVSHELL_FLAKE variable names a flake directory (repo-relative,
       # e.g. `shells/terraform`), every dev-shell and inputs-from call below
-      # uses that flake instead of the repository root flake. See the `runner`
-      # input for why these overrides are repository variables.
-      TF_DEVSHELL_FLAKE: ${{ vars.TERRAFORM_DEVSHELL_FLAKE != '' && format('{0}/{1}', github.workspace, vars.TERRAFORM_DEVSHELL_FLAKE) || '' }}
+      # uses that flake instead of the repository root flake, once the
+      # "Resolve the Terraform dev shell" step has found it in the checkout.
+      # See the `runner` input for why these overrides are repository variables.
+      TF_DEVSHELL_FLAKE_REQUESTED: ${{ vars.TERRAFORM_DEVSHELL_FLAKE }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -1495,6 +1547,22 @@ jobs:
           attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           substituter-preflight: ${{ inputs.substituter_preflight }}
           fallback: ${{ inputs.nix_fallback }}
+
+      - name: Resolve the Terraform dev shell
+        # TERRAFORM_DEVSHELL_FLAKE names a flake directory in the CALLER's
+        # checkout. A checkout that predates that directory (an older PR branch,
+        # or a re-run of an older commit) must not fail every Nix step, so it
+        # falls back to the repository flake. Only this step sets
+        # TF_DEVSHELL_FLAKE (no job-level value competes with GITHUB_ENV).
+        if: env.TF_DEVSHELL_FLAKE_REQUESTED != ''
+        run: |
+          dir="$GITHUB_WORKSPACE/$TF_DEVSHELL_FLAKE_REQUESTED"
+          if [ -f "$dir/flake.nix" ]; then
+            echo "TF_DEVSHELL_FLAKE=$dir" >> "$GITHUB_ENV"
+            echo "Terraform dev shell: $TF_DEVSHELL_FLAKE_REQUESTED"
+          else
+            echo "::notice::TERRAFORM_DEVSHELL_FLAKE=$TF_DEVSHELL_FLAKE_REQUESTED is not in this checkout; using the repository flake"
+          fi
 
       - name: Decrypt provider credentials
         if: inputs.agenix_plan_secret_path != ''
