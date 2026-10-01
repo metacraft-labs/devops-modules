@@ -28,7 +28,9 @@
     # PINNED to a specific rev (not a bare branch): we deploy reprobuild to
     # servers through this input, so an explicit pin keeps the installed
     # `repro` reproducible. Bump this SHA to roll forward (the mainline is the
-    # `dev` branch; `main` was retired). This SHA is the single source of truth
+    # `dev` branch; `main` was retired). The SHA must be on reprobuild `dev` or be
+    # the commit of a published release tag (a release branch reaches `dev`
+    # later). This SHA is the single source of truth
     # for the reprobuild revision: nearly every consumer reaches `repro` through
     # this input with `follows` rather than declaring a pin of its own, so a
     # machine cannot end up running a `repro` other than the one its closure was
@@ -55,7 +57,7 @@
     # name a revision that carries reprobuild's `nix/modules/` directory — a pin
     # older than that makes `modules/` fail to evaluate, not merely ship a stale
     # `repro`.
-    reprobuild.url = "github:metacraft-labs/reprobuild/55219d924d40c30bd20889749b171c2086d6790b";
+    reprobuild.url = "github:metacraft-labs/reprobuild/466bd8d7a4192786f836bf5f74a119bcf15ff05d";
 
     nixpkgs.follows = "nixos-2511";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
