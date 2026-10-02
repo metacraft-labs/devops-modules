@@ -71,6 +71,7 @@
     ./packages-ci-matrix.nix
     ./pre-commit.nix
     ./git-hooks-reprobuild-handoff.nix
+    ./git-hooks-same-repo-git.nix
     ./secret-integration
     ./setup-nix-transfer-resilience.nix
     ./terraform-ci-matrix.nix
