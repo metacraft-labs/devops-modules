@@ -29,6 +29,14 @@
             export GITHUB_PROVIDER_CREDENTIAL_GATE_SCRIPT=${../terraform/ci/github-provider-credential-gate}
             export GITHUB_PROVIDER_CREDENTIAL_GATE_PYTHON=${pkgs.python3}/bin/python3
             ${pkgs.bash}/bin/bash ${../terraform/ci/tests/test-github-provider-credential-gate.sh}
+
+            export TOFU_CREDENTIAL_DEADLINE_SCRIPT=${../terraform/ci/tofu-credential-deadline}
+            export TOFU_CREDENTIAL_DEADLINE_BASH=${pkgs.bash}/bin/bash
+            ${pkgs.bash}/bin/bash ${../terraform/ci/tests/test-tofu-credential-deadline.sh}
+
+            export GITHUB_APP_RATE_BUDGET_SCRIPT=${../terraform/ci/github-app-rate-budget}
+            export GITHUB_APP_RATE_BUDGET_PYTHON=${pkgs.python3}/bin/python3
+            ${pkgs.bash}/bin/bash ${../terraform/ci/tests/test-github-app-rate-budget.sh}
             touch "$out"
           '';
     };

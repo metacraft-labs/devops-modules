@@ -113,7 +113,9 @@ every supported system. `tests/test-plan-destroy-guard.sh` exercises
 replay of the 2026-09-23 incident; the same flake check runs it.
 `tests/test-github-provider-credential-gate.sh` exercises
 `github-provider-credential-gate`, including a replay of the 2026-09-24
-incident; the same flake check runs it.
+incident; the same flake check runs it. `tests/test-tofu-credential-deadline.sh`
+and `tests/test-github-app-rate-budget.sh` cover the two scripts below; the
+same flake check runs them.
 
 ## GitHub provider credential gate
 
@@ -142,3 +144,32 @@ secrets:
 The credentialed PR plan and the drift plan are also bounded by
 `plan_timeout_minutes` (default 60), and the PR plan streams its stdout to the
 job log, so any other stall fails visibly instead of holding a runner.
+
+## Credential deadline
+
+Every credential a job mints is short-lived: a GitHub App installation token
+lives 1 h, the AWS OIDC session `aws_role_duration_seconds`. Nothing tells tofu
+that. On 2026-10-01 a 66-minute governance refresh outlived both: the App token
+answered `401 Bad credentials`, and the DynamoDB lock release then failed with
+`ExpiredTokenException`, stranding the state lock.
+
+Each credentialed job therefore records `TF_CREDENTIALS_NOT_AFTER` (the earliest
+expiry, computed before minting so it errs early) and runs every tofu call that
+can take the lock under `tofu-credential-deadline run`, which sends SIGINT
+10 minutes before that moment (SIGKILL 4 minutes later). OpenTofu answers an
+interrupt by finishing in-flight operations, writing state and releasing its
+lock, while the credentials still work. A run that would start with less than
+5 minutes left is refused instead.
+
+The apply job plans and applies in two steps and mints a fresh App token and
+AWS session between them, so a long refresh cannot leave the apply with
+whatever is left of the first token.
+
+## GitHub App API budget
+
+An App installation has ONE hourly REST bucket (12,500 requests for an org
+installation on a paid plan), shared by every job that mints from it. The plan
+and apply jobs read `GET /rate_limit` (free) with the App token before and after
+tofu (`github-app-rate-budget`) and print the requests consumed in between to
+the log and step summary: a direct measurement of what a root's refresh costs
+(an upper bound when other jobs drew on the bucket at the same time).
