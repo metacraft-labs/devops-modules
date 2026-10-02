@@ -162,7 +162,9 @@ merges it into its `repositories` in the same change:
 
 ```nix
 repositories = map (r: r // (mainline.repositoryMergeSettings.${r.name} or { })) inventory.repositories;
-``` The `mergeQueues` output reports each queued
+```
+
+The `mergeQueues` output reports each queued
 repository's settings, branch and the policy's `strictRequiredStatusChecks`
 (false). The caller drops "require branches to be up to date" on that branch in
 the same change, because the queue already tests every group against the
