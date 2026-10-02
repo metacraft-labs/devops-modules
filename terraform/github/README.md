@@ -160,7 +160,7 @@ allowed method at all, so the helper also returns `repositoryMergeSettings`,
 every PR-only covered repository, derived from the same field. The caller
 merges it into its `repositories` in the same change:
 
-```nix
+````nix
 repositories = map (r: r // (mainline.repositoryMergeSettings.${r.name} or { })) inventory.repositories;
 ``` The `mergeQueues` output reports each queued
 repository's settings, branch and the policy's `strictRequiredStatusChecks`
@@ -226,7 +226,7 @@ import "${inputs.nixos-modules}/terraform/github/tf-bootstrap.nix" {
   namePrefix = "…-prod";               # state key derives: bootstrap/github/<namePrefix>.tfstate
   githubOwner = "…";                   # githubRepo defaults to "infra"
 }
-```
+````
 
 The reviewer team, its maintainers and repository grant, the `sensitive-change`
 and `allow-destroy` labels, the `production` Environment and the deploy branch's

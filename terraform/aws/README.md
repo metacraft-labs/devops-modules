@@ -34,16 +34,16 @@ All identifiers are per-repo — two repos may point at the same AWS account
 today yet each keeps its own variables, so either can move to a separate
 account later without touching the other.
 
-| Param                                | Example                                                                    |
-| ------------------------------------ | -------------------------------------------------------------------------- |
-| `awsAccountId`                       | `"000000000000"`                                                           |
-| `awsRegion`                          | `"us-east-1"`                                                              |
-| `budgetAlertEmails`                  | retired; accepted and ignored                                              |
-| `githubOwner` / `githubRepo`         | `"example-org"` / `"infra"`                                                |
-| `githubBranch` / `githubEnvironment` | `"live"` / `"production"`                                                  |
-| `lockTableName`                      | `"example-prod-tofu-locks"`                                                |
-| `namePrefix`                         | `"example-prod"` (state keys, role/ARN patterns)                           |
-| `orgLabel`                           | `"Example"` (PascalCase infix for Sids and the break-glass role)          |
+| Param                                | Example                                                          |
+| ------------------------------------ | ---------------------------------------------------------------- |
+| `awsAccountId`                       | `"000000000000"`                                                 |
+| `awsRegion`                          | `"us-east-1"`                                                    |
+| `budgetAlertEmails`                  | retired; accepted and ignored                                    |
+| `githubOwner` / `githubRepo`         | `"example-org"` / `"infra"`                                      |
+| `githubBranch` / `githubEnvironment` | `"live"` / `"production"`                                        |
+| `lockTableName`                      | `"example-prod-tofu-locks"`                                      |
+| `namePrefix`                         | `"example-prod"` (state keys, role/ARN patterns)                 |
+| `orgLabel`                           | `"Example"` (PascalCase infix for Sids and the break-glass role) |
 
 ### Usage
 
