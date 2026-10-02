@@ -23,6 +23,17 @@ profile_actions="$(jq -r '.resource.aws_iam_role_policy.terraform_apply_managed_
   | fromjson | .Statement[] | select(.Sid | test("^Manage.*InstanceProfiles$")) | .Action[]' <<<"$json")"
 grep -qxF "iam:RemoveRoleFromInstanceProfile" <<<"$profile_actions" \
   || { echo "FAIL: managed-IAM instance-profile statement lacks iam:RemoveRoleFromInstanceProfile"; fail=1; }
+# Layer 0 is the CI machinery only: the budget and cost-allocation settings are
+# account governance, owned by the consumer's CI-applied account root. They must
+# not render here, and their old addresses must be forgotten, never destroyed.
+for t in aws_budgets_budget aws_ce_cost_allocation_tag aws_ce_cost_category; do
+  [[ "$(jq --arg t "$t" '.resource[$t] // {} | length' <<<"$json")" == "0" ]] \
+    || { echo "FAIL: $t is not Layer 0 and must not render"; fail=1; }
+done
+for a in aws_budgets_budget.monthly_cost aws_ce_cost_allocation_tag.project aws_ce_cost_category.agent_harbor_cost_layer; do
+  jq -e --arg a "$a" '.removed[] | select(.from == $a and .lifecycle.destroy == false)' <<<"$json" >/dev/null \
+    || { echo "FAIL: expected removed { from = $a, destroy = false }"; fail=1; }
+done
 # No real-account leakage from the example.
 # The example must render only placeholder identifiers — flag any 12-digit AWS
 # account id other than the 000000000000 placeholder (no real value embedded here).
