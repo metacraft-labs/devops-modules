@@ -10,7 +10,16 @@
 # actually established rather than refused).
 #
 # Loopback TCP is available inside the Nix build sandbox, which is what lets the
-# handshake half run here rather than only by hand.
+# handshake half run here rather than only by hand — but only on Linux by
+# default. macOS's sandbox denies even loopback unless the derivation asks, which
+# is what `__darwinAllowLocalNetworking` does; without it this check cannot bind a
+# port on a darwin builder and the handshake subtests fail there while passing on
+# Linux. It is set unconditionally because the attribute is simply ignored
+# elsewhere.
+#
+# The darwin leg is UNVERIFIED: no darwin builder was available when this was
+# written, and the aarch64-darwin CI batch that would have exercised it died with
+# "the self-hosted runner lost communication with the server" before reporting.
 { ... }:
 {
   perSystem =
@@ -24,6 +33,7 @@
               pkgs.jq
               pkgs.coreutils
             ];
+            __darwinAllowLocalNetworking = true;
           }
           ''
             cp ${../scripts/mint-dev-certificates.sh} ./mint-dev-certificates.sh

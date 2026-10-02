@@ -26,7 +26,18 @@ MINT="$HERE/../mint-dev-certificates.sh"
 }
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+
+# The TLS server this test starts must not outlive it. `stop_srv` is called on
+# the happy path, but a failed assertion between `serve` and it would leave an
+# `openssl s_server` holding a port — on a shared self-hosted runner, for as long
+# as the machine stays up. So the EXIT trap kills it too, and does so before
+# removing the work directory the server is reading its certificate from.
+SRV_PID=
+cleanup() {
+  [ -z "$SRV_PID" ] || kill "$SRV_PID" 2>/dev/null || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 pass=0
 fail=0
@@ -202,7 +213,6 @@ await_port() {
 }
 
 # serve <label>  -> starts a server on a free port, echoes the port
-SRV_PID=
 serve() {
   local port
   port="$(free_port)" || return 1
