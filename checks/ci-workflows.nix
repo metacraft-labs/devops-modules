@@ -7,6 +7,41 @@
       terraformWorkflow = ../.github/workflows/reusable-terraform-ci.yml;
     in
     {
+      # Selector input fixtures exercise the committed workflow expressions.
+      # No network client or authentication response is mocked: GitHub evaluates
+      # these same expressions in the live reusable workflow.
+      checks.reusable-flake-checks-nix-token =
+        pkgs.runCommand "reusable-flake-checks-nix-token" { nativeBuildInputs = [ pkgs.python3 ]; }
+          ''
+            python3 - <<'PY'
+            import re
+            from pathlib import Path
+
+            workflow = Path("${flakeChecksWorkflow}").read_text()
+            expressions = re.findall(r"nix-github-token:\s*\$\{\{(.*?)\}\}", workflow)
+            assert len(expressions) == 5, "every Nix setup job must be covered"
+            for expression in expressions:
+                names = [part.strip() for part in expression.split("||")]
+                assert names == ["secrets.NIX_GITHUB_TOKEN",
+                                 "secrets.GH_READ_METACRAFT_PRIVATE_REPOS",
+                                 "github.token"], "private credentials must retain precedence"
+                # These contexts contain only strings: GitHub || returns the
+                # first truthy operand, and an empty string is falsy.
+                def select(context):
+                    return next((context[name] for name in names if context[name]), "")
+                fixtures = [
+                    (("dedicated", "private", "workflow"), "dedicated"),
+                    (("", "private", "workflow"), "private"),
+                    (("", "", "workflow"), "workflow"),
+                    (("", "", ""), ""),
+                ]
+                for values, expected in fixtures:
+                    assert select(dict(zip(names, values))) == expected
+                assert not select(dict.fromkeys(names, "")), "no token cannot imply authentication"
+            PY
+            touch "$out"
+          '';
+
       checks.reusable-flake-checks-mcl-ref =
         pkgs.runCommand "reusable-flake-checks-mcl-ref"
           {
