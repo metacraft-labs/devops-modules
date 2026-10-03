@@ -92,6 +92,8 @@ type job struct {
 	State              string            `json:"state"`
 	TerminationReason  *string           `json:"terminationReason"`
 	ExitCode           *int              `json:"exitCode"`
+	CommandExitCode    *int              `json:"commandExitCode,omitempty"`
+	CommandSignal      *int              `json:"commandSignal,omitempty"`
 	Error              *string           `json:"error"`
 	Labels             map[string]string `json:"labels"`
 	Command            []string          `json:"command"`
@@ -132,6 +134,9 @@ type Server struct {
 	FailLaunch string
 	// OmitCleanupToken makes the server return jobs without a cleanupToken.
 	OmitCleanupToken bool
+	// LegacyExitStatus emulates a server that predates commandExitCode /
+	// commandSignal: only the launcher's 0/1 exitCode is reported.
+	LegacyExitStatus bool
 	// TamperManifest flips a byte of the signed payload after signing.
 	TamperManifest bool
 
@@ -637,17 +642,30 @@ func (s *Server) spawnLocked(j *job, req createReq) error {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if j.State == "running" {
-			code := 0
-			if werr != nil {
-				code = 1
-				if ee, ok := werr.(*exec.ExitError); ok {
-					code = ee.ExitCode()
+			// The spec's launcher contract: exitCode is 0/1, the command's
+			// own status is commandExitCode / commandSignal.
+			launcher := 0
+			var cmdCode, cmdSignal *int
+			if st, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok && st.Signaled() {
+				sig := int(st.Signal())
+				cmdSignal = &sig
+				launcher = 1
+			} else {
+				code := cmd.ProcessState.ExitCode()
+				cmdCode = &code
+				if code != 0 {
+					launcher = 1
 				}
+			}
+			_ = werr
+			if !s.LegacyExitStatus {
+				j.CommandExitCode = cmdCode
+				j.CommandSignal = cmdSignal
 			}
 			reason := "completed"
 			ended := time.Now().UTC()
 			j.State = "exited"
-			j.ExitCode = &code
+			j.ExitCode = &launcher
 			j.TerminationReason = &reason
 			j.EndedAt = &ended
 		}

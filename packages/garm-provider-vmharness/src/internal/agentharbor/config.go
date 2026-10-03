@@ -33,8 +33,11 @@ const (
 
 // Runner-install templates the provider can hand the sandbox as stdin.
 const (
-	// TemplateSandbox is the rootless Linux template: it installs the runner
-	// inside the job's per-job workspace. The default for local-sandbox.
+	// TemplateSandbox is the rootless Linux payload for local-sandbox: it
+	// fetches the JIT credentials into the job's per-job workspace and execs
+	// the host's Nix-packaged actions runner (nixpkgs `github-runner`, see
+	// [runner]) the way the NixOS `services.github-runners` module runs it.
+	// It downloads nothing. The default for local-sandbox.
 	TemplateSandbox = "sandbox"
 	// TemplateUpstream is GARM upstream's cloudconfig template (plus the
 	// cached-runner version guard). It needs root in a full guest OS, so it is
@@ -98,6 +101,34 @@ type Config struct {
 
 	Sandbox      SandboxOptions     `toml:"sandbox"`
 	Capabilities CapabilitiesConfig `toml:"capabilities"`
+	// Runner is the Nix-packaged actions runner the `sandbox` payload execs.
+	Runner NixRunnerConfig `toml:"runner"`
+}
+
+// DefaultMaxMinorLag is the staleness rule of infra's actions-runner pin check
+// (services/github-runners/check-runner-version.sh, MAX_MINOR_LAG): a runner
+// two or more minor releases behind the latest one is stale, and GitHub soon
+// refuses to dispatch jobs to it.
+const DefaultMaxMinorLag = 2
+
+// NixRunnerConfig names the host's nixpkgs `github-runner` package, the same
+// one (and the same PATH/environment) the host's systemd runners
+// (`services.github-runners`) use. The services.garm module renders it from
+// the package, so the version guard and infra's pin check judge one version.
+type NixRunnerConfig struct {
+	// Listener is the absolute path of the package's bin/Runner.Listener.
+	Listener string `toml:"listener"`
+	// Version is the package's actions/runner version (x.y.z).
+	Version string `toml:"version"`
+	// Path is the job's PATH, in order (the module's `path`: bash, coreutils,
+	// git, gnutar, gzip, nix and the extra packages, as bin directories).
+	Path []string `toml:"path"`
+	// Env is extra, non-secret runner environment (the module's
+	// extraEnvironment).
+	Env map[string]string `toml:"env"`
+	// MaxMinorLag refuses launches when the package is this many minor
+	// releases behind the version GARM offers (default DefaultMaxMinorLag).
+	MaxMinorLag int `toml:"max_minor_lag"`
 }
 
 // SandboxOptions is the non-interactive subset of `ah agent sandbox` options a
@@ -188,6 +219,9 @@ func (c *Config) applyDefaults() {
 	if c.TTLSeconds == 0 {
 		c.TTLSeconds = DefaultTTLSeconds
 	}
+	if c.Runner.MaxMinorLag == 0 {
+		c.Runner.MaxMinorLag = DefaultMaxMinorLag
+	}
 }
 
 // Validate checks the config after defaults were applied.
@@ -216,6 +250,14 @@ func (c *Config) Validate() error {
 	case TemplateSandbox, TemplateUpstream:
 	default:
 		return fmt.Errorf("runner_template %q must be sandbox or upstream", c.RunnerTemplate)
+	}
+	if c.Substrate == SubstrateLocalSandbox && c.RunnerTemplate == TemplateUpstream {
+		return fmt.Errorf("runner_template upstream needs root in a full guest OS; local-sandbox takes the sandbox payload")
+	}
+	if c.RunnerTemplate == TemplateSandbox {
+		if err := c.Runner.validate(); err != nil {
+			return fmt.Errorf("runner: %w", err)
+		}
 	}
 	if c.RequestTimeoutSec < 0 {
 		return fmt.Errorf("request_timeout_sec must be positive")
@@ -258,4 +300,30 @@ func (c *Config) ResolveToken() (string, error) {
 		return tok, nil
 	}
 	return "", fmt.Errorf("auth_scheme %q needs a credential: set auth_token_file or the %s environment variable", c.AuthScheme, c.AuthTokenEnv)
+}
+
+func (r NixRunnerConfig) validate() error {
+	if r.Listener == "" {
+		return fmt.Errorf("listener is required: the sandbox payload execs the host's Nix-packaged actions runner (<github-runner>/bin/Runner.Listener) and never downloads one")
+	}
+	if !strings.HasPrefix(r.Listener, "/") || !strings.HasSuffix(r.Listener, "/bin/Runner.Listener") {
+		return fmt.Errorf("listener %q must be an absolute <github-runner>/bin/Runner.Listener path", r.Listener)
+	}
+	if _, ok := parseRunnerVersion(r.Version); !ok {
+		return fmt.Errorf("version %q must be x.y.z", r.Version)
+	}
+	for _, d := range r.Path {
+		if !strings.HasPrefix(d, "/") {
+			return fmt.Errorf("path entry %q must be absolute", d)
+		}
+	}
+	for k := range r.Env {
+		if k == "" || strings.ContainsAny(k, "= ") {
+			return fmt.Errorf("env key %q is not a valid variable name", k)
+		}
+	}
+	if r.MaxMinorLag < 1 {
+		return fmt.Errorf("max_minor_lag must be >= 1")
+	}
+	return nil
 }

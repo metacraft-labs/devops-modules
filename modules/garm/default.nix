@@ -354,6 +354,9 @@
           auth_token_file = "${stagedAhTokenPath name}"
         ''
         + optStr "runner_template" a.runnerTemplate
+        + optionalString (ahUsesNixRunner a) ''
+          command = ["${pkgs.bashInteractive}/bin/bash", "-s"]
+        ''
         + optStr "ca_cert_file" (if a.caCertFile == null then "" else toString a.caCertFile)
         + optStr "guest_metadata_url" (if p.guestMetadataURL == null then "" else p.guestMetadataURL)
         + optStr "guest_callback_url" (if p.guestCallbackURL == null then "" else p.guestCallbackURL)
@@ -377,7 +380,46 @@
           [capabilities]
           key_id = "${a.capabilities.keyId}"
           public_key = "${a.capabilities.publicKey}"
-        '';
+        ''
+        + optionalString (ahUsesNixRunner a) (mkAgentharborRunnerKeys a.runner);
+      # The sandbox payload execs the Nix github-runner (Sovereign-CI-Fleet
+      # AH3/AH7): every local-sandbox provider, or any provider that asks for
+      # the `sandbox` template.
+      ahUsesNixRunner =
+        a: a.runnerTemplate == "sandbox" || (a.runnerTemplate == "" && a.substrate == "local-sandbox");
+      # The payload runs the runner the way nixpkgs' services.github-runners
+      # unit does: the same package, and the unit's `path` (bash, coreutils,
+      # git, gnutar, gzip, nix) plus extraPackages, plus what the payload
+      # itself calls (curl, sed). The job's shell is the store bash, so the
+      # payload never depends on an FHS /bin/bash.
+      mkAgentharborRunnerKeys =
+        r:
+        let
+          pathPkgs = [
+            pkgs.bashInteractive
+            pkgs.coreutils
+            pkgs.git
+            pkgs.gnutar
+            pkgs.gzip
+            config.nix.package
+            pkgs.curl
+            pkgs.gnused
+          ]
+          ++ r.extraPackages;
+          binDirs = map (p: "${lib.getBin p}/bin") pathPkgs;
+        in
+        ''
+
+          [runner]
+          listener = "${r.package}/bin/Runner.Listener"
+          version = "${r.package.version}"
+          path = [${lib.concatMapStringsSep ", " (d: "\"${d}\"") binDirs}]
+          max_minor_lag = ${toString r.maxMinorLag}
+        ''
+        + optionalString (r.extraEnvironment != { }) (
+          "\n[runner.env]\n"
+          + lib.concatStrings (lib.mapAttrsToList (k: v: "${k} = \"${tomlStr v}\"\n") r.extraEnvironment)
+        );
       mkProviderConfigText =
         name: p:
         ''
@@ -2761,13 +2803,14 @@
                     ];
                     default = "";
                     description = ''
-                      Runner-install script handed to the job on stdin. `sandbox`
-                      (the default for local-sandbox) is rootless: it installs the
-                      runner inside the job's per-job workspace, so the host must
-                      already provide the runner's native dependencies and an FHS
-                      `/bin/bash` (the actions/runner scripts hard-code it). `upstream`
-                      is GARM's own template and needs root in a full guest (the
-                      default for vm/cloud-vm). Empty picks the substrate default.
+                      Runner payload handed to the job on stdin. `sandbox` (the
+                      default for local-sandbox) is rootless and downloads nothing:
+                      it fetches the JIT credentials into the job's per-job
+                      workspace and execs the host's Nix-packaged runner
+                      (`runner.package`) the way nixpkgs' `services.github-runners`
+                      unit runs it. `upstream` is GARM's own template and needs
+                      root in a full guest (the default for vm/cloud-vm). Empty
+                      picks the substrate default.
                     '';
                   };
                   ttlSeconds = mkOption {
@@ -2840,6 +2883,48 @@
                           type = types.str;
                           default = "";
                           description = "`--tmpfs-size`.";
+                        };
+                      };
+                    };
+                  };
+                  runner = mkOption {
+                    default = { };
+                    description = ''
+                      The Nix-packaged GitHub Actions runner the `sandbox` payload
+                      execs. Use the SAME package and extra packages as the host's
+                      `services.github-runners` (infra's overlaid `pkgs.github-runner`),
+                      so the sandbox runners and the systemd runners run one version
+                      and the actions-runner pin check covers both. The store paths
+                      must be realised on the agent-harbor HOST (the payload runs
+                      there), not only on this GARM controller.
+                    '';
+                    type = types.submodule {
+                      options = {
+                        package = mkOption {
+                          type = types.package;
+                          default = pkgs.github-runner;
+                          defaultText = lib.literalExpression "pkgs.github-runner";
+                          description = "The nixpkgs `github-runner` package (its `bin/Runner.Listener` and `version`).";
+                        };
+                        extraPackages = mkOption {
+                          type = types.listOf types.package;
+                          default = [ ];
+                          description = "Extra packages on the job's PATH, as `services.github-runners.<name>.extraPackages`.";
+                        };
+                        extraEnvironment = mkOption {
+                          type = types.attrsOf types.str;
+                          default = { };
+                          description = "Extra NON-SECRET runner environment, as `services.github-runners.<name>.extraEnvironment`.";
+                        };
+                        maxMinorLag = mkOption {
+                          type = types.ints.positive;
+                          default = 2;
+                          description = ''
+                            Refuse launches when `package` is this many minor releases
+                            behind the runner GitHub offers: the actions-runner pin
+                            check's staleness rule (MAX_MINOR_LAG), after which GitHub
+                            soon stops dispatching jobs to it.
+                          '';
                         };
                       };
                     };
