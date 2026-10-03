@@ -4305,17 +4305,17 @@
         "runquota-src": "runquota-src"
       },
       "locked": {
-        "lastModified": 1790859658,
-        "narHash": "sha256-batN6PUcX6TGkwZul+mRRAB3JotD/CuCsk/vgchA7Mw=",
+        "lastModified": 1791057758,
+        "narHash": "sha256-dloybGLPoGLyIk+KxIQLw7RY6j8MY0gyGIxw+H/Joxs=",
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "75f8e33c4428ea873fc358c514d3de63ef3e1891",
+        "rev": "a8b6c0c400da39a98304a835dce202a90b25499f",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "75f8e33c4428ea873fc358c514d3de63ef3e1891",
+        "rev": "a8b6c0c400da39a98304a835dce202a90b25499f",
         "type": "github"
       }
     },
