@@ -140,6 +140,10 @@
         # `garm-provider-vmharness` (env+stdin/stdout JSON protocol; shells to
         # virsh/vm-harness). Wired into `services.garm` as an optional provider.
         garm-provider-vmharness = pkgs.callPackage ./garm-provider-vmharness { };
+        # Sovereign-CI-Fleet AH3 — `garm-provider-agentharbor`: ephemeral runners
+        # as agent-harbor sandbox jobs over ah's REST direct-sandbox-launch API.
+        # Same Go module as garm-provider-vmharness (shared JIT templates).
+        garm-provider-agentharbor = pkgs.callPackage ./garm-provider-agentharbor { };
         # Runner-Fleet-Capability-Pools-And-Remote-Driving RE3/RE4 — the AWS
         # burst provider `garm-provider-aws` (cloudbase's EC2 external provider)
         # + a Metacraft Labs Apache-2.0 spot/InstanceMarketOptions patch. Wired

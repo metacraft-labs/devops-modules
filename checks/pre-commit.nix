@@ -40,9 +40,8 @@ in
       # replaces an existing `.pre-commit-config.yaml` SYMLINK without question.
       # It cost metacraft-labs/infra a day of silently running REPROBUILD's hooks
       # instead of prettier/nixfmt/editorconfig. See lib/git-hooks-repo-guard.nix.
-      repoGuard = import ../lib/git-hooks-repo-guard.nix {
-        expectedFlakeNixHash = builtins.hashFile "sha256" (self + "/flake.nix");
-      };
+      expectedFlakeNixHash = builtins.hashFile "sha256" (self + "/flake.nix");
+      repoGuard = import ../lib/git-hooks-repo-guard.nix { inherit expectedFlakeNixHash; };
 
       binCfg = config.mcl.gitHooks.committedBinaries;
       # Bound out here on purpose: inside `perSystem` the argument named
@@ -227,6 +226,16 @@ in
               check.enable = false;
 
               settings = {
+                # Upstream's own entry points (`pre-commit.devShell`,
+                # `pre-commit.installationScript`, `pre-commit.shellHook`) run
+                # its installer unguarded; they are read-only and cannot be
+                # replaced here, but they all ask this git whether they stand
+                # in a repository. Outside this flake's repository it says no.
+                # See lib/git-hooks-same-repo-git.nix.
+                gitPackage = lib.mkDefault (
+                  import ../lib/git-hooks-same-repo-git.nix { inherit pkgs expectedFlakeNixHash; }
+                );
+
                 # Use Rust-based alternative to pre-commit:
                 # https://github.com/j178/prek
                 package = pkgs.prek;

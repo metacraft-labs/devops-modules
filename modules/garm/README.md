@@ -289,6 +289,47 @@ and hostile pool `extra_specs` cannot change the remote create command.
 
 ---
 
+## 3a. The agent-harbor backend (`backend = "agentharbor"`, Sovereign-CI-Fleet AH3)
+
+`garm-provider-agentharbor` launches each runner as an ephemeral agent-harbor
+**sandbox job** through an ah server's REST direct-sandbox-launch endpoints
+(agent-harbor `specs/REST-Service/Direct-Sandbox-Launch.md`). It is a thin,
+stateless REST client: GARM's DB is the source of truth, the job `name` is the
+GARM instance name and the job `id` (`sbj_…`) is the `provider_id`. The runner
+runs on the **ah server's host**, so the GARM host needs only network reach to
+the endpoint; the provider relaxes nothing in the systemd sandbox.
+
+```nix
+services.garm.providers.ah-sandbox = {
+  backend = "agentharbor";          # package defaults to garm-provider-agentharbor
+  agentharbor = {
+    endpoint = "https://ah-ci.example.net:8443";
+    authTokenFile = "/run/agenix/garm/ah-api-key";   # LoadCredential-staged, never in the store
+    substrate = "local-sandbox";    # vm / cloud-vm answer 501 until AH1/AH6
+    ttlSeconds = 7200;              # sent with EVERY launch; the server enforces it
+    sandbox = { memoryMax = "8G"; pidsMax = 4096; };
+    capabilities = {                # pin the host's Ed25519 manifest key
+      keyId = "ahcap-…";
+      publicKey = "<base64url 32-byte key>";
+    };
+  };
+};
+```
+
+With `capabilities.publicKey` set, every launch first verifies the host's
+signed capability manifest (pinned key, unexpired, offers `substrate`, and
+derives every `ah-*` label the pool advertises) and refuses the launch
+otherwise. `DeleteInstance` is idempotent (`404` is success) and falls back to
+the job's `cleanupToken` if the DELETE itself fails.
+
+The default `sandbox` runner template is rootless: it installs the runner in
+the job's per-job workspace (deleted with the job) and skips
+`installdependencies.sh`, so the ah host must already provide the runner's
+native dependencies and an FHS `/bin/bash` inside the sandbox (the
+actions/runner scripts hard-code it). Gates: `t_garm_provider_agentharbor`
+(hermetic behaviour + end-to-end runner lifecycle + negative controls) and
+`t_garm_provider_agentharbor_module` (this example, eval-only).
+
 ## 4. Provisioning orgs + scale sets at runtime
 
 Scale sets carry GitHub-side state, so they are applied after the daemon is up.
