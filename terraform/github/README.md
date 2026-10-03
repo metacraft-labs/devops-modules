@@ -162,7 +162,9 @@ merges it into its `repositories` in the same change:
 
 ```nix
 repositories = map (r: r // (mainline.repositoryMergeSettings.${r.name} or { })) inventory.repositories;
-``` The `mergeQueues` output reports each queued
+```
+
+The `mergeQueues` output reports each queued
 repository's settings, branch and the policy's `strictRequiredStatusChecks`
 (false). The caller drops "require branches to be up to date" on that branch in
 the same change, because the queue already tests every group against the
@@ -206,8 +208,6 @@ branchProtectionExceptions ? { }; }`. When it is set, the render throws on
   `github_governance_branch_protection_admin_bypass_count` for `tofu test`
   assertions. Tested by
   [`tests/test-no-bypass-policy.sh`](./tests/test-no-bypass-policy.sh).
-- `tf-bootstrap.nix`: `enforceAdmins` defaults to `true`, and `false` needs
-  `enforceAdminsException`.
 
 A bypass that tooling genuinely needs, for example a release App that must write to
 a PR-only branch, is granted narrowly (`Integration` by App id) as a documented
@@ -275,34 +275,41 @@ bash terraform/github/tests/test-forbidden-branches.sh
 
 ## `tf-bootstrap.nix` — CI-enabling GitHub Layer-0 root
 
-The GitHub counterpart of the AWS `tf-bootstrap.nix`: a value-independent module
-rendering the minimal GitHub facts the CI/CD pipeline depends on to run — the
-reviewer team, the deploy Environment, the AWS OIDC role-ARN Actions variables,
-the Terraform safety labels, and branch protection for the deploy branch. Each
-consumer's `bootstrap/github/<name>/default.nix` is a thin caller:
+The GitHub counterpart of the AWS `tf-bootstrap.nix`. It renders only the GitHub
+facts the Terraform workflow reads to authenticate: the three AWS OIDC role-ARN
+Actions variables (`AWS_TERRAFORM_{PLAN,APPLY,DRIFT}_ROLE_ARN`) and
+`BACKEND_CONFIG_FILE`. Each consumer's `bootstrap/github/<name>/default.nix` is a
+thin caller:
 
 ```nix
 { ... }:
 import "${inputs.nixos-modules}/terraform/github/tf-bootstrap.nix" {
   awsAccountId = "…";
   namePrefix = "…-prod";               # state key derives: bootstrap/github/<namePrefix>.tfstate
-  githubOwner = "…";                   # githubRepo defaults to "infra", protectedBranch to "live"
-  reviewerTeam = {
-    name = "infra";
-    slug = "infra";
-    description = "Maintainers for … infrastructure.";
-    initialMaintainer = "…";           # the bootstrap admin username
-  };
-  requiredStatusCheckContexts = [ "…" ];   # the repo's real CI check contexts
+  githubOwner = "…";                   # githubRepo defaults to "infra"
 }
 ```
 
-Broader org governance (repositories, memberships, org secrets) is the separate
-[`governance.nix`](#governancenix--github-governance-engine) engine — this module
-is only the per-repo settings that unblock the pipeline. See
-[`tf-bootstrap.example.nix`](./tf-bootstrap.example.nix) and
-[`tests/test-bootstrap-render.sh`](./tests/test-bootstrap-render.sh). Verifying an
-extraction is a no-op is the same `nix eval --json | jq -S` diff as the AWS module.
+The reviewer team, its maintainers and repository grant, the `sensitive-change`
+and `allow-destroy` labels, the `production` Environment and the deploy branch's
+classic protection used to be rendered here. They are org governance, so each
+consumer now models them in its CI-applied governance root
+([`governance.nix`](#governancenix--github-governance-engine)). This module emits
+`removed` blocks (`destroy = false`) for their old addresses, so bumping a
+consumer's pin forgets them without touching GitHub. Import them into the
+governance root **first**, then bump. The retired arguments (`reviewerTeam`,
+`requiredStatusCheckContexts`, `enforceAdmins`, …) are still accepted;
+`reviewerTeam.additionalMaintainers` is read only to name the membership
+addresses to forget.
+
+The `production` Environment's existence is CI-authentication plumbing (the
+apply role trusts `repo:<owner>/<repo>:environment:production`), but it moved to
+governance as a whole: GitHub models existence and policy as one object, and the
+trust binds to the name, so an org admin can restore it with one GitHub call and
+no AWS login. See metacraft-pm `infrastructure/terraform-bootstrap-boundary.md`.
+
+See [`tf-bootstrap.example.nix`](./tf-bootstrap.example.nix) and
+[`tests/test-bootstrap-render.sh`](./tests/test-bootstrap-render.sh).
 
 ## `governance.nix` — GitHub governance engine
 

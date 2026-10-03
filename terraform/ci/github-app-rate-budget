@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Report the GitHub REST budget of the credential the github provider uses.
+
+WHY
+
+A GitHub App installation shares ONE primary rate-limit bucket (12,500
+requests/hour for an org installation on a paid plan) across every job that
+mints a token from it: every PR plan, push apply and drift check of every root
+that uses that App. A full refresh of a large governance root costs thousands
+of requests, so a few concurrent plans exhaust it, and the plan dies part-way
+with `403 API rate limit of 12500 still exceeded` (metacraft-labs/infra run
+36943870915, 2026-10-02). The existing "GH API rate limits" step reads the
+job's GITHUB_TOKEN (a different, 5,000/hour bucket), so it says nothing about
+this one.
+
+This script reads `GET /rate_limit` (which does not count against the limit)
+with the token in $GITHUB_TOKEN, prints the `core` bucket, and — given the
+reading taken before tofu ran — the number of requests consumed in between,
+which is a direct measurement of what a plan/apply costs (an upper bound when
+other jobs share the bucket at the same time; exact when they do not).
+
+It never prints the token, and it never fails the job: a measurement step must
+not turn an API hiccup into a red build.
+
+USAGE
+  github-app-rate-budget --label before --save FILE
+  github-app-rate-budget --label after --since FILE
+  (--from-file JSON reads a saved /rate_limit response instead of the API;
+   the tests use it.)
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+
+def fetch(api_url: str, token: str) -> dict:
+    req = urllib.request.Request(
+        f"{api_url.rstrip('/')}/rate_limit",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "terraform-ci-github-app-rate-budget",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.load(resp)
+
+
+def core_bucket(doc: dict) -> dict:
+    core = (doc.get("resources") or {}).get("core") or doc.get("rate")
+    if not isinstance(core, dict):
+        raise ValueError("no core bucket in the /rate_limit response")
+    out = {}
+    for key in ("limit", "used", "remaining", "reset"):
+        value = core.get(key)
+        if not isinstance(value, int):
+            raise ValueError(f"core.{key} is not an integer")
+        out[key] = value
+    return out
+
+
+def consumed(before: dict, after: dict) -> str:
+    """Requests used between two readings, or why it cannot be known."""
+    if before["reset"] == after["reset"]:
+        return str(after["used"] - before["used"])
+    # The hourly window rolled over in between: what was used before the
+    # rollover is lost, so only a lower bound is knowable.
+    return f">= {after['used']} (the hourly window reset in between)"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--label", default="")
+    ap.add_argument("--save")
+    ap.add_argument("--since")
+    ap.add_argument("--from-file")
+    ap.add_argument("--api-url", default=os.environ.get("GITHUB_API_URL", "https://api.github.com"))
+    args = ap.parse_args()
+
+    try:
+        if args.from_file:
+            with open(args.from_file, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        else:
+            token = os.environ.get("GITHUB_TOKEN", "")
+            if not token:
+                print("::warning::github-app-rate-budget: GITHUB_TOKEN is empty; nothing measured.")
+                return 0
+            doc = fetch(args.api_url, token)
+        core = core_bucket(doc)
+    except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        print(f"::warning::github-app-rate-budget: could not read the App's rate limit ({exc}); nothing measured.")
+        return 0
+
+    reset_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(core["reset"]))
+    lines = [
+        f"GitHub App REST budget ({args.label or 'now'}): "
+        f"limit={core['limit']} used={core['used']} remaining={core['remaining']} reset={reset_utc}"
+    ]
+
+    if args.since:
+        try:
+            with open(args.since, encoding="utf-8") as fh:
+                before = json.load(fh)
+            lines.append(f"Requests consumed since the earlier reading: {consumed(before, core)}")
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            lines.append(f"(no earlier reading to compare with: {exc})")
+
+    if args.save:
+        with open(args.save, "w", encoding="utf-8") as fh:
+            json.dump(core, fh)
+
+    for line in lines:
+        print(line)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as fh:
+            for line in lines:
+                fh.write(f"- {line}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

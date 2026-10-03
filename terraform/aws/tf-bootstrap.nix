@@ -1,7 +1,10 @@
 {
   awsAccountId,
   awsRegion,
-  budgetAlertEmails,
+  # Retired: the monthly budget is governance of the account, not CI
+  # machinery, and moved to the consumer's CI-applied account root
+  # (terraform/aws/<namePrefix>). Accepted so existing callers evaluate.
+  budgetAlertEmails ? [ ],
   githubBranch,
   githubEnvironment,
   githubOwner,
@@ -9,9 +12,9 @@
   lockTableName,
   namePrefix,
   orgLabel,
-  # Cost-allocation tags and Cost Categories can only be managed from the AWS
-  # Organizations management/payer account. Set false for member-account
-  # bootstraps (e.g. a dedicated per-org prod account) to skip them.
+  # Retired: cost-allocation tags and Cost Categories are account billing
+  # configuration, not CI machinery; they moved to the CI-applied account root.
+  # Accepted so existing callers evaluate; it no longer changes the render.
   manageCostAllocation ? true,
   # The GitHub Actions OIDC provider is account-global: only one owner may
   # create it. When two repos share an AWS account, the owning repo keeps
@@ -44,7 +47,7 @@ let
       values = [ githubApplyOidcSubject ];
     }
   ];
-  monthlyBudgetLimitUsd = 100;
+  # Retired cost-allocation tag keys, kept only to name the `removed` addresses.
   costAllocationTags = {
     project = "Project";
     environment = "Environment";
@@ -60,26 +63,23 @@ let
     role = "Role";
     tier = "Tier";
   };
-  costAllocationTagResourceRefs = builtins.map (
-    allocationTagName: "aws_ce_cost_allocation_tag.${allocationTagName}"
-  ) (builtins.attrNames costAllocationTags);
-  mkInheritedCostCategory = name: tagKey: {
-    inherit name;
-    rule_version = "CostCategoryExpression.v1";
-    default_value = "unallocated";
-    depends_on = costAllocationTagResourceRefs;
-    rule = [
-      {
-        type = "INHERITED_VALUE";
-        inherited_value = [
-          {
-            dimension_name = "TAG";
-            dimension_key = tagKey;
-          }
-        ];
-      }
-    ];
-  };
+  # Addresses this module rendered before the Layer-0 boundary was narrowed to
+  # the CI machinery (metacraft-pm infrastructure/terraform-bootstrap-boundary.md).
+  # The monthly budget and the cost-allocation settings are account governance;
+  # each consumer's CI-applied account root imports them FIRST, then a bump to
+  # this revision forgets them here (`removed`, destroy = false: AWS is not
+  # touched). A `removed` block for an address not in state is a no-op, so the
+  # list is the same for every consumer whatever `manageCostAllocation` was.
+  retiredAddresses = [
+    "aws_budgets_budget.monthly_cost"
+  ]
+  ++ map (name: "aws_ce_cost_allocation_tag.${name}") (builtins.attrNames costAllocationTags)
+  ++ map (name: "aws_ce_cost_category.${name}") [
+    "agent_harbor_cost_layer"
+    "agent_harbor_workload"
+    "agent_harbor_platform_layer"
+    "agent_harbor_component"
+  ];
   repo = "${githubOwner}/${githubRepo}";
   bootstrapStateKey = "bootstrap/aws/${namePrefix}.tfstate";
   managedStatePrefix = "terraform/";
@@ -401,31 +401,6 @@ in
       role = "\${aws_iam_role.break_glass_admin.name}";
       policy_arn = breakGlassAdministratorAccessPolicyArn;
     };
-
-    aws_budgets_budget.monthly_cost = {
-      name = "${namePrefix}-monthly-cost";
-      budget_type = "COST";
-      limit_amount = toString monthlyBudgetLimitUsd;
-      limit_unit = "USD";
-      time_unit = "MONTHLY";
-
-      notification = [
-        {
-          comparison_operator = "GREATER_THAN";
-          threshold = 80;
-          threshold_type = "PERCENTAGE";
-          notification_type = "ACTUAL";
-          subscriber_email_addresses = budgetAlertEmails;
-        }
-        {
-          comparison_operator = "GREATER_THAN";
-          threshold = 100;
-          threshold_type = "PERCENTAGE";
-          notification_type = "FORECASTED";
-          subscriber_email_addresses = budgetAlertEmails;
-        }
-      ];
-    };
   }
   // (
     # Account-global: only the owning repo creates it (see manageGithubOidcProvider).
@@ -435,24 +410,6 @@ in
           url = "https://${githubTokenHost}";
           client_id_list = [ "sts.amazonaws.com" ];
           thumbprint_list = [ "\${data.tls_certificate.github_actions.certificates[0].sha1_fingerprint}" ];
-        };
-      }
-    else
-      { }
-  )
-  // (
-    if manageCostAllocation then
-      {
-        aws_ce_cost_allocation_tag = builtins.mapAttrs (_name: tagKey: {
-          tag_key = tagKey;
-          status = "Active";
-        }) costAllocationTags;
-
-        aws_ce_cost_category = {
-          agent_harbor_cost_layer = mkInheritedCostCategory "${orgLabel}CostLayer" "CostLayer";
-          agent_harbor_workload = mkInheritedCostCategory "${orgLabel}Workload" "Workload";
-          agent_harbor_platform_layer = mkInheritedCostCategory "${orgLabel}PlatformLayer" "PlatformLayer";
-          agent_harbor_component = mkInheritedCostCategory "${orgLabel}Component" "Component";
         };
       }
     else
@@ -649,6 +606,11 @@ in
       }
   );
 
+  removed = map (from: {
+    inherit from;
+    lifecycle.destroy = false;
+  }) retiredAddresses;
+
   output = {
     expected_aws_account_id = {
       value = awsAccountId;
@@ -703,25 +665,6 @@ in
     common_tags = {
       value = "\${local.common_tags}";
       description = "Common cost-allocation and ownership tags applied to bootstrap AWS resources.";
-    };
-
-    cost_allocation_tag_keys = {
-      value = if manageCostAllocation then costAllocationTags else { };
-      description = "User-defined AWS cost allocation tag keys activated by the bootstrap root.";
-    };
-
-    cost_category_names = {
-      value =
-        if manageCostAllocation then
-          [
-            "\${aws_ce_cost_category.agent_harbor_cost_layer.name}"
-            "\${aws_ce_cost_category.agent_harbor_workload.name}"
-            "\${aws_ce_cost_category.agent_harbor_platform_layer.name}"
-            "\${aws_ce_cost_category.agent_harbor_component.name}"
-          ]
-        else
-          [ ];
-      description = "AWS Cost Categories managed by the bootstrap root for Agent Harbor cost reporting.";
     };
 
     terraform_plan_role_arn = {
@@ -812,11 +755,6 @@ in
         BACKEND_CONFIG_FILE = "backends/aws-${namePrefix}.hcl";
       };
       description = "GitHub Actions repository variables surfaced for the GitHub bootstrap layer.";
-    };
-
-    budget_alert_emails = {
-      value = budgetAlertEmails;
-      description = "Email addresses subscribed to budget alerts.";
     };
 
     github_branch = {

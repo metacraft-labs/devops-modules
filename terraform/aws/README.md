@@ -15,7 +15,18 @@ depends on:
 - the **DynamoDB lock table**,
 - the GitHub **OIDC provider** and the `PLAN` / `APPLY` / `DRIFT` **IAM roles**
   (trust scoped to the repo/branch/environment), plus their policies,
-- cost-allocation tags, cost categories, and a monthly budget.
+- the MFA-gated **break-glass** administrator role. It is not CI machinery, but
+  CI must not be able to write it: a CI-writable role holding
+  `AdministratorAccess` would let CI make itself administrator.
+
+That is all of Layer 0: the infrastructure of running `plan` and `apply` in CI.
+The monthly budget, the cost-allocation tags and the cost categories used to be
+rendered here too. They are account governance, so each consumer now declares
+them in its CI-applied account root (`terraform/aws/<namePrefix>`). Their old
+addresses are emitted as `removed` blocks (`destroy = false`), so bumping a
+consumer's pin forgets them without touching AWS. Import them into the account
+root **first**, then bump. See metacraft-pm
+`infrastructure/terraform-bootstrap-boundary.md`.
 
 ### Parameters
 
@@ -23,16 +34,16 @@ All identifiers are per-repo — two repos may point at the same AWS account
 today yet each keeps its own variables, so either can move to a separate
 account later without touching the other.
 
-| Param                                | Example                                                                    |
-| ------------------------------------ | -------------------------------------------------------------------------- |
-| `awsAccountId`                       | `"000000000000"`                                                           |
-| `awsRegion`                          | `"us-east-1"`                                                              |
-| `budgetAlertEmails`                  | `[ "ops@example.com" ]`                                                    |
-| `githubOwner` / `githubRepo`         | `"example-org"` / `"infra"`                                                |
-| `githubBranch` / `githubEnvironment` | `"live"` / `"production"`                                                  |
-| `lockTableName`                      | `"example-prod-tofu-locks"`                                                |
-| `namePrefix`                         | `"example-prod"` (state keys, role/ARN patterns)                           |
-| `orgLabel`                           | `"Example"` (PascalCase infix for Sids, cost categories, break-glass role) |
+| Param                                | Example                                                          |
+| ------------------------------------ | ---------------------------------------------------------------- |
+| `awsAccountId`                       | `"000000000000"`                                                 |
+| `awsRegion`                          | `"us-east-1"`                                                    |
+| `budgetAlertEmails`                  | retired; accepted and ignored                                    |
+| `githubOwner` / `githubRepo`         | `"example-org"` / `"infra"`                                      |
+| `githubBranch` / `githubEnvironment` | `"live"` / `"production"`                                        |
+| `lockTableName`                      | `"example-prod-tofu-locks"`                                      |
+| `namePrefix`                         | `"example-prod"` (state keys, role/ARN patterns)                 |
+| `orgLabel`                           | `"Example"` (PascalCase infix for Sids and the break-glass role) |
 
 ### Usage
 
@@ -42,7 +53,6 @@ A consumer's `bootstrap/aws/<name>/default.nix` becomes a thin caller:
 import "${inputs.nixos-modules}/terraform/aws/tf-bootstrap.nix" {
   awsAccountId = "…";
   awsRegion = "us-east-1";
-  budgetAlertEmails = [ "…" ];
   githubOwner = "…";
   githubRepo = "infra";
   githubBranch = "live";

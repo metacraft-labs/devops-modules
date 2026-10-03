@@ -671,6 +671,23 @@ jobs:
       # the App (e.g. the governance App) and export it as GITHUB_TOKEN for the
       # github provider. Preferred over a long-lived PAT — nothing new is stored,
       # the token expires in ~1h, and it is scoped to github_app_owner.
+      # CREDENTIAL DEADLINE. Recorded BEFORE minting, so it errs early: the
+      # moment the first short-lived credential this job mints (the 1 h App
+      # installation token, the AWS OIDC session) stops working. Every tofu
+      # call that can take the state lock runs under
+      # terraform/ci/tofu-credential-deadline, which interrupts it (SIGINT)
+      # while the credentials still work, so tofu releases its own lock instead
+      # of stranding it (infra run 36860633451, 2026-10-01).
+      - name: Record credential deadline
+        env:
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
+          GITHUB_APP: ${{ inputs.github_app_owner != '' }}
+          AWS_DURATION: ${{ inputs.aws_plan_role_arn != '' && inputs.aws_role_duration_seconds || '' }}
+        run: |
+          set -euo pipefail
+          not_after="$(bash "$DEADLINE_SCRIPT" not-after --github-app "$GITHUB_APP" --aws-duration "$AWS_DURATION")"
+          echo "TF_CREDENTIALS_NOT_AFTER=$not_after" >> "$GITHUB_ENV"
+
       - name: Mint GitHub App token
         if: inputs.github_app_owner != ''
         id: gh_app_token
@@ -685,6 +702,18 @@ jobs:
         run: |
           echo "::add-mask::${{ steps.gh_app_token.outputs.token }}"
           echo "GITHUB_TOKEN=${{ steps.gh_app_token.outputs.token }}" >> "$GITHUB_ENV"
+
+      # The App installation's ONE hourly REST bucket is shared by every job
+      # minting from it; reading it before and after tofu measures what this
+      # plan/apply cost. See terraform/ci/github-app-rate-budget.
+      - name: GitHub App API budget (before)
+        if: inputs.github_app_owner != ''
+        continue-on-error: true
+        env:
+          BUDGET_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-app-rate-budget
+        run: |
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$BUDGET_SCRIPT" --label before --save "$RUNNER_TEMP/gh-app-rate-budget.json"
 
       - name: Configure AWS credentials for plan
         if: inputs.aws_plan_role_arn != ''
@@ -728,6 +757,7 @@ jobs:
         env:
           BACKEND_CONFIG_FILE: ${{ inputs.backend_config_file }}
           WORKING_DIRECTORY: ${{ inputs.working_directory }}
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
         run: |
           set -euo pipefail
 
@@ -757,6 +787,12 @@ jobs:
           run_tofu() {
             env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
           }
+          # Interrupted while the job's credentials still work; see the
+          # "Record credential deadline" step.
+          run_tofu_bounded() {
+            bash "$DEADLINE_SCRIPT" run --not-after "${TF_CREDENTIALS_NOT_AFTER:-}" -- \
+              env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
+          }
 
           run_tofu init -input=false "${backend_args[@]}"
 
@@ -768,7 +804,7 @@ jobs:
           # stdout is streamed (tee) so a slow or stuck refresh is visible in
           # the job log while it happens, not only after tofu exits.
           set +e
-          run_tofu plan \
+          run_tofu_bounded plan \
             -input=false \
             -no-color \
             -lock=false \
@@ -837,6 +873,15 @@ jobs:
               for key, value in counts.items():
                   print(f"{key}={value}", file=output)
           PY
+
+      - name: GitHub App API budget (after)
+        if: always() && inputs.github_app_owner != ''
+        continue-on-error: true
+        env:
+          BUDGET_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-app-rate-budget
+        run: |
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$BUDGET_SCRIPT" --label after --since "$RUNNER_TEMP/gh-app-rate-budget.json"
 
       - name: Post plan comment
         if: steps.plan.outputs.text_plan_path != ''
@@ -1256,6 +1301,23 @@ jobs:
             printf '__MCL_TERRAFORM_SECRET__\n'
           } >> "$GITHUB_ENV"
 
+      # CREDENTIAL DEADLINE. Recorded BEFORE minting, so it errs early: the
+      # moment the first short-lived credential this job mints (the 1 h App
+      # installation token, the AWS OIDC session) stops working. Every tofu
+      # call that can take the state lock runs under
+      # terraform/ci/tofu-credential-deadline, which interrupts it (SIGINT)
+      # while the credentials still work, so tofu releases its own lock instead
+      # of stranding it (infra run 36860633451, 2026-10-01).
+      - name: Record credential deadline
+        env:
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
+          GITHUB_APP: ${{ inputs.github_app_owner != '' }}
+          AWS_DURATION: ${{ inputs.aws_apply_role_arn != '' && inputs.aws_role_duration_seconds || '' }}
+        run: |
+          set -euo pipefail
+          not_after="$(bash "$DEADLINE_SCRIPT" not-after --github-app "$GITHUB_APP" --aws-duration "$AWS_DURATION")"
+          echo "TF_CREDENTIALS_NOT_AFTER=$not_after" >> "$GITHUB_ENV"
+
       - name: Mint GitHub App token
         if: inputs.github_app_owner != ''
         id: gh_app_token
@@ -1270,6 +1332,18 @@ jobs:
         run: |
           echo "::add-mask::${{ steps.gh_app_token.outputs.token }}"
           echo "GITHUB_TOKEN=${{ steps.gh_app_token.outputs.token }}" >> "$GITHUB_ENV"
+
+      # The App installation's ONE hourly REST bucket is shared by every job
+      # minting from it; reading it before and after tofu measures what this
+      # plan/apply cost. See terraform/ci/github-app-rate-budget.
+      - name: GitHub App API budget (before)
+        if: inputs.github_app_owner != ''
+        continue-on-error: true
+        env:
+          BUDGET_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-app-rate-budget
+        run: |
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$BUDGET_SCRIPT" --label before --save "$RUNNER_TEMP/gh-app-rate-budget.json"
 
       - name: Configure AWS credentials for apply
         if: inputs.aws_apply_role_arn != ''
@@ -1300,11 +1374,17 @@ jobs:
           nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
             python3 "$GATE_SCRIPT" "$WORKING_DIRECTORY" --github-app-owner "$GITHUB_APP_OWNER"
 
-      - name: Apply
-        id: apply
+      # The apply is TWO tofu runs — refresh+plan, then apply of the saved plan
+      # — each taking the state lock. A large root's refresh can use most of a
+      # 1 h credential by itself, so the apply does not inherit what is left:
+      # the plan step saves the plan, fresh credentials are minted, and only
+      # then is the saved plan applied (each run under its own deadline).
+      - name: Plan for apply
+        id: apply_plan
         env:
           BACKEND_CONFIG_FILE: ${{ inputs.backend_config_file }}
           WORKING_DIRECTORY: ${{ inputs.working_directory }}
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
           DESTROY_GUARD: ${{ inputs.destroy_guard }}
           ALLOW_DESTROY: ${{ inputs.allow_destroy }}
           DESTROY_LABEL: ${{ inputs.destroy_label }}
@@ -1340,16 +1420,19 @@ jobs:
             env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
           }
 
+          run_tofu_bounded() {
+            bash "$DEADLINE_SCRIPT" run --not-after "${TF_CREDENTIALS_NOT_AFTER:-}" -- \
+              env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
+          }
+
           run_tofu init -input=false "${backend_args[@]}"
 
           plan_bin="$apply_dir/plan.tfplan"
           plan_text="$apply_dir/plan.txt"
           plan_stderr="$apply_dir/plan.stderr"
-          apply_text="$apply_dir/apply.txt"
-          apply_stderr="$apply_dir/apply.stderr"
 
           set +e
-          run_tofu plan \
+          run_tofu_bounded plan \
             -input=false \
             -no-color \
             -lock-timeout=300s \
@@ -1364,6 +1447,7 @@ jobs:
 
           if [ "$plan_exit" -eq 0 ]; then
             echo "No changes to apply."
+            echo "changes=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$plan_exit" -ne 2 ]; then
@@ -1407,13 +1491,80 @@ jobs:
             fi
           fi
 
+          echo "changes=true" >> "$GITHUB_OUTPUT"
+          echo "plan_bin=$plan_bin" >> "$GITHUB_OUTPUT"
+
+      # CREDENTIAL DEADLINE. Recorded BEFORE minting, so it errs early: the
+      # moment the first short-lived credential this job mints (the 1 h App
+      # installation token, the AWS OIDC session) stops working. Every tofu
+      # call that can take the state lock runs under
+      # terraform/ci/tofu-credential-deadline, which interrupts it (SIGINT)
+      # while the credentials still work, so tofu releases its own lock instead
+      # of stranding it (infra run 36860633451, 2026-10-01).
+      - name: Record credential deadline (apply)
+        if: steps.apply_plan.outputs.changes == 'true'
+        env:
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
+          GITHUB_APP: ${{ inputs.github_app_owner != '' }}
+          AWS_DURATION: ${{ inputs.aws_apply_role_arn != '' && inputs.aws_role_duration_seconds || '' }}
+        run: |
+          set -euo pipefail
+          not_after="$(bash "$DEADLINE_SCRIPT" not-after --github-app "$GITHUB_APP" --aws-duration "$AWS_DURATION")"
+          echo "TF_CREDENTIALS_NOT_AFTER=$not_after" >> "$GITHUB_ENV"
+
+      - name: Re-mint GitHub App token for apply
+        if: steps.apply_plan.outputs.changes == 'true' && inputs.github_app_owner != ''
+        id: gh_app_token_apply
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.github_app_owner }}
+
+      - name: Export the re-minted GITHUB_TOKEN
+        if: steps.apply_plan.outputs.changes == 'true' && inputs.github_app_owner != ''
+        run: |
+          echo "::add-mask::${{ steps.gh_app_token_apply.outputs.token }}"
+          echo "GITHUB_TOKEN=${{ steps.gh_app_token_apply.outputs.token }}" >> "$GITHUB_ENV"
+
+      - name: Refresh AWS credentials for apply
+        if: steps.apply_plan.outputs.changes == 'true' && inputs.aws_apply_role_arn != ''
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ inputs.aws_apply_role_arn }}
+          role-session-name: terraform-apply-${{ github.run_id }}
+          role-duration-seconds: ${{ inputs.aws_role_duration_seconds }}
+
+      - name: Apply
+        id: apply
+        if: steps.apply_plan.outputs.changes == 'true'
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
+          PLAN_BIN: ${{ steps.apply_plan.outputs.plan_bin }}
+        run: |
+          set -euo pipefail
+
+          apply_id="$(printf '%s' "$WORKING_DIRECTORY" | tr '/[:space:]' '--')"
+          apply_dir="$GITHUB_WORKSPACE/.result/terraform-apply/$apply_id"
+          apply_text="$apply_dir/apply.txt"
+          apply_stderr="$apply_dir/apply.stderr"
+
+          cd "$WORKING_DIRECTORY"
+
+          # `.terraform/` from the plan step's init is still here; the backend
+          # reads the refreshed AWS credentials from the environment.
+          tofu_bin="$(nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
+
           set +e
-          run_tofu apply \
+          bash "$DEADLINE_SCRIPT" run --not-after "${TF_CREDENTIALS_NOT_AFTER:-}" -- \
+            env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" apply \
             -input=false \
             -no-color \
             -auto-approve \
             -lock-timeout=300s \
-            "$plan_bin" \
+            "$PLAN_BIN" \
             >"$apply_text" 2>"$apply_stderr"
           apply_exit=$?
           set -e
@@ -1425,6 +1576,15 @@ jobs:
             echo "failure-reason=apply-failed" >> "$GITHUB_OUTPUT"
             exit "$apply_exit"
           fi
+
+      - name: GitHub App API budget (after)
+        if: always() && inputs.github_app_owner != ''
+        continue-on-error: true
+        env:
+          BUDGET_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-app-rate-budget
+        run: |
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$BUDGET_SCRIPT" --label after --since "$RUNNER_TEMP/gh-app-rate-budget.json"
 
       - name: Post-apply smoke tests
         if: inputs.smoke_test_command != ''
@@ -1608,6 +1768,23 @@ jobs:
             printf '__MCL_TERRAFORM_SECRET__\n'
           } >> "$GITHUB_ENV"
 
+      # CREDENTIAL DEADLINE. Recorded BEFORE minting, so it errs early: the
+      # moment the first short-lived credential this job mints (the 1 h App
+      # installation token, the AWS OIDC session) stops working. Every tofu
+      # call that can take the state lock runs under
+      # terraform/ci/tofu-credential-deadline, which interrupts it (SIGINT)
+      # while the credentials still work, so tofu releases its own lock instead
+      # of stranding it (infra run 36860633451, 2026-10-01).
+      - name: Record credential deadline
+        env:
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
+          GITHUB_APP: ${{ inputs.github_app_owner != '' }}
+          AWS_DURATION: ${{ (inputs.aws_drift_role_arn || inputs.aws_plan_role_arn) != '' && inputs.aws_role_duration_seconds || '' }}
+        run: |
+          set -euo pipefail
+          not_after="$(bash "$DEADLINE_SCRIPT" not-after --github-app "$GITHUB_APP" --aws-duration "$AWS_DURATION")"
+          echo "TF_CREDENTIALS_NOT_AFTER=$not_after" >> "$GITHUB_ENV"
+
       - name: Mint GitHub App token
         if: inputs.github_app_owner != ''
         id: gh_app_token
@@ -1684,13 +1861,18 @@ jobs:
       - name: Detect drift
         id: drift
         timeout-minutes: ${{ inputs.plan_timeout_minutes }}
+        env:
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
         run: |
           set -euo pipefail
 
           cd ${{ inputs.working_directory }}
           tofu_bin="$(nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
+          # Drift's plan takes the state lock, so it runs under the credential
+          # deadline too (see "Record credential deadline").
           run_tofu() {
-            env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
+            bash "$DEADLINE_SCRIPT" run --not-after "${TF_CREDENTIALS_NOT_AFTER:-}" -- \
+              env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
           }
 
           set +e

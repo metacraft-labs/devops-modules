@@ -1,12 +1,23 @@
-# Company-agnostic GitHub Layer-0 bootstrap module (CI-enabling repo settings).
+# Company-agnostic GitHub Layer-0 bootstrap module (CI-authentication plumbing).
 #
-# Renders the minimal GitHub facts the CI/CD pipeline depends on to run: the
-# reviewer team, the deploy Environment, the AWS OIDC role-ARN Actions variables,
-# the Terraform safety labels, and branch protection for the deploy branch. This
-# is the GitHub counterpart of tf-bootstrap.nix on the AWS side — a value-
-# independent module; each consumer's bootstrap/github/<name>/default.nix thin-
-# calls it with its own identifiers. Broader org governance (repos, memberships,
-# org secrets) lives in the separate governance engine (governance.nix).
+# Renders ONLY the GitHub facts the Terraform workflow reads to authenticate:
+# the three AWS OIDC role-ARN Actions variables and BACKEND_CONFIG_FILE. That is
+# the whole of the GitHub side of Layer 0 ("the true bootstrap resources are the
+# ones related to the infrastructure of running terraform plan and apply in CI,
+# nothing else"); see metacraft-pm infrastructure/terraform-bootstrap-boundary.md.
+#
+# Everything this module used to render besides those four variables -- the
+# reviewer team, its maintainers and repository grant, the Terraform safety
+# labels, the deploy Environment and the deploy branch's classic protection --
+# is ordinary org governance. It now lives in each consumer's CI-applied
+# governance root (governance.nix), which imports it. For every such address
+# this module emits a `removed` block with `destroy = false`, so a consumer that
+# bumps its pin FORGETS those objects (GitHub is not touched). A `removed` block
+# for an address that is not in state is a no-op.
+#
+# The retired arguments are still accepted so existing callers evaluate
+# unchanged; only `reviewerTeam.additionalMaintainers` is read, to name the
+# per-maintainer membership addresses that must be forgotten.
 {
   awsAccountId,
   awsRegion ? "us-east-1",
@@ -15,32 +26,20 @@
   githubRepo ? "infra",
   githubEnvironment ? "production",
   protectedBranch ? "live",
-  # { name, slug, description, initialMaintainer, additionalMaintainers ? [ ] }
-  # `additionalMaintainers` are further GitHub logins made team maintainers;
-  # `initialMaintainer` keeps its own resource address so existing state is
-  # unaffected.
-  reviewerTeam,
-  # Whether classic branch protection binds org/repo admins too. The shared
-  # branch-protection policy's `noBypass` rule requires it: agents act under
-  # their operator's identity, so an admin escape hatch is one every agent
-  # holds (branching-policy.md "No bypass"; this reverses the earlier Phase P
-  # "protect the mainline, but NOT enforce_admins" model, 2026-09-25).
-  # Passing false requires `enforceAdminsException`, the documented reason.
+  # Retired (governance-owned now). Accepted for caller compatibility;
+  # `additionalMaintainers` names the membership addresses to forget.
+  reviewerTeam ? { },
   enforceAdmins ? true,
   enforceAdminsException ? null,
-  # During single-maintainer bootstrap, mandatory PR-review gates would block
-  # every PR. Required checks stay enforced regardless; flip to false once the
-  # reviewer team has at least two admins.
   singleMaintainerBootstrap ? true,
   productionEnvironmentRequiresManualApproval ? false,
   productionEnvironmentUsesBranchPolicy ? true,
-  requiredStatusCheckContexts,
+  requiredStatusCheckContexts ? [ ],
   backendConfigFile ? "backends/aws-${namePrefix}.hcl",
 }:
 let
   githubRepository = "${githubOwner}/${githubRepo}";
   githubBootstrapStateKey = "bootstrap/github/${namePrefix}.tfstate";
-  requirePullRequestReviews = !singleMaintainerBootstrap;
   terraformRoles = {
     AWS_TERRAFORM_PLAN_ROLE_ARN = "arn:aws:iam::${awsAccountId}:role/${namePrefix}-terraform-plan";
     AWS_TERRAFORM_APPLY_ROLE_ARN = "arn:aws:iam::${awsAccountId}:role/${namePrefix}-terraform-apply";
@@ -51,11 +50,23 @@ let
   githubActionsVariables = terraformRoles // {
     BACKEND_CONFIG_FILE = backendConfigFile;
   };
+  # Addresses this module rendered before the Layer-0 boundary was narrowed.
+  # They are forgotten, never destroyed: each object is imported by the
+  # consumer's governance root first (import-first ordering).
+  retiredAddresses = [
+    "github_team.infra"
+    "github_team_membership.infra_initial_maintainer"
+    "github_team_repository.infra"
+    "github_issue_label.sensitive_change"
+    "github_issue_label.allow_destroy"
+    "github_repository_environment.production"
+    "github_branch_protection.main"
+  ]
+  ++ map (
+    login:
+    "github_team_membership.infra_maintainer_${builtins.replaceStrings [ "-" "." ] [ "_" "_" ] login}"
+  ) (reviewerTeam.additionalMaintainers or [ ]);
 in
-assert
-  enforceAdmins
-  || (builtins.isString enforceAdminsException && builtins.stringLength enforceAdminsException >= 20)
-  || throw "tf-bootstrap: enforceAdmins = false without a documented `enforceAdminsException` — the branch-protection policy forbids admin bypass";
 {
   terraform = {
     required_version = ">= 1.8.0";
@@ -71,36 +82,6 @@ assert
   };
 
   resource = {
-    github_team.infra = {
-      name = reviewerTeam.name;
-      description = reviewerTeam.description;
-      privacy = "closed";
-    };
-
-    github_team_membership = {
-      infra_initial_maintainer = {
-        team_id = "\${github_team.infra.id}";
-        username = reviewerTeam.initialMaintainer;
-        role = "maintainer";
-      };
-    }
-    // builtins.listToAttrs (
-      map (login: {
-        name = "infra_maintainer_${builtins.replaceStrings [ "-" "." ] [ "_" "_" ] login}";
-        value = {
-          team_id = "\${github_team.infra.id}";
-          username = login;
-          role = "maintainer";
-        };
-      }) (reviewerTeam.additionalMaintainers or [ ])
-    );
-
-    github_team_repository.infra = {
-      team_id = "\${github_team.infra.id}";
-      repository = githubRepo;
-      permission = "maintain";
-    };
-
     github_actions_variable = {
       backend_config_file = {
         repository = githubRepo;
@@ -126,75 +107,12 @@ assert
         value = githubActionsVariables.AWS_TERRAFORM_DRIFT_ROLE_ARN;
       };
     };
-
-    github_issue_label = {
-      sensitive_change = {
-        repository = githubRepo;
-        name = "sensitive-change";
-        color = "D93F0B";
-        description = "Terraform safety gate";
-      };
-
-      allow_destroy = {
-        repository = githubRepo;
-        name = "allow-destroy";
-        color = "D93F0B";
-        description = "Terraform safety gate";
-      };
-    };
-
-    github_repository_environment.production = {
-      repository = githubRepo;
-      environment = githubEnvironment;
-      wait_timer = 0;
-      can_admins_bypass = false;
-      deployment_branch_policy = [
-        {
-          protected_branches = productionEnvironmentUsesBranchPolicy;
-          custom_branch_policies = false;
-        }
-      ];
-    };
-
-    github_branch_protection.main = {
-      repository_id = githubRepo;
-      pattern = protectedBranch;
-      enforce_admins = enforceAdmins;
-      allows_deletions = false;
-      allows_force_pushes = false;
-      require_conversation_resolution = true;
-      # NOT linear history. The protected branch is a PR-gated mainline
-      # (infra `live`), where the branch-protection policy allows merge commits
-      # only (branching-policy.md, "Repository Merge-Method Settings"): squash
-      # and rebase are forbidden because they land something other than the
-      # reviewed commits. Linear history forbids merge commits, so the
-      # combination would leave no allowed method and every pull request
-      # unmergeable.
-      required_linear_history = false;
-
-      required_status_checks = [
-        {
-          strict = true;
-          contexts = requiredStatusCheckContexts;
-        }
-      ];
-    }
-    // (
-      if requirePullRequestReviews then
-        {
-          required_pull_request_reviews = [
-            {
-              dismiss_stale_reviews = true;
-              require_code_owner_reviews = true;
-              require_last_push_approval = true;
-              required_approving_review_count = 1;
-            }
-          ];
-        }
-      else
-        { }
-    );
   };
+
+  removed = map (from: {
+    inherit from;
+    lifecycle.destroy = false;
+  }) retiredAddresses;
 
   output = {
     expected_aws_account_id = {
@@ -219,52 +137,12 @@ assert
 
     github_environment = {
       value = githubEnvironment;
-      description = "GitHub Environment used by Terraform apply jobs.";
-    };
-
-    github_reviewer_team_slug = {
-      value = reviewerTeam.slug;
-      description = "GitHub team slug used for CODEOWNERS and future PR review rules.";
-    };
-
-    github_reviewer_team_name = {
-      value = "\${github_team.infra.name}";
-      description = "GitHub team name managed by this bootstrap layer.";
-    };
-
-    github_reviewer_team_initial_maintainer = {
-      value = reviewerTeam.initialMaintainer;
-      description = "Initial maintainer for the Terraform-managed infrastructure reviewer team.";
-    };
-
-    single_maintainer_bootstrap = {
-      value = singleMaintainerBootstrap;
-      description = "Whether GitHub PR review gates are relaxed for a single-maintainer bootstrap phase.";
-    };
-
-    production_environment_requires_manual_approval = {
-      value = productionEnvironmentRequiresManualApproval;
-      description = "Whether production Environment requires a separate post-merge deployment approval.";
-    };
-
-    production_environment_uses_branch_policy = {
-      value = productionEnvironmentUsesBranchPolicy;
-      description = "Whether production Environment deployments are limited to protected branches.";
-    };
-
-    branch_protection_requires_pull_request_reviews = {
-      value = requirePullRequestReviews;
-      description = "Whether branch protection requires pull request reviews.";
+      description = "GitHub Environment the apply role's OIDC trust is bound to (the Environment itself is governance-owned).";
     };
 
     protected_branch = {
       value = protectedBranch;
-      description = "GitHub branch protected by this bootstrap layer.";
-    };
-
-    required_status_check_contexts = {
-      value = requiredStatusCheckContexts;
-      description = "Required GitHub status check contexts for the protected branch.";
+      description = "The deploy branch (its protection is governance-owned).";
     };
 
     github_bootstrap_state_key = {
@@ -275,6 +153,11 @@ assert
     github_actions_variables = {
       value = githubActionsVariables;
       description = "GitHub Actions repository variables managed by the GitHub provider.";
+    };
+
+    retired_addresses = {
+      value = retiredAddresses;
+      description = "Addresses this layer forgets (removed, destroy = false); their objects are governance-owned.";
     };
   };
 }
