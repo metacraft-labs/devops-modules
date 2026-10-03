@@ -179,7 +179,13 @@ func (p *Provider) renderInstallScript(bootstrap commonParams.BootstrapInstance,
 	}
 	switch template {
 	case TemplateSandbox:
-		return provider.RenderLinuxSandboxRunnerInstallScript(bootstrap, tools, bootstrap.Name)
+		if err := p.cfg.Runner.validate(); err != nil {
+			return nil, fmt.Errorf("the sandbox payload needs [runner]: %w", err)
+		}
+		if err := checkNixRunnerFresh(p.cfg.Runner.Version, provider.OfferedRunnerVersion(tools), p.cfg.Runner.MaxMinorLag); err != nil {
+			return nil, err
+		}
+		return renderNixRunnerPayload(bootstrap, tools, p.cfg.Runner)
 	default:
 		return provider.RenderUpstreamRunnerInstallScript(bootstrap, tools, bootstrap.Name)
 	}
@@ -506,6 +512,12 @@ func toProviderInstance(job Job, fallbackOS commonParams.OSType) commonParams.Pr
 		OSArch:     osArch,
 		Status:     GARMStatus(job.State),
 	}
+	if job.State == StateExited {
+		if fault := exitFault(job); fault != "" {
+			inst.Status = commonParams.InstanceError
+			inst.ProviderFault = []byte(fault)
+		}
+	}
 	for _, a := range job.Addresses {
 		inst.Addresses = append(inst.Addresses, commonParams.Address{Address: a, Type: commonParams.PrivateAddress})
 	}
@@ -513,4 +525,51 @@ func toProviderInstance(job Job, fallbackOS commonParams.OSType) commonParams.Pr
 		inst.ProviderFault = []byte(*job.Error)
 	}
 	return inst
+}
+
+// runnerExitMeanings are actions/runner's Runner.Listener return codes
+// (src/Runner.Common/Constants.cs, Runner.ReturnCode). They are the RUNNER's
+// meanings, applied here because the payload execs the runner; agent-harbor
+// only reports the number.
+var runnerExitMeanings = map[int]string{
+	1: "TerminatedError: the runner failed (for example its registration was rejected)",
+	2: "RetryableError",
+	3: "RunnerUpdating (updates are disabled; unexpected)",
+	4: "RunOnceRunnerUpdating (updates are disabled; unexpected)",
+	5: "SessionConflict: another listener holds this runner's session",
+	6: "RunnerConfigurationRefreshed",
+	7: "RunnerVersionDeprecated: GitHub refuses this runner version; bump the Nix github-runner",
+
+	PayloadFailureExit: "the sandbox payload failed before starting the runner; see the instance's status messages",
+}
+
+// exitFault decides whether an EXITED job ended cleanly, from GARM's point of
+// view. A clean ephemeral runner exits 0 after its one job; anything else is a
+// crash or a refused registration and is reported as InstanceError with the
+// reason as the provider fault, so GARM (and its operator) can tell them apart.
+//
+// It prefers the job command's own status (commandExitCode/commandSignal) and
+// falls back to the launcher's exitCode for servers that do not report it,
+// where 0 still means the command succeeded (the launcher's 0/1 contract).
+// Returns "" for a clean exit.
+func exitFault(job Job) string {
+	switch {
+	case job.CommandSignal != nil:
+		return fmt.Sprintf("runner was killed by signal %d", *job.CommandSignal)
+	case job.CommandExitCode != nil:
+		code := *job.CommandExitCode
+		if code == 0 {
+			return ""
+		}
+		if meaning, ok := runnerExitMeanings[code]; ok {
+			return fmt.Sprintf("runner exited with code %d (%s)", code, meaning)
+		}
+		return fmt.Sprintf("runner exited with code %d", code)
+	case job.ExitCode != nil && *job.ExitCode == 0:
+		return ""
+	case job.ExitCode != nil:
+		return fmt.Sprintf("runner did not exit cleanly (sandbox launcher exit %d; the server reports no command status)", *job.ExitCode)
+	default:
+		return "runner exited without a reported status"
+	}
 }

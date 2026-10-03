@@ -75,12 +75,17 @@ type HostInfo struct {
 
 // Job is a SandboxJob as returned by every endpoint.
 type Job struct {
-	ID                 string            `json:"id"`
-	Name               string            `json:"name"`
-	Substrate          string            `json:"substrate"`
-	State              string            `json:"state"`
-	TerminationReason  *string           `json:"terminationReason"`
-	ExitCode           *int              `json:"exitCode"`
+	ID                string  `json:"id"`
+	Name              string  `json:"name"`
+	Substrate         string  `json:"substrate"`
+	State             string  `json:"state"`
+	TerminationReason *string `json:"terminationReason"`
+	ExitCode          *int    `json:"exitCode"`
+	// CommandExitCode/CommandSignal are the job command's own status (the
+	// runner payload's), when the server can observe it (spec § Exit codes);
+	// older servers omit them.
+	CommandExitCode    *int              `json:"commandExitCode"`
+	CommandSignal      *int              `json:"commandSignal"`
 	Error              *string           `json:"error"`
 	Labels             map[string]string `json:"labels"`
 	Command            []string          `json:"command"`
