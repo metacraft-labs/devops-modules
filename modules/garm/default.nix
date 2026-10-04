@@ -1235,9 +1235,17 @@
           #   Compute a pool's classic-runner tag set. With a manifest: derive the
           #   proven hardware labels (RA6→RC1), LINT any declared set (advertised
           #   ⊆ derived, FAIL-CLOSED), then append policy labels. Without a
-          #   manifest: the declared set verbatim + policy. Prints a CSV tag list;
-          #   non-zero on a lint/derive failure (no pool for an over-advertised or
-          #   unverifiable host — never a guessed label set).
+          #   manifest: the declared set verbatim + policy. Prints a CSV tag list.
+          #   Two distinct failure codes, because they differ in PERMANENCE and
+          #   the epilogue's exit-code decision turns on exactly that:
+          #     1  the proven set could not be obtained at all (manifest
+          #        unreadable, runner-label-tool failed). Might be transient.
+          #     2  the proven set WAS obtained and the declaration is not a
+          #        subset of it (advertised ⊄ derived). The manifest is a
+          #        build-time artifact, so every retry returns this same
+          #        verdict — a declaration error, never transient.
+          #   Either way: no pool for an over-advertised or unverifiable host —
+          #   never a guessed label set.
           derive_tags() {
             local mf="$1" declared="$2" policy="$3" derived=""
             if [ -n "$mf" ]; then
@@ -1251,7 +1259,7 @@
               fi
               if [ -n "$declared" ] && ! runner-label-tool lint -m "$mf" -a "$declared" >/dev/null 2>&1; then
                 log "ERROR: declared labels ($declared) NOT proven by '$mf' (advertised ⊄ derived) — refusing pool"
-                return 1
+                return 2
               fi
               printf '%s' "$derived''${policy:+,$policy}"
             else
@@ -1402,8 +1410,20 @@
             mf="$(echo "$pl" | jq -r '.manifestFile // ""')"
             declared="$(echo "$pl" | jq -r '.labels | join(",")')"
             policy="$(echo "$pl" | jq -r '.policyLabels | join(",")')"
-            if ! tags="$(derive_tags "$mf" "$declared" "$policy")"; then
-              pool_failed "$plname" "labels" "label derivation/lint failed against manifest '$mf' (fail-closed)"
+            derive_rc=0
+            tags="$(derive_tags "$mf" "$declared" "$policy")" || derive_rc=$?
+            if [ "$derive_rc" -ne 0 ]; then
+              if [ "$derive_rc" -eq 2 ]; then
+                # advertised ⊄ derived. Re-running cannot change this: the
+                # manifest is a store path and the declaration is in the unit
+                # that is already running. Mark it so the epilogue exits 3
+                # instead of looping every RestartSec.
+                pool_failed "$plname" "labels" \
+                  "declared labels ($declared) are NOT proven by manifest '$mf' (advertised ⊄ derived) — DECLARATION ERROR, fail-closed"
+              else
+                # The proven set could not be obtained. UNSURE ⇒ TRANSIENT.
+                pool_failed "$plname" "labels" "label derivation failed against manifest '$mf' (fail-closed)"
+              fi
               continue
             fi
             # RC5: append legacy alias class names verbatim (NOT linted — a name,
@@ -1578,7 +1598,10 @@
           #   0  everything converged.
           #   3  every pool that failed did so for a reason RE-RUNNING CANNOT
           #      FIX — the forge/controller returned a 4xx-class refusal of the
-          #      DECLARATION itself. garm-reconcile.service pairs this with
+          #      DECLARATION itself, or the declaration was refused LOCALLY by
+          #      the fail-closed label lint (advertised ⊄ derived, which is a
+          #      verdict on two build-time artifacts and so never changes).
+          #      garm-reconcile.service pairs this with
           #      RestartPreventExitStatus=3, so systemd leaves the unit FAILED
           #      (loud: `systemctl --failed`, the deploy, any unit-state alert)
           #      and does NOT re-run it. Everything else on the controller is
@@ -1603,13 +1626,14 @@
               case "$f_detail" in
                 *"[400]"* | *"[404]"* | *"[409]"* | *"[422]"* \
                   | *"Bad Request"* | *"invalid OS type"* | *"invalid OS architecture"* \
-                  | *"no such provider"* | *"no default template can be found"*) ;;
+                  | *"no such provider"* | *"no default template can be found"* \
+                  | *"DECLARATION ERROR"*) ;;
                 *) permanent=0 ;;
               esac
             done < "$failed_pools"
             log "ERROR: ============================================================"
             if [ "$permanent" = 1 ]; then
-              log "ERROR: every failure above is a DECLARATION error (4xx-class): re-running"
+              log "ERROR: every failure above is a DECLARATION error: re-running"
               log "ERROR: this reconcile cannot fix it, so systemd is told NOT to retry"
               log "ERROR: (exit 3 + RestartPreventExitStatus). Fix the declaration and deploy."
               exit 3

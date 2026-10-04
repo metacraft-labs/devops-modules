@@ -288,7 +288,56 @@ top@{ ... }:
             controller.wait_for_unit("garm.service")
             controller.wait_for_open_port(${toString mockPort})
             controller.wait_for_open_port(9997)
-            controller.wait_for_unit("garm-reconcile.service")
+
+            # `hms-overclaim` is a DELIBERATELY invalid declaration (it advertises
+            # `gpu` on a non-GPU host), so a converged run is impossible by
+            # construction and the unit must end up `failed` — demanding success
+            # here would be demanding that the fail-closed lint not fire.
+            # What is pinned instead is HOW it fails, which is the part that
+            # regressed: exit 3, the declaration-error code that
+            # RestartPreventExitStatus=3 turns into ONE loud failure, rather
+            # than exit 1 and a reconcile every RestartSec forever.
+            def reconcile_settled():
+                controller.wait_until_succeeds(
+                    "systemctl show -p ActiveState --value garm-reconcile.service "
+                    "| grep -qxE 'active|failed'",
+                    timeout=180,
+                )
+
+            reconcile_settled()
+            state = controller.succeed(
+                "systemctl show -p ActiveState,Result,ExecMainStatus,NRestarts "
+                "garm-reconcile.service"
+            )
+            print(f"[reconcile] {state.strip()}")
+            assert "ActiveState=failed" in state, (
+                f"the refused over-claim must leave the unit failed and loud:\n{state}"
+            )
+            assert "ExecMainStatus=3" in state, (
+                "a label over-claim is a DECLARATION error: the reconcile must exit 3 "
+                "(permanent, not retried), not 1 (retry until the start limit trips)."
+                f"\n{state}"
+            )
+
+            # ...and exit 3 must actually STOP the loop. Sampling NRestarts twice
+            # across more than RestartSec (5s) tests that without depending on
+            # whatever happened while garm was still coming up.
+            def nrestarts():
+                return int(
+                    controller.succeed(
+                        "systemctl show -p NRestarts --value garm-reconcile.service"
+                    ).strip()
+                )
+
+            n_before = nrestarts()
+            controller.sleep(12)
+            n_after = nrestarts()
+            assert n_after == n_before, (
+                "exit 3 was retried anyway (NRestarts "
+                f"{n_before} -> {n_after}): RestartPreventExitStatus=3 is what stops "
+                "the 5s doomed-reconcile loop, and it is not holding."
+            )
+            print(f"[reconcile] exit 3 not retried (NRestarts stable at {n_after})")
 
             def gcli(args):
                 return controller.succeed(
@@ -374,8 +423,21 @@ top@{ ... }:
             print("[coexist] scale set 'legacy-eph' runs in parallel with the pools")
 
             # --- idempotency: a second reconcile is a no-op on the pool count -
-            controller.succeed("systemctl start garm-reconcile.service")
-            controller.wait_until_succeeds("systemctl is-active garm-reconcile.service || systemctl show -p Result garm-reconcile.service | grep -q success", timeout=60)
+            # `systemctl restart` exits non-zero here (the unit exits 3 by
+            # design), so drive it with `execute` and wait for a NEW invocation
+            # to reach a terminal state — otherwise the already-failed state
+            # from the first run satisfies the wait immediately and nothing is
+            # re-run.
+            inv_before = controller.succeed(
+                "systemctl show -p InvocationID --value garm-reconcile.service"
+            ).strip()
+            controller.execute("systemctl restart garm-reconcile.service")
+            controller.wait_until_succeeds(
+                "test \"$(systemctl show -p InvocationID --value garm-reconcile.service)\" "
+                f"!= '{inv_before}'",
+                timeout=120,
+            )
+            reconcile_settled()
             pools2 = J.loads(gcli(f"pool list --org {oid}"))
             assert len(pools2) == len(pools), (
                 f"reconcile not idempotent: {len(pools)} -> {len(pools2)} pools"
