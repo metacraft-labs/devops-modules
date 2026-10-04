@@ -50,6 +50,7 @@
     ./garm-central-recovery.nix
     ./garm-provider-vmharness-protocol.nix
     ./garm-provider-vmharness-windows-toolchain.nix
+    ./garm-provider-agentharbor.nix
     ./vmharness-image-is-honoured.nix
     ./vmharness-serve-linux-deploy.nix
     ./vmharness-serve-inventory-textfile.nix
@@ -70,6 +71,7 @@
     ./packages-ci-matrix.nix
     ./pre-commit.nix
     ./git-hooks-reprobuild-handoff.nix
+    ./git-hooks-same-repo-git.nix
     ./secret-integration
     ./setup-nix-transfer-resilience.nix
     ./terraform-ci-matrix.nix

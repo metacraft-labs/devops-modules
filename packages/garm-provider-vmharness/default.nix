@@ -20,7 +20,29 @@ buildGoModule {
   # Self-contained Go source (its own go.mod + vendored deps). Kept inside
   # nixos-modules for M1 (may graduate to its own repo later, like the M0
   # garm package graduated conceptually).
-  src = ./src;
+  #
+  # The same Go module also hosts `garm-provider-agentharbor` (Sovereign-CI-Fleet
+  # AH3; see ../garm-provider-agentharbor). Its files are filtered OUT of this
+  # package's source so garm-provider-vmharness keeps a byte-identical store
+  # path — adding the sibling provider must not roll GARM on every vmharness
+  # host. `builtins.path` with the original name "src" keeps the hash equal to
+  # the unfiltered `./src` of before. (runner_install_shared.go only exports
+  # this package's templates to the sibling; nothing here calls it.)
+  src = builtins.path {
+    path = ./src;
+    name = "src";
+    filter =
+      path: _type:
+      let
+        rel = lib.removePrefix (toString ./src + "/") (toString path);
+      in
+      !(builtins.elem rel [
+        "cmd/garm-provider-agentharbor"
+        "internal/agentharbor"
+        "internal/protocoltest/agentharbor_protocol_test.go"
+        "internal/provider/runner_install_shared.go"
+      ]);
+  };
 
   # Deps are vendored in-tree → build offline against `vendor/`.
   vendorHash = null;
