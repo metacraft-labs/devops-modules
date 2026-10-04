@@ -30,7 +30,10 @@ top@{ ... }:
   #   (4) delivery-health external check FIRES on a non-2xx delivery fixture:
   #       github_webhook_last_delivery_ok == 0 + deliveries_failed_total >= 1.
   #   (5) blackbox probe: probe_success == 1 for the live endpoint (it answers,
-  #       even a 403), == 0 for a dead endpoint.
+  #       even a 403), == 0 for a dead endpoint, and == 0 for a reachable
+  #       endpoint whose TLS chain does not validate (the `untrusted-tls`
+  #       control, which keeps (5) from passing on a probe that stopped
+  #       verifying certificates at all).
   #
   # (1)/(2)/(4)/(5) are exactly the samples the RE1b GarmWebhookHmacFailures /
   # GithubWebhookDeliveryFailing / GithubWebhookEndpointProbeDown alerts key on.
@@ -61,10 +64,25 @@ top@{ ... }:
       # the exporter's HTTPS blackbox probe trust the same material — real
       # GitHub uses a publicly-trusted cert; here the probe sets SSL_CERT_FILE to
       # this and curl uses -k.
+      #
+      # The validity window must outlive the STORE PATH, not the test run. This
+      # was `-days 3`, which is a time bomb rather than a short-lived credential:
+      # the output is content-addressed on its inputs, so Nix builds it once and
+      # then reuses it forever, cert and all. Three days later every run of this
+      # test serves an expired cert, the exporter's probe correctly refuses it,
+      # and `probe_success ... 1` fails — with no change to any input, and
+      # therefore no bisectable commit. Measured on `dev`: the cached
+      # webhook-test-cert was minted 2026-09-10 and expired 2026-09-13, which is
+      # when this gate went red and why it stayed red.
+      #
+      # A long window is not a weaker fixture. The probe still verifies the
+      # chain against SSL_CERT_FILE, and the `untrusted-tls` probe below is the
+      # control proving it: an endpoint this cert does not vouch for still
+      # reports probe_success 0.
       testCert = pkgs.runCommand "webhook-test-cert" { nativeBuildInputs = [ pkgs.openssl ]; } ''
         mkdir -p $out
         openssl req -x509 -newkey rsa:2048 -nodes \
-          -keyout $out/key.pem -out $out/cert.pem -days 3 \
+          -keyout $out/key.pem -out $out/cert.pem -days 36500 \
           -subj "/CN=${hostname}" -addext "subjectAltName=DNS:${hostname}"
       '';
 
@@ -156,6 +174,17 @@ top@{ ... }:
                   {
                     name = "dead";
                     url = "http://127.0.0.1:1/webhooks";
+                  }
+                  # CONTROL for the `live` probe: the SAME relay, same port,
+                  # reached by IP. The test cert only vouches for `${hostname}`,
+                  # so the chain does not validate and the probe must report 0.
+                  # Were TLS verification ever disabled — the tempting way to
+                  # "fix" an expired fixture cert — this endpoint would start
+                  # answering 403 (it is off the pinned GitHub range) and report
+                  # probe_success 1, failing the assertion below.
+                  {
+                    name = "untrusted-tls";
+                    url = "https://${garmIp}/webhooks";
                   }
                 ];
               };
@@ -287,6 +316,16 @@ top@{ ... }:
                 # (5) blackbox probe: live endpoint answers (probe_success 1), dead is 0.
                 assert 'probe_success{endpoint="https://${hostname}/webhooks",name="live"} 1' in prom, prom
                 assert 'probe_success{endpoint="http://127.0.0.1:1/webhooks",name="dead"} 0' in prom, prom
+            # (5b) the probe still VERIFIES TLS: same endpoint, hostname the
+            # test cert does not cover -> transport failure -> 0, status 0.
+            assert (
+                'probe_success{endpoint="https://${garmIp}/webhooks",name="untrusted-tls"} 0'
+                in prom
+            ), prom
+            assert (
+                'probe_http_status_code{endpoint="https://${garmIp}/webhooks",name="untrusted-tls"} 0'
+                in prom
+            ), prom
 
             print("ALL RC3 WEBHOOK-DELIVERY ASSERTIONS PASSED")
           '';
