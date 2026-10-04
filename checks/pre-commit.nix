@@ -45,8 +45,8 @@ in
 
       binCfg = config.mcl.gitHooks.committedBinaries;
       # Bound out here on purpose: inside `perSystem` the argument named
-      # `config` is the PER-SYSTEM config, which shadows this one and has no
-      # `mcl` attribute at all.
+      # `config` is the PER-SYSTEM config, which shadows this one and carries
+      # none of the `mcl.*` flake options.
       editorconfigExcludes = config.mcl.gitHooks.editorconfigExcludes;
     in
     {
