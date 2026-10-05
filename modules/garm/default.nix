@@ -1279,7 +1279,10 @@
           #   ⊆ derived, FAIL-CLOSED), then append policy labels. Without a
           #   manifest: the declared set verbatim + policy. Prints a CSV tag list;
           #   non-zero on a lint/derive failure (no pool for an over-advertised or
-          #   unverifiable host — never a guessed label set).
+          #   unverifiable host — never a guessed label set). Returns 2 when the
+          #   DECLARATION over-claims (advertised ⊄ derived): no retry can fix
+          #   that, so the epilogue counts it as permanent (exit 3). An
+          #   unreadable manifest or a failed derive returns 1 (may be transient).
           derive_tags() {
             local mf="$1" declared="$2" policy="$3" derived=""
             if [ -n "$mf" ]; then
@@ -1293,7 +1296,7 @@
               fi
               if [ -n "$declared" ] && ! runner-label-tool lint -m "$mf" -a "$declared" >/dev/null 2>&1; then
                 log "ERROR: declared labels ($declared) NOT proven by '$mf' (advertised ⊄ derived) — refusing pool"
-                return 1
+                return 2
               fi
               printf '%s' "$derived''${policy:+,$policy}"
             else
@@ -1444,7 +1447,12 @@
             mf="$(echo "$pl" | jq -r '.manifestFile // ""')"
             declared="$(echo "$pl" | jq -r '.labels | join(",")')"
             policy="$(echo "$pl" | jq -r '.policyLabels | join(",")')"
-            if ! tags="$(derive_tags "$mf" "$declared" "$policy")"; then
+            dt_rc=0
+            tags="$(derive_tags "$mf" "$declared" "$policy")" || dt_rc=$?
+            if [ "$dt_rc" = 2 ]; then
+              pool_failed "$plname" "labels" "declared labels not proven by manifest '$mf' (fail-closed) [declaration error]"
+              continue
+            elif [ "$dt_rc" != 0 ]; then
               pool_failed "$plname" "labels" "label derivation/lint failed against manifest '$mf' (fail-closed)"
               continue
             fi
@@ -1645,7 +1653,8 @@
               case "$f_detail" in
                 *"[400]"* | *"[404]"* | *"[409]"* | *"[422]"* \
                   | *"Bad Request"* | *"invalid OS type"* | *"invalid OS architecture"* \
-                  | *"no such provider"* | *"no default template can be found"*) ;;
+                  | *"no such provider"* | *"no default template can be found"* \
+                  | *"[declaration error]"*) ;;
                 *) permanent=0 ;;
               esac
             done < "$failed_pools"
