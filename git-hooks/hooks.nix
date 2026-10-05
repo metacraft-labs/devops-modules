@@ -59,10 +59,27 @@ in
   # consumer's definition wins outright instead, which is the intended
   # "declared exception" semantics. (Measured: 6 consumers already pass their
   # own --maxkb.)
+  #
+  # `stages = [ "pre-commit" ]`: upstream git-hooks.nix gives this hook
+  # [ "pre-commit" "pre-push" "manual" ], so every consumer's devShell also
+  # installed a prek PRE-PUSH shim. At pre-push the hook checks nothing (its
+  # candidate set is the STAGED diff, empty at push time), yet the shim fails
+  # the push whenever the `.pre-commit-config.yaml` in the pushing checkout has
+  # no pre-push hook ("No hooks found for stage `pre-push`"): a linked worktree
+  # or a checkout whose config predates this hook set. In a Reprobuild workspace
+  # that shim is chained as `pre-push.repro-local`, so it blocked the
+  # publication gate too (metacraft-labs/infra, 2026-10-01/02). Pre-commit only:
+  # the shell installs no pre-push hook, and Reprobuild's pre-push dispatcher
+  # runs alone.
   check-added-large-files = {
     enable = lib.mkDefault true;
     args = lib.mkDefault [ "--maxkb=${toString maxKB}" ];
     excludes = largeFileExceptions;
+    # mkOverride 90, not mkDefault: upstream's own `stages` is a plain (100)
+    # definition, and `stages` is a list, so at equal priority the two lists
+    # would concatenate and keep pre-push. 90 replaces upstream's value; a
+    # consumer that really wants a pre-push stage still wins with mkForce.
+    stages = lib.mkOverride 90 [ "pre-commit" ];
   };
 
   # ---------------------------------------------------------------------

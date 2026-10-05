@@ -16,7 +16,11 @@
 #      slot and a commit runs it;
 #   5. upstream's relative `core.hooksPath` (`.git/hooks`) is rewritten as the
 #      absolute common hooks directory, and hooks then run in a LINKED
-#      worktree, where the relative value resolved to nothing.
+#      worktree, where the relative value resolved to nothing;
+#   6. a generated shim chained for a stage the config no longer installs
+#      (a stale `pre-push.repro-local`) is removed, so a push runs only the
+#      managed hook; a hand-written one is kept; and an entry where the
+#      installer did not run prunes nothing.
 #
 # TEST DOUBLE, JUSTIFIED: the Reprobuild dispatcher is a fixture, not the real
 # `repro hooks ensure` output. Reprobuild is not an input of this flake, and
@@ -165,6 +169,32 @@ _: {
             git worktree add -q "$TMPDIR/ws-linked" -b linked
             cd "$TMPDIR/ws-linked"
             commit_runs linked "managed prek "
+
+            echo "== 6. a stale chained shim for an uninstalled stage is pruned"
+            new_repo "$TMPDIR/stale"
+            install_dispatcher
+            cat > .git/hooks/pre-push <<'EOF'
+            #!/bin/sh
+            # reprobuild hook dispatcher protocol=2
+            # (fixture: see the header of checks/git-hooks-reprobuild-handoff.nix)
+            EOF
+            chmod +x .git/hooks/pre-push
+            # what an earlier config with a pre-push stage left chained
+            prek install -c .pre-commit-config.yaml -t pre-push >/dev/null 2>&1
+            mv .git/hooks/pre-push .git/hooks/pre-push.repro-local
+            mv .git/hooks/pre-push.legacy .git/hooks/pre-push
+            is_prek .git/hooks/pre-push.repro-local || fail "fixture: no stale prek pre-push shim"
+            # an entry where the installer did not run prunes nothing
+            _mcl_hooks_reprobuild_handoff
+            [ -e .git/hooks/pre-push.repro-local ] || fail "pruned without an installer run"
+            shell_entry 2>"$TMPDIR/err6"
+            [ ! -e .git/hooks/pre-push.repro-local ] || fail "stale pre-push.repro-local kept"
+            grep -q 'removed .git/hooks/pre-push.repro-local' "$TMPDIR/err6" || fail "no report of the pruned shim"
+            is_dispatcher .git/hooks/pre-push || fail "pre-push dispatcher lost"
+            is_prek .git/hooks/pre-commit.repro-local || fail "current pre-commit shim pruned"
+            printf '#!/bin/sh\necho mine\n' > .git/hooks/pre-push.repro-local
+            shell_entry 2>/dev/null
+            grep -q 'echo mine' .git/hooks/pre-push.repro-local || fail "hand-written pre-push.repro-local removed"
 
             echo "all git-hooks handoff cases passed"
             touch "$out"
