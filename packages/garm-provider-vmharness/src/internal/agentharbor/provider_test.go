@@ -74,6 +74,9 @@ func newProvider(t *testing.T, m *ahmock.Server, extraTOML string) *Provider {
 	if err := os.WriteFile(tokenFile, []byte(testAPIKey+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if !strings.Contains(extraTOML, "[runner]") {
+		extraTOML += "\n" + testRunnerTOML
+	}
 	cfg, err := ParseBytes([]byte(`endpoint = "` + m.URL() + `"
 auth_token_file = "` + tokenFile + `"
 ttl_seconds = 3600
@@ -87,6 +90,15 @@ ttl_seconds = 3600
 	}
 	return p
 }
+
+// testRunnerTOML names a Nix github-runner. The unit tests never execute it
+// (the mock does not run jobs here); the end-to-end gate runs a real one.
+const testRunnerTOML = `[runner]
+listener = "/nix/store/00000000000000000000000000000000-github-runner-2.336.0/bin/Runner.Listener"
+version = "2.336.0"
+path = ["/nix/store/00000000000000000000000000000000-bash/bin", "/nix/store/00000000000000000000000000000000-curl/bin"]
+env = { RUNNER_ALLOW_RUNASROOT = "0" }
+`
 
 func bootstrap(name string) commonParams.BootstrapInstance {
 	return commonParams.BootstrapInstance{
@@ -158,21 +170,26 @@ func TestCreateHandsRunnerInstallScriptToLaunch(t *testing.T) {
 	stdin, _ := body["stdin"].(string)
 	for _, want := range []string{
 		"METADATA_URL='https://garm.example.test/api/v1/metadata'",
-		`get_metadata_file "credentials/runner"`,
-		"actions-runner-linux-x64-2.330.0.tar.gz",
-		`RUN_HOME="${PWD}/actions-runner"`,
-		"exec ./run.sh",
+		`get_metadata_file "credentials/runner" "$STATE_DIRECTORY/.runner"`,
+		"RUNNER_LISTENER='/nix/store/00000000000000000000000000000000-github-runner-2.336.0/bin/Runner.Listener'",
+		"RUNNER_VERSION='2.336.0'",
+		"/nix/store/00000000000000000000000000000000-github-runner-2.336.0/lib/github-runner/Runner.Listener.deps.json",
+		"export PATH='/nix/store/00000000000000000000000000000000-bash/bin:/nix/store/00000000000000000000000000000000-curl/bin'",
+		"export RUNNER_ALLOW_RUNASROOT='0'",
+		`export RUNNER_ROOT="$STATE_DIRECTORY"`,
+		`export HOME="$WORK_DIRECTORY"`,
+		`exec "$RUNNER_LISTENER" run --startuptype service`,
 	} {
 		if !strings.Contains(stdin, want) {
 			t.Errorf("install script lacks %q", want)
 		}
 	}
-	// No privileged step. (The shared cached-runner version guard keeps a
-	// `|| sudo -n ...` fallback after a failed unprivileged rm/tar; in a fresh
-	// per-job workspace that branch cannot fire, so it is not forbidden here.)
-	for _, forbidden := range []string{"useradd", "groupadd", "exec sudo", "sudo -u", "/etc/sudoers.d", "installdependencies.sh"} {
+	// The payload runs the host's Nix runner: it downloads, extracts and
+	// installs nothing, and has no privileged step.
+	for _, forbidden := range []string{"actions-runner-linux-x64", "tar ", "curl -L", "./run.sh", "./config.sh",
+		"useradd", "groupadd", "sudo", "/etc/sudoers.d", "installdependencies.sh"} {
 		if strings.Contains(stdin, forbidden) {
-			t.Errorf("rootless sandbox script contains %q", forbidden)
+			t.Errorf("sandbox payload contains %q", forbidden)
 		}
 	}
 	// The instance token rides only in stdin — never in env, labels or argv,
@@ -625,5 +642,143 @@ func TestValidatePoolInfoAndConfig(t *testing.T) {
 	cfg, err := ParseBytes([]byte(`endpoint = "http://127.0.0.1:1"` + "\nsubstrate = \"vm\""))
 	if err != nil || cfg.RunnerTemplate != TemplateUpstream || cfg.TTLSeconds != DefaultTTLSeconds {
 		t.Fatalf("vm defaults: %+v, %v", cfg, err)
+	}
+}
+
+// The sandbox payload execs the host's Nix runner, so the guard is the
+// persistent runners' pin-check rule (stale at 2 minors behind what GitHub
+// offers), applied before anything launches: a refused create records no job.
+func TestNixRunnerVersionGuard(t *testing.T) {
+	m := startMock(t, nil)
+	p := newProvider(t, m, "")
+	ctx := context.Background()
+	for _, tc := range []struct {
+		offered string
+		ok      bool
+	}{
+		{"2.330.0", true}, // older than the package: fine
+		{"2.336.5", true},
+		{"2.337.0", true}, // one minor behind: fresh, as in the pin check
+		{"2.338.0", false},
+		{"3.0.0", false},
+		{"", true}, // no derivable version: the guard stays out of the way
+	} {
+		b := bootstrap("runner-guard-" + strings.ReplaceAll(tc.offered, ".", "-"))
+		file := "actions-runner-linux-x64.tar.gz"
+		if tc.offered != "" {
+			file = "actions-runner-linux-x64-" + tc.offered + ".tar.gz"
+		}
+		b.Tools[0].Filename = ptr(file)
+		b.Tools[0].DownloadURL = ptr("https://example.test/" + file)
+		before := len(m.Requests())
+		inst, err := p.CreateInstance(ctx, b)
+		launched := false
+		for _, r := range m.Requests()[before:] {
+			if r.Method == "POST" && r.Path == "/sandbox-jobs" {
+				launched = true
+			}
+		}
+		if tc.ok && (err != nil || !launched) {
+			t.Errorf("offered %q: want a launch, got %v (launched=%v)", tc.offered, err, launched)
+		}
+		if !tc.ok {
+			if err == nil || !errors.Is(err, garmErrors.ErrBadRequest) || inst.Status != commonParams.InstanceError || launched {
+				t.Errorf("offered %q: want a refused launch, got %+v, %v (launched=%v)", tc.offered, inst, err, launched)
+			}
+			if err != nil && !strings.Contains(err.Error(), "behind") {
+				t.Errorf("offered %q: refusal does not say why: %v", tc.offered, err)
+			}
+		}
+	}
+}
+
+// A local-sandbox job runs the Nix runner, so a config without one is refused
+// up front instead of launching a payload that cannot start.
+func TestSandboxPayloadRequiresNixRunner(t *testing.T) {
+	for _, bad := range []string{
+		``,
+		"[runner]\nversion = \"2.336.0\"",
+		"[runner]\nlistener = \"relative/bin/Runner.Listener\"\nversion = \"2.336.0\"",
+		"[runner]\nlistener = \"/nix/store/x-github-runner/bin/run.sh\"\nversion = \"2.336.0\"",
+		"[runner]\nlistener = \"/nix/store/x-github-runner/bin/Runner.Listener\"\nversion = \"latest\"",
+		"[runner]\nlistener = \"/nix/store/x-github-runner/bin/Runner.Listener\"\nversion = \"2.336.0\"\npath = [\"usr/bin\"]",
+	} {
+		if _, err := ParseBytes([]byte("endpoint = \"http://x\"\n" + bad)); err == nil {
+			t.Errorf("config accepted without a valid Nix runner: %q", bad)
+		}
+	}
+	if _, err := ParseBytes([]byte("endpoint = \"http://x\"\n" + testRunnerTOML)); err != nil {
+		t.Fatalf("valid Nix runner config rejected: %v", err)
+	}
+}
+
+// AH3 open question 2: GARM must tell a runner crash from a clean ephemeral
+// exit. ah reports the payload's raw status (commandExitCode/commandSignal);
+// the provider decides what it means.
+func TestExitedJobDistinguishesCrashFromCleanExit(t *testing.T) {
+	i := func(v int) *int { return &v }
+	for _, tc := range []struct {
+		name  string
+		job   Job
+		want  commonParams.InstanceStatus
+		fault string
+	}{
+		{"clean", Job{ExitCode: i(0), CommandExitCode: i(0)}, commonParams.InstanceStopped, ""},
+		{"runner error", Job{ExitCode: i(1), CommandExitCode: i(1)}, commonParams.InstanceError, "code 1 (TerminatedError"},
+		{"deprecated", Job{ExitCode: i(1), CommandExitCode: i(7)}, commonParams.InstanceError, "RunnerVersionDeprecated"},
+		{"payload failed", Job{ExitCode: i(1), CommandExitCode: i(PayloadFailureExit)}, commonParams.InstanceError, "payload failed before starting the runner"},
+		{"killed", Job{ExitCode: i(1), CommandSignal: i(9)}, commonParams.InstanceError, "signal 9"},
+		{"legacy clean", Job{ExitCode: i(0)}, commonParams.InstanceStopped, ""},
+		{"legacy failure", Job{ExitCode: i(1)}, commonParams.InstanceError, "launcher exit 1"},
+		{"no status", Job{}, commonParams.InstanceError, "without a reported status"},
+	} {
+		tc.job.State = StateExited
+		got := toProviderInstance(tc.job, commonParams.Linux)
+		if got.Status != tc.want || !strings.Contains(string(got.ProviderFault), tc.fault) ||
+			(tc.fault == "" && len(got.ProviderFault) != 0) {
+			t.Errorf("%s: got %q fault %q, want %q fault containing %q", tc.name, got.Status, got.ProviderFault, tc.want, tc.fault)
+		}
+	}
+	// Non-exited states are unaffected by a stale status.
+	running := toProviderInstance(Job{State: StateRunning, CommandExitCode: i(1)}, commonParams.Linux)
+	if running.Status != commonParams.InstanceRunning {
+		t.Fatalf("running job reported %q", running.Status)
+	}
+
+	// Through the mock's real execution, both server generations.
+	for _, legacy := range []bool{false, true} {
+		m := startMock(t, func(s *ahmock.Server) {
+			s.Exec = true
+			s.WorkRoot = t.TempDir()
+			s.LegacyExitStatus = legacy
+		})
+		p := newProvider(t, m, `command = ["sh", "-c", "exit \"$AH_TEST_EXIT\""]`+"\n"+`env = { AH_TEST_EXIT = "0" }`)
+		ctx := context.Background()
+		for _, code := range []string{"0", "1"} {
+			p.cfg.Env = map[string]string{"AH_TEST_EXIT": code}
+			inst, err := p.CreateInstance(ctx, bootstrap("runner-exit-"+code))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got commonParams.ProviderInstance
+			deadline := time.Now().Add(20 * time.Second)
+			for {
+				got, err = p.GetInstance(ctx, inst.ProviderID)
+				if err == nil && got.Status != commonParams.InstanceRunning {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("legacy=%v exit %s: job never ended (%+v, %v)", legacy, code, got, err)
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			want := commonParams.InstanceStopped
+			if code != "0" {
+				want = commonParams.InstanceError
+			}
+			if got.Status != want {
+				t.Errorf("legacy=%v exit %s: status %q (fault %q), want %q", legacy, code, got.Status, got.ProviderFault, want)
+			}
+		}
 	}
 }

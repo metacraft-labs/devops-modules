@@ -18,47 +18,76 @@
 // It drives the BUILT garm-provider-agentharbor binary through GARM's real
 // v0.1.1 external-provider protocol (GARM_* env, BootstrapInstance JSON on
 // stdin, ProviderInstance JSON on stdout, exit codes 0/30/31), one fresh
-// process per call exactly as GARM does, and follows one ephemeral runner
-// through its whole life: launched as a sandbox job, REGISTERS (fetches its
-// JIT credentials from GARM's metadata endpoint, reports idle), SERVES a job
-// (acquires it from a fake GitHub and holds it), finishes, is reported
-// stopped, is REAPED by DeleteInstance, and leaves NO RESIDUE: no process, no
-// workspace, no provider-side file. A second runner is reaped mid-job.
+// process per call exactly as GARM does.
 //
-// MOCK JUSTIFICATION (workspace rule: every mock is justified here). Three
-// stand-ins, each at the narrowest seam that keeps the gate hermetic:
+// TestAgentharborGateEphemeralRunnerLifecycle follows one ephemeral runner
+// through its whole life: launched as a sandbox job, REGISTERS (fetches its
+// JIT credentials from GARM's metadata endpoint into RUNNER_ROOT, reports
+// idle), SERVES a job, exits cleanly, is reported STOPPED, is REAPED by
+// DeleteInstance, and leaves NO RESIDUE: no process, no workspace, no
+// provider-side file. A second runner is reaped mid-job.
+//
+// TestAgentharborGateRealNixRunner runs the REAL nixpkgs `github-runner`
+// (GARM_AH_E2E_GITHUB_RUNNER, set by the Nix check) through the same payload,
+// in the Nix build sandbox: an environment with no /bin/bash and no FHS
+// libraries, which is exactly what defeated the upstream actions/runner
+// tarball on a NixOS ah host. The runner starts from the store, loads the JIT
+// credentials the payload laid out (the fake GitHub verifies the RS256 client
+// assertion it signs with the key from .credentials_rsaparams), is then told
+// its registration was deleted (`invalid_client`), exits with its own
+// TerminatedError, and the provider reports that crash to GARM as an ERROR
+// instance with the reason, not as a clean stop.
+//
+// MOCK JUSTIFICATION (workspace rule: every mock is justified here). Each
+// stand-in sits at the narrowest seam that keeps the gate hermetic:
 //
 //  1. ahmock (agent-harbor REST). The real `ah daemon serve` is not packaged
-//     in this repo and its local-sandbox substrate needs user namespaces and a
-//     delegated cgroup scope unavailable in a Nix build sandbox. The mock
-//     implements the Direct-Sandbox-Launch.md contract and, crucially, EXECUTES
-//     the job for real: the provider's rendered install script runs under
-//     `bash -s` in a fresh per-job directory with the spec's environment, and
-//     the process group + directory are freed on exit/destroy. Only the
-//     isolation layer is absent; that is agent-harbor's own AH4 gate.
+//     in this repo (agent-harbor is a separate, AGPL code base) and its
+//     local-sandbox substrate needs user namespaces and a delegated cgroup
+//     scope unavailable in a Nix build sandbox. The mock implements the
+//     Direct-Sandbox-Launch.md contract, including the launcher's 0/1
+//     exitCode with the command's own commandExitCode/commandSignal, and
+//     EXECUTES the job for real: the provider's payload runs under `bash -s`
+//     in a fresh per-job directory with the spec's environment, and the
+//     process group + directory are freed on exit/destroy. Only the isolation
+//     layer is absent; that is agent-harbor's own AH4 gate. The live
+//     end-to-end run against a real `ah daemon serve` is Sovereign-CI-Fleet
+//     AH3 step 4, outside this hermetic gate.
 //  2. Fake GARM metadata/callback endpoints. GARM itself would need a GitHub
 //     App and a forge to mint JIT configs; the provider only ever hands the
-//     script GARM's URLs + instance token, so an HTTP endpoint serving the
+//     payload GARM's URLs + instance token, so an HTTP endpoint serving the
 //     same paths (credentials/runner, credentials/credentials,
 //     credentials/credentials_rsaparams, callbacks/status, system-info) and
-//     checking the bearer token is the exact boundary the script talks to.
-//  3. Fake actions/runner tarball + fake GitHub job endpoint. The real runner
-//     needs github.com; the fake run.sh refuses to start unless the three JIT
-//     credential files were installed, then long-polls a job from the fake
-//     GitHub, which is what "serves" means at this boundary.
+//     checking the bearer token is the exact boundary the payload talks to.
+//  3. Fake GitHub. The real runner needs github.com. For the real-runner
+//     test the fake implements the first step of the runner's protocol (the
+//     OAuth JWT-bearer token exchange, with real signature verification) and
+//     then answers the way GitHub answers a deleted registration.
+//  4. Fake Nix runner package (lifecycle test only). Serving a job with the
+//     real runner needs GitHub's job-dispatch protocol, which a fake cannot
+//     reproduce faithfully; the lifecycle test therefore uses a stand-in
+//     package with the real package's layout (bin/Runner.Listener,
+//     lib/github-runner/Runner.Listener.deps.json) whose listener enforces
+//     the same contract the payload must meet for the real one (invoked as
+//     `run --startuptype service`, RUNNER_ROOT holding the three JIT files,
+//     HOME/working directory = the work dir with the credentials linked), then
+//     long-polls one job and exits 0. The real runner is exercised by
+//     TestAgentharborGateRealNixRunner and the live step-4 run.
 //
 // Everything else is real: the provider binary, the HTTP sockets, the Ed25519
-// manifest signature, the shell script, curl, tar and sha256sum.
+// manifest signature, the payload script, bash, curl and coreutils.
 package protocoltest
 
 import (
-	"archive/tar"
 	"bytes"
-	"compress/gzip"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
-	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -77,22 +106,27 @@ const (
 	ahPool          = "pool-ah3-e2e"
 	ahInstanceToken = "garm-instance-jwt-e2e"
 	ahAPIKey        = "e2e-api-key-not-a-secret"
-	ahRunnerVersion = "2.330.0"
+	ahRunnerVersion = "2.336.0"
 	ahTTLSeconds    = 5400
 )
 
-// fakeRunnerRunSh is the fake actions/runner entrypoint. Like the real one it
-// cannot start unregistered; registered, it acquires ONE job (ephemeral) from
-// the server named in .runner, holds it until the fake GitHub completes it,
-// and exits. The shebang is filled in with the resolved bash (see
-// buildRunnerTarball).
-const fakeRunnerRunSh = `#!@BASH@
+// fakeListener is the stand-in package's bin/Runner.Listener (see MOCK
+// JUSTIFICATION 4). It refuses to start unless the payload set it up the way
+// the NixOS module sets up the real one, then acquires ONE job (ephemeral)
+// from the server named in .runner, holds it until the fake GitHub completes
+// it, and exits 0. The shebang is filled in with the resolved bash.
+const fakeListener = `#!@BASH@
 set -euo pipefail
+[ "$*" = "run --startuptype service" ] || { echo "unexpected listener args: $*" >&2; exit 64; }
+[ -n "${RUNNER_ROOT:-}" ] || { echo "RUNNER_ROOT is not set" >&2; exit 65; }
 for f in .runner .credentials .credentials_rsaparams; do
-  test -s "$f" || { echo "runner is not registered: $f missing" >&2; exit 3; }
+  test -s "$RUNNER_ROOT/$f" || { echo "runner is not registered: $RUNNER_ROOT/$f missing" >&2; exit 3; }
+  test -L "$PWD/$f" || { echo "$f is not linked into the work directory" >&2; exit 66; }
 done
-server=$(sed -n 's/.*"serverUrl": *"\([^"]*\)".*/\1/p' .runner)
-name=$(sed -n 's/.*"agentName": *"\([^"]*\)".*/\1/p' .runner)
+[ "$HOME" = "$PWD" ] || { echo "HOME ($HOME) is not the work directory ($PWD)" >&2; exit 67; }
+[ "$(readlink "$PWD/_diag")" != "" ] || { echo "_diag is not linked" >&2; exit 68; }
+server=$(sed -n 's/.*"serverUrl": *"\([^"]*\)".*/\1/p' "$RUNNER_ROOT/.runner")
+name=$(sed -n 's/.*"agentName": *"\([^"]*\)".*/\1/p' "$RUNNER_ROOT/.runner")
 echo "listening for jobs as $name"
 curl -fsS --max-time 120 -X POST "$server/acquirejob?runner=$name&sandbox_job=${AH_SANDBOX_JOB_ID:-}" >/dev/null
 echo "job completed"
@@ -104,15 +138,15 @@ type fakeGARM struct {
 	statuses map[string][]string // runner name -> reported statuses
 	acquired map[string]string   // runner name -> AH_SANDBOX_JOB_ID seen
 	release  map[string]chan struct{}
-	tarball  []byte
-	sha      string
+	// Real-runner JIT material (TestAgentharborGateRealNixRunner).
+	jitKey     *rsa.PrivateKey
+	clientID   string
+	oauthCalls []string // verdict of each OAuth token request
+	other      []string // every other fake-GitHub request
 }
 
 func newFakeGARM(t *testing.T) *fakeGARM {
 	g := &fakeGARM{statuses: map[string][]string{}, acquired: map[string]string{}, release: map[string]chan struct{}{}}
-	g.tarball = buildRunnerTarball(t)
-	sum := sha256.Sum256(g.tarball)
-	g.sha = hex.EncodeToString(sum[:])
 	g.srv = httptest.NewServer(http.HandlerFunc(g.serve))
 	t.Cleanup(func() {
 		g.mu.Lock()
@@ -145,8 +179,18 @@ func (g *fakeGARM) releaseCh(name string) chan struct{} {
 // file hands it back to run.sh.
 func (g *fakeGARM) serve(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
-	if strings.HasPrefix(p, "/runner/") {
-		_, _ = w.Write(g.tarball)
+	if p == "/real-github/oauth/token" {
+		g.serveOAuth(w, r)
+		return
+	}
+	if strings.HasPrefix(p, "/real-github/") {
+		g.mu.Lock()
+		g.other = append(g.other, r.Method+" "+p)
+		g.mu.Unlock()
+		// Unauthenticated: the runner's OAuth credential treats a Bearer
+		// challenge as its cue to exchange its JWT for a token.
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 	if strings.HasPrefix(p, "/github/acquirejob") {
@@ -170,6 +214,10 @@ func (g *fakeGARM) serve(w http.ResponseWriter, r *http.Request) {
 	// the token; a path segment keeps the fake simple and checkable).
 	if rest, ok := strings.CutPrefix(p, "/api/v1/metadata/"); ok {
 		name, file, _ := strings.Cut(rest, "/")
+		if g.jitKey != nil {
+			g.serveRealJIT(w, name, file)
+			return
+		}
 		switch file {
 		case "credentials/runner":
 			_ = json.NewEncoder(w).Encode(map[string]string{"agentName": name, "serverUrl": g.srv.URL + "/github"})
@@ -205,36 +253,131 @@ func (g *fakeGARM) state(name string) (statuses []string, acquiredBy string, acq
 	return append([]string(nil), g.statuses[name]...), acquiredBy, acquired
 }
 
-func buildRunnerTarball(t *testing.T) []byte {
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-	add := func(name string, mode int64, body string) {
-		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: mode, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := io.WriteString(tw, body); err != nil {
-			t.Fatal(err)
-		}
+// b64Int is the .NET RSAParameters encoding of a big integer.
+func b64Int(n *big.Int) string { return base64.StdEncoding.EncodeToString(n.Bytes()) }
+
+// enableRealJIT makes the metadata endpoint serve JIT material in the exact
+// shape GitHub's generate-jitconfig emits, pointing the runner at this fake.
+func (g *fakeGARM) enableRealJIT(t *testing.T) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The real actions/runner scripts start with #!/bin/bash. Neither a Nix
-	// build sandbox nor a NixOS host has /bin/bash, so the fake uses the
-	// resolved bash. (A NixOS sandbox host running the REAL runner needs an
-	// FHS /bin/bash inside the sandbox; see the AH7 notes in the module.)
+	key.Precompute()
+	g.mu.Lock()
+	g.jitKey = key
+	g.clientID = "8d2b5a1e-0000-4000-8000-0000000000a3"
+	g.mu.Unlock()
+}
+
+func (g *fakeGARM) serveRealJIT(w http.ResponseWriter, name, file string) {
+	k := g.jitKey
+	var doc any
+	switch file {
+	case "credentials/runner":
+		doc = map[string]any{
+			"agentId": 42, "agentName": name, "poolId": 1, "poolName": "Default",
+			"ephemeral": true, "disableUpdate": true,
+			"serverUrl":  g.srv.URL + "/real-github/runner-service",
+			"gitHubUrl":  "https://github.com/example-org/repo",
+			"workFolder": "_work",
+		}
+	case "credentials/credentials":
+		doc = map[string]any{"scheme": "OAuth", "data": map[string]string{
+			"clientId":                g.clientID,
+			"authorizationUrl":        g.srv.URL + "/real-github/oauth/token",
+			"requireFipsCryptography": "False",
+		}}
+	case "credentials/credentials_rsaparams":
+		doc = map[string]string{
+			"d": b64Int(k.D), "dp": b64Int(k.Precomputed.Dp), "dq": b64Int(k.Precomputed.Dq),
+			"exponent": b64Int(big.NewInt(int64(k.E))), "inverseQ": b64Int(k.Precomputed.Qinv),
+			"modulus": b64Int(k.N), "p": b64Int(k.Primes[0]), "q": b64Int(k.Primes[1]),
+		}
+	default:
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(doc)
+}
+
+// serveOAuth verifies the runner's RS256 JWT client assertion against the JIT
+// key (so it proves the runner loaded .credentials and .credentials_rsaparams
+// from where the payload put them) and then answers as GitHub does for a
+// deleted registration: invalid_client, which the runner treats as fatal.
+func (g *fakeGARM) serveOAuth(w http.ResponseWriter, r *http.Request) {
+	verdict := "unverified"
+	if err := r.ParseForm(); err == nil {
+		verdict = g.verifyAssertion(r.PostForm.Get("client_assertion"), r.PostForm.Get("client_assertion_type"))
+	}
+	g.mu.Lock()
+	g.oauthCalls = append(g.oauthCalls, verdict)
+	g.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	_, _ = io.WriteString(w, `{"error":"invalid_client","error_description":"the runner registration was deleted (fake GitHub)"}`)
+}
+
+func (g *fakeGARM) verifyAssertion(assertion, assertionType string) string {
+	if assertionType != "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" {
+		return "bad assertion type " + assertionType
+	}
+	parts := strings.Split(assertion, ".")
+	if len(parts) != 3 {
+		return "not a JWT"
+	}
+	dec := func(s string) []byte { b, _ := base64.RawURLEncoding.DecodeString(s); return b }
+	var hdr struct {
+		Alg string `json:"alg"`
+	}
+	var claims struct {
+		Iss string `json:"iss"`
+		Sub string `json:"sub"`
+	}
+	if json.Unmarshal(dec(parts[0]), &hdr) != nil || json.Unmarshal(dec(parts[1]), &claims) != nil {
+		return "undecodable JWT"
+	}
+	if hdr.Alg != "RS256" {
+		return "alg " + hdr.Alg
+	}
+	sum := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if err := rsa.VerifyPKCS1v15(&g.jitKey.PublicKey, crypto.SHA256, sum[:], dec(parts[2])); err != nil {
+		return "signature does not verify against the JIT key"
+	}
+	if claims.Sub != g.clientID || claims.Iss != g.clientID {
+		return "claims name " + claims.Iss + "/" + claims.Sub
+	}
+	return "verified"
+}
+
+func (g *fakeGARM) realState() (oauth, other []string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.oauthCalls...), append([]string(nil), g.other...)
+}
+
+// fakeRunnerPackage lays out the stand-in Nix runner package (MOCK
+// JUSTIFICATION 4) and returns its bin/Runner.Listener.
+func fakeRunnerPackage(t *testing.T, version string) string {
 	bash, err := exec.LookPath("bash")
 	if err != nil {
 		t.Fatal(err)
 	}
-	add("run.sh", 0o755, strings.Replace(fakeRunnerRunSh, "@BASH@", bash, 1))
-	add("config.sh", 0o755, "#!"+bash+"\necho 'config.sh must not run in JIT mode' >&2\nexit 9\n")
-	add("bin/Runner.Listener.deps.json", 0o644, `{"libraries":{"Runner.Listener/`+ahRunnerVersion+`":{}}}`)
-	if err := tw.Close(); err != nil {
+	pkg := filepath.Join(t.TempDir(), "fake-github-runner-"+version)
+	for _, d := range []string{"bin", "lib/github-runner"} {
+		if err := os.MkdirAll(filepath.Join(pkg, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listener := filepath.Join(pkg, "bin", "Runner.Listener")
+	if err := os.WriteFile(listener, []byte(strings.Replace(fakeListener, "@BASH@", bash, 1)), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := gz.Close(); err != nil {
+	deps := `{"libraries":{"Runner.Listener/` + version + `.0":{"type":"project"}}}`
+	if err := os.WriteFile(filepath.Join(pkg, "lib/github-runner/Runner.Listener.deps.json"), []byte(deps), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return buf.Bytes()
+	return listener
 }
 
 type ahHarness struct {
@@ -271,13 +414,23 @@ func providerBinary(t *testing.T) string {
 	return binary
 }
 
-func newAHHarness(t *testing.T) *ahHarness {
+// newAHHarness starts the mocks and writes a provider config whose [runner]
+// is the given Nix runner package (listener path + version).
+func newAHHarness(t *testing.T, listener, version string) *ahHarness {
 	t.Helper()
-	for _, tool := range []string{"bash", "curl", "tar", "gzip", "sha256sum", "sed", "mktemp"} {
+	for _, tool := range []string{"bash", "curl", "sed", "mkdir", "ln", "chmod", "head"} {
 		if _, err := exec.LookPath(tool); err != nil {
-			t.Fatalf("the gate needs %s on PATH to execute the install script: %v", tool, err)
+			t.Fatalf("the gate needs %s on PATH to execute the payload: %v", tool, err)
 		}
 	}
+	// The job PATH, as services.garm renders it from the module's `path`.
+	var runnerPath []string
+	for _, d := range filepath.SplitList(os.Getenv("PATH")) {
+		if filepath.IsAbs(d) {
+			runnerPath = append(runnerPath, d)
+		}
+	}
+	pathTOML, _ := json.Marshal(runnerPath)
 	tmp := t.TempDir()
 	h := &ahHarness{t: t, binary: providerBinary(t), garm: newFakeGARM(t)}
 	h.workDir = filepath.Join(tmp, "ah-work")
@@ -310,6 +463,12 @@ pids_max = 4096
 [capabilities]
 key_id = "` + h.ah.KeyID() + `"
 public_key = "` + h.ah.PublicKey() + `"
+
+[runner]
+listener = "` + listener + `"
+version = "` + version + `"
+path = ` + string(pathTOML) + `
+env = { DOTNET_CLI_TELEMETRY_OPTOUT = "1" }
 `
 	configFile := filepath.Join(tmp, "provider.toml")
 	if err := os.WriteFile(configFile, []byte(cfg), 0o644); err != nil {
@@ -353,15 +512,16 @@ func (h *ahHarness) run(command string, stdin string, extra ...string) ahResult 
 	return ahResult{stdout.String(), stderr.String(), code}
 }
 
-func (h *ahHarness) bootstrapJSON(name string) string {
-	tarURL := h.garm.srv.URL + "/runner/actions-runner-linux-x64-" + ahRunnerVersion + ".tar.gz"
+// bootstrapJSON is GARM's BootstrapInstance; GARM offers the newest runner
+// (offered), which the provider's version guard judges the Nix runner against.
+func (h *ahHarness) bootstrapJSON(name, offered string) string {
+	file := "actions-runner-linux-x64-" + offered + ".tar.gz"
 	b, _ := json.Marshal(map[string]any{
 		"name": name,
 		"tools": []map[string]string{{
 			"os": "linux", "architecture": "x64",
-			"download_url":    tarURL,
-			"filename":        "actions-runner-linux-x64-" + ahRunnerVersion + ".tar.gz",
-			"sha256_checksum": h.garm.sha,
+			"download_url": "https://github.com/actions/runner/releases/download/v" + offered + "/" + file,
+			"filename":     file,
 		}},
 		"repo_url":           "https://github.com/example-org/repo",
 		"callback-url":       h.garm.srv.URL + "/api/v1/callbacks/" + name,
@@ -399,7 +559,7 @@ func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool,
 }
 
 func TestAgentharborGateEphemeralRunnerLifecycle(t *testing.T) {
-	h := newAHHarness(t)
+	h := newAHHarness(t, fakeRunnerPackage(t, ahRunnerVersion), ahRunnerVersion)
 
 	// Introspection commands.
 	if r := h.run("GetVersion", ""); r.code != 0 || !strings.HasPrefix(r.stdout, "v") {
@@ -418,7 +578,7 @@ func TestAgentharborGateEphemeralRunnerLifecycle(t *testing.T) {
 
 	// ---- CreateInstance: the runner-install payload goes to the launch.
 	const name = "garm-ah-e2e-0001"
-	r := h.run("CreateInstance", h.bootstrapJSON(name), "GARM_POOL_ID="+ahPool)
+	r := h.run("CreateInstance", h.bootstrapJSON(name, "2.337.0"), "GARM_POOL_ID="+ahPool)
 	if r.code != 0 {
 		t.Fatalf("CreateInstance exit %d: %s", r.code, r.stderr)
 	}
@@ -437,8 +597,8 @@ func TestAgentharborGateEphemeralRunnerLifecycle(t *testing.T) {
 		}
 	}
 	stdin, _ := launch["stdin"].(string)
-	if !strings.Contains(stdin, "credentials/runner") || !strings.Contains(stdin, h.garm.sha) {
-		t.Fatalf("launch stdin is not the JIT runner-install script:\n%s", stdin)
+	if !strings.Contains(stdin, "credentials/runner") || !strings.Contains(stdin, "fake-github-runner-"+ahRunnerVersion+"/bin/Runner.Listener") {
+		t.Fatalf("launch stdin is not the JIT runner payload:\n%s", stdin)
 	}
 	if launch["ttlSeconds"] != float64(ahTTLSeconds) {
 		t.Fatalf("launch ttlSeconds = %v, want %d", launch["ttlSeconds"], ahTTLSeconds)
@@ -514,7 +674,7 @@ func TestAgentharborGateEphemeralRunnerLifecycle(t *testing.T) {
 
 	// ---- A second runner is reaped MID-JOB (GARM scale-down / timeout).
 	const busy = "garm-ah-e2e-0002"
-	r = h.run("CreateInstance", h.bootstrapJSON(busy), "GARM_POOL_ID="+ahPool)
+	r = h.run("CreateInstance", h.bootstrapJSON(busy, "2.337.0"), "GARM_POOL_ID="+ahPool)
 	if r.code != 0 {
 		t.Fatalf("CreateInstance(busy) exit %d: %s", r.code, r.stderr)
 	}
@@ -531,6 +691,20 @@ func TestAgentharborGateEphemeralRunnerLifecycle(t *testing.T) {
 	}
 	if r := h.run("ListInstances", "", "GARM_POOL_ID="+ahPool); strings.TrimSpace(r.stdout) != "[]" {
 		t.Fatalf("instances left after reaping: %s", r.stdout)
+	}
+
+	// ---- A stale Nix runner is refused before anything launches (the
+	// persistent runners' pin-check rule: two minors behind what GitHub
+	// offers).
+	before := len(h.ah.Requests())
+	r = h.run("CreateInstance", h.bootstrapJSON("garm-ah-e2e-stale", "2.338.0"), "GARM_POOL_ID="+ahPool)
+	if r.code == 0 || !strings.Contains(r.stdout+r.stderr, "behind") {
+		t.Fatalf("CreateInstance with a stale Nix runner: exit %d, %s %s", r.code, r.stdout, r.stderr)
+	}
+	for _, req := range h.ah.Requests()[before:] {
+		if req.Method == "POST" && req.Path == "/sandbox-jobs" {
+			t.Fatal("a stale Nix runner was launched")
+		}
 	}
 
 	// ---- No residue: no process, no workspace, no provider-side state.
@@ -557,4 +731,73 @@ func contains(xs []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func TestAgentharborGateRealNixRunner(t *testing.T) {
+	pkg := os.Getenv("GARM_AH_E2E_GITHUB_RUNNER")
+	version := os.Getenv("GARM_AH_E2E_GITHUB_RUNNER_VERSION")
+	if pkg == "" || version == "" {
+		t.Skip("GARM_AH_E2E_GITHUB_RUNNER(_VERSION) unset: the Nix check sets them (and asserts this test ran)")
+	}
+	h := newAHHarness(t, filepath.Join(pkg, "bin", "Runner.Listener"), version)
+	h.garm.enableRealJIT(t)
+
+	const name = "garm-ah-e2e-real"
+	r := h.run("CreateInstance", h.bootstrapJSON(name, version), "GARM_POOL_ID="+ahPool)
+	if r.code != 0 {
+		t.Fatalf("CreateInstance exit %d: %s", r.code, r.stderr)
+	}
+	providerID, _ := decodeInstance(t, r)["provider_id"].(string)
+	if !h.ah.WaitExited(providerID, 180*time.Second) {
+		t.Fatalf("the real runner never exited\nlog:\n%s", h.ah.JobLog(providerID))
+	}
+	log := h.ah.JobLog(providerID)
+	statuses, _, _ := h.garm.state(name)
+	oauth, other := h.garm.realState()
+	diag := func() string {
+		return "statuses: " + strings.Join(statuses, ",") + "\noauth: " + strings.Join(oauth, ",") +
+			"\nother requests: " + strings.Join(other, ",") + "\njob log:\n" + log
+	}
+	// The payload reached the exec (it reported idle, not failed) ...
+	if !contains(statuses, "idle") || contains(statuses, "failed") {
+		t.Fatalf("payload did not hand over to the runner cleanly\n%s", diag())
+	}
+	// ... and the real runner started from the store and loaded the JIT
+	// credentials from RUNNER_ROOT: it signed a JWT with the JIT key.
+	if !contains(oauth, "verified") {
+		t.Fatalf("the real runner never presented a verifiable JWT client assertion\n%s", diag())
+	}
+	// It exited with its own TerminatedError, and GARM is told that it
+	// CRASHED (error + reason), which a clean ephemeral exit never is.
+	r = h.run("GetInstance", "", "GARM_INSTANCE_ID="+providerID, "GARM_POOL_ID="+ahPool)
+	inst := decodeInstance(t, r)
+	if r.code != 0 || inst["status"] != "error" {
+		t.Fatalf("crashed runner reported %v (exit %d), want error\n%s", inst["status"], r.code, diag())
+	}
+	// ProviderFault is []byte, so it travels base64-encoded.
+	rawFault, _ := inst["provider_fault"].(string)
+	faultBytes, _ := base64.StdEncoding.DecodeString(rawFault)
+	fault := string(faultBytes)
+	if !strings.Contains(fault, "code 1 (TerminatedError") {
+		t.Fatalf("crash reason %q does not name the runner's exit\n%s", fault, diag())
+	}
+	r = h.run("ListInstances", "", "GARM_POOL_ID="+ahPool)
+	var list []map[string]any
+	if r.code != 0 || json.Unmarshal([]byte(r.stdout), &list) != nil || len(list) != 1 || list[0]["status"] != "error" {
+		t.Fatalf("ListInstances does not report the crash: %+v", r)
+	}
+
+	// Reaped, no residue.
+	if r := h.run("DeleteInstance", "", "GARM_INSTANCE_ID="+providerID); r.code != 0 {
+		t.Fatalf("DeleteInstance exit %d: %s", r.code, r.stderr)
+	}
+	if pids := h.ah.LivePIDs(); len(pids) != 0 {
+		t.Fatalf("runner processes survived: %v", pids)
+	}
+	entries, _ := os.ReadDir(h.workDir)
+	for _, e := range entries {
+		if e.IsDir() {
+			t.Fatalf("job workspace left behind: %s", e.Name())
+		}
+	}
 }

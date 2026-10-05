@@ -312,6 +312,10 @@ services.garm.providers.ah-sandbox = {
       keyId = "ahcap-…";
       publicKey = "<base64url 32-byte key>";
     };
+    runner = {                      # the SAME runner the host's services.github-runners use
+      package = pkgs.github-runner;
+      extraPackages = [ /* services.github-runners extraPackages */ ];
+    };
   };
 };
 ```
@@ -322,12 +326,27 @@ derives every `ah-*` label the pool advertises) and refuses the launch
 otherwise. `DeleteInstance` is idempotent (`404` is success) and falls back to
 the job's `cleanupToken` if the DELETE itself fails.
 
-The default `sandbox` runner template is rootless: it installs the runner in
-the job's per-job workspace (deleted with the job) and skips
-`installdependencies.sh`, so the ah host must already provide the runner's
-native dependencies and an FHS `/bin/bash` inside the sandbox (the
-actions/runner scripts hard-code it). Gates: `t_garm_provider_agentharbor`
-(hermetic behaviour + end-to-end runner lifecycle + negative controls) and
+The default `sandbox` payload is rootless and downloads nothing. It runs the
+host's nixpkgs `github-runner` (`runner.package`) the way nixpkgs'
+`services.github-runners` unit does: the JIT credentials go into a
+`RUNNER_ROOT` in the job's per-job workspace (deleted with the job), the work
+directory is `HOME` with the credentials and `_diag` linked in, the job PATH is
+the unit's `path` plus `runner.extraPackages`, and the payload execs
+`Runner.Listener run --startuptype service`. So the sandbox needs no FHS
+`/bin/bash` and no `installdependencies.sh`. The store paths must be realised
+on the ah host. `CreateInstance` refuses a launch when `runner.package` is
+`maxMinorLag` (2) minor releases behind the runner GitHub offers, the same
+rule as infra's actions-runner pin check.
+
+agent-harbor reports the payload's raw exit status (`commandExitCode` /
+`commandSignal`) and nothing runner-specific. The provider interprets it: an
+exited job whose runner exited 0 is `stopped` (a clean ephemeral exit).
+Anything else is `error`, with the reason as the provider fault, for example
+`runner exited with code 1 (TerminatedError…)`, `…code 7
+(RunnerVersionDeprecated…)`, a signal, or exit 78 (the payload failed before
+starting the runner). Gates: `t_garm_provider_agentharbor` (hermetic behaviour,
+end-to-end lifecycle, the REAL Nix runner's start-up and crash path inside the
+Nix build sandbox, and negative controls) and
 `t_garm_provider_agentharbor_module` (this example, eval-only).
 
 ## 4. Provisioning orgs + scale sets at runtime

@@ -492,19 +492,19 @@ top@{ config, ... }:
               assert re.search(
                   r"non-nix-runner:\s*\n"
                   r"\s+description:.*\n"
-                  r"\s+default:\s*'\[\"eph-linux-x64\"\]'\s*\n"
+                  r"\s+default:\s*'\[\"self-hosted\",\"linux\",\"x64\"\]'\s*\n"
                   r"\s+required:\s*false\s*\n"
                   r"\s+type:\s*string",
                   workflow,
-              ), "workflow must default non-nix-runner to the ephemeral Linux class"
+              ), "workflow must default non-nix-runner to the central Linux base capabilities"
               assert re.search(
                   r"results-runner:\s*\n"
                   r"\s+description:.*\n"
-                  r"\s+default:\s*'\[\"eph-linux-x64\"\]'\s*\n"
+                  r"\s+default:\s*'\[\"self-hosted\",\"linux\",\"x64\"\]'\s*\n"
                   r"\s+required:\s*false\s*\n"
                   r"\s+type:\s*string",
                   workflow,
-              ), "workflow must default results-runner to the ephemeral Linux class"
+              ), "workflow must default results-runner to the central Linux base capabilities"
               assert "runs-on: ''${{ fromJSON(inputs.non-nix-runner) }}" in workflow, "non-nix helper jobs must use JSON runner labels"
               assert "foundry-darwin-bootstrap-runner: '[\"aarch64-darwin\"]'" in repo_workflow, "only the long Foundry Darwin bootstrap build must use the persistent runner class"
               assert "matrix.name == 'foundry'" in workflow, "Foundry bootstrap runner selection must stay package-scoped"
