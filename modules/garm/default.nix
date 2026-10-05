@@ -434,7 +434,7 @@
           [provider.external]
           provider_executable = "${lib.getExe p.package}"
           config_file = "${mkProviderConfigFile name p}"
-          interface_version = "v0.1.1"
+          interface_version = "${p.interfaceVersion}"
           # GARM does NOT propagate its own environment to external providers,
           # so the provider inherits only the vars listed here.
           #   * PATH  — libvirt: the provider shells to genisoimage (config-drive)
@@ -698,11 +698,67 @@
       # into a per-pool `extraSpecs` JSON string exactly as garm forwards it to
       # the provider (BootstrapInstance.ExtraSpecs), which the garm-provider-aws
       # spot patch consumes to set InstanceMarketOptions.
+      #
+      # The in-guest TTL backstop (`ttlMinutes`) and the infra-supplied
+      # `extraSpecs` are merged in too. garm-provider-common decodes
+      # `pre_install_scripts` values as Go `[]byte`, i.e. BASE64 in JSON, so the
+      # TTL script is base64-encoded at eval time by `toBase64` below.
+      #
+      # Pure-Nix base64 over the printable-ASCII + \n/\t subset (all a shell
+      # script here needs). Any other character fails eval rather than being
+      # silently mis-encoded. t_aws_burst_runners decodes the result with
+      # coreutils and compares it byte-for-byte.
+      toBase64 =
+        s:
+        let
+          alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+          printable = lib.stringToCharacters " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+          codes = lib.listToAttrs (lib.imap0 (i: c: lib.nameValuePair c (i + 32)) printable);
+          code =
+            c:
+            if c == "\n" then
+              10
+            else if c == "\t" then
+              9
+            else
+              codes.${c} or (throw "toBase64: unsupported (non-printable-ASCII) character in burst-pool script");
+          bytes = map code (lib.stringToCharacters s);
+          n = builtins.length bytes;
+          at = i: if i < n then builtins.elemAt bytes i else 0;
+          enc = k: builtins.substring k 1 alphabet;
+          group =
+            g:
+            let
+              i = g * 3;
+              w = (at i) * 65536 + (at (i + 1)) * 256 + (at (i + 2));
+              left = n - i;
+            in
+            enc (w / 262144)
+            + enc (lib.mod (w / 4096) 64)
+            + (if left > 1 then enc (lib.mod (w / 64) 64) else "=")
+            + (if left > 2 then enc (lib.mod w 64) else "=");
+        in
+        lib.concatStrings (map group (lib.range 0 ((n + 2) / 3 - 1)));
+
+      # The TTL backstop script. It runs as root from cloud-init BEFORE the
+      # runner install and only ARMS a power-off; it never blocks the boot.
+      # Paired with InstanceInitiatedShutdownBehavior=terminate (set by the
+      # garm-provider-aws downstream patch), the power-off TERMINATES the
+      # instance, so a runner that GARM loses track of (controller down,
+      # credentials revoked, DB lost) still stops billing within the TTL with
+      # no control-plane action at all.
+      burstTtlScript = minutes: ''
+        #!/bin/sh
+        # garm burst-pool TTL backstop (devops-modules services.garm.burstPools.<n>.ttlMinutes)
+        shutdown -P +${toString minutes} "garm burst TTL reached" || systemd-run --on-active=${toString minutes}m /bin/systemctl poweroff
+        exit 0
+      '';
+
       desiredBurstPools = lib.mapAttrsToList (
         _: bp:
         let
           effectiveMinIdle = if bp.floorPolicy == "lazy" then 0 else bp.minIdleRunners;
-          extraSpecs = lib.optionalAttrs bp.spot.enable (
+          spotSpecs = lib.optionalAttrs bp.spot.enable (
             {
               market_type = "spot";
               spot_instance_type = bp.spot.instanceType;
@@ -711,6 +767,12 @@
             }
             // lib.optionalAttrs (bp.spot.maxPrice != "") { spot_max_price = bp.spot.maxPrice; }
           );
+          ttlSpecs = lib.optionalAttrs (bp.ttlMinutes > 0) {
+            pre_install_scripts."00-garm-burst-ttl" = toBase64 (burstTtlScript bp.ttlMinutes);
+          };
+          # Module-owned keys win: `extraSpecs` cannot switch off the spot
+          # policy or the TTL that the typed options declare.
+          extraSpecs = lib.recursiveUpdate bp.extraSpecs (lib.recursiveUpdate spotSpecs ttlSpecs);
         in
         {
           name = bp.poolName;
@@ -1937,6 +1999,33 @@
                 only `incus-admin` socket-group access and no /dev/kvm (keeps the
                 STRICT knobs), whereas `libvirt` relaxes them for qemu
                 (libvirtd/kvm groups + DeviceAllow /dev/kvm + ProtectSystem=full).
+              '';
+            };
+
+            interfaceVersion = mkOption {
+              type = types.enum [
+                "v0.1.0"
+                "v0.1.1"
+              ];
+              default = if config.backend == "aws" then "v0.1.0" else "v0.1.1";
+              defaultText = lib.literalMD "`v0.1.0` for `backend = \"aws\"`, else `v0.1.1`";
+              description = ''
+                The external-provider ABI GARM speaks to this provider
+                (`interface_version` in the `[[provider]]` block, exported to the
+                provider as `GARM_INTERFACE_VERSION`). It MUST be a version the
+                provider binary implements: a mismatch makes EVERY call
+                (create, delete, list) fail at the provider's dispatch with
+                `provider does not implement <v> ExternalProvider`, before any
+                cloud API is reached.
+
+                `garm-provider-vmharness` and `garm-provider-agentharbor`
+                implement v0.1.1. Upstream `cloudbase/garm-provider-aws`
+                implements ONLY v0.1.0 (provider/provider.go imports
+                `execution/v0.1.0`, true of `main` as of 2026-10-05), so the aws
+                backend defaults to v0.1.0. Rendering v0.1.1 for it — the
+                module's single hard-coded value until 2026-10-05 — left the
+                central GARM's AWS burst pool unable to create OR delete a single
+                instance, with every failed runner stuck in `pending_delete`.
               '';
             };
 
@@ -4002,6 +4091,46 @@
                     type = types.bool;
                     default = true;
                     description = "Whether the burst pool is enabled.";
+                  };
+                  ttlMinutes = mkOption {
+                    type = types.ints.unsigned;
+                    default = 0;
+                    example = 360;
+                    description = ''
+                      Hard lifetime of every instance in this pool, in minutes,
+                      enforced INSIDE the guest: a pre-install script arms
+                      `shutdown -P +<ttl>` before the runner is installed. With
+                      the packaged garm-provider-aws (which launches with
+                      InstanceInitiatedShutdownBehavior=terminate) that power-off
+                      TERMINATES the instance, so billing stops even if GARM
+                      never issues a delete (controller down, revoked
+                      credentials, lost DB). Set it above the longest job the
+                      pool serves plus the bootstrap timeout. 0 disables it.
+                    '';
+                  };
+                  extraSpecs = mkOption {
+                    type = types.attrsOf types.anything;
+                    default = { };
+                    example = {
+                      security_group_ids = [ "sg-0123456789abcdef0" ];
+                      iam_instance_profile = "arn:aws:iam::123456789012:instance-profile/runners";
+                      volume_size = 50;
+                      volume_type = "gp3";
+                    };
+                    description = ''
+                      Additional provider `extra_specs` for this pool, merged into
+                      the JSON GARM forwards to the provider
+                      (BootstrapInstance.ExtraSpecs). For garm-provider-aws these
+                      are the keys of `internal/spec/spec.go` `extraSpecs`:
+                      `security_group_ids`, `iam_instance_profile` (an ARN),
+                      `subnet_id`, `volume_size`, `volume_type`, `iops`,
+                      `throughput`, `disable_updates`, `extra_packages`,
+                      `pre_install_scripts` (base64 values), …. Without
+                      `security_group_ids` EC2 uses the VPC's default security
+                      group, and without `iam_instance_profile` the instance has
+                      no role. The keys rendered from `spot` and `ttlMinutes`
+                      take precedence over the same keys here.
+                    '';
                   };
                   spot = mkOption {
                     default = { };
