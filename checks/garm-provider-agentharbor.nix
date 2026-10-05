@@ -16,11 +16,17 @@ top@{ ... }:
   #       Ed25519 capability manifest gates launches; no provider-side state.
   #   (2) the END-TO-END protocol gate (internal/protocoltest): the PACKAGED
   #       binary, driven over GARM's real v0.1.1 protocol, launches a runner
-  #       whose install script really executes, registers (JIT credentials +
-  #       idle), serves a job, is reported stopped, is reaped, and leaves no
-  #       process, workspace or provider file behind; a second runner is
-  #       reaped mid-job.
-  #   (3) NEGATIVE CONTROLS: the end-to-end gate is re-run against four
+  #       whose payload really executes, registers (JIT credentials into
+  #       RUNNER_ROOT + idle), serves a job, is reported stopped, is reaped,
+  #       and leaves no process, workspace or provider file behind; a second
+  #       runner is reaped mid-job; a stale Nix runner is refused. Then the
+  #       REAL nixpkgs github-runner runs through the same payload inside this
+  #       build sandbox (no /bin/bash, no FHS libraries: the environment that
+  #       defeated the upstream tarball on NixOS), proves it loaded the JIT
+  #       credentials (a JWT signed with the JIT key), exits with its own
+  #       TerminatedError, and is reported to GARM as a crash (error + reason)
+  #       rather than a clean stop.
+  #   (3) NEGATIVE CONTROLS: the end-to-end gate is re-run against seven
   #       single-line mutations of the provider source and MUST fail each time
   #       with a test failure (not a build failure), plus once against the
   #       unmutated source copy, which MUST pass — so a control cannot fail
@@ -72,6 +78,13 @@ top@{ ... }:
               publicKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
             };
             env.RUNNER_ALLOW_RUNASROOT = "0";
+            # The sandbox payload execs the same Nix runner the host's
+            # services.github-runners use.
+            runner = {
+              package = pkgs.github-runner;
+              extraPackages = [ pkgs.jq ];
+              extraEnvironment.ACTIONS_RUNNER_HOOK_JOB_STARTED = "/etc/runner-hook.sh";
+            };
           };
         };
         scaleSets.ah-linux = {
@@ -133,6 +146,10 @@ top@{ ... }:
               ];
               src = ../packages/garm-provider-vmharness/src;
               providerBin = lib.getExe provider;
+              # The real Nix runner the sandbox payload execs (the module's
+              # default `runner.package`).
+              githubRunner = pkgs.github-runner;
+              githubRunnerVersion = pkgs.github-runner.version;
             }
             ''
               set -euo pipefail
@@ -161,16 +178,23 @@ top@{ ... }:
                 TestErrorMappingFollowsSpecErrorModel \
                 TestFailedLaunchReportsErrorInstance \
                 TestCapabilityManifestGatesLaunch \
-                TestProviderKeepsNoState; do
+                TestProviderKeepsNoState \
+                TestNixRunnerVersionGuard \
+                TestSandboxPayloadRequiresNixRunner \
+                TestExitedJobDistinguishesCrashFromCleanExit; do
                 grep -q -- "--- PASS: $t " unit.log || fail "$t did not run and pass"
               done
 
               # ---- (2) end-to-end gate against the PACKAGED binary ---------
+              export GARM_AH_E2E_GITHUB_RUNNER="$githubRunner"
+              export GARM_AH_E2E_GITHUB_RUNNER_VERSION="$githubRunnerVersion"
+              [ ! -e /bin/bash ] || fail "this build sandbox has /bin/bash: it no longer reproduces a NixOS ah host"
               (cd base && GARM_PROVIDER_AGENTHARBOR_BIN="$providerBin" \
                 go test -count=1 -v -run 'TestAgentharborGate' ./internal/protocoltest/) 2>&1 | tee e2e.log \
                 || fail "end-to-end gate failed against the packaged binary"
-              grep -q -- '--- PASS: TestAgentharborGateEphemeralRunnerLifecycle' e2e.log \
-                || fail "end-to-end gate did not run and pass"
+              for t in TestAgentharborGateEphemeralRunnerLifecycle TestAgentharborGateRealNixRunner; do
+                grep -q -- "--- PASS: $t " e2e.log || fail "$t did not run and pass"
+              done
 
               # ---- (3) negative controls ------------------------------------
               # run_gate <dir> <log>: the e2e gate against a binary built from
@@ -197,7 +221,7 @@ top@{ ... }:
                   cat "$dir.log"
                   fail "negative control $name: the gate PASSED against the mutant — it cannot detect this defect"
                 fi
-                grep -q -- '--- FAIL: TestAgentharborGateEphemeralRunnerLifecycle' "$dir.log" \
+                grep -q -- '--- FAIL: TestAgentharborGate' "$dir.log" \
                   || { cat "$dir.log"; fail "negative control $name: failed for a reason other than a gate assertion"; }
                 echo "[t_garm_provider_agentharbor] negative control $name: gate FAILED as required"
               }
@@ -220,8 +244,21 @@ top@{ ... }:
               mutate stdin "$P" \
                 'Stdin:              &stdin,' \
                 'Stdin:              func() *string { _ = stdin; return nil }(),'
+              N=internal/agentharbor/nixrunner.go
+              # A runner crash is reported to GARM as a clean stop.
+              mutate crash "$P" \
+                'inst.Status = commonParams.InstanceError' \
+                'inst.Status = commonParams.InstanceStopped'
+              # The payload does not point the runner at its JIT state.
+              mutate runnerroot "$N" \
+                'export RUNNER_ROOT="$STATE_DIRECTORY"' \
+                'export RUNNER_ROOT_UNSET="$STATE_DIRECTORY"'
+              # The stale-runner guard never fires.
+              mutate guard "$N" \
+                'if lag >= maxMinorLag {' \
+                'if false && lag >= maxMinorLag {'
 
-              echo "[t_garm_provider_agentharbor][PASS] behaviour matrix + end-to-end runner lifecycle + 4/4 negative controls"
+              echo "[t_garm_provider_agentharbor][PASS] behaviour matrix + end-to-end runner lifecycle + real Nix runner crash path + 7/7 negative controls"
               touch "$out"
             '';
 
@@ -235,6 +272,10 @@ top@{ ... }:
               ];
               inherit garmUnit failedAssertions;
               providerBin = lib.getExe provider;
+              githubRunner = pkgs.github-runner;
+              githubRunnerVersion = pkgs.github-runner.version;
+              bash = pkgs.bashInteractive;
+              jq = lib.getBin pkgs.jq;
             }
             ''
               set -euo pipefail
@@ -265,9 +306,22 @@ top@{ ... }:
                 'memory_max = "8G"' \
                 'pids_max = 4096' \
                 'key_id = "ahcap-630dcd2966c43366"' \
-                'RUNNER_ALLOW_RUNASROOT = "0"'; do
+                'RUNNER_ALLOW_RUNASROOT = "0"' \
+                "command = [\"$bash/bin/bash\", \"-s\"]" \
+                '[runner]' \
+                "listener = \"$githubRunner/bin/Runner.Listener\"" \
+                "version = \"$githubRunnerVersion\"" \
+                'max_minor_lag = 2' \
+                '[runner.env]' \
+                'ACTIONS_RUNNER_HOOK_JOB_STARTED = "/etc/runner-hook.sh"'; do
                 grep -qxF "$line" "$cfg" || fail "provider config lacks: $line"
               done
+              grep -q "^path = \[\"$bash/bin\", .*\"$jq/bin\"\]\$" "$cfg" \
+                || fail "the runner PATH is not the module's path + extraPackages"
+              # `command` must be a top-level key, i.e. before the first table.
+              first_table=$(grep -n '^\[' "$cfg" | head -1 | cut -d: -f1)
+              cmd_line=$(grep -n '^command = ' "$cfg" | cut -d: -f1)
+              [ "$cmd_line" -lt "$first_table" ] || fail "command is rendered inside a TOML table"
               ! grep -q 'images' "$cfg" || fail "a golden-image map leaked into the agentharbor config"
               ! grep -q '/run/agenix' "$cfg" || fail "provider config points at the agenix source instead of the staged copy"
 

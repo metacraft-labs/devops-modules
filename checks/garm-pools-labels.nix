@@ -140,6 +140,36 @@ top@{ ... }:
         ];
       };
 
+      validPools = {
+        hms-linux = {
+          provider = "hms";
+          org = "metacraft-labs";
+          credentials = "mcl-app";
+          image = "golden";
+          osType = "linux";
+          policyLabels = [ "ephemeral" ];
+          maxRunners = 4;
+          minIdleRunners = 0;
+          priority = 10;
+        };
+        gpu001-linux = {
+          provider = "gpu001";
+          org = "metacraft-labs";
+          credentials = "mcl-app";
+          image = "golden";
+          osType = "linux";
+          maxRunners = 2;
+        };
+        gpu002-linux = {
+          provider = "gpu002";
+          org = "metacraft-labs";
+          credentials = "mcl-app";
+          image = "golden";
+          osType = "linux";
+          maxRunners = 2;
+        };
+      };
+
       # A dummy provider whose backend needs no host daemon/groups (mirrors
       # garm-reconcile's approach) — the reconcile only NAMES the provider on
       # pool add; no provider process is ever contacted. manifestFile is what
@@ -161,6 +191,7 @@ top@{ ... }:
             { ... }:
             {
               imports = [ flake.modules.nixos.garm ];
+              specialisation.valid-pools.configuration.services.garm.pools = lib.mkForce validPools;
               virtualisation.memorySize = 2048;
               environment.systemPackages = [
                 pkgs.curl
@@ -219,34 +250,7 @@ top@{ ... }:
 
                 # RC2 explicit capability pools — one per host. Tags DERIVED from
                 # each provider's manifestFile.
-                pools = {
-                  hms-linux = {
-                    provider = "hms";
-                    org = "metacraft-labs";
-                    credentials = "mcl-app";
-                    image = "golden";
-                    osType = "linux";
-                    policyLabels = [ "ephemeral" ];
-                    maxRunners = 4;
-                    minIdleRunners = 0;
-                    priority = 10;
-                  };
-                  gpu001-linux = {
-                    provider = "gpu001";
-                    org = "metacraft-labs";
-                    credentials = "mcl-app";
-                    image = "golden";
-                    osType = "linux";
-                    maxRunners = 2;
-                  };
-                  gpu002-linux = {
-                    provider = "gpu002";
-                    org = "metacraft-labs";
-                    credentials = "mcl-app";
-                    image = "golden";
-                    osType = "linux";
-                    maxRunners = 2;
-                  };
+                pools = validPools // {
                   # FAIL-CLOSED: declares `gpu` on the NON-GPU hms host — the
                   # reconcile must refuse this pool (advertised ⊄ derived).
                   hms-overclaim = {
@@ -288,7 +292,8 @@ top@{ ... }:
             controller.wait_for_unit("garm.service")
             controller.wait_for_open_port(${toString mockPort})
             controller.wait_for_open_port(9997)
-            controller.wait_for_unit("garm-reconcile.service")
+            controller.wait_until_succeeds("systemctl is-failed garm-reconcile.service")
+            controller.succeed("journalctl -u garm-reconcile.service --no-pager | grep -F \"hms-overclaim\" | grep -F \"fail-closed\"")
 
             def gcli(args):
                 return controller.succeed(
@@ -323,6 +328,21 @@ top@{ ... }:
                 f"{len(by_provider['hms'])}: {by_provider['hms']}"
             )
             print("[pools] one pool per host; the gpu over-claim on hms was refused")
+
+            # The invalid fixture MUST fail; a separate real valid configuration
+            # must also converge successfully with the same three genuine pools.
+            controller.succeed("/run/current-system/specialisation/valid-pools/bin/switch-to-configuration test")
+            controller.succeed("systemctl reset-failed garm-reconcile.service && systemctl restart garm-reconcile.service")
+            controller.wait_until_succeeds("test \"$(systemctl show -p Result --value garm-reconcile.service)\" = success")
+            valid_pools = J.loads(gcli(f"pool list --org {oid}"))
+            assert len(valid_pools) == len(pools), f"valid activation changed pool count: {pools} -> {valid_pools}"
+            pools = valid_pools
+            by_provider = {}
+            for p in pools:
+                by_provider.setdefault(p.get("provider_name"), []).append(p)
+            for name in ("hms", "gpu001", "gpu002"):
+                assert len(by_provider.get(name, [])) == 1, f"valid fixture missing or duplicates {name}: {pools}"
+
 
             # --- (2) TAGS are the DERIVED (proven) label sets ----------------
             hms_tags = tagset(by_provider["hms"][0])

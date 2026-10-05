@@ -657,11 +657,14 @@ for workflow_and_count in \
   check "$workflow_name documents the fallback as lower-precedence and optional" $?
 
   # The literal GitHub expression must reach the workflow unchanged. The one
-  # permitted extension is a LAST-resort App-minted token (reusable-lint's
-  # `app-token` step, which runs only when neither secret is set), so the
-  # static secrets keep their order and precedence.
+  # permitted extension is a single LAST-resort token after the static
+  # secrets: reusable-lint's App-minted `app-token` step (runs only when
+  # neither secret is set), or the workflow's own `github.token`
+  # (a5bc0d79: it authenticates PUBLIC Nix inputs against the anonymous
+  # rate limit when no secret is configured). Either way the static secrets
+  # keep their order and precedence.
   # shellcheck disable=SC2016
-  precedence_count="$(grep -Ec 'nix-github-token: \$\{\{ secrets\.NIX_GITHUB_TOKEN \|\| secrets\.GH_READ_METACRAFT_PRIVATE_REPOS( \|\| steps\.app-token\.outputs\.token)? \}\}$' "$workflow")"
+  precedence_count="$(grep -Ec 'nix-github-token: \$\{\{ secrets\.NIX_GITHUB_TOKEN \|\| secrets\.GH_READ_METACRAFT_PRIVATE_REPOS( \|\| (steps\.app-token\.outputs\.token|github\.token))? \}\}$' "$workflow")"
   token_input_count="$(grep -Ec '^[[:space:]]+nix-github-token:' "$workflow")"
   [[ "$precedence_count" -eq "$expected_precedence_count" ]] &&
     [[ "$token_input_count" -eq "$expected_precedence_count" ]]
