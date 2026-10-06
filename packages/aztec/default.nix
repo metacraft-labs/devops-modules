@@ -12,11 +12,11 @@ stdenv.mkDerivation {
     })
     (fetchurl {
       url = "https://install.aztec.network/aztec";
-      hash = "sha256-Z3tst1Fn5dQibZzaSnXzPz3DPwY6bkiRSeilM5DZbro=";
+      hash = "sha256-jEYhHpQJMzOg8Nx0AzYW6vOP4mW0TlzGd6/KDu6zQ9U=";
     })
     (fetchurl {
       url = "https://install.aztec.network/aztec-up";
-      hash = "sha256-9mJWn+cj8loFkw/RhpV/y1rGapMYYTmiCiDmUJqeqdc=";
+      hash = "sha256-8CB1s2pQzo3KiigKRmgRAKbgfb+p3YcJIDfMTdru3Uo=";
     })
     (fetchurl {
       url = "https://install.aztec.network/aztec-nargo";

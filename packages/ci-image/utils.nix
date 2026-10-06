@@ -45,8 +45,8 @@ rec {
       trusted-users = ${lib.concatStringsSep " " trustedUsers}
       experimental-features = nix-command flakes
       fallback = true
-      download-attempts = 2
-      connect-timeout = 5
+      download-attempts = 5
+      connect-timeout = 20
       narinfo-cache-negative-ttl = 120
       allow-import-from-derivation = true
       EOF

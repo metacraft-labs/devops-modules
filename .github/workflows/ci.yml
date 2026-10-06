@@ -7,9 +7,10 @@ on:
   # Allow this workflow to be run in merge queues:
   merge_group:
 
-  # Run this workflow when PRs target `main` and when they're merged in `main`:
+  # Run this workflow when PRs target the active integration branches:
   pull_request:
     branches:
+      - dev
       - main
 
 concurrency:
@@ -22,17 +23,21 @@ jobs:
     secrets: inherit
 
   test-mcl:
+    # Measured over the last 100 CI runs: successful runs take 2-3 minutes.
+    # Without a bound, a hung test (see mcl.utils.process) held a self-hosted
+    # runner for the 6-hour default on every PR, starving other repos' jobs.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       # Test setup-nix's support for specifying which Nix version to install
       # on github-hosted runners
       matrix:
         include:
-          - runner: ['self-hosted', 'nixos', 'x86-64-v2', 'bare-metal']
+          - runner: [self-hosted, linux, x64]
             nix-version: ''
-          - runner: ['self-hosted', 'nixos', 'x86-64-v2', 'bare-metal']
+          - runner: [self-hosted, linux, x64]
             nix-version: 2.28.5
-          - runner: ['self-hosted', 'nixos', 'x86-64-v2', 'bare-metal']
+          - runner: [self-hosted, linux, x64]
             nix-version: 2.33.0
     runs-on: ${{ matrix.runner }}
     steps:
@@ -48,8 +53,8 @@ jobs:
           substituters: ${{ vars.SUBSTITUTERS }}
           devshell: default
 
-      - name: Build and test the `mcl` command
-        run: dub test --root packages/mcl -- -e 'fetchJson|(coda\.)|nix.run|nix.build'
+      - name: Build and test the `mcl-devops` command
+        run: dub test --root packages/mcl-devops -- -e 'fetchJson|(coda\.)|nix.run|nix.build'
 
   # Regression test for the setup-nix action: a devShell that fails to build
   # must make the action fail (not silently report success and surface later as
@@ -58,7 +63,9 @@ jobs:
   # `.github/setup-nix/tests/devshell-fixture/`.
   test-setup-nix-devshell:
     name: Validate setup-nix devShell build-failure detection
-    runs-on: [self-hosted, nixos, x86-64-v2, bare-metal]
+    # Successful runs: at most 5 minutes (last 100 CI runs).
+    timeout-minutes: 20
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout first to use locally defined actions
         uses: actions/checkout@v6.0.2
@@ -103,8 +110,74 @@ jobs:
           fi
           echo "OK: devShell environment exported; hello resolved to $(command -v hello)."
 
+  # Regression test for the OTHER way a Nix setup step lies: reporting success
+  # while `experimental-features` never took effect. `cachix/install-nix-action`
+  # does this on every `eph-*` image — it finds the pre-installed Nix, prints
+  # "Aborting: Nix is already installed", exits 0, and silently discards
+  # `extra_nix_config`, so the job dies later in an unrelated step with
+  # "nix-command is disabled".
+  #
+  # The Linux case is deliberately retained because that runner IS the
+  # pre-installed-Nix case where the upstream action no-ops. Native Darwin is
+  # equally deliberate: it exercises macOS's symlinked /var temp root and the
+  # service PATH that originally omitted system utilities. If our guard were
+  # wrong in either direction — too strict, or not checking at all — one of
+  # these real platform contracts says so.
+  test-setup-nix-verification:
+    name: Validate setup-nix verification (${{ matrix.system }})
+    # Successful runs: at most 1 minute; failures at most 10 (last 100 CI runs).
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: [self-hosted, linux, x64]
+          - system: aarch64-darwin
+            runner: [self-hosted, macos, arm64]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout first to use locally defined actions
+        uses: actions/checkout@v6.0.2
+
+      # On this runner Nix already exists, so the installer step is skipped and
+      # only `Configure Nix` + the new verification run. A green step here is
+      # positive evidence that the features are live on a pre-installed Nix.
+      - name: Setup Nix on a runner that already has Nix
+        uses: ./.github/setup-nix
+        with:
+          push-to-cache: false
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+
+      - name: Confirm the requested features are usable without extra flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No --extra-experimental-features anywhere: if configuration alone
+          # did not enable these, this fails exactly as a real job step would.
+          nix eval --raw --expr '"nix-command-ok"'
+          echo
+          nix config show experimental-features
+
+      - name: Run the verification contract test
+        shell: bash
+        run: bash .github/setup-nix/tests/verify-nix-config-test.sh
+
+      # The credential path that makes a `type = "git"` private flake input
+      # fetchable. `access-tokens` does not cover it — Nix shells out to git,
+      # which reads ~/.netrc and not Nix's own netrc. See write-netrc.sh.
+      - name: Run the netrc contract test
+        shell: bash
+        # The HARNESS (not write-netrc.sh) uses grep/sed/cmp/find, which the
+        # minimal-PATH self-hosted runners (m3, high-mem-server) do not have.
+        # The test refuses to run if any harness tool is still missing.
+        run: nix shell nixpkgs#gnugrep nixpkgs#gnused nixpkgs#diffutils nixpkgs#findutils --command bash .github/setup-nix/tests/write-netrc-test.sh
+
   test-mcl-secret-integration:
-    runs-on: [self-hosted, nixos, x86-64-v2, bare-metal]
+    # Successful runs: at most 20 minutes (last 100 CI runs).
+    timeout-minutes: 45
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout first to use locally defined actions
         uses: actions/checkout@v6.0.2
@@ -116,7 +189,7 @@ jobs:
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
 
-      - name: Run mcl secret integration tests
+      - name: Run mcl-devops secret integration tests
         run: nix run .#checks.x86_64-linux.secret-integration
 
   ci:
@@ -127,23 +200,53 @@ jobs:
       pull-requests: write
     secrets: inherit
     with:
+      # Foundry takes longer than vm-harness's currently deployed 600-second
+      # default. Remove this override after this PR's provider fix is deployed.
+      foundry-darwin-bootstrap-runner: '["aarch64-darwin"]'
+      # Route this repo's flake-check matrix at the GPU hosts' ephemeral scale
+      # set `eph-linux-x64-g1` (gpu-server-001) instead of the saturated
+      # `eph-linux-x64` class on high-mem-server. Only this CALLER is
+      # re-pointed; the reusable workflow's own defaults stay on
+      # `eph-linux-x64` (checks/deployment-production-cutover.nix asserts
+      # those literals), and `results-runner` is deliberately left alone
+      # because `ci / Final Results` is a required status check.
+      non-nix-runner: '["self-hosted", "linux", "x64"]'
+      # Cap the Darwin fan-out. Measured on run 34275237639 (2026-09-08): this
+      # repo asked for 52 `eph-macos-arm64` jobs per CI run — 51 from this
+      # matrix plus one from `test-setup-nix-verification` — against a pool
+      # whose ceiling is 2 concurrent runners (maxRunners = 2, and the runbook
+      # host-caps Tart at 2 simultaneous macOS VMs). That made this repo 47% of
+      # the whole org's macOS demand and starved every other repo behind it.
+      #
+      # 6 jobs still saturates a 2-runner pool three times over, so nothing is
+      # gained by asking for more. Every flake output is still built, named and
+      # individually reported inside its job; only the GitHub job boundary is
+      # coarser. x86_64-linux is left uncapped — that class is elastic.
+      build-max-jobs: |
+        {
+          "aarch64-darwin": 6
+        }
       runners: |
         {
           "x86_64-linux": [
-            "self-hosted",
-            "nixos",
-            "x86-64-v3",
-            "bare-metal"
+            "self-hosted", "linux", "x64"
           ],
           "aarch64-darwin": [
-            "self-hosted",
-            "macOS",
-            "aarch64-darwin"
+            "self-hosted", "macos", "arm64"
           ]
         }
 
+  # The `just act lint` step builds `ci-image` and runs the lint workflow inside
+  # it via `act`, i.e. it needs nested Docker. Every `eph-linux-x64` container
+  # now provides it: the runner-image consolidation folded the retired
+  # `vmharness-nested` provider's capability into the single `vmharness` provider
+  # and `vmh-linux-runner` image (nested Docker + nested KVM), so the separate
+  # `eph-linux-x64-nested` class is a transitional alias for the same container
+  # and carries no extra capability.
   test-act:
-    runs-on: [self-hosted, nixos, x86-64-v3, bare-metal]
+    # Successful runs: at most 26 minutes (last 100 CI runs).
+    timeout-minutes: 60
+    runs-on: [self-hosted, linux, x64]
     steps:
       - name: Checkout first to use locally defined actions
         uses: actions/checkout@v6.0.2

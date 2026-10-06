@@ -122,7 +122,7 @@ top@{ config, ... }:
               ];
               environment.etc."production-cutover-fixture".source = fixture;
               environment.systemPackages = [
-                self'.packages.mcl
+                self'.packages.mcl-devops
                 pkgs.attic-client
                 pkgs.jq
                 pkgs.openssh
@@ -151,7 +151,7 @@ top@{ config, ... }:
                 };
                 services.mcl-deployment-ssh-apply = {
                   enable = true;
-                  package = self'.packages.mcl;
+                  package = self'.packages.mcl-devops;
                   targetName = targetName;
                   manifestPrincipal = "mcl-deployment";
                   manifestPublicKeys = [ manifestPublicKey ];
@@ -176,9 +176,9 @@ top@{ config, ... }:
                     ".firstTargetSelection.selectedProductionTarget == null and "
                     ".firstTargetSelection.simulationTarget.production == false and "
                     ".liveCanaryCycles.requiredBeforeCachixDeployRemoval == 2 and "
-                    ".liveCanaryCycles.recorded == 0 and "
-                    ".cachixDeployFallback.retained == true and "
-                    ".cachixDeployFallback.explicitOnly == true"
+                    ".cachixRetirement.deployBackendRemovedFromCI == true and "
+                    ".cachixRetirement.cacheBackendRemovedFromCI == true and "
+                    "(.cachixRetirement.removalGateSatisfied == false or .liveCanaryCycles.recorded >= 2)"
                     "' ${docs}/production-cutover-gates.json"
                 )
             with subtest("create public Attic cache"):
@@ -214,7 +214,7 @@ top@{ config, ... }:
                 controller.succeed(f"nix path-info {shlex.quote(closure)}")
                 substituter = "http://attic:8080/${atticCacheName}"
                 controller.succeed(
-                    "mcl cache push-closure "
+                    "mcl-devops cache push-closure "
                     "--backend attic "
                     "--cache ${atticCacheName} "
                     "--target ${targetName} "
@@ -233,7 +233,7 @@ top@{ config, ... }:
                 restored_health = f"restored|5|test -e {closure}"
                 controller.succeed(
                     "${fakeClosureEnv} GITHUB_RUN_ID=9001 GITHUB_SHA=9999999999999999999999999999999999999999 "
-                    "mcl deploy-plan "
+                    "mcl-devops deploy-plan "
                     "--target ${targetName} "
                     f"--desired-system-path {shlex.quote(closure)} "
                     "--git-revision 9999999999999999999999999999999999999999 "
@@ -252,7 +252,7 @@ top@{ config, ... }:
 
             with subtest("shadow deploy is dry-run only and does not switch target"):
                 controller.succeed(
-                    "mcl deploy-ssh ${targetName} "
+                    "mcl-devops deploy-ssh ${targetName} "
                     "--manifest /tmp/cutover-manifest.json "
                     "--state-dir /tmp/shadow-state "
                     "--ssh-host target "
@@ -268,7 +268,7 @@ top@{ config, ... }:
                     "jq -s -e 'any(.[]; .phase == \"cache-push\" and .backend.controller == \"attic\" and .command.status == \"succeeded\")' /tmp/shadow-events.jsonl"
                 )
                 controller.succeed(
-                    "jq -s -e '[.[] | select(.phase == \"activate-requested\" and .command.name == \"mcl deploy-reconcile --dry-run\" and .command.status == \"pending\")] | length == 1' /tmp/shadow-events.jsonl"
+                    "jq -s -e '[.[] | select(.phase == \"activate-requested\" and .command.name == \"mcl-devops deploy-reconcile --dry-run\" and .command.status == \"pending\")] | length == 1' /tmp/shadow-events.jsonl"
                 )
                 controller.succeed(
                     "jq -s -e 'all(.[]; ((.command.argv | join(\" \") | ascii_downcase) | contains(\"cachix deploy activate\") | not))' /tmp/shadow-events.jsonl"
@@ -278,7 +278,7 @@ top@{ config, ... }:
                 target.succeed("install -d -m 0755 /var/lib/mcl-test")
                 target.succeed("printf 'success\\n' > /var/lib/mcl-test/next-generation")
                 controller.succeed(
-                    "mcl deploy-ssh ${targetName} "
+                    "mcl-devops deploy-ssh ${targetName} "
                     "--manifest /tmp/cutover-manifest.json "
                     "--state-dir /tmp/cutover-state "
                     "--ssh-host target "
@@ -295,7 +295,7 @@ top@{ config, ... }:
 
             with subtest("monitoring and event artifacts show healthy final generation"):
                 target.succeed(
-                    "mcl deploy-status summarize /var/log/mcl/deployments/${targetName}.jsonl "
+                    "mcl-devops deploy-status summarize /var/log/mcl/deployments/${targetName}.jsonl "
                     "--output /tmp/cutover-summary.md "
                     "--json-output /tmp/cutover-summary.json"
                 )
@@ -329,7 +329,7 @@ top@{ config, ... }:
                 target.succeed("printf 'failed-health\\n' > /var/lib/mcl-test/next-generation")
                 controller.succeed(
                     "${fakeClosureEnv} GITHUB_RUN_ID=9002 GITHUB_SHA=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
-                    "mcl deploy-plan "
+                    "mcl-devops deploy-plan "
                     "--target ${targetName} "
                     f"--desired-system-path {shlex.quote(closure)} "
                     "--git-revision aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
@@ -348,7 +348,7 @@ top@{ config, ... }:
                     "--state-dir /tmp/cutover-state"
                 )
                 controller.fail(
-                    "mcl deploy-ssh ${targetName} "
+                    "mcl-devops deploy-ssh ${targetName} "
                     "--manifest /tmp/rollback-manifest.json "
                     "--state-dir /tmp/cutover-state "
                     "--ssh-host target "
@@ -464,42 +464,52 @@ top@{ config, ... }:
               workflow = Path("${workflow}").read_text()
               setup_nix = Path("${setupNix}").read_text()
               cutover_doc = Path("${docs}/production-cutover.md").read_text()
-              deploy_spec = Path("${repoRoot}/packages/mcl/src/mcl/commands/deploy_spec.d").read_text()
+              deploy_spec = Path("${repoRoot}/packages/mcl-devops/src/mcl/commands/deploy_spec.d").read_text()
 
               assert gate["defaultCutoverPath"]["usesCachixDeploy"] is False, gate
               assert gate["defaultCutoverPath"]["cacheBackend"] == "attic", gate
+              assert gate["defaultCutoverPath"]["activation"] == "mcl-devops deploy-ssh or mcl-devops deploy-reconcile", gate
               assert gate["firstTargetSelection"]["selectedProductionTarget"] is None, gate
               assert gate["firstTargetSelection"]["simulationTarget"]["production"] is False, gate
               assert gate["m7FullTopology"]["requiredBeforeFirstProductionTarget"] is True, gate
-              assert gate["liveCanaryCycles"]["requiredBeforeCachixDeployRemoval"] == 2, gate
-              assert gate["liveCanaryCycles"]["recorded"] == 0, gate
-              assert gate["cachixDeployFallback"]["retained"] is True, gate
-              assert gate["cachixDeployFallback"]["explicitOnly"] is True, gate
-              assert gate["cachixDeployFallback"]["removeDefaultBlocked"] is True, gate
-              assert gate["cachixDeployFallback"]["removeCacheDependencyBlocked"] is True, gate
+              retire = gate["cachixRetirement"]
+              assert retire["deployBackendRemovedFromCI"] is True, gate
+              assert retire["cacheBackendRemovedFromCI"] is True, gate
+              canary = gate["liveCanaryCycles"]
+              assert canary["requiredBeforeCachixDeployRemoval"] == 2, gate
+              assert isinstance(canary["recorded"], int) and canary["recorded"] >= 0, gate
+              if retire["removalGateSatisfied"]:
+                  assert canary["recorded"] >= canary["requiredBeforeCachixDeployRemoval"], "removal gate cannot be satisfied without the required live canary cycles"
+                  assert gate["m7FullTopology"]["evidenceRecorded"] is True, gate
+                  assert retire["manualFallbackRetired"] is True, gate
+              else:
+                  assert retire["manualFallbackRetired"] is False, gate
+              if retire["manualFallbackRetired"]:
+                  assert "cachix deploy activate" not in deploy_spec, "manual Cachix fallback must be removed once retired"
+              else:
+                  assert "cachix deploy activate" in deploy_spec, "manual Cachix fallback must remain available until the removal gate is satisfied"
 
-              assert re.search(r"run-cachix-deploy:\s*false", repo_workflow), "generic repo CI must keep Cachix Deploy off by default"
-              assert "run-cachix-deploy:" in workflow, "workflow no longer exposes the legacy deploy gate"
-              assert re.search(r"run-cachix-deploy:.*?default:\s*false", workflow, re.S), "legacy deploy gate must default false in the reusable workflow"
-              assert "push-deployment-caches:" in workflow, "workflow no longer exposes the deployment cache publish gate"
-              assert re.search(r"push-deployment-caches:.*?default:\s*false", workflow, re.S), "deployment cache publish gate must default false in the reusable workflow"
               assert re.search(
                   r"non-nix-runner:\s*\n"
                   r"\s+description:.*\n"
-                  r"\s+default:\s*'\[\"self-hosted\",\s*\"nixos\",\s*\"x86-64-v2\",\s*\"bare-metal\"\]'\s*\n"
+                  r"\s+default:\s*'\[\"self-hosted\",\"linux\",\"x64\"\]'\s*\n"
                   r"\s+required:\s*false\s*\n"
                   r"\s+type:\s*string",
                   workflow,
-              ), "workflow must expose non-nix-runner defaulting to self-hosted labels"
+              ), "workflow must default non-nix-runner to the central Linux base capabilities"
               assert re.search(
                   r"results-runner:\s*\n"
                   r"\s+description:.*\n"
-                  r"\s+default:\s*'\[\"self-hosted\",\s*\"nixos\",\s*\"x86-64-v2\",\s*\"bare-metal\"\]'\s*\n"
+                  r"\s+default:\s*'\[\"self-hosted\",\"linux\",\"x64\"\]'\s*\n"
                   r"\s+required:\s*false\s*\n"
                   r"\s+type:\s*string",
                   workflow,
-              ), "workflow must expose results-runner defaulting to self-hosted labels"
+              ), "workflow must default results-runner to the central Linux base capabilities"
               assert "runs-on: ''${{ fromJSON(inputs.non-nix-runner) }}" in workflow, "non-nix helper jobs must use JSON runner labels"
+              assert "foundry-darwin-bootstrap-runner: '[\"aarch64-darwin\"]'" in repo_workflow, "only the long Foundry Darwin bootstrap build must use the persistent runner class"
+              assert "matrix.name == 'foundry'" in workflow, "Foundry bootstrap runner selection must stay package-scoped"
+              assert "matrix.system == 'aarch64-darwin'" in workflow, "Foundry bootstrap runner selection must stay Darwin-scoped"
+              assert "inputs.foundry-darwin-bootstrap-runner" in workflow, "Foundry bootstrap runner override must remain opt-in for reusable-workflow callers"
               results_job_match = re.search(
                   r"(?ms)^  results:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
                   workflow,
@@ -508,21 +518,23 @@ top@{ config, ... }:
               results_job = results_job_match.group("body")
               assert "runs-on: ''${{ fromJSON(inputs.results-runner) }}" in results_job, "Final Results must run on the results-runner input"
               assert "runs-on: ''${{ fromJSON(inputs.runners).x86_64-linux }}" not in results_job, "Final Results must not run on the x86_64-linux fleet runner map"
-              assert "if: inputs.run-cachix-deploy" in workflow, "legacy deploy step must remain explicitly gated"
-              assert "inputs.push-deployment-caches || inputs.run-cachix-deploy" in workflow, "deployment cache publish gate must be independent of legacy Cachix activation"
-              assert "if: ''${{ (inputs.push-deployment-caches || inputs.run-cachix-deploy) && !matrix.noop && matrix.deploymentTarget }}" in workflow, "deployment cache push must be limited to deployment targets"
-              assert "if: ''${{ always() && (inputs.push-deployment-caches || inputs.run-cachix-deploy) && !matrix.noop && matrix.deploymentTarget }}" in workflow, "deployment cache artifact upload must be limited to deployment targets"
-              assert "DEPLOY_KIND: ''${{ matrix.deploymentKind }}" in workflow, "deployment cache push must receive the matrix deployment kind"
-              assert '--kind "$DEPLOY_KIND"' in workflow, "deployment cache push must pass the deployment kind to mcl"
-              assert "Normalize Cachix inputs" in setup_nix, "setup-nix must normalize legacy Cachix cache inputs"
-              assert '"" | disabled | none | false)' in setup_nix, "setup-nix must treat the disabled Cachix sentinel as empty"
-              assert "steps.cachix.outputs.cache !=" in setup_nix, "setup-nix must gate Cachix action on normalized cache output"
-              assert "vars.CACHIX_CACHE != 'disabled' && vars.CACHIX_CACHE" in workflow, "mcl workflow must not pass the disabled Cachix sentinel as a cache name"
-              assert "mcl_flake_cmd }} deploy-spec" in workflow, "legacy fallback deploy-spec call disappeared"
-              assert "cachix deploy activate" in deploy_spec, "fallback deploy-spec no longer exposes Cachix Deploy activation"
+              assert "run-cachix-deploy" not in repo_workflow, "repo CI must not reference the removed Cachix Deploy gate"
+              assert "run-cachix-deploy" not in workflow, "reusable workflow must not reference the removed Cachix Deploy gate"
+              assert "deploy-spec" not in workflow, "legacy deploy-spec invocation must be absent from CI"
+              assert "cachix" not in workflow.lower(), "reusable workflow must be free of Cachix references"
+              assert "cachix" not in setup_nix.lower(), "setup-nix must be free of Cachix references"
+              assert "DeterminateSystems/nix-installer-action" in setup_nix, "setup-nix must use the Determinate installer that replaced cachix/install-nix-action"
+              assert "push-deployment-caches:" in workflow
+              assert re.search(r"push-deployment-caches:.*?default:\s*false", workflow, re.S)
+              assert "if: ''${{ inputs.push-deployment-caches && !matrix.noop && matrix.deploymentTarget }}" in workflow
+              assert "if: ''${{ always() && inputs.push-deployment-caches && !matrix.noop && matrix.deploymentTarget }}" in workflow
+              assert re.search(r"deployment-cache-push-backends:.*?default:\s*'attic'", workflow, re.S)
+              assert re.search(r"deployment-cache-required-backends:.*?default:\s*'attic'", workflow, re.S)
+              assert "--transport attic-ci" in workflow, "deployment cache push must use the Attic CI transport"
 
               required_doc_terms = [
-                  "Cachix Deploy is legacy fallback",
+                  "Attic is the sole deployment cache and activation backend",
+                  "Cachix Deploy is removed from CI",
                   "two successful live canary cycles",
                   "M7 full-topology runtime evidence",
                   "local-production-cutover-canary",

@@ -1,0 +1,17 @@
+{
+  "manifestVersion": "1",
+  "os": "macos",
+  "arch": "arm64",
+  "archLevel": "",
+  "cpuCount": 12,
+  "memTotalMb": 65536,
+  "gpu": false,
+  "nestedVirt": false,
+  "docker": false,
+  "podman": false,
+  "rrHwCounters": false,
+  "hypervisors": [
+    {"id": "tart",    "available": true,  "guests": ["macos", "linux"]},
+    {"id": "libvirt", "available": false, "guests": []}
+  ]
+}

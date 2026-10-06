@@ -127,22 +127,22 @@ top@{ config, ... }:
         assert public_key, "Attic cache info did not expose a public key"
       '';
       slowMcl = pkgs.writeShellApplication {
-        name = "mcl";
+        name = "mcl-devops";
         runtimeInputs = [
           pkgs.coreutils
         ];
         text = ''
           set -euo pipefail
           if [ "''${1:-}" != deploy-reconcile ]; then
-            echo "fake mcl only supports deploy-reconcile" >&2
+            echo "fake mcl-devops only supports deploy-reconcile" >&2
             exit 64
           fi
 
           mkdir -p /var/lib/mcl-test
-          printf 'start:%s\n' "$$" >> /var/lib/mcl-test/reconciler-runs
+          printf 'start:%s:%s\n' "$$" "$*" >> /var/lib/mcl-test/reconciler-runs
           touch /var/lib/mcl-test/reconciler-started
           sleep 12
-          printf 'end:%s\n' "$$" >> /var/lib/mcl-test/reconciler-runs
+          printf 'end:%s:%s\n' "$$" "$*" >> /var/lib/mcl-test/reconciler-runs
         '';
       };
 
@@ -153,7 +153,7 @@ top@{ config, ... }:
           {
             services.mcl-deployment-reconciler = {
               enable = true;
-              package = self'.packages.mcl;
+              package = self'.packages.mcl-devops;
               stateDir = "/var/lib/mcl/test-deployments";
               eventLog = "/var/log/mcl/deployments/test-reconciler.jsonl";
               interval = "7min";
@@ -181,7 +181,7 @@ top@{ config, ... }:
         ) "reconciler service does not use configured flock lock")
         (lib.optional (
           !lib.hasInfix "deploy-reconcile" execStart
-        ) "reconciler service does not call mcl deploy-reconcile")
+        ) "reconciler service does not call mcl-devops deploy-reconcile")
         (lib.optional (
           !lib.hasInfix "--state-dir /var/lib/mcl/test-deployments" execStart
         ) "reconciler service does not pass state dir")
@@ -208,7 +208,7 @@ top@{ config, ... }:
           nodes = {
             controller = {
               environment.systemPackages = [
-                self'.packages.mcl
+                self'.packages.mcl-devops
                 pkgs.openssh
                 pkgs.python3
               ];
@@ -227,7 +227,7 @@ top@{ config, ... }:
                 };
                 services.mcl-deployment-ssh-apply = {
                   enable = true;
-                  package = self'.packages.mcl;
+                  package = self'.packages.mcl-devops;
                   targetName = "target";
                   manifestPrincipal = "mcl-deployment";
                   manifestPublicKeys = [ manifestPublicKey ];
@@ -247,7 +247,7 @@ top@{ config, ... }:
                 controller.succeed("install -m 0600 ${deployPrivateKey} /tmp/deploy-key")
                 controller.succeed("install -m 0600 ${manifestPrivateKey} /tmp/manifest-key")
                 controller.succeed(
-                    "${fakeClosureEnv} mcl deploy-plan "
+                    "${fakeClosureEnv} mcl-devops deploy-plan "
                     "--target target "
                     "--desired-system-path ${successSystemPath} "
                     "--git-revision 0123456789abcdef0123456789abcdef01234567 "
@@ -324,7 +324,7 @@ top@{ config, ... }:
           nodes = {
             controller = {
               environment.systemPackages = [
-                self'.packages.mcl
+                self'.packages.mcl-devops
                 pkgs.openssh
                 pkgs.python3
               ];
@@ -343,7 +343,7 @@ top@{ config, ... }:
                 };
                 services.mcl-deployment-ssh-apply = {
                   enable = true;
-                  package = self'.packages.mcl;
+                  package = self'.packages.mcl-devops;
                   targetName = "target";
                   manifestPrincipal = "mcl-deployment";
                   manifestPublicKeys = [ manifestPublicKey ];
@@ -364,7 +364,7 @@ top@{ config, ... }:
                 controller.succeed("install -m 0600 ${deployPrivateKey} /tmp/deploy-key")
                 controller.succeed("install -m 0600 ${manifestPrivateKey} /tmp/manifest-key")
                 controller.succeed(
-                    "${fakeClosureEnv} mcl deploy-plan "
+                    "${fakeClosureEnv} mcl-devops deploy-plan "
                     "--target target "
                     "--desired-system-path ${rollbackSystemPath} "
                     "--git-revision 2222222222222222222222222222222222222222 "
@@ -431,7 +431,7 @@ top@{ config, ... }:
           nodes = {
             controller = {
               environment.systemPackages = [
-                self'.packages.mcl
+                self'.packages.mcl-devops
                 pkgs.openssh
                 pkgs.python3
               ];
@@ -450,7 +450,7 @@ top@{ config, ... }:
                 };
                 services.mcl-deployment-ssh-apply = {
                   enable = true;
-                  package = self'.packages.mcl;
+                  package = self'.packages.mcl-devops;
                   targetName = "target";
                   manifestPrincipal = "mcl-deployment";
                   manifestPublicKeys = [ manifestPublicKey ];
@@ -471,7 +471,7 @@ top@{ config, ... }:
                 controller.succeed("install -m 0600 ${manifestPrivateKey} /tmp/manifest-key")
                 controller.succeed(
                     "${fakeClosureEnv} GITHUB_RUN_ID=41 GITHUB_SHA=0123456789abcdef0123456789abcdef01234567 "
-                    "mcl deploy-plan "
+                    "mcl-devops deploy-plan "
                     "--target target "
                     "--desired-system-path ${oldSystemPath} "
                     "--git-revision 0123456789abcdef0123456789abcdef01234567 "
@@ -483,7 +483,7 @@ top@{ config, ... }:
                 )
                 controller.succeed(
                     "${fakeClosureEnv} GITHUB_RUN_ID=42 GITHUB_SHA=1123456789abcdef0123456789abcdef01234567 "
-                    "mcl deploy-plan "
+                    "mcl-devops deploy-plan "
                     "--target target "
                     "--desired-system-path ${newSystemPath} "
                     "--git-revision 1123456789abcdef0123456789abcdef01234567 "
@@ -496,7 +496,7 @@ top@{ config, ... }:
 
             with subtest("reconciler sends only the newest manifest over forced-command ssh"):
                 controller.succeed(
-                    "mcl deploy-reconcile "
+                    "mcl-devops deploy-reconcile "
                     "--state-dir /tmp/reconciler-state "
                     "--manifest /tmp/old.json "
                     "--manifest /tmp/new.json "
@@ -559,13 +559,13 @@ top@{ config, ... }:
                 imports = [ flake.modules.nixos.deployment-reconciler-timer ];
 
                 environment.systemPackages = [
-                  self'.packages.mcl
+                  self'.packages.mcl-devops
                   pkgs.openssh
                   pkgs.python3
                 ];
                 services.mcl-deployment-reconciler = {
                   enable = true;
-                  package = self'.packages.mcl;
+                  package = self'.packages.mcl-devops;
                   stateDir = "/var/lib/mcl/deployments";
                   eventLog = "/var/log/mcl/deployments/reconciler.jsonl";
                   interval = "1min";
@@ -595,7 +595,7 @@ top@{ config, ... }:
                 };
                 services.mcl-deployment-ssh-apply = {
                   enable = true;
-                  package = self'.packages.mcl;
+                  package = self'.packages.mcl-devops;
                   targetName = "target";
                   manifestPrincipal = "mcl-deployment";
                   manifestPublicKeys = [ manifestPublicKey ];
@@ -617,7 +617,7 @@ top@{ config, ... }:
                 controller.succeed("install -m 0600 ${deployPrivateKey} /run/mcl-test/deploy-key")
                 controller.succeed("install -m 0600 ${manifestPrivateKey} /tmp/manifest-key")
                 controller.succeed(
-                    "${fakeClosureEnv} mcl deploy-plan "
+                    "${fakeClosureEnv} mcl-devops deploy-plan "
                     "--target target "
                     "--desired-system-path ${successSystemPath} "
                     "--git-revision 0123456789abcdef0123456789abcdef01234567 "
@@ -687,7 +687,7 @@ top@{ config, ... }:
                 "flakes"
               ];
               environment.systemPackages = [
-                self'.packages.mcl
+                self'.packages.mcl-devops
                 pkgs.attic-client
                 pkgs.openssh
                 pkgs.python3
@@ -714,7 +714,7 @@ top@{ config, ... }:
                 };
                 services.mcl-deployment-ssh-apply = {
                   enable = true;
-                  package = self'.packages.mcl;
+                  package = self'.packages.mcl-devops;
                   targetName = "target";
                   manifestPrincipal = "mcl-deployment";
                   manifestPublicKeys = [ manifestPublicKey ];
@@ -751,7 +751,7 @@ top@{ config, ... }:
             with subtest("create signed manifest requiring Attic substitution"):
                 restored_health = f"restored|5|test -e {closure}/file"
                 controller.succeed(
-                    "mcl deploy-plan "
+                    "mcl-devops deploy-plan "
                     "--target target "
                     f"--desired-system-path {shlex.quote(closure)} "
                     "--git-revision 0123456789abcdef0123456789abcdef01234567 "
@@ -824,13 +824,13 @@ top@{ config, ... }:
                 imports = [ flake.modules.nixos.deployment-reconciler-timer ];
 
                 environment.systemPackages = [
-                  self'.packages.mcl
+                  self'.packages.mcl-devops
                   pkgs.openssh
                   pkgs.python3
                 ];
                 services.mcl-deployment-reconciler = {
                   enable = true;
-                  package = self'.packages.mcl;
+                  package = self'.packages.mcl-devops;
                   stateDir = "/var/lib/mcl/canary-deployments";
                   eventLog = "/var/log/mcl/deployments/local-canary-reconciler.jsonl";
                   interval = "4h";
@@ -860,7 +860,7 @@ top@{ config, ... }:
                 };
                 services.mcl-deployment-ssh-apply = {
                   enable = true;
-                  package = self'.packages.mcl;
+                  package = self'.packages.mcl-devops;
                   targetName = "local-canary";
                   manifestPrincipal = "mcl-deployment";
                   manifestPublicKeys = [ manifestPublicKey ];
@@ -883,7 +883,7 @@ top@{ config, ... }:
                 controller.succeed("install -m 0600 ${manifestPrivateKey} /tmp/manifest-key")
                 controller.succeed(
                     "${fakeClosureEnv} GITHUB_RUN_ID=7001 GITHUB_SHA=7777777777777777777777777777777777777777 "
-                    "mcl deploy-plan "
+                    "mcl-devops deploy-plan "
                     "--target local-canary "
                     "--desired-system-path ${successSystemPath} "
                     "--git-revision 7777777777777777777777777777777777777777 "
@@ -899,7 +899,7 @@ top@{ config, ... }:
                 controller.succeed("systemctl cat mcl-deployment-reconciler.timer | grep -q 'OnUnitActiveSec=4h'")
                 controller.succeed("systemctl cat mcl-deployment-reconciler.timer | grep -q 'RandomizedDelaySec=0'")
                 controller.succeed("test ! -e /var/lib/mcl-test/restore-runs")
-                controller.succeed("! grep -R -E 'gpu-server|solunska|hetzner|nedislav|eli' /var/lib/mcl/canary-deployments /var/log/mcl 2>/dev/null")
+                controller.succeed("! grep -R -E 'gpu-node|gpu-server|example-site|hetzner|app-node' /var/lib/mcl/canary-deployments /var/log/mcl 2>/dev/null")
 
             with subtest("scheduled canary service applies through the reconciler path"):
                 controller.succeed("systemctl start mcl-deployment-reconciler.service")
@@ -972,8 +972,8 @@ top@{ config, ... }:
             with subtest("lock releases after the service exits"):
                 controller.wait_until_succeeds("test \"$(grep -c '^end:' /var/lib/mcl-test/reconciler-runs)\" = 1")
                 controller.succeed("${pkgs.util-linux}/bin/flock -n /run/lock/mcl-test-reconciler.lock ${lib.getExe slowMcl} deploy-reconcile --after-service")
-                controller.succeed("test \"$(grep -c '^start:' /var/lib/mcl-test/reconciler-runs)\" = 2")
-                controller.succeed("test \"$(grep -c '^end:' /var/lib/mcl-test/reconciler-runs)\" = 2")
+                controller.succeed("test \"$(grep -c '^start:.*--after-service' /var/lib/mcl-test/reconciler-runs)\" = 1")
+                controller.succeed("test \"$(grep -c '^end:.*--after-service' /var/lib/mcl-test/reconciler-runs)\" = 1")
           '';
         };
 

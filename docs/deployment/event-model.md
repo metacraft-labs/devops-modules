@@ -85,7 +85,7 @@ Propagation points:
 
 - GitHub Actions: expose `DEPLOYMENT_CORRELATION_ID` in deploy jobs and upload
   it with status artifacts.
-- `mcl` logs: include `correlationId`, `deploymentId`, `phase`, and `target` in
+- `mcl-devops` logs: include `correlationId`, `deploymentId`, `phase`, and `target` in
   every structured log line.
 - Target journald: pass the id to target-side apply or agent wrappers and log
   it through systemd journal fields or structured JSON.

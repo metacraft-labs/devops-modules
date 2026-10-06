@@ -1,44 +1,44 @@
 {
   "mclCommands": {
-    "mcl cache push-closure": {
-      "source": "packages/mcl/src/mcl/commands/cache.d",
+    "mcl-devops cache push-closure": {
+      "source": "packages/mcl-devops/src/mcl/commands/cache.d",
       "tokens": [
         "Command(\"cache\")",
         "Command(\"push-closure\")"
       ]
     },
-    "mcl deploy-agent": {
-      "source": "packages/mcl/src/mcl/commands/deploy_agent.d",
+    "mcl-devops deploy-agent": {
+      "source": "packages/mcl-devops/src/mcl/commands/deploy_agent.d",
       "tokens": [
         "Command(\"deploy-agent\")"
       ]
     },
-    "mcl deploy-apply": {
-      "source": "packages/mcl/src/mcl/commands/deploy_apply.d",
+    "mcl-devops deploy-apply": {
+      "source": "packages/mcl-devops/src/mcl/commands/deploy_apply.d",
       "tokens": [
         "Command(\"deploy-apply\")"
       ]
     },
-    "mcl deploy-plan": {
-      "source": "packages/mcl/src/mcl/commands/deploy_plan.d",
+    "mcl-devops deploy-plan": {
+      "source": "packages/mcl-devops/src/mcl/commands/deploy_plan.d",
       "tokens": [
         "Command(\"deploy-plan\")"
       ]
     },
-    "mcl deploy-reconcile": {
-      "source": "packages/mcl/src/mcl/commands/deploy_reconcile.d",
+    "mcl-devops deploy-reconcile": {
+      "source": "packages/mcl-devops/src/mcl/commands/deploy_reconcile.d",
       "tokens": [
         "Command(\"deploy-reconcile\")"
       ]
     },
-    "mcl deploy-ssh": {
-      "source": "packages/mcl/src/mcl/commands/deploy_ssh.d",
+    "mcl-devops deploy-ssh": {
+      "source": "packages/mcl-devops/src/mcl/commands/deploy_ssh.d",
       "tokens": [
         "Command(\"deploy-ssh\")"
       ]
     },
-    "mcl deploy-status summarize": {
-      "source": "packages/mcl/src/mcl/commands/deploy_status.d",
+    "mcl-devops deploy-status summarize": {
+      "source": "packages/mcl-devops/src/mcl/commands/deploy_status.d",
       "tokens": [
         "Command(\"deploy-status\")",
         "Command(\"summarize\")"

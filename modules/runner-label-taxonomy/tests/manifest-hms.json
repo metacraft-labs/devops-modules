@@ -1,0 +1,27 @@
+{
+  "identity": {
+    "keyId": "vmh1-3f9a2c1b7e0d4a56",
+    "host": "high-mem-server",
+    "issuedAt": 1757440000,
+    "notAfter": 1757443600,
+    "alg": "hmac-sha256",
+    "manifest": {
+      "manifestVersion": "1",
+      "os": "linux",
+      "arch": "x86_64",
+      "archLevel": "x86-64-v3",
+      "cpuCount": 32,
+      "memTotalMb": 128000,
+      "gpu": true,
+      "nestedVirt": true,
+      "docker": true,
+      "podman": false,
+      "rrHwCounters": true,
+      "hypervisors": [
+        {"id": "incus",   "available": true,  "guests": ["linux"]},
+        {"id": "libvirt", "available": true,  "guests": ["windows", "linux"]}
+      ]
+    }
+  },
+  "sig": "0000000000000000000000000000000000000000000000000000000000000000"
+}

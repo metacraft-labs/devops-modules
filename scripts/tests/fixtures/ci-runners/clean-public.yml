@@ -1,0 +1,30 @@
+# Fixture (RD2 gate): a compliant PUBLIC-repo workflow.
+# Only standard free hosted runners + a matrix over them + a self-hosted class.
+name: clean-public
+on: [push]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo ok
+  pinned:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo ok
+  heavy-native:
+    # Large local build stays on self-hosted (free on public repos).
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - run: echo ok
+  legacy-class:
+    runs-on: eph-linux-x64
+    steps:
+      - run: echo ok
+  hybrid:
+    # RD3 dynamic runs-on — trusted, skipped by the checker.
+    runs-on: ${{ fromJson(needs.choose.outputs.runs_on) }}
+    steps:
+      - run: echo ok

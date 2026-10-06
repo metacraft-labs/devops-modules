@@ -77,9 +77,9 @@
         fi
         printf '%s\n' "$*" >> /tmp/fake-cachix-commands
       '';
-      mclFakeCachix = self'.packages.mcl.overrideAttrs (_old: {
+      mclFakeCachix = self'.packages.mcl-devops.overrideAttrs (_old: {
         postFixup = ''
-          wrapProgram "$out/bin/mcl" \
+          wrapProgram "$out/bin/mcl-devops" \
             --prefix PATH : "${
               lib.makeBinPath (
                 [
@@ -135,7 +135,7 @@
             attic = atticServerNode;
             client = lib.recursiveUpdate clientBaseNode {
               environment.systemPackages = clientBaseNode.environment.systemPackages ++ [
-                self'.packages.mcl
+                self'.packages.mcl-devops
               ];
             };
           };
@@ -146,9 +146,9 @@
             with subtest("create public Attic cache"):
             ${indent "    " createCacheScript}
 
-            with subtest("push closure through mcl and verify substitute probe"):
+            with subtest("push closure through mcl-devops and verify substitute probe"):
                 client.succeed(
-                    "mcl cache push-closure "
+                    "mcl-devops cache push-closure "
                     "--backend attic "
                     "--cache ${cacheName} "
                     "--target attic-client "
@@ -194,7 +194,7 @@
           nodes = {
             client = lib.recursiveUpdate clientBaseNode {
               environment.systemPackages = clientBaseNode.environment.systemPackages ++ [
-                self'.packages.mcl
+                self'.packages.mcl-devops
               ];
             };
           };
@@ -204,7 +204,7 @@
 
             with subtest("missing substitute fails the cache integrity gate"):
                 client.fail(
-                    "mcl cache push-closure "
+                    "mcl-devops cache push-closure "
                     "--backend none "
                     "--cache missing-cache "
                     "--target missing-cache-target "
@@ -262,7 +262,7 @@
 
             with subtest("push through fake Cachix backend"):
                 client.succeed(
-                    "mcl cache push-closure "
+                    "mcl-devops cache push-closure "
                     "--backend cachix "
                     "--cache fake-cachix-cache "
                     "--target app-server-01 "
@@ -276,7 +276,7 @@
 
             with subtest("push through real Attic backend and substitute it"):
                 client.succeed(
-                    "mcl cache push-closure "
+                    "mcl-devops cache push-closure "
                     "--backend attic "
                     "--cache ${cacheName} "
                     "--target app-server-01 "

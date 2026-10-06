@@ -6,6 +6,7 @@ import subprocess
 import sys
 
 SCRIPT = os.path.join(os.path.dirname(__file__), "..", "tofu-plan-policy.py")
+CI_RUNNER = os.path.join(os.path.dirname(__file__), "..", "tofu-plan-policy-ci")
 FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
 
 
@@ -13,6 +14,15 @@ def run_policy(fixture: str, *args) -> subprocess.CompletedProcess:
     """Run the policy script with a fixture and extra args."""
     return subprocess.run(
         [sys.executable, SCRIPT, os.path.join(FIXTURES, fixture)] + list(args),
+        capture_output=True,
+        text=True,
+    )
+
+
+def run_policy_ci(fixture: str, *args) -> subprocess.CompletedProcess:
+    """Run the CI adapter around the policy script."""
+    return subprocess.run(
+        ["bash", CI_RUNNER, SCRIPT, os.path.join(FIXTURES, fixture)] + list(args),
         capture_output=True,
         text=True,
     )
@@ -90,6 +100,18 @@ def main():
     # Test 13: Blast radius — expected resource types
     r = run_policy("scope_wrong_type.json", "--expected-resource-types", "cloudflare_r2_bucket")
     all_passed &= test("Blast radius unexpected type detected", r, 1, "unexpected resource types")
+
+    # Test 14: CI treats documented advisory exit 2 as a successful annotation.
+    r = run_policy_ci("moved_blocks_missing.json")
+    all_passed &= test("CI adapter annotates advisory warnings without failing", r, 0, "::warning::")
+
+    # Test 15: CI preserves hard policy failures.
+    r = run_policy_ci("import_with_update.json", "--mode", "import-only")
+    all_passed &= test("CI adapter preserves hard policy failure", r, 1, "POLICY VIOLATIONS")
+
+    # Test 16: CI preserves clean success.
+    r = run_policy_ci("no_changes.json", "--mode", "import-only")
+    all_passed &= test("CI adapter preserves clean success", r, 0, "Policy check PASSED")
 
     print()
     if all_passed:

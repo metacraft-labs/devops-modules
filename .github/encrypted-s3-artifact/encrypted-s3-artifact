@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  encrypted-s3-artifact upload --directory DIR --bucket BUCKET --object-key KEY \
+    --identity-file FILE --kms-key-id KEY_ID [--expected-bucket-owner ACCOUNT_ID]
+  encrypted-s3-artifact download --directory DIR --bucket BUCKET --object-key KEY \
+    --identity-file FILE --expected-run-id RUN_ID [--expected-bucket-owner ACCOUNT_ID]
+
+Upload creates an authenticated age-encrypted deterministic tar archive and
+uses an S3 conditional write, so a reviewed run ID cannot be overwritten.
+Download binds the object metadata to the expected run ID, verifies the
+ciphertext digest, decrypts it, validates archive paths, and extracts only into
+an empty destination directory.
+EOF
+}
+
+fail() {
+  echo "encrypted-s3-artifact: $*" >&2
+  exit 1
+}
+
+[[ $# -gt 0 ]] || {
+  usage >&2
+  exit 2
+}
+mode="$1"
+shift
+
+directory=""
+bucket=""
+object_key=""
+identity_file=""
+kms_key_id=""
+expected_run_id=""
+expected_bucket_owner=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --directory)
+      directory="${2:-}"
+      shift 2
+      ;;
+    --bucket)
+      bucket="${2:-}"
+      shift 2
+      ;;
+    --object-key)
+      object_key="${2:-}"
+      shift 2
+      ;;
+    --identity-file)
+      identity_file="${2:-}"
+      shift 2
+      ;;
+    --kms-key-id)
+      kms_key_id="${2:-}"
+      shift 2
+      ;;
+    --expected-run-id)
+      expected_run_id="${2:-}"
+      shift 2
+      ;;
+    --expected-bucket-owner)
+      expected_bucket_owner="${2:-}"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      fail "unknown argument: $1"
+      ;;
+  esac
+done
+
+case "$mode" in
+  upload | download) ;;
+  *)
+    usage >&2
+    fail "mode must be upload or download"
+    ;;
+esac
+
+for command in age age-keygen aws jq sha256sum tar; do
+  command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
+done
+
+[[ -n "$directory" ]] || fail "--directory is required"
+[[ -n "$bucket" ]] || fail "--bucket is required"
+[[ -n "$object_key" ]] || fail "--object-key is required"
+[[ -f "$identity_file" ]] || fail "--identity-file must name a readable age identity"
+[[ "$bucket" != *$'\n'* && "$object_key" != *$'\n'* ]] || fail "bucket and object key must not contain newlines"
+if [[ -n "$expected_bucket_owner" && ! "$expected_bucket_owner" =~ ^[0-9]{12}$ ]]; then
+  fail "--expected-bucket-owner must be a 12-digit AWS account ID"
+fi
+
+owner_args=()
+if [[ -n "$expected_bucket_owner" ]]; then
+  owner_args+=(--expected-bucket-owner "$expected_bucket_owner")
+fi
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf -- "$tmp_dir"' EXIT
+chmod 0700 "$tmp_dir"
+ciphertext="$tmp_dir/artifact.tar.age"
+archive="$tmp_dir/artifact.tar"
+head_json="$tmp_dir/head.json"
+
+write_output() {
+  local key="$1" value="$2"
+  [[ -n "${GITHUB_OUTPUT:-}" ]] || return 0
+  printf '%s=%s\n' "$key" "$value" >>"$GITHUB_OUTPUT"
+}
+
+derive_recipient() {
+  local recipient=""
+
+  if recipient="$(age-keygen -y "$identity_file" 2>/dev/null)"; then
+    [[ "$recipient" == age1* ]] || fail "derived an unsupported native age recipient"
+    printf '%s\n' "$recipient"
+    return 0
+  fi
+
+  command -v ssh-keygen >/dev/null 2>&1 ||
+    fail "ssh-keygen is required when --identity-file is an OpenSSH private key"
+  if ! recipient="$(ssh-keygen -y -f "$identity_file" 2>/dev/null)"; then
+    fail "could not derive an age or SSH recipient from the identity"
+  fi
+  case "$recipient" in
+    ssh-ed25519\ * | ssh-rsa\ *) printf '%s\n' "$recipient" ;;
+    *) fail "derived an SSH key type that age does not support" ;;
+  esac
+}
+
+if [[ "$mode" == "upload" ]]; then
+  [[ -n "$kms_key_id" ]] || fail "--kms-key-id is required for upload"
+  [[ -d "$directory" ]] || fail "upload directory does not exist: $directory"
+  [[ -n "${GITHUB_RUN_ID:-}" && "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]] || fail "GITHUB_RUN_ID must be numeric for upload"
+  [[ -n "${GITHUB_SHA:-}" && "$GITHUB_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || fail "GITHUB_SHA must be a 40-character commit for upload"
+  find "$directory" -mindepth 1 -print -quit | grep -q . || fail "upload directory is empty"
+  if find "$directory" -mindepth 1 ! -type f ! -type d -print -quit | grep -q .; then
+    fail "upload directory may contain only regular files and directories"
+  fi
+
+  recipient="$(derive_recipient)"
+  kms_key_arn="$(
+    aws kms describe-key \
+      --key-id "$kms_key_id" \
+      --query KeyMetadata.Arn \
+      --output text
+  )"
+  [[ "$kms_key_arn" =~ ^arn:[^:]+:kms:[^:]+:[0-9]{12}:key/[A-Za-z0-9-]+$ ]] ||
+    fail "could not resolve --kms-key-id to a canonical KMS key ARN"
+
+  tar \
+    --sort=name \
+    --mtime=@0 \
+    --owner=0 \
+    --group=0 \
+    --numeric-owner \
+    --format=posix \
+    --pax-option=delete=atime,delete=ctime \
+    -C "$directory" \
+    -cf "$archive" .
+  age --encrypt --recipient "$recipient" --output "$ciphertext" "$archive"
+  ciphertext_sha256="$(sha256sum "$ciphertext" | awk '{print $1}')"
+
+  put_result="$tmp_dir/put.json"
+  aws s3api put-object \
+    --bucket "$bucket" \
+    --key "$object_key" \
+    --body "$ciphertext" \
+    --if-none-match '*' \
+    --server-side-encryption aws:kms \
+    --ssekms-key-id "$kms_key_arn" \
+    --metadata "format=age-tar-v1,source-run-id=${GITHUB_RUN_ID},source-sha=${GITHUB_SHA,,},ciphertext-sha256=${ciphertext_sha256}" \
+    "${owner_args[@]}" >"$put_result"
+
+  version_id="$(jq -r '.VersionId // empty' "$put_result")"
+  [[ -n "$version_id" ]] || fail "S3 did not return a version ID; require versioning on the artifact bucket"
+  write_output ciphertext-sha256 "$ciphertext_sha256"
+  write_output source-run-id "$GITHUB_RUN_ID"
+  write_output source-sha "${GITHUB_SHA,,}"
+  write_output version-id "$version_id"
+  echo "Uploaded encrypted S3 artifact for run ${GITHUB_RUN_ID} (ciphertext sha256 ${ciphertext_sha256})."
+  exit 0
+fi
+
+[[ "$expected_run_id" =~ ^[0-9]+$ ]] || fail "--expected-run-id must be numeric for download"
+mkdir -p "$directory"
+if find "$directory" -mindepth 1 -print -quit | grep -q .; then
+  fail "download directory must be empty: $directory"
+fi
+
+aws s3api head-object \
+  --bucket "$bucket" \
+  --key "$object_key" \
+  "${owner_args[@]}" >"$head_json"
+
+format="$(jq -r '.Metadata.format // empty' "$head_json")"
+source_run_id="$(jq -r '.Metadata["source-run-id"] // empty' "$head_json")"
+source_sha="$(jq -r '.Metadata["source-sha"] // empty' "$head_json")"
+expected_ciphertext_sha256="$(jq -r '.Metadata["ciphertext-sha256"] // empty' "$head_json")"
+version_id="$(jq -r '.VersionId // empty' "$head_json")"
+
+[[ "$format" == "age-tar-v1" ]] || fail "unsupported or missing encrypted artifact format"
+[[ "$source_run_id" == "$expected_run_id" ]] || fail "object source run ID does not match the reviewed plan run"
+[[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || fail "object source commit metadata is invalid"
+[[ "$expected_ciphertext_sha256" =~ ^[0-9a-f]{64}$ ]] || fail "object ciphertext digest metadata is invalid"
+[[ -n "$version_id" ]] || fail "object has no version ID"
+
+aws s3api get-object \
+  --bucket "$bucket" \
+  --key "$object_key" \
+  --version-id "$version_id" \
+  "${owner_args[@]}" \
+  "$ciphertext" >/dev/null
+
+ciphertext_sha256="$(sha256sum "$ciphertext" | awk '{print $1}')"
+[[ "$ciphertext_sha256" == "$expected_ciphertext_sha256" ]] || fail "ciphertext digest does not match immutable object metadata"
+age --decrypt --identity "$identity_file" --output "$archive" "$ciphertext"
+
+while IFS= read -r member; do
+  [[ "$member" != /* ]] || fail "archive contains an absolute path"
+  case "/$member/" in
+    */../*) fail "archive contains a parent-directory path" ;;
+  esac
+done < <(tar -tf "$archive")
+tar -C "$directory" --no-same-owner --no-same-permissions -xf "$archive"
+
+if find "$directory" -mindepth 1 ! -type f ! -type d -print -quit | grep -q .; then
+  fail "decrypted archive contained unsupported filesystem entries"
+fi
+
+write_output ciphertext-sha256 "$ciphertext_sha256"
+write_output source-run-id "$source_run_id"
+write_output source-sha "$source_sha"
+write_output version-id "$version_id"
+echo "Downloaded authenticated encrypted S3 artifact from reviewed run ${source_run_id} (source ${source_sha})."

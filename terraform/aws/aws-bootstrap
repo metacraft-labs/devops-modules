@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+# Company-agnostic AWS Layer-0 bootstrap driver.
+#
+# Renders a consumer repo's bootstrap/<config>/default.nix (a Terranix root,
+# typically a thin caller of terraform/aws/tf-bootstrap.nix), guards the target
+# AWS account via STS, and runs plan/apply/outputs/sync-backend/migrate-state/
+# managed-iam-status. All deployment facts (account, region, bucket, lock table,
+# state keys) are read from the rendered outputs — nothing about a specific
+# company is hardcoded here. Consumers supply --root-dir (their repo) and the
+# bootstrap root config; the bootstrap-backend filename derives from the config
+# and may be overridden with AWS_BOOTSTRAP_BACKEND_FILE.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  aws-bootstrap <plan|apply|outputs|sync-backend|migrate-state|managed-iam-status> <aws/<name>> [--root-dir DIR]
+
+Environment:
+  AWS_PROFILE                 AWS profile to use (set by the consumer's dev shell).
+  AWS_BOOTSTRAP_BACKEND_FILE  Repo-relative bootstrap backend file.
+                              Defaults to backends/aws-<config-slug>-bootstrap.hcl.
+
+Deployment facts live in the tracked Terraform/Nix files, not in operator
+environment variables.
+EOF
+}
+
+action="${1:-}"
+config="${2:-}"
+shift $(( $# >= 2 ? 2 : $# )) || true
+root="$PWD"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root-dir)
+      [[ $# -ge 2 ]] || { echo "--root-dir requires a directory." >&2; exit 2; }
+      root="$(cd -- "$2" && pwd)"; shift 2 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "$action" || "$action" == "-h" || "$action" == "--help" ]]; then
+  usage; exit 0
+fi
+case "$action" in
+  plan | apply | outputs | sync-backend | migrate-state | managed-iam-status) ;;
+  *) usage >&2; exit 2 ;;
+esac
+[[ -n "$config" ]] || { echo "A bootstrap config (e.g. aws/<name>) is required." >&2; usage >&2; exit 2; }
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+matrix_bin="${script_dir}/../ci/terraform-ci-matrix"
+src="${root}/bootstrap/${config}"
+dst="${root}/.result/bootstrap/${config}"
+config_slug="$(printf '%s' "$config" | sed -e 's|^aws/||' -e 's|/|-|g')"
+bootstrap_backend="${root}/${AWS_BOOTSTRAP_BACKEND_FILE:-backends/aws-${config_slug}-bootstrap.hcl}"
+profile="${AWS_PROFILE:-}"
+identity_json=""
+expected_account_id=""
+actual_account_id=""
+aws_region=""
+
+render_config() {
+  terranix "${src}/default.nix" > "${dst}/config.tf.json"
+  jq . "${dst}/config.tf.json" >/dev/null
+}
+
+strip_backend_config() {
+  local tmp
+  tmp="$(mktemp)"
+  jq 'del(.terraform.backend)' "${dst}/config.tf.json" > "$tmp"
+  mv "$tmp" "${dst}/config.tf.json"
+}
+
+if [[ -z "$profile" ]]; then
+  cat >&2 <<'EOF'
+AWS_PROFILE is not set.
+Enter the repo dev shell or export the profile explicitly, for example:
+
+  export AWS_PROFILE=<your-admin-profile>
+
+EOF
+  exit 1
+fi
+
+if [[ ! -f "${src}/default.nix" ]]; then
+  echo "Bootstrap root '${config}' does not exist at ${src}" >&2
+  exit 1
+fi
+
+mkdir -p "$dst"
+render_config
+expected_account_id="$(jq -r '.output.expected_aws_account_id.value // ""' "${dst}/config.tf.json")"
+aws_region="$(jq -r '.output.aws_region.value // ""' "${dst}/config.tf.json")"
+
+if [[ -z "$expected_account_id" ]]; then
+  cat >&2 <<EOF
+The production AWS account ID is not pinned yet.
+Set awsAccountId in ${src}/default.nix to the 12-digit production account ID,
+commit that change, then rerun this command.
+EOF
+  exit 1
+fi
+
+if [[ -z "$aws_region" ]]; then
+  cat >&2 <<EOF
+The production AWS region is not pinned.
+Set awsRegion in ${src}/default.nix, commit that change, then rerun this command.
+EOF
+  exit 1
+fi
+
+if ! identity_json="$(aws --region "$aws_region" sts get-caller-identity --profile "$profile" --output json 2>/dev/null)"; then
+  echo "AWS profile '${profile}' is not authenticated. Run your dev shell's aws-login for ${profile}." >&2
+  exit 1
+fi
+
+actual_account_id="$(jq -r '.Account' <<<"$identity_json")"
+if [[ "$actual_account_id" != "$expected_account_id" ]]; then
+  cat >&2 <<EOF
+AWS profile '${profile}' is authenticated to account ${actual_account_id}, but
+this bootstrap root is pinned to account ${expected_account_id}.
+Refusing to run bootstrap against the wrong account.
+EOF
+  exit 1
+fi
+
+export AWS_PROFILE="$profile"
+export AWS_REGION="$aws_region"
+export AWS_DEFAULT_REGION="$aws_region"
+export AWS_SDK_LOAD_CONFIG=1
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
+unset AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE
+eval "$(aws --region "$aws_region" configure export-credentials --profile "$profile" --format env)"
+
+cp "${src}"/*.tftest.hcl "$dst"/ 2>/dev/null || true
+if [[ -f "${src}/.terraform.lock.hcl" ]]; then
+  cp "${src}/.terraform.lock.hcl" "$dst"/
+fi
+
+cd "$dst"
+
+init_bootstrap() {
+  if [[ -f "$bootstrap_backend" ]]; then
+    tofu init -input=false -reconfigure -backend-config="$bootstrap_backend"
+  else
+    tofu init -input=false -reconfigure -backend=false
+  fi
+}
+
+had_bootstrap_backend=false
+if [[ -f "$bootstrap_backend" ]]; then
+  had_bootstrap_backend=true
+else
+  strip_backend_config
+fi
+
+init_bootstrap
+tofu fmt -check -recursive .
+tofu validate
+
+write_backend() {
+  local backend="$1" key="$2"
+  local bucket="$3" region="$4" table="$5" credentials="$6"
+
+  cat > "$backend" <<EOF
+# Non-secret backend configuration generated by aws-bootstrap.
+# Credentials are supplied by ${credentials}.
+
+bucket         = "${bucket}"
+key            = "${key}"
+region         = "${region}"
+encrypt        = true
+dynamodb_table = "${table}"
+EOF
+
+  echo "Updated ${backend}"
+}
+
+sync_backends() {
+  local outputs bucket bootstrap_key region table matrix root_config backend_rel state_key backend
+  outputs="$(tofu output -json)"
+  bucket="$(jq -r '.state_bucket_name.value' <<<"$outputs")"
+  bootstrap_key="$(jq -r '.bootstrap_state_key.value' <<<"$outputs")"
+  region="$(jq -r '.aws_region.value' <<<"$outputs")"
+  table="$(jq -r '.lock_table_name.value' <<<"$outputs")"
+  matrix="$("$matrix_bin" --root-dir "$root")"
+
+  while IFS= read -r root_config; do
+    backend_rel="$(jq -r '.backend_config_file' <<<"$root_config")"
+    state_key="$(jq -r '.state_key' <<<"$root_config")"
+    backend="${root}/${backend_rel}"
+    mkdir -p "$(dirname "$backend")"
+    write_backend "$backend" "$state_key" "$bucket" "$region" "$table" "GitHub OIDC or human break-glass credentials"
+  done < <(jq -c '.include[]' <<<"$matrix")
+
+  write_backend "$bootstrap_backend" "$bootstrap_key" "$bucket" "$region" "$table" "human AWS CLI bootstrap credentials"
+}
+
+migrate_bootstrap_state() {
+  if [[ ! -f "$bootstrap_backend" ]]; then
+    cat >&2 <<EOF
+Missing bootstrap backend config: ${bootstrap_backend}
+Run 'aws-bootstrap sync-backend ${config}' after bootstrap resources exist.
+EOF
+    exit 1
+  fi
+
+  render_config
+  tofu init -input=false -migrate-state -force-copy -backend-config="$bootstrap_backend"
+}
+
+statement_has_action_on_resource() {
+  local policy="$1" action="$2" resource="$3"
+  jq -e --arg action "$action" --arg resource "$resource" '
+    any(.Statement[]; (
+      (if (.Action | type) == "array" then (.Action | index($action)) != null else .Action == $action end)
+      and
+      (if (.Resource | type) == "array" then (.Resource | index($resource)) != null else .Resource == $resource end)
+    ))
+  ' <<<"$policy" >/dev/null
+}
+
+statement_condition_contains() {
+  local policy="$1" action="$2" resource="$3" condition_operator="$4" condition_key="$5" condition_value="$6"
+  jq -e \
+    --arg action "$action" \
+    --arg resource "$resource" \
+    --arg condition_operator "$condition_operator" \
+    --arg condition_key "$condition_key" \
+    --arg condition_value "$condition_value" '
+      any(.Statement[]; (
+        (if (.Action | type) == "array" then (.Action | index($action)) != null else .Action == $action end)
+        and
+        (if (.Resource | type) == "array" then (.Resource | index($resource)) != null else .Resource == $resource end)
+        and
+        (.Condition[$condition_operator][$condition_key] as $actual
+          | if ($actual | type) == "array" then ($actual | index($condition_value)) != null else $actual == $condition_value end)
+      ))
+    ' <<<"$policy" >/dev/null
+}
+
+managed_iam_status() {
+  local role_name policy_name policy_json policy_doc role_resource profile_resource user_resource group_resource missing=0
+  role_name="$(jq -r '.resource.aws_iam_role.terraform_apply.name' "${dst}/config.tf.json")"
+  policy_name="$(jq -r '.resource.aws_iam_role_policy.terraform_apply_managed_iam.name' "${dst}/config.tf.json")"
+  role_resource="$(jq -r '.output.managed_iam_role_arn_pattern.value' "${dst}/config.tf.json")"
+  profile_resource="$(jq -r '.output.managed_iam_instance_profile_arn_pattern.value' "${dst}/config.tf.json")"
+  user_resource="$(jq -r '.output.managed_iam_user_arn_pattern.value' "${dst}/config.tf.json")"
+  group_resource="$(jq -r '.output.managed_iam_group_arn_pattern.value' "${dst}/config.tf.json")"
+
+  echo "Checking live AWS inline policy '${policy_name}' on role '${role_name}'."
+  if ! policy_json="$(aws --region "$aws_region" iam get-role-policy \
+    --role-name "$role_name" \
+    --policy-name "$policy_name" \
+    --profile "$profile" \
+    --output json 2>/dev/null)"; then
+    cat >&2 <<EOF
+missing inline policy '${policy_name}' on role '${role_name}'.
+Apply the bootstrap root (plan then apply) and rerun this check.
+EOF
+    return 1
+  fi
+
+  policy_doc="$(jq -c '.PolicyDocument' <<<"$policy_json")"
+
+  require_action() {
+    local action="$1" resource="$2"
+    if statement_has_action_on_resource "$policy_doc" "$action" "$resource"; then
+      echo "ok      ${action} on ${resource}"
+    else
+      echo "missing ${action} on ${resource}"
+      missing=1
+    fi
+  }
+
+  require_condition_value() {
+    local action="$1" resource="$2" operator="$3" key="$4" value="$5"
+    if statement_condition_contains "$policy_doc" "$action" "$resource" "$operator" "$key" "$value"; then
+      echo "ok      ${action} condition ${key} includes ${value}"
+    else
+      echo "missing ${action} condition ${key} includes ${value}"
+      missing=1
+    fi
+  }
+
+  require_action "iam:CreateRole" "$role_resource"
+  require_action "iam:UpdateAssumeRolePolicy" "$role_resource"
+  require_action "iam:CreateInstanceProfile" "$profile_resource"
+  require_action "iam:AddRoleToInstanceProfile" "$profile_resource"
+  require_action "iam:CreateUser" "$user_resource"
+  require_action "iam:ListGroupsForUser" "$user_resource"
+  require_action "iam:CreateGroup" "$group_resource"
+  require_action "iam:PutGroupPolicy" "$group_resource"
+  require_action "iam:AddUserToGroup" "$group_resource"
+  require_action "iam:AttachRolePolicy" "$role_resource"
+  require_condition_value "iam:AttachRolePolicy" "$role_resource" "ArnEquals" "iam:PolicyARN" "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  require_condition_value "iam:PassRole" "$role_resource" "StringEquals" "iam:PassedToService" "ec2.amazonaws.com"
+  require_condition_value "iam:PassRole" "$role_resource" "StringEquals" "iam:PassedToService" "lambda.amazonaws.com"
+
+  if [[ "$missing" != 0 ]]; then
+    cat >&2 <<'EOF'
+
+The live apply role is missing at least one scoped managed-IAM permission.
+Review and apply the current AWS bootstrap root, then rerun this check.
+EOF
+    return 1
+  fi
+
+  echo
+  echo "AWS apply role managed-IAM policy is ready."
+}
+
+case "$action" in
+  plan)
+    tofu plan -out=bootstrap.tfplan
+    ;;
+  apply)
+    tofu plan -out=bootstrap.tfplan
+    tofu apply bootstrap.tfplan
+    sync_backends
+    if [[ "$had_bootstrap_backend" == false ]]; then
+      migrate_bootstrap_state
+    fi
+    ;;
+  outputs)
+    tofu output
+    ;;
+  sync-backend)
+    sync_backends
+    ;;
+  migrate-state)
+    sync_backends
+    migrate_bootstrap_state
+    ;;
+  managed-iam-status)
+    managed_iam_status
+    ;;
+esac

@@ -1,0 +1,25 @@
+# Fixture (RD2 gate): a NON-compliant PUBLIC-repo workflow.
+# Each job below names a larger/GPU GitHub-hosted runner that bills even on a
+# public repo (and is blocked under the $0 budget). The checker must FAIL.
+name: billed-public
+on: [push]
+jobs:
+  gpu-build:
+    runs-on: ubuntu-latest-gpu
+    steps:
+      - run: echo billed
+  big-cores:
+    runs-on: ubuntu-latest-8-cores
+    steps:
+      - run: echo billed
+  matrix-billed:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-latest-4-core]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo billed
+  mac-large:
+    runs-on: macos-14-xlarge
+    steps:
+      - run: echo billed

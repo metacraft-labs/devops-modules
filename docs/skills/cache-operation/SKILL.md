@@ -19,7 +19,7 @@ description: Use when inspecting Attic or Cachix deployment cache health, provin
 ## Commands
 
 ```sh
-mcl cache push-closure --backend attic --cache "$CACHE" --target "$TARGET" \
+mcl-devops cache push-closure --backend attic --cache "$CACHE" --target "$TARGET" \
   --transport ssh --substituter "$ATTIC_SUBSTITUTER" \
   --trusted-public-key "$ATTIC_TRUSTED_PUBLIC_KEY" --require-substitute "$SYSTEM_PATH"
 nix path-info --store "$ATTIC_SUBSTITUTER" --recursive "$SYSTEM_PATH" \
@@ -30,7 +30,7 @@ just attic-verify-host-substituters --dry-run --resolve-netbird-peers
 ```
 
 Use the host substituter verifier for target-side trust and netrc checks. Use
-`mcl cache push-closure` for controller-side cache push and closure substitute
+`mcl-devops cache push-closure` for controller-side cache push and closure substitute
 proof.
 
 ## Workflow

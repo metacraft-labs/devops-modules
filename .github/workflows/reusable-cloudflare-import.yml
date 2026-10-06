@@ -1,0 +1,359 @@
+name: 'Cloudflare Import (reusable)'
+
+# Reusable import-only adoption workflow for a Cloudflare Terranix root, mirroring
+# the GitHub governance import path. Callers stay thin — they supply the root
+# config, backend, and agenix token paths; the shared cloudflare-import-{blocks,ci}
+# tooling does the work. The consumer repo must provide a `just build-terranix
+# <config>` target that renders terraform/<config>/default.nix into
+# .result/terraform/<config>/config.tf.json, plus a committed
+# terraform/<config>/import-ids.json and .terraform.lock.hcl.
+
+on:
+  workflow_call:
+    inputs:
+      root_config:
+        description: 'Root under terraform/, e.g. cloudflare/<name>-prod'
+        type: string
+        required: true
+      backend_config_file:
+        description: 'Repo-relative backend hcl (S3 state key only)'
+        type: string
+        required: true
+      credentials_env_name:
+        description: 'Provider token env var read by the Cloudflare provider'
+        type: string
+        required: false
+        default: 'CLOUDFLARE_API_TOKEN'
+      agenix_plan_secret_path:
+        description: 'Repo-relative agenix plan (read) token'
+        type: string
+        required: true
+      agenix_apply_secret_path:
+        description: 'Repo-relative agenix apply (write) token'
+        type: string
+        required: true
+      nixos_modules_ref:
+        description: 'nixos-modules ref providing the shared import tooling'
+        type: string
+        required: false
+        default: 'main'
+      runner:
+        description: 'JSON-encoded runner labels (infra exemption)'
+        type: string
+        required: false
+        default: '["self-hosted", "Linux", "x86-64-v2"]'
+      aws_region:
+        type: string
+        required: false
+        default: 'us-east-1'
+      mode:
+        description: 'workflow_dispatch mode: plan | apply (empty on pull_request)'
+        type: string
+        required: false
+        default: ''
+      scope:
+        description: 'Import scope: all, an alias (dns|pages|r2|workers|zones), or a cloudflare_<type>'
+        type: string
+        required: false
+        default: 'all'
+      confirm_apply:
+        description: 'Must equal apply-reviewed-imports for apply mode'
+        type: string
+        required: false
+        default: ''
+    secrets:
+      AGENIX_CI_PRIVATE_KEY:
+        required: true
+      NIX_GITHUB_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Offline: render, generate import blocks, validate. No credentials.
+  # ---------------------------------------------------------------------------
+  offline:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: metacraft-labs/devops-modules
+          ref: ${{ inputs.nixos_modules_ref }}
+          path: .ci/nixos-modules
+
+      - name: Setup Nix
+        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          push-to-cache: false
+          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+
+      - name: Render and generate import blocks
+        env:
+          ROOT_CONFIG: ${{ inputs.root_config }}
+          IMPORT_SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          nix develop --accept-flake-config --command just build-terranix "$ROOT_CONFIG"
+          src="terraform/$ROOT_CONFIG"
+          res=".result/terraform/$ROOT_CONFIG"
+          mkdir -p "$res"
+          nix shell --accept-flake-config --inputs-from . nixpkgs#python3 --command \
+            python3 .ci/nixos-modules/terraform/cloudflare/cloudflare-import-blocks \
+            --config "$ROOT_CONFIG" --root-dir . --scope "${IMPORT_SCOPE:-all}" \
+            --output "$res/imports.tf"
+          cp "$src"/*.tftest.hcl "$res"/ 2>/dev/null || true
+          cp "$src/.terraform.lock.hcl" "$res"/
+
+      - name: Offline validation
+        env:
+          ROOT_CONFIG: ${{ inputs.root_config }}
+        run: |
+          set -euo pipefail
+          cd ".result/terraform/$ROOT_CONFIG"
+          rm -rf .terraform
+          rm -f terraform.tfstate terraform.tfstate.backup
+          nix develop --accept-flake-config --command tofu fmt -check -recursive .
+          nix develop --accept-flake-config --command tofu init -backend=false
+          nix develop --accept-flake-config --command tofu validate
+
+  # ---------------------------------------------------------------------------
+  # Plan: speculative import-only plan (same-repo PR or dispatch mode=plan).
+  # ---------------------------------------------------------------------------
+  plan:
+    needs: offline
+    if: >-
+      (github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository)
+      || (github.event_name == 'workflow_dispatch' && inputs.mode == 'plan')
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: metacraft-labs/devops-modules
+          ref: ${{ inputs.nixos_modules_ref }}
+          path: .ci/nixos-modules
+
+      - name: Setup Nix
+        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          push-to-cache: false
+          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+
+      - name: Validate plan role configuration
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          AWS_DRIFT_ROLE_ARN: ${{ vars.AWS_TERRAFORM_DRIFT_ROLE_ARN }}
+          AWS_PLAN_ROLE_ARN: ${{ vars.AWS_TERRAFORM_PLAN_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            [ -n "$AWS_DRIFT_ROLE_ARN" ] || { echo "::error::AWS_TERRAFORM_DRIFT_ROLE_ARN is not configured."; exit 1; }
+          else
+            [ -n "$AWS_PLAN_ROLE_ARN" ] || { echo "::error::AWS_TERRAFORM_PLAN_ROLE_ARN is not configured."; exit 1; }
+          fi
+
+      - name: Decrypt Cloudflare plan token
+        id: token
+        env:
+          AGENIX_SECRET_PATH: ${{ inputs.agenix_plan_secret_path }}
+        run: |
+          set -euo pipefail
+          install -m 600 /dev/null "$RUNNER_TEMP/ci-key"
+          printf '%s\n' "${{ secrets.AGENIX_CI_PRIVATE_KEY }}" > "$RUNNER_TEMP/ci-key"
+          [ -s "$RUNNER_TEMP/ci-key" ] || { echo "::error::AGENIX_CI_PRIVATE_KEY is empty."; exit 1; }
+          token_file="$RUNNER_TEMP/cloudflare-token"
+          install -m 600 /dev/null "$token_file"
+          nix develop --accept-flake-config --command bash -euo pipefail -c \
+            "age -d -i \"\$1\" \"\$2\" > \"\$3\"" \
+            bash "$RUNNER_TEMP/ci-key" "$AGENIX_SECRET_PATH" "$token_file" >/dev/null
+          [ -s "$token_file" ] || { echo "::error::Decrypted Cloudflare token is empty."; exit 1; }
+          echo "token_path=$token_file" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials for plan
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ github.event_name == 'workflow_dispatch' && vars.AWS_TERRAFORM_DRIFT_ROLE_ARN || vars.AWS_TERRAFORM_PLAN_ROLE_ARN }}
+          role-session-name: cloudflare-import-plan-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: Plan reviewed imports
+        id: plan
+        env:
+          ROOT_CONFIG: ${{ inputs.root_config }}
+          BACKEND_CONFIG_FILE: ${{ inputs.backend_config_file }}
+          CREDENTIALS_ENV_NAME: ${{ inputs.credentials_env_name }}
+          CLOUDFLARE_TOKEN_PATH: ${{ steps.token.outputs.token_path }}
+          IMPORT_SCOPE: ${{ inputs.scope }}
+        run: .ci/nixos-modules/terraform/cloudflare/cloudflare-import-ci plan
+
+      - name: Post plan comment
+        if: github.event_name == 'pull_request' && steps.plan.outputs.text_plan_path != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN_CHANGED: ${{ steps.plan.outputs.changes }}
+          PLAN_TEXT_PATH: ${{ steps.plan.outputs.text_plan_path }}
+          PLAN_DIFFS_PATH: ${{ steps.plan.outputs.diffs_path }}
+          TO_IMPORT: ${{ steps.plan.outputs.to_import }}
+          TO_ADD: ${{ steps.plan.outputs.to_add }}
+          TO_CHANGE: ${{ steps.plan.outputs.to_change }}
+          TO_DESTROY: ${{ steps.plan.outputs.to_destroy }}
+          TO_REPLACE: ${{ steps.plan.outputs.to_replace }}
+          IMPORT_SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          marker="<!-- cloudflare-import-plan:${{ inputs.root_config }}:${IMPORT_SCOPE} -->"
+          comments_api="repos/${GITHUB_REPOSITORY}/issues/${{ github.event.pull_request.number }}/comments"
+          diffs="$GITHUB_WORKSPACE/$PLAN_DIFFS_PATH"
+          [ -s "$diffs" ] || { diffs="$(mktemp)"; echo "_(no differences summary produced)_" > "$diffs"; }
+          plan_text="$GITHUB_WORKSPACE/$PLAN_TEXT_PATH"
+          display_plan="$(mktemp)"
+          max_plan_bytes=52000
+          if [ "$(wc -c < "$plan_text")" -gt "$max_plan_bytes" ]; then
+            head -c "$max_plan_bytes" "$plan_text" >"$display_plan"
+            printf '\n\n... truncated; see the workflow log for the full output.\n' >>"$display_plan"
+          else
+            cp "$plan_text" "$display_plan"
+          fi
+          if [ "$PLAN_CHANGED" = "true" ]; then result="Changes detected"; else result="No changes"; fi
+          comment_body="$(mktemp)"
+          {
+            echo "$marker"
+            echo "### Cloudflare Import Plan — \`${{ inputs.root_config }}\`"
+            echo
+            echo "Speculative import-block plan (does not write state). Scope \`${IMPORT_SCOPE}\` · Result: ${result}"
+            echo
+            echo "| Import | Add | Change | Destroy | Replace |"
+            echo "| ---: | ---: | ---: | ---: | ---: |"
+            echo "| ${TO_IMPORT:-0} | ${TO_ADD:-0} | ${TO_CHANGE:-0} | ${TO_DESTROY:-0} | ${TO_REPLACE:-0} |"
+            echo
+            cat "$diffs"
+            echo
+            echo "<details><summary>Full plan output</summary>"
+            echo
+            echo '```text'
+            cat "$display_plan"
+            echo '```'
+            echo
+            echo "</details>"
+          } >"$comment_body"
+          existing_comment_id="$(gh api "$comments_api" --paginate --jq ".[] | select(.body | contains(\"$marker\")) | .id" | tail -n 1)"
+          body="$(cat "$comment_body")"
+          if [ -n "$existing_comment_id" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing_comment_id}" -f body="$body" >/dev/null
+          else
+            gh api -X POST "$comments_api" -f body="$body" >/dev/null
+          fi
+
+      - name: Safety gate
+        env:
+          TO_ADD: ${{ steps.plan.outputs.to_add }}
+          TO_CHANGE: ${{ steps.plan.outputs.to_change }}
+          TO_DESTROY: ${{ steps.plan.outputs.to_destroy }}
+          TO_REPLACE: ${{ steps.plan.outputs.to_replace }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # A Cloudflare adoption has no allowed non-import creates (unlike the
+          # GitHub governance-app secret bootstrap), so any create is a hard fail.
+          if [ "${TO_ADD:-0}" -gt 0 ]; then
+            echo "::error::Import plan contains ${TO_ADD} create(s); an adoption must be import-only."
+            exit 1
+          fi
+          if [ "${TO_DESTROY:-0}" -gt 0 ] || [ "${TO_REPLACE:-0}" -gt 0 ]; then
+            echo "::error::Import plan contains destroy/replace actions. Refine the reviewed data model before applying."
+            exit 1
+          fi
+          if [ "${TO_CHANGE:-0}" -gt 0 ] && [ "${{ github.event_name }}" = "pull_request" ]; then
+            if ! gh pr view "${{ github.event.pull_request.number }}" --json labels -q '.labels[].name' | grep -q 'sensitive-change'; then
+              echo "::error::Import plan contains updates. Add the 'sensitive-change' label after reviewing the diff."
+              exit 1
+            fi
+          fi
+
+      - name: Cleanup token
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ci-key" "$RUNNER_TEMP/cloudflare-token"
+
+  # ---------------------------------------------------------------------------
+  # Apply: import-only apply (dispatch mode=apply, production environment).
+  # ---------------------------------------------------------------------------
+  apply:
+    needs: offline
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'apply'
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    environment: production
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: metacraft-labs/devops-modules
+          ref: ${{ inputs.nixos_modules_ref }}
+          path: .ci/nixos-modules
+
+      - name: Setup Nix
+        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+        with:
+          push-to-cache: false
+          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+
+      - name: Validate apply request
+        env:
+          APPLY_CONFIRM: ${{ inputs.confirm_apply }}
+          AWS_APPLY_ROLE_ARN: ${{ vars.AWS_TERRAFORM_APPLY_ROLE_ARN }}
+        run: |
+          set -euo pipefail
+          [ "$APPLY_CONFIRM" = "apply-reviewed-imports" ] || { echo "::error::Set confirm_apply to apply-reviewed-imports."; exit 1; }
+          [ -n "$AWS_APPLY_ROLE_ARN" ] || { echo "::error::AWS_TERRAFORM_APPLY_ROLE_ARN is not configured."; exit 1; }
+
+      - name: Decrypt Cloudflare apply token
+        id: token
+        env:
+          AGENIX_SECRET_PATH: ${{ inputs.agenix_apply_secret_path }}
+        run: |
+          set -euo pipefail
+          install -m 600 /dev/null "$RUNNER_TEMP/ci-key"
+          printf '%s\n' "${{ secrets.AGENIX_CI_PRIVATE_KEY }}" > "$RUNNER_TEMP/ci-key"
+          [ -s "$RUNNER_TEMP/ci-key" ] || { echo "::error::AGENIX_CI_PRIVATE_KEY is empty."; exit 1; }
+          token_file="$RUNNER_TEMP/cloudflare-token"
+          install -m 600 /dev/null "$token_file"
+          nix develop --accept-flake-config --command bash -euo pipefail -c \
+            "age -d -i \"\$1\" \"\$2\" > \"\$3\"" \
+            bash "$RUNNER_TEMP/ci-key" "$AGENIX_SECRET_PATH" "$token_file" >/dev/null
+          [ -s "$token_file" ] || { echo "::error::Decrypted Cloudflare token is empty."; exit 1; }
+          echo "token_path=$token_file" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials for apply
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ vars.AWS_TERRAFORM_APPLY_ROLE_ARN }}
+          role-session-name: cloudflare-import-apply-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      - name: Apply reviewed imports
+        env:
+          ROOT_CONFIG: ${{ inputs.root_config }}
+          BACKEND_CONFIG_FILE: ${{ inputs.backend_config_file }}
+          CREDENTIALS_ENV_NAME: ${{ inputs.credentials_env_name }}
+          CLOUDFLARE_TOKEN_PATH: ${{ steps.token.outputs.token_path }}
+          IMPORT_SCOPE: ${{ inputs.scope }}
+          APPLY_CONFIRM: ${{ inputs.confirm_apply }}
+        run: .ci/nixos-modules/terraform/cloudflare/cloudflare-import-ci apply
+
+      - name: Cleanup token
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ci-key" "$RUNNER_TEMP/cloudflare-token"

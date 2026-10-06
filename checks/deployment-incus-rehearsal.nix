@@ -163,7 +163,7 @@ top@{ config, ... }:
                   by_group.setdefault(role.get("targetGroup"), []).append(role)
                   role_networks = set(role["networks"])
                   assert role_networks <= networks, role
-                  if role.get("targetGroup") in {"home-lab-gpu", "solunska"}:
+                  if role.get("targetGroup") in {"home-lab-gpu", "example-site"}:
                       assert role["avahi"] is True, role
                       assert "home-lab" in role_networks, role
                   if role.get("targetGroup") in {"hetzner", "workstation"}:
@@ -174,7 +174,7 @@ top@{ config, ... }:
                       assert "workstation" in role_networks, role
 
               assert by_group["home-lab-gpu"], by_group
-              assert by_group["solunska"], by_group
+              assert by_group["example-site"], by_group
               assert by_group["hetzner"], by_group
               assert by_group["workstation"], by_group
               assert any(role["role"] == "orchestrator" for role in roles), roles

@@ -9,7 +9,9 @@
     }:
     let
       cfg = config.services.mcl-deployment-ssh-apply;
-      defaultPackage = withSystem pkgs.stdenv.hostPlatform.system ({ config, ... }: config.packages.mcl);
+      defaultPackage = withSystem pkgs.stdenv.hostPlatform.system (
+        { config, ... }: config.packages.mcl-devops
+      );
       inherit (lib)
         concatMapStringsSep
         escapeShellArg
@@ -71,7 +73,7 @@
         package = mkOption {
           type = types.package;
           default = defaultPackage;
-          description = "Package providing the mcl binary.";
+          description = "Package providing the mcl-devops binary.";
         };
 
         user = mkOption {

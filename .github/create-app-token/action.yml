@@ -1,0 +1,45 @@
+name: Create GitHub App Token
+description: >-
+  Mint a short-lived GitHub App installation token, optionally scoped to
+  specific repositories and permissions. Replaces long-lived PATs for
+  cross-repo access in CI. Company-specific values (App ID, private key,
+  target repos) are passed in by the caller; this action is org-agnostic.
+
+inputs:
+  app-id:
+    description: GitHub App ID (public). e.g. the CI_TOKEN_PROVIDER_APP_ID secret.
+    required: true
+  private-key:
+    description: GitHub App private key PEM. e.g. the CI_TOKEN_PROVIDER_PRIVATE_KEY secret.
+    required: true
+  owner:
+    description: Org/owner the token is scoped to. Defaults to the current repo's owner.
+    required: false
+    default: ${{ github.repository_owner }}
+  repositories:
+    description: >-
+      Comma- or newline-separated unqualified repo names the token may access.
+      Empty means every repo the app installation can reach in `owner`.
+    required: false
+    default: ''
+  permission-contents:
+    description: '`contents` permission for the minted token: read | write.'
+    required: false
+    default: read
+
+outputs:
+  token:
+    description: The minted installation access token (mask it; it is short-lived).
+    value: ${{ steps.mint.outputs.token }}
+
+runs:
+  using: composite
+  steps:
+    - id: mint
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.private-key }}
+        owner: ${{ inputs.owner }}
+        repositories: ${{ inputs.repositories }}
+        permission-contents: ${{ inputs.permission-contents }}

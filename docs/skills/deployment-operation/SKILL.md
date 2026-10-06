@@ -22,16 +22,16 @@ description: Use when performing normal deployment operations, confirming deploy
 ```sh
 just deploy-machine "$TARGET"
 just deploy-machine-direct-ssh "$TARGET" "$SSH_HOST" deploy
-mcl cache push-closure --backend attic --cache "$CACHE" --target "$TARGET" \
+mcl-devops cache push-closure --backend attic --cache "$CACHE" --target "$TARGET" \
   --transport ssh --substituter "$ATTIC_SUBSTITUTER" \
   --trusted-public-key "$ATTIC_TRUSTED_PUBLIC_KEY" --require-substitute "$SYSTEM_PATH"
-mcl deploy-plan --target "$TARGET" --desired-system-path "$SYSTEM_PATH" \
+mcl-devops deploy-plan --target "$TARGET" --desired-system-path "$SYSTEM_PATH" \
   --git-revision "$GIT_REVISION" --sequence "$SEQUENCE" \
   --signing-key "$MCL_DEPLOY_MANIFEST_SIGNING_KEY" --output "$MANIFEST"
-mcl deploy-ssh "$TARGET" --manifest "$MANIFEST" --ssh-host "$SSH_HOST" \
+mcl-devops deploy-ssh "$TARGET" --manifest "$MANIFEST" --ssh-host "$SSH_HOST" \
   --ssh-user deploy --identity-file "$MCL_DEPLOY_SSH_IDENTITY" \
   --ssh-option BatchMode=yes --ssh-option StrictHostKeyChecking=yes
-mcl deploy-status summarize "$EVENTS_JSONL"
+mcl-devops deploy-status summarize "$EVENTS_JSONL"
 ```
 
 Prefer the repository wrapper when it exists, because it keeps build, cache
@@ -54,7 +54,7 @@ path is ready.
 
 - Target, git revision, sequence, manifest path, and desired system path.
 - Cache prefill or substitute proof.
-- Event JSONL and `mcl deploy-status summarize` output.
+- Event JSONL and `mcl-devops deploy-status summarize` output.
 - Target-side `agent-restore`, `switch`, `healthcheck`, and `complete` events
   when the direct apply path is used.
 

@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Cloudflare API-token deep-link builder — scopes DERIVED from managed resources.
+
+Shared engine consumed by every infra repo (metacraft, agent-harbor, blocksense).
+The required Cloudflare permission groups for a plan / apply / import token are
+COMPUTED from the set of `cloudflare_*` resource types a repo's Terraform actually
+manages, via the canonical resource-type -> permission-group mapping below. So the
+token is least-privilege by construction and there is NO per-repo hand-maintained
+scope list — only the token NAME (company label) and the account/zone differ per
+repo, and those are passed in.
+
+Usage:
+  cloudflare-token <plan|apply|import> --scan <tf-root-dir> --name "Metacraft Terraform"
+  cloudflare-token plan --resource-types cloudflare_zone,cloudflare_dns_record --name "X" --open
+
+Discovery: `--scan DIR` greps the managed `cloudflare_<type>` resource types out of
+the root's *.tf (resource blocks + `to =` import targets); or pass them explicitly
+with `--resource-types`.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+import urllib.parse
+import webbrowser
+
+# ---------------------------------------------------------------------------
+# Canonical Cloudflare resource-type -> permission group.
+# `writable` = an apply that manages this type needs the group at `edit`
+# (vs merely `read`). `zone` is intentionally read-only here: managing DNS /
+# R2 / Pages needs Zone:Read to reference the zone, not Zone:Edit — a repo that
+# manages zone-level settings can bump `cloudflare_zone` to writable via
+# --zone-writable. Names are the dashboard permissionGroupKeys.
+# ---------------------------------------------------------------------------
+RESOURCE_SCOPES = {
+    "cloudflare_zone":                 {"group": "zone",                "writable": False},
+    "cloudflare_zone_setting":         {"group": "zone",                "writable": True},
+    "cloudflare_zone_settings_override": {"group": "zone",              "writable": True},
+    "cloudflare_dns_record":           {"group": "dns",                 "writable": True},
+    "cloudflare_record":               {"group": "dns",                 "writable": True},  # provider v4 name
+    "cloudflare_r2_bucket":            {"group": "workers_r2",          "writable": True},
+    "cloudflare_r2_custom_domain":     {"group": "workers_r2",          "writable": True},
+    "cloudflare_r2_managed_domain":    {"group": "workers_r2",          "writable": True},
+    "cloudflare_pages_project":        {"group": "page",                "writable": True},
+    "cloudflare_pages_domain":         {"group": "page",                "writable": True},
+    "cloudflare_workers_script":       {"group": "workers_scripts",     "writable": True},
+    "cloudflare_worker_script":        {"group": "workers_scripts",     "writable": True},  # v4 name
+    "cloudflare_workers_route":        {"group": "workers_routes",      "writable": True},
+    "cloudflare_workers_kv_namespace": {"group": "workers_kv_storage",  "writable": True},
+    "cloudflare_workers_kv":           {"group": "workers_kv_storage",  "writable": True},
+    "cloudflare_d1_database":          {"group": "d1",                  "writable": True},
+    "cloudflare_queue":                {"group": "queues",              "writable": True},
+    "cloudflare_ruleset":              {"group": "waf",                 "writable": True},
+}
+
+# `import` (inventory/adoption) tokens read broadly for discovery — the union of
+# every group this engine knows about, plus account settings.
+ALL_GROUPS = sorted({v["group"] for v in RESOURCE_SCOPES.values()})
+
+
+def discover_resource_types(scan_dir):
+    """Return the set of cloudflare_* resource types managed under scan_dir.
+
+    Matches only real resource contexts — `resource "cloudflare_X"`, `data
+    "cloudflare_X"`, and `to = cloudflare_X.…` import targets — so variables
+    (`var.cloudflare_api_token`) and comments don't count.
+    """
+    found = set()
+    pat = re.compile(
+        r'(?:resource|data)\s+"(cloudflare_[a-z0-9_]+)"'
+        r'|\bto\s*=\s*(cloudflare_[a-z0-9_]+)\b'
+    )
+    for tf in glob.glob(os.path.join(scan_dir, "**", "*.tf"), recursive=True):
+        with open(tf, encoding="utf-8", errors="replace") as fh:
+            for a, b in pat.findall(fh.read()):
+                found.add(a or b)
+    return found
+
+
+def compute_permissions(resource_types, mode, zone_writable=False):
+    """Compute the [{key, type}] permission set for the given mode."""
+    unknown = sorted(t for t in resource_types if t not in RESOURCE_SCOPES)
+
+    if mode == "import":
+        groups = list(ALL_GROUPS)
+        perms = [{"key": "account_settings", "type": "read"}]
+        perms += [{"key": g, "type": "read"} for g in groups]
+        return perms, unknown
+
+    # plan / apply: derive groups from the managed types.
+    want = {}  # group -> writable?
+    for t in resource_types:
+        spec = RESOURCE_SCOPES.get(t)
+        if not spec:
+            continue
+        w = spec["writable"] or (spec["group"] == "zone" and zone_writable)
+        want[spec["group"]] = want.get(spec["group"], False) or w
+
+    perms = []
+    for g in sorted(want):
+        if mode == "plan":
+            perms.append({"key": g, "type": "read"})
+        else:  # apply
+            perms.append({"key": g, "type": "edit" if want[g] else "read"})
+    return perms, unknown
+
+
+def build_url(permissions, name, owner, account_id, zone_id):
+    perm_json = json.dumps(permissions, separators=(",", ":"))
+    q_perm = urllib.parse.quote(perm_json, safe="")
+    q_name = urllib.parse.quote(name, safe="")
+    if owner == "account":
+        return (
+            "https://dash.cloudflare.com/?to=/:account/api-tokens"
+            f"&permissionGroupKeys={q_perm}&name={q_name}"
+        )
+    return (
+        "https://dash.cloudflare.com/profile/api-tokens"
+        f"?permissionGroupKeys={q_perm}"
+        f"&accountId={urllib.parse.quote(account_id, safe='')}"
+        f"&zoneId={urllib.parse.quote(zone_id, safe='')}"
+        f"&name={q_name}"
+    )
+
+
+def main():
+    p = argparse.ArgumentParser(description="Build a Cloudflare API-token deep-link with scopes derived from managed resources.")
+    p.add_argument("mode", choices=["plan", "apply", "import"])
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--scan", help="Terraform root dir to scan for managed cloudflare_* resource types.")
+    src.add_argument("--resource-types", help="Comma-separated cloudflare_* types (instead of --scan).")
+    p.add_argument("--name", required=True, help="Token name prefix (company label), e.g. 'Metacraft Terraform'.")
+    p.add_argument("--owner", choices=["account", "user"], default="account")
+    p.add_argument("--account-id", default="*")
+    p.add_argument("--zone-id", default="all")
+    p.add_argument("--zone-writable", action="store_true", help="Grant Zone:Edit (managing zone-level settings).")
+    p.add_argument("--open", action="store_true", help="Open the URL in a browser.")
+    p.add_argument("--json", action="store_true", help="Emit machine-readable metadata.")
+    args = p.parse_args()
+
+    if args.resource_types:
+        types = {t.strip() for t in args.resource_types.split(",") if t.strip()}
+    else:
+        types = discover_resource_types(args.scan)
+        if not types:
+            print(f"WARNING: no cloudflare_* resource types found under {args.scan}", file=sys.stderr)
+
+    perms, unknown = compute_permissions(types, args.mode, args.zone_writable)
+    name = f"{args.name} {args.mode.capitalize()}"
+    url = build_url(perms, name, args.owner, args.account_id, args.zone_id)
+
+    if args.json:
+        print(json.dumps({"mode": args.mode, "name": name, "resource_types": sorted(types),
+                          "permissions": perms, "unknown_types": unknown, "url": url}, indent=2))
+    else:
+        print(name)
+        print(f"Derived from {len(types)} managed resource type(s).")
+        if unknown:
+            print(f"NOTE: no scope mapping for: {', '.join(unknown)} (add to RESOURCE_SCOPES if managed).", file=sys.stderr)
+        print("Permissions:")
+        for perm in perms:
+            print(f"  - {perm['key']}: {perm['type']}")
+        print()
+        print(url)
+
+    if args.open and not webbrowser.open(url, new=2):
+        print("Could not open a browser automatically.", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

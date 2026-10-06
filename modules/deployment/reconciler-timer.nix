@@ -9,7 +9,9 @@
     }:
     let
       cfg = config.services.mcl-deployment-reconciler;
-      defaultPackage = withSystem pkgs.stdenv.hostPlatform.system ({ config, ... }: config.packages.mcl);
+      defaultPackage = withSystem pkgs.stdenv.hostPlatform.system (
+        { config, ... }: config.packages.mcl-devops
+      );
       inherit (lib)
         concatMapStringsSep
         escapeShellArg
@@ -45,7 +47,7 @@
         package = mkOption {
           type = types.package;
           default = defaultPackage;
-          description = "Package providing the mcl binary.";
+          description = "Package providing the mcl-devops binary.";
         };
 
         stateDir = mkOption {
@@ -102,7 +104,7 @@
             "BatchMode=yes"
             "ConnectTimeout=15"
           ];
-          description = "Extra ssh -o options passed to mcl deploy-reconcile.";
+          description = "Extra ssh -o options passed to mcl-devops deploy-reconcile.";
         };
 
         identityFile = mkOption {
@@ -128,6 +130,13 @@
           description = "Reconcile pending mcl desired-state deployments";
           after = [ "network-online.target" ];
           wants = [ "network-online.target" ];
+          # Hardening, same rationale as mcl-deploy-agent: this runs
+          # switch-to-configuration and the activated closure contains a new version
+          # of this unit, so keep restartIfChanged false to avoid restarting it
+          # mid-switch. Defensive only -- the historical deploy wedge was a lost
+          # dbus JobRemoved signal blocking switch-to-configuration-ng, fixed in the
+          # consumer via dbus-broker plus a TimeoutStartSec bound, not here.
+          restartIfChanged = false;
           serviceConfig = {
             Type = "oneshot";
             ExecStart = "${pkgs.util-linux}/bin/flock -n ${escapeShellArg cfg.lockFile} ${reconcileCommand}";

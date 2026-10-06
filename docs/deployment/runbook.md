@@ -12,7 +12,7 @@ Start with the deployment event artifact when it exists:
 ```sh
 gh run view "$RUN_ID" --log
 gh run download "$RUN_ID" --dir .result/deployment-artifacts
-mcl deploy-status summarize .result/deployment-artifacts/events.jsonl \
+mcl-devops deploy-status summarize .result/deployment-artifacts/events.jsonl \
   --output .result/deployment-summary.md \
   --json-output .result/deployment-summary.json
 ```
@@ -48,18 +48,18 @@ just deploy-machine-direct-ssh "$TARGET" "$SSH_HOST" deploy
 The direct SSH path expands to:
 
 ```sh
-mcl cache push-closure --backend attic --cache "$CACHE" --target "$TARGET" \
+mcl-devops cache push-closure --backend attic --cache "$CACHE" --target "$TARGET" \
   --transport ssh --substituter "$ATTIC_SUBSTITUTER" \
   --trusted-public-key "$ATTIC_TRUSTED_PUBLIC_KEY" --require-substitute "$SYSTEM_PATH"
-mcl deploy-plan --target "$TARGET" --desired-system-path "$SYSTEM_PATH" \
+mcl-devops deploy-plan --target "$TARGET" --desired-system-path "$SYSTEM_PATH" \
   --git-revision "$GIT_REVISION" --sequence "$SEQUENCE" \
   --signing-key "$MCL_DEPLOY_MANIFEST_SIGNING_KEY" --output "$MANIFEST"
-mcl deploy-ssh "$TARGET" --manifest "$MANIFEST" --ssh-host "$SSH_HOST" \
+mcl-devops deploy-ssh "$TARGET" --manifest "$MANIFEST" --ssh-host "$SSH_HOST" \
   --ssh-user deploy --identity-file "$MCL_DEPLOY_SSH_IDENTITY" \
   --ssh-option BatchMode=yes --ssh-option StrictHostKeyChecking=yes
 ```
 
-Confirm success with `mcl deploy-status summarize`, target journal evidence,
+Confirm success with `mcl-devops deploy-status summarize`, target journal evidence,
 and any service-specific health checks from the manifest.
 
 ## Desired-state Reconciliation
@@ -78,7 +78,7 @@ The state directory contains:
 Inspect retry behavior with:
 
 ```sh
-mcl deploy-reconcile --state-dir "$STATE_DIR" --event-log "$EVENTS_JSONL" --dry-run
+mcl-devops deploy-reconcile --state-dir "$STATE_DIR" --event-log "$EVENTS_JSONL" --dry-run
 systemctl status mcl-deployment-reconciler.service mcl-deployment-reconciler.timer
 systemctl status mcl-deploy-agent.service mcl-deploy-agent.timer
 ```
@@ -132,7 +132,7 @@ The forced command invokes `sudo -n` for the root apply wrapper only.
 The root wrapper runs:
 
 ```sh
-mcl deploy-apply --manifest - --allowed-signers "$ALLOWED_SIGNERS" \
+mcl-devops deploy-apply --manifest - --allowed-signers "$ALLOWED_SIGNERS" \
   --target "$TARGET" --reject-ssh-original-command
 ```
 
@@ -145,7 +145,7 @@ state. Any non-empty `SSH_ORIGINAL_COMMAND` must be rejected.
 Controller-side cache repair:
 
 ```sh
-mcl cache push-closure --backend attic --cache "$CACHE" --target "$TARGET" \
+mcl-devops cache push-closure --backend attic --cache "$CACHE" --target "$TARGET" \
   --transport ssh --substituter "$ATTIC_SUBSTITUTER" \
   --trusted-public-key "$ATTIC_TRUSTED_PUBLIC_KEY" --require-substitute "$SYSTEM_PATH"
 ```

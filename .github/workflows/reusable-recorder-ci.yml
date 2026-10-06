@@ -1,0 +1,116 @@
+name: recorder-ci
+
+# Reusable CI for the CodeTracer recorder fleet. The recorders share one
+# lint-and-test shape — checkout, mint a CI token, setup-dev-env (nix), an
+# optional recorder-specific prep, then `just lint` / `just test`, then upload
+# logs to GitHub (short retention) AND mirror them to the in-house S3 artifact
+# store. Centralising it here means the S3 mirror (and every future CI change)
+# lives in ONE file instead of ~30 near-identical copies.
+#
+# A recorder adopts it by reducing its own `.github/workflows/ci.yml` to a
+# caller (see the codetracer-*-recorder repos) and moving any recorder-specific
+# CI prep (corelib fetch, sibling library build, …) out of inline YAML and into
+# a `just <prepare-recipe>` recipe — which also satisfies the
+# ci-workflow-standards.md "no complex CI scripts" rule. The prep recipe may
+# export variables to later steps by appending to "$GITHUB_ENV".
+#
+# See metacraft-dev-guidelines policies/ci-workflow-standards.md
+# (§ In-house artifact store, § Local Reproducibility).
+
+on:
+  workflow_call:
+    inputs:
+      runners:
+        description: >
+          JSON array of runner values to run the lint-and-test job across, as a
+          matrix. Each element is a `runs-on` value — an RC1 capability label set
+          (a JSON array of labels), or a bare label string. Defaults to the three
+          self-hosted Nix legs as minimal capability label sets.
+        type: string
+        default: '[["self-hosted","linux","x64"], ["self-hosted","linux","arm64"], ["self-hosted","macos","arm64"]]'
+      prepare-recipe:
+        description: >
+          Optional `just` recipe run after setup-dev-env, before lint/test, for
+          recorder-specific prep. Empty (default) skips it.
+        type: string
+        default: ''
+      log-path:
+        description: 'Path uploaded/mirrored as the failure log bundle.'
+        type: string
+        default: 'target/'
+      env-flavor:
+        description: 'setup-dev-env flavor.'
+        type: string
+        default: 'nix'
+    secrets:
+      CI_TOKEN_PROVIDER_APP_ID:
+        required: true
+      CI_TOKEN_PROVIDER_PRIVATE_KEY:
+        required: true
+      ATTIC_TOKEN:
+        required: false
+      MCL_S3_ARTIFACTS_ACCESS_KEY_ID:
+        required: false
+      MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY:
+        required: false
+
+jobs:
+  lint-and-test:
+    name: Lint and test (${{ join(matrix.runner, '-') }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate CI token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CI_TOKEN_PROVIDER_APP_ID }}
+          private-key: ${{ secrets.CI_TOKEN_PROVIDER_PRIVATE_KEY }}
+          owner: metacraft-labs
+
+      - name: Setup dev env
+        uses: metacraft-labs/metacraft-github-actions/setup-dev-env@dev
+        with:
+          env-flavor: ${{ inputs.env-flavor }}
+          gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-cache: ${{ vars.ATTIC_CACHE }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
+
+      - name: Prepare (recorder-specific)
+        if: inputs.prepare-recipe != ''
+        run: dev-exec just ${{ inputs.prepare-recipe }}
+
+      - name: Lint
+        run: dev-exec just lint
+
+      - name: Test
+        run: dev-exec just test
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ join(matrix.runner, '-') }}
+          path: ${{ inputs.log-path }}
+          retention-days: 1
+
+      - name: Mirror test logs to S3 (non-blocking)
+        if: failure()
+        continue-on-error: true
+        uses: metacraft-labs/metacraft-github-actions/mirror-artifacts-s3@dev
+        with:
+          path: ${{ inputs.log-path }}
+          prefix: test-logs-${{ join(matrix.runner, '-') }}/${{ github.run_id }}
+          endpoint: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          bucket: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          region: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          access-key-id: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}

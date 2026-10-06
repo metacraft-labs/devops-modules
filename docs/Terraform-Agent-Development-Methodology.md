@@ -844,10 +844,16 @@ run `tofu apply` to fix itself.
 files. Both layers use Terraform/OpenTofu, but the bootstrap layer is
 applied manually by humans — never through the CI pipeline it enables:
 
-| Layer                   | Contents                                               | Applied by                       | State            |
-| ----------------------- | ------------------------------------------------------ | -------------------------------- | ---------------- |
-| **Layer 0 (bootstrap)** | State bucket, IAM, CI keypair, OIDC, break-glass roles | Human admin (`tofu apply` local) | Separate backend |
-| **Layer 1+ (managed)**  | Cloudflare resources, application infra                | CI pipeline (agent PRs)          | CI-managed       |
+| Layer                   | Contents                                                                             | Applied by                       | State            |
+| ----------------------- | ------------------------------------------------------------------------------------ | -------------------------------- | ---------------- |
+| **Layer 0 (bootstrap)** | State bucket, IAM, CI keypair, OIDC, break-glass roles                               | Human admin (`tofu apply` local) | Separate backend |
+| **Layer 1+ (managed)**  | Everything else — cloud resources, application infra, SaaS and GitHub org governance | CI pipeline (agent PRs)          | CI-managed       |
+
+The split is by _dependency_, not by importance or blast radius: Layer 0 is
+what the pipeline needs in order to run, and nothing else. A large, org-wide,
+high-consequence root is still Layer 1+ — plan review, the sensitive-change
+label, and the destroy/replace gates are what bound it. See
+[root layering](./Terraform-Root-Layering.md#which-layer-a-root-belongs-to).
 
 The critical property is **state isolation**: the bootstrap state is
 never touched by the CI pipeline, so agent-produced code cannot corrupt

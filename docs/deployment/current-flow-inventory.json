@@ -7,42 +7,39 @@
     "shard-matrix",
     "eval-matrix",
     "merge-matrices",
+    "plan-build-matrix",
     "build",
     "results"
   ],
-  "deployPath": {
-    "entryJob": "results",
-    "deployStep": "Deploy",
-    "deployCondition": "inputs.run-cachix-deploy",
-    "mclCommand": "deploy-spec"
+  "removedDeployPath": {
+    "note": "Cachix Deploy in-CI activation removed in c056211; activation is now out-of-band via mcl-devops deploy-ssh / mcl-devops deploy-reconcile.",
+    "absentTokens": ["run-cachix-deploy", "deploy-spec", "cachix"]
   },
   "deploymentCachePublishPath": {
     "entryJob": "build",
     "publishStep": "Push deployment closure caches ${{ matrix.name }}",
-    "publishCondition": "inputs.push-deployment-caches || inputs.run-cachix-deploy",
+    "publishCondition": "inputs.push-deployment-caches",
     "mclCommand": "cache push-closure"
   },
   "criticalSteps": [
     "Compute reusable workflow SHA and set mcl nix run command",
     "Setup Nix",
+    "Authenticate nix to the private Attic cache",
     "Generate Shard Matrix",
     "Generate CI Matrix",
     "Merge matrices",
+    "Group flake outputs into build jobs",
     "Build ${{ matrix.name }}",
     "Push deployment closure caches ${{ matrix.name }}",
     "Print CI Matrix",
-    "Update GitHub Comment",
-    "Deploy"
+    "Update GitHub Comment"
   ],
   "criticalCommands": [
     "nix build -L --no-link --keep-going --show-trace",
     "cache push-closure",
-    "deploy-spec"
+    "--transport attic-ci"
   ],
   "environmentInputs": [
-    "CACHIX_CACHE",
-    "CACHIX_AUTH_TOKEN",
-    "CACHIX_ACTIVATE_TOKEN",
     "ATTIC_TOKEN",
     "ATTIC_CACHE",
     "ATTIC_SUBSTITUTER",

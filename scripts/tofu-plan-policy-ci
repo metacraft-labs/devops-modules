@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+if (($# < 2)); then
+  echo "usage: tofu-plan-policy-ci POLICY_SCRIPT PLAN_JSON [POLICY_ARGS...]" >&2
+  exit 64
+fi
+
+policy_script="$1"
+shift
+
+if python3 "$policy_script" "$@"; then
+  exit 0
+else
+  policy_status=$?
+fi
+
+case "$policy_status" in
+  2)
+    echo "::warning::OpenTofu plan policy reported advisory warnings; see the policy output above."
+    exit 0
+    ;;
+  *)
+    exit "$policy_status"
+    ;;
+esac

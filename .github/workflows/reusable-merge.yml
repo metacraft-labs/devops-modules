@@ -4,8 +4,8 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: 'JSON-encoded list of runner labels'
-        default: '["self-hosted", "nixos", "x86-64-v2", "bare-metal"]'
+        description: 'JSON-encoded runner label set (RC1 capability labels, e.g. ["self-hosted","linux","x64"])'
+        default: '["self-hosted","linux","x64"]'
         required: false
         type: string
       source_branch:

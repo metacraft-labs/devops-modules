@@ -1,76 +1,15 @@
 {
-  "schemaVersion": 1,
-  "status": "preproduction-first-pass",
-  "defaultCutoverPath": {
-    "name": "attic-direct-ssh-shadow",
-    "cacheBackend": "attic",
-    "activation": "mcl deploy-ssh or mcl deploy-reconcile",
-    "usesCachixDeploy": false
-  },
-  "m7FullTopology": {
-    "requiredBeforeFirstProductionTarget": true,
-    "requiredScenarios": [
-      "full-topology",
-      "full-topology-failures",
-      "offline-latest-only",
-      "forced-command",
-      "pull-agent"
-    ],
-    "acceptedEvidence": [
-      "runtime artifact directory",
-      "runtime command log without Cachix Deploy activation",
-      "deployment event JSONL",
-      "target journal snippets",
-      "cache logs",
-      "metrics or status collector output",
-      "final state for every rollout group"
-    ]
-  },
-  "firstTargetSelection": {
-    "selectedProductionTarget": null,
-    "simulationTarget": {
-      "name": "local-production-cutover-canary",
-      "kind": "local-simulation",
-      "production": false
-    },
-    "requiresHumanApprovalBeforeLiveSelection": true
-  },
-  "liveCanaryCycles": {
-    "requiredBeforeCachixDeployRemoval": 2,
-    "recorded": 0,
-    "evidence": []
-  },
-  "cachixDeployFallback": {
-    "retained": true,
-    "explicitOnly": true,
-    "removeDefaultBlocked": true,
-    "removeCacheDependencyBlocked": true,
-    "rollbackWindow": "until every target batch has migrated and the live canary remains green"
-  },
+  "schemaVersion": 2,
+  "status": "ci-backend-cutover-complete-operational-retirement-pending",
+  "defaultCutoverPath": { "name": "attic-direct-ssh-shadow", "cacheBackend": "attic", "activation": "mcl-devops deploy-ssh or mcl-devops deploy-reconcile", "usesCachixDeploy": false },
+  "m7FullTopology": { "requiredBeforeFirstProductionTarget": true, "evidenceRecorded": false, "requiredScenarios": ["full-topology","full-topology-failures","offline-latest-only","forced-command","pull-agent"], "acceptedEvidence": ["runtime artifact directory","runtime command log without Cachix Deploy activation","deployment event JSONL","target journal snippets","cache logs","metrics or status collector output","final state for every rollout group"] },
+  "firstTargetSelection": { "selectedProductionTarget": null, "simulationTarget": { "name": "local-production-cutover-canary", "kind": "local-simulation", "production": false }, "requiresHumanApprovalBeforeLiveSelection": true },
+  "liveCanaryCycles": { "requiredBeforeCachixDeployRemoval": 2, "recorded": 0, "evidence": [] },
+  "cachixRetirement": { "deployBackendRemovedFromCI": true, "cacheBackendRemovedFromCI": true, "manualFallbackRetired": false, "removalGateSatisfied": false, "rollbackWindow": "manual `cachix deploy activate` remains available until removalGateSatisfied" },
   "rolloutBatches": [
-    {
-      "name": "first-production-canary",
-      "requiresM7Evidence": true,
-      "requiresHumanApproval": true,
-      "requiresLiveCanaryCycleEvidence": false
-    },
-    {
-      "name": "batch-1-directly-reachable-servers",
-      "requiresM7Evidence": true,
-      "requiresHumanApproval": true,
-      "requiresLiveCanaryCycleEvidence": true
-    },
-    {
-      "name": "batch-2-remote-servers",
-      "requiresM7Evidence": true,
-      "requiresHumanApproval": true,
-      "requiresLiveCanaryCycleEvidence": true
-    },
-    {
-      "name": "batch-3-explicitly-opted-in-workstations",
-      "requiresM7Evidence": true,
-      "requiresHumanApproval": true,
-      "requiresLiveCanaryCycleEvidence": true
-    }
+    { "name": "first-production-canary", "requiresM7Evidence": true, "requiresHumanApproval": true, "requiresLiveCanaryCycleEvidence": false },
+    { "name": "batch-1-directly-reachable-servers", "requiresM7Evidence": true, "requiresHumanApproval": true, "requiresLiveCanaryCycleEvidence": true },
+    { "name": "batch-2-remote-servers", "requiresM7Evidence": true, "requiresHumanApproval": true, "requiresLiveCanaryCycleEvidence": true },
+    { "name": "batch-3-explicitly-opted-in-workstations", "requiresM7Evidence": true, "requiresHumanApproval": true, "requiresLiveCanaryCycleEvidence": true }
   ]
 }

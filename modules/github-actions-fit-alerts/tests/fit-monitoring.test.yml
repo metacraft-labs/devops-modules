@@ -1,0 +1,87 @@
+# `promtool test rules` for the github-actions-fit alert-rule library (RD4 gate
+# t_runner_fit_monitoring, part c).
+#
+# Rendered against the DEFAULT thresholds by checks/fit-monitoring.nix — the gate
+# copies the rendered rules next to this file as `github-actions-fit-alerts.yml`
+# and runs promtool.
+#
+# Every alert is asserted in BOTH directions: a replay of a real "does not fit"
+# incident that MUST fire, and controls (a sub-threshold blip, a job under the
+# duration floor, an out-of-scope self-hosted/private series) that MUST stay
+# silent. An alert with only a firing test is one that pages on every ordinary
+# job.
+rule_files:
+  - github-actions-fit-alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ── GithubActionsUbuntuLatestDurationRegression ────────────────────────────
+  - interval: 1m
+    name: 'a hosted public job 3x its baseline pages; a blip, a tiny job, and a self-hosted job stay silent'
+    input_series:
+      # REGRESSION: build held 300s for 40m, then jumped to 900s (3x > 1.5x) and
+      # stayed. Baseline (avg over [30m] offset 30m) sees the 300s era; current
+      # is 900s. The real "moved to ubuntu-latest and got slower" case.
+      - series: 'github_actions_job_duration_seconds{repo="metacraft-labs/web", workflow="CI", job="build", runner_type="github-hosted", visibility="public"}'
+        values: '300x40 900x30'
+      # NEGATIVE 1 — a sub-threshold blip: 300 -> 400 (< 1.5x = 450). Never fires.
+      - series: 'github_actions_job_duration_seconds{repo="metacraft-labs/web", workflow="CI", job="lint", runner_type="github-hosted", visibility="public"}'
+        values: '300x40 400x30'
+      # NEGATIVE 2 — a tiny job doubling: 40 -> 100. Over 1.5x baseline but below
+      # the 120s floor, so it is noise, not a regression.
+      - series: 'github_actions_job_duration_seconds{repo="metacraft-labs/web", workflow="CI", job="fast", runner_type="github-hosted", visibility="public"}'
+        values: '40x40 100x30'
+      # NEGATIVE 3 — a self-hosted job with a huge regression. Out of the
+      # github-hosted/public scope, so the fit alert must ignore it entirely.
+      - series: 'github_actions_job_duration_seconds{repo="metacraft-labs/web", workflow="CI", job="build-native", runner_type="self-hosted", visibility="public"}'
+        values: '300x40 3000x30'
+    alert_rule_test:
+      - eval_time: 45m # regression only 4m old; for: 10m not elapsed
+        alertname: GithubActionsUbuntuLatestDurationRegression
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: GithubActionsUbuntuLatestDurationRegression
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: runner-fit
+              repo: metacraft-labs/web
+              workflow: CI
+              job: build
+              runner_type: github-hosted
+              visibility: public
+            exp_annotations:
+              summary: 'Workflow slower on ubuntu-latest: metacraft-labs/web CI/build'
+              description: 'Job build of workflow CI (metacraft-labs/web) is taking 15m 0s on the github-hosted runner — over 1.5x its recent baseline — for 10m. The workflow may not fit public ubuntu-latest (4 vCPU / 16 GB / 14 GB SSD); compare hosted vs self-hosted on the runner-fit dashboard and consider keeping it on self-hosted.'
+
+  # ── GithubActionsUbuntuLatestResourceLimit ─────────────────────────────────
+  - interval: 1m
+    name: 'a hosted public OOM pages; a private-repo limit stays silent'
+    input_series:
+      # A public github-hosted job that OOM-killed on its most recent run.
+      - series: 'github_actions_job_resource_limit{repo="metacraft-labs/web", workflow="CI", job="test-oom", runner_type="github-hosted", visibility="public", signature="oom"}'
+        values: '1x15'
+      # NEGATIVE — the same failure signature on a PRIVATE repo: out of scope
+      # (the fit page is about the public repos moved to free hosted runners).
+      - series: 'github_actions_job_resource_limit{repo="metacraft-labs/internal", workflow="CI", job="test-oom", runner_type="github-hosted", visibility="private", signature="oom"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 5m # for: 10m not elapsed
+        alertname: GithubActionsUbuntuLatestResourceLimit
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: GithubActionsUbuntuLatestResourceLimit
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: runner-fit
+              repo: metacraft-labs/web
+              workflow: CI
+              job: test-oom
+              runner_type: github-hosted
+              visibility: public
+              signature: oom
+            exp_annotations:
+              summary: 'Workflow hit a oom limit on ubuntu-latest: metacraft-labs/web CI/test-oom'
+              description: 'Job test-oom of workflow CI (metacraft-labs/web) hit a resource limit (oom: oom = out of RAM, no_space = the ~14 GB SSD full, timeout = job wall-clock) on the github-hosted runner. It does NOT fit public ubuntu-latest — move it back to a self-hosted capability label set or shrink its footprint.'

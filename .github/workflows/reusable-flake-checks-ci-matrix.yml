@@ -5,31 +5,56 @@ on:
   workflow_call:
     inputs:
       runners:
-        description: 'JSON-encoded map of nix system to a list of runner labels'
+        description: 'JSON-encoded map of nix system to its RC1 capability label set'
+        # Map each Nix system to its minimum capability label set (RC1):
+        # Linux x64 -> [self-hosted, linux, x64], macOS arm64 ->
+        # [self-hosted, macos, arm64] (the two Nix systems this matrix covers).
         default: | # json
           {
             "x86_64-linux": [
               "self-hosted",
-              "nixos",
-              "x86-64-v3",
-              "bare-metal"
+              "linux",
+              "x64"
             ],
             "aarch64-darwin": [
               "self-hosted",
-              "macOS",
-              "aarch64-darwin"
+              "macos",
+              "arm64"
             ]
           }
         required: false
         type: string
       non-nix-runner:
-        description: 'JSON-encoded runner labels for non-nix tasks (initial comment, mcl reference compute)'
-        default: '["self-hosted", "nixos", "x86-64-v2", "bare-metal"]'
+        description: 'JSON-encoded runner label set for non-nix tasks (initial comment, mcl-devops reference compute)'
+        default: '["self-hosted","linux","x64"]'
         required: false
         type: string
       results-runner:
-        description: 'JSON-encoded runner labels for Final Results and deploy orchestration'
-        default: '["self-hosted", "nixos", "x86-64-v2", "bare-metal"]'
+        description: 'JSON-encoded runner label set for Final Results and deploy orchestration'
+        default: '["self-hosted","linux","x64"]'
+        required: false
+        type: string
+      foundry-darwin-bootstrap-runner:
+        description: 'Temporary JSON-encoded runner class for Foundry on Darwin while vm-harness lifetime fixes are deployed'
+        default: ''
+        required: false
+        type: string
+      build-max-jobs:
+        # Opt-in fan-out cap. The build matrix is one GitHub job per flake
+        # output, which is fine on an elastic runner class and ruinous on a
+        # capped one: the macOS pool tops out at 2 concurrent runners, so a
+        # single run asking for ~50 `aarch64-darwin` jobs monopolises the
+        # class for hours and starves every other repo behind it.
+        #
+        # Set a system's value to cap how many BUILD JOBS that system may use.
+        # Outputs are distributed evenly across that many jobs and each job
+        # builds its share sequentially. Nothing is dropped: every output is
+        # still built, still reported by name, and still able to fail the run
+        # (see the `Build` step). Systems absent from the map keep one job per
+        # output, so the default `{}` reproduces the previous behaviour
+        # exactly and no caller changes unless it opts in.
+        description: 'JSON-encoded map of nix system to the maximum number of build jobs for that system ({} = one job per flake output)'
+        default: '{}'
         required: false
         type: string
       push-deployment-caches:
@@ -53,14 +78,31 @@ on:
         required: false
         type: string
     secrets:
+      ATTIC_PULL_TOKEN:
+        description: 'Read-only Attic token for cache substitution and status probes'
+        required: false
       ATTIC_TOKEN:
-        description: 'Attic push token for optional deployment closure mirroring'
+        description: 'Attic push token for optional deployment closure mirroring and pull-token fallback'
         required: false
       NIX_GITHUB_TOKEN:
         description: GitHub token to add as access-token in nix.conf
         required: false
+      GH_READ_METACRAFT_PRIVATE_REPOS:
+        description: 'Legacy org-wide read token used only when NIX_GITHUB_TOKEN is unset (optional)'
+        required: false
       NIX_GITLAB_TOKEN:
         description: GitLab token to add as access-token in nix.conf
+        required: false
+      # In-house S3 artifact store (Garage on high-mem-server). When set, CI
+      # artifacts are ALSO mirrored to the `ci-artifacts` bucket over the
+      # NetBird VPN, moving them off GitHub's quota-limited artifact storage.
+      # The upload is strictly non-blocking. Distributed per-repo by
+      # infra/scripts/s3-artifact-store/configure-github-repo.sh.
+      MCL_S3_ARTIFACTS_ACCESS_KEY_ID:
+        description: 'S3 access key id for the CI artifact store (optional)'
+        required: false
+      MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY:
+        description: 'S3 secret access key for the CI artifact store (optional)'
         required: false
 
 jobs:
@@ -83,33 +125,33 @@ jobs:
 
           workflow_repo=""
           case "${GITHUB_WORKFLOW_REF:-}" in
-            metacraft-labs/nixos-modules/.github/workflows/reusable-flake-checks-ci-matrix.yml@*)
-              workflow_repo="metacraft-labs/nixos-modules"
+            metacraft-labs/devops-modules/.github/workflows/reusable-flake-checks-ci-matrix.yml@*)
+              workflow_repo="metacraft-labs/devops-modules"
               ;;
           esac
 
           mcl_ref=""
 
-          if [[ "${GITHUB_REPOSITORY:-}" == "metacraft-labs/nixos-modules" ]] &&
+          if [[ "${GITHUB_REPOSITORY:-}" == "metacraft-labs/devops-modules" ]] &&
             is_commit_sha "${GITHUB_SHA:-}"; then
-            # Local calls from nixos-modules PRs should test the PR commit.
+            # Local calls from devops-modules PRs should test the PR commit.
             mcl_ref="$GITHUB_SHA"
-          elif [[ "$workflow_repo" == "metacraft-labs/nixos-modules" ]] &&
+          elif [[ "$workflow_repo" == "metacraft-labs/devops-modules" ]] &&
             is_commit_sha "${GITHUB_WORKFLOW_SHA:-}"; then
             mcl_ref="$GITHUB_WORKFLOW_SHA"
           else
-            echo "::warning title=MCL workflow ref fallback::Could not read a valid nixos-modules workflow SHA from GitHub Actions context; using main"
-            mcl_ref="main"
+            echo "::warning title=MCL workflow ref fallback::Could not read a valid devops-modules workflow SHA from GitHub Actions context; using dev"
+            mcl_ref="dev"
           fi
 
-          if ! is_commit_sha "$mcl_ref" && [[ "$mcl_ref" != "main" ]]; then
-            echo "::warning title=Invalid MCL workflow ref::Ignoring invalid workflow ref '$mcl_ref'; using main"
-            mcl_ref="main"
+          if ! is_commit_sha "$mcl_ref" && [[ "$mcl_ref" != "dev" ]]; then
+            echo "::warning title=Invalid MCL workflow ref::Ignoring invalid workflow ref '$mcl_ref'; using dev"
+            mcl_ref="dev"
           fi
 
           {
             printf 'workflow_sha=%s\n' "$mcl_ref"
-            printf 'mcl_flake_cmd=nix run --accept-flake-config github:metacraft-labs/nixos-modules/%s#mcl\n' "$mcl_ref"
+            printf 'mcl_flake_cmd=nix --option download-attempts 5 run --accept-flake-config github:metacraft-labs/devops-modules/%s#mcl-devops\n' "$mcl_ref"
           } >> "$GITHUB_OUTPUT"
 
   post-initial-comment:
@@ -121,7 +163,7 @@ jobs:
       pull-requests: write
     steps:
       - name: 'Post initial package status comment'
-        uses: metacraft-labs/nixos-modules/.github/sticky-comment@main
+        uses: metacraft-labs/devops-modules/.github/sticky-comment@dev
         with:
           message: |
             Thanks for your Pull Request!
@@ -137,14 +179,28 @@ jobs:
       pull-requests: write
     steps:
       - name: Setup Nix
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
         with: &setup-nix-no-push
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
-          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
           nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
+
+      - name: Authenticate nix to the private Attic cache
+        shell: bash
+        env:
+          ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+        run: |
+          [ -n "$ATTIC_SUBSTITUTER" ] && [ -n "$ATTIC_TOKEN" ] || exit 0
+          h="${ATTIC_SUBSTITUTER#http://}"; h="${h#https://}"; h="${h%%/*}"
+          mkdir -p "$HOME/.config/nix"
+          touch "$HOME/.config/nix/netrc"
+          chmod 0600 "$HOME/.config/nix/netrc"
+          grep -q "^machine $h " "$HOME/.config/nix/netrc" 2>/dev/null || \
+            printf 'machine %s password %s\n' "$h" "$ATTIC_TOKEN" >> "$HOME/.config/nix/netrc"
 
       - uses: actions/checkout@v6.0.2
 
@@ -153,11 +209,15 @@ jobs:
         env:
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
           SYSTEM_TO_GITHUB_RUNNER_LABELS: ${{ inputs.runners }}
+          # Authenticate mcl-devops's cache-status (narinfo) probe to the private
+          # Attic cache; scoped to the Attic host inside mcl-devops.
+          ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
         run: ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} shard-matrix
 
       - name: Post CI matrix comment
         if: steps.generate-matrix.outputs.full_matrix
-        uses: metacraft-labs/nixos-modules/.github/sticky-comment@main
+        uses: metacraft-labs/devops-modules/.github/sticky-comment@dev
         with:
           path: comment.md
 
@@ -174,14 +234,28 @@ jobs:
       matrix: ${{fromJSON(needs.shard-matrix.outputs.eval_matrix)}}
     steps:
       - name: Setup Nix
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
         with:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
-          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
           nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
+
+      - name: Authenticate nix to the private Attic cache
+        shell: bash
+        env:
+          ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+        run: |
+          [ -n "$ATTIC_SUBSTITUTER" ] && [ -n "$ATTIC_TOKEN" ] || exit 0
+          h="${ATTIC_SUBSTITUTER#http://}"; h="${h#https://}"; h="${h%%/*}"
+          mkdir -p "$HOME/.config/nix"
+          touch "$HOME/.config/nix/netrc"
+          chmod 0600 "$HOME/.config/nix/netrc"
+          grep -q "^machine $h " "$HOME/.config/nix/netrc" 2>/dev/null || \
+            printf 'machine %s password %s\n' "$h" "$ATTIC_TOKEN" >> "$HOME/.config/nix/netrc"
 
       - uses: actions/checkout@v6.0.2
 
@@ -191,6 +265,10 @@ jobs:
         env:
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
           SYSTEM_TO_GITHUB_RUNNER_LABELS: ${{ inputs.runners }}
+          # Authenticate mcl-devops's cache-status (narinfo) probe to the private
+          # Attic cache; scoped to the Attic host inside mcl-devops.
+          ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
         run: |
           ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} -- ci-matrix \
             --flake-attribute-path "${{ matrix.flakeAttrPath }}" \
@@ -220,15 +298,31 @@ jobs:
     if: needs.shard-matrix.outputs.eval_matrix != '{"include":[]}' &&
       needs.eval-matrix.result == 'success'
     steps:
+      - uses: actions/checkout@v6.0.2
+
       - name: Setup Nix
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
         with:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
-          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
           nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
+
+      - name: Authenticate nix to the private Attic cache
+        shell: bash
+        env:
+          ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+        run: |
+          [ -n "$ATTIC_SUBSTITUTER" ] && [ -n "$ATTIC_TOKEN" ] || exit 0
+          h="${ATTIC_SUBSTITUTER#http://}"; h="${h#https://}"; h="${h%%/*}"
+          mkdir -p "$HOME/.config/nix"
+          touch "$HOME/.config/nix/netrc"
+          chmod 0600 "$HOME/.config/nix/netrc"
+          grep -q "^machine $h " "$HOME/.config/nix/netrc" 2>/dev/null || \
+            printf 'machine %s password %s\n' "$h" "$ATTIC_TOKEN" >> "$HOME/.config/nix/netrc"
 
       - name: Download CI matrix shards
         uses: actions/download-artifact@v8
@@ -243,6 +337,10 @@ jobs:
           MCL_FLAKE_CMD: ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }}
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
           SYSTEM_TO_GITHUB_RUNNER_LABELS: ${{ inputs.runners }}
+          # Authenticate mcl-devops's cache-status (narinfo) probe (same reason as the
+          # Merge matrices step below).
+          ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -295,21 +393,237 @@ jobs:
         env:
           IS_INITIAL: 'true'
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
+          ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           PRECALC_MATRIX: ${{ steps.merge.outputs.full_matrix }}
         run: ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} print-table
 
       - name: Post CI matrix comment
-        uses: metacraft-labs/nixos-modules/.github/sticky-comment@main
+        uses: metacraft-labs/devops-modules/.github/sticky-comment@dev
         with:
           path: comment.md
 
+  # Collapse the one-job-per-flake-output build matrix into at most
+  # `inputs.build-max-jobs[system]` jobs for the systems the caller caps.
+  #
+  # This job only exists for callers that opt in; when `build-max-jobs` is the
+  # default `{}` it is skipped entirely and `build` falls back to the exact
+  # matrix expression it used before, so non-opted-in repos see no extra job
+  # and no behaviour change at all.
+  plan-build-matrix:
+    name: Plan build matrix
+    needs: [shard-matrix, merge-matrices]
+    if: always() && inputs.build-max-jobs != '' && inputs.build-max-jobs != '{}'
+    runs-on: ${{ fromJSON(inputs.runners).x86_64-linux }}
+    outputs:
+      build_matrix: ${{ steps.plan.outputs.build_matrix }}
+    steps:
+      - name: Group flake outputs into build jobs
+        id: plan
+        shell: bash
+        env:
+          # Same precedence the `build` job applies when picking its matrix:
+          # the merged matrix when `merge-matrices` succeeded, otherwise the
+          # shard matrix. Empty means "nothing to plan" and `build` falls back.
+          SOURCE_BUILD_MATRIX: >-
+            ${{
+              (
+                needs.merge-matrices.result == 'success' &&
+                needs.merge-matrices.outputs.build_matrix
+              ) ||
+              needs.shard-matrix.outputs.build_matrix ||
+              ''
+            }}
+          BUILD_MAX_JOBS: ${{ inputs.build-max-jobs }}
+          FOUNDRY_DARWIN_BOOTSTRAP_RUNNER: ${{ inputs.foundry-darwin-bootstrap-runner }}
+          PUSH_DEPLOYMENT_CACHES: ${{ inputs.push-deployment-caches }}
+        run: |
+          set -euo pipefail
+
+          run_python() {
+            if command -v python3 >/dev/null 2>&1; then
+              python3 "$@"
+            else
+              # This job deliberately skips Setup Nix (it needs no Nix store),
+              # so the pre-installed Nix here may still have the flake features
+              # disabled. Ask for them explicitly rather than failing with the
+              # familiar "nix-command is disabled".
+              nix --extra-experimental-features 'nix-command flakes' \
+                shell nixpkgs#python3 --command python3 "$@"
+            fi
+          }
+
+          run_python - <<'PY'
+          import json
+          import os
+          import sys
+
+          raw = os.environ.get("SOURCE_BUILD_MATRIX", "").strip()
+          raw_max_jobs = os.environ.get("BUILD_MAX_JOBS", "").strip() or "{}"
+          foundry_override = os.environ.get("FOUNDRY_DARWIN_BOOTSTRAP_RUNNER", "").strip()
+          push_deployment_caches = (
+              os.environ.get("PUSH_DEPLOYMENT_CACHES", "").strip().lower() == "true"
+          )
+
+          def emit(matrix):
+              line = "build_matrix=" + json.dumps(matrix, separators=(",", ":")) + "\n"
+              path = os.environ.get("GITHUB_OUTPUT")
+              if path:
+                  with open(path, "a", encoding="utf-8") as handle:
+                      handle.write(line)
+              else:
+                  sys.stdout.write(line)
+
+          def note(message):
+              print(message)
+              path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if path:
+                  with open(path, "a", encoding="utf-8") as handle:
+                      handle.write(message + "\n")
+
+          # No source matrix at all: emit an empty plan so `build` falls back to
+          # its own expression instead of inventing work.
+          if not raw or raw == '{"include":[]}':
+              emit({"include": []})
+              sys.exit(0)
+
+          packages = json.loads(raw).get("include", [])
+          max_jobs = json.loads(raw_max_jobs) if raw_max_jobs else {}
+          if not isinstance(max_jobs, dict):
+              raise SystemExit("build-max-jobs must be a JSON object mapping system -> integer")
+
+          def member(pkg):
+              return {"name": pkg.get("name", ""), "attrPath": pkg.get("attrPath", "")}
+
+          def row(pkg):
+              return "{}\t{}".format(pkg.get("name", ""), pkg.get("attrPath", ""))
+
+          def singleton(pkg):
+              # Preserve the original entry verbatim and only ADD batch fields,
+              # so every existing `matrix.*` reference keeps its exact meaning.
+              entry = dict(pkg)
+              entry["batch"] = [member(pkg)]
+              entry["batchSize"] = 1
+              entry["batchTsv"] = row(pkg)
+              return entry
+
+          def must_stay_alone(pkg):
+              # Synthetic "nothing to build" entry.
+              if pkg.get("noop"):
+                  return True
+              # Deployment targets carry per-target push/upload steps keyed on
+              # `matrix.output` / `matrix.deploymentKind`, which only make sense
+              # one target per job.
+              if push_deployment_caches and pkg.get("deploymentTarget"):
+                  return True
+              # The Foundry Darwin bootstrap runner override is selected by
+              # `matrix.name == 'foundry'`; batching would rename the job and
+              # silently route it back to the ephemeral class.
+              if (
+                  foundry_override
+                  and pkg.get("name") == "foundry"
+                  and pkg.get("system") == "aarch64-darwin"
+              ):
+                  return True
+              return False
+
+          planned = []
+          groups = {}
+          group_order = []
+
+          for pkg in packages:
+              if must_stay_alone(pkg):
+                  planned.append(singleton(pkg))
+                  continue
+              # Batches must be homogeneous in runner and in allowedToFail so
+              # `runs-on` and `continue-on-error` keep working per-entry.
+              key = (
+                  pkg.get("system", ""),
+                  json.dumps(pkg.get("ghRunner"), sort_keys=True),
+                  bool(pkg.get("allowedToFail", False)),
+              )
+              if key not in groups:
+                  groups[key] = []
+                  group_order.append(key)
+              groups[key].append(pkg)
+
+          for key in group_order:
+              system, _runner, allowed_to_fail = key
+              members = sorted(
+                  groups[key], key=lambda p: (p.get("name", ""), p.get("attrPath", ""))
+              )
+              limit = max_jobs.get(system)
+              if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+                  # This system is uncapped: keep one job per flake output.
+                  planned.extend(singleton(pkg) for pkg in members)
+                  continue
+              if len(members) <= limit:
+                  planned.extend(singleton(pkg) for pkg in members)
+                  continue
+
+              base, extra = divmod(len(members), limit)
+              cursor = 0
+              for index in range(limit):
+                  size = base + (1 if index < extra else 0)
+                  chunk = members[cursor:cursor + size]
+                  cursor += size
+                  if not chunk:
+                      continue
+                  planned.append({
+                      "name": "batch {}/{} ({} outputs)".format(index + 1, limit, len(chunk)),
+                      "system": system,
+                      "ghRunner": chunk[0].get("ghRunner"),
+                      "allowedToFail": allowed_to_fail,
+                      "noop": False,
+                      "deploymentTarget": False,
+                      "deploymentKind": "",
+                      "attrPath": chunk[0].get("attrPath", ""),
+                      "output": "",
+                      "batch": [member(pkg) for pkg in chunk],
+                      "batchSize": len(chunk),
+                      "batchTsv": "\n".join(row(pkg) for pkg in chunk),
+                  })
+
+          # Reconciliation: batching may reorder, but it must never drop,
+          # duplicate or invent a flake output. Failing loudly here is far
+          # better than silently building less than the caller asked for.
+          before = sorted(
+              (pkg.get("system", ""), pkg.get("name", ""), pkg.get("attrPath", ""))
+              for pkg in packages
+          )
+          after = sorted(
+              (entry.get("system", ""), item["name"], item["attrPath"])
+              for entry in planned
+              for item in entry["batch"]
+          )
+          if before != after:
+              raise SystemExit(
+                  "build matrix batching changed the output set: "
+                  "{} in, {} out".format(len(before), len(after))
+              )
+
+          note(
+              "Planned {} flake output(s) into {} build job(s) "
+              "(unbatched would have been {}).".format(
+                  len(before), len(planned), len(packages)
+              )
+          )
+          emit({"include": planned})
+          PY
+
   build:
-    needs: [compute-mcl-ref, shard-matrix, merge-matrices]
+    needs: [compute-mcl-ref, shard-matrix, merge-matrices, plan-build-matrix]
     if: always()
     strategy:
       fail-fast: false
       matrix: >-
         ${{fromJSON(
+          (
+            needs.plan-build-matrix.result == 'success' &&
+            needs.plan-build-matrix.outputs.build_matrix &&
+            needs.plan-build-matrix.outputs.build_matrix != '{"include":[]}' &&
+            needs.plan-build-matrix.outputs.build_matrix
+          ) ||
           (
             needs.merge-matrices.result == 'success' &&
             needs.merge-matrices.outputs.build_matrix &&
@@ -328,9 +642,17 @@ jobs:
         )}}
 
     name: ${{ matrix.name }} | ${{ matrix.system }}
-    runs-on: ${{ matrix.ghRunner }}
+    # The provider fix in this PR cannot affect the runner executing this PR.
+    # Keep this narrow escape hatch until that fix is deployed, then remove it.
+    runs-on: >-
+      ${{
+        matrix.name == 'foundry' &&
+        matrix.system == 'aarch64-darwin' &&
+        inputs.foundry-darwin-bootstrap-runner != '' &&
+        fromJSON(inputs.foundry-darwin-bootstrap-runner) ||
+        matrix.ghRunner
+      }}
     continue-on-error: ${{ matrix.allowedToFail }}
-
     steps:
       - name: No builds required
         if: ${{ matrix.noop }}
@@ -342,20 +664,100 @@ jobs:
 
       - name: Setup Nix
         if: ${{ !matrix.noop }}
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
         with:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
-          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
           nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
 
+      - name: Authenticate nix to the private Attic cache
+        shell: bash
+        env:
+          ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+        run: |
+          [ -n "$ATTIC_SUBSTITUTER" ] && [ -n "$ATTIC_TOKEN" ] || exit 0
+          h="${ATTIC_SUBSTITUTER#http://}"; h="${h#https://}"; h="${h%%/*}"
+          mkdir -p "$HOME/.config/nix"
+          touch "$HOME/.config/nix/netrc"
+          chmod 0600 "$HOME/.config/nix/netrc"
+          grep -q "^machine $h " "$HOME/.config/nix/netrc" 2>/dev/null || \
+            printf 'machine %s password %s\n' "$h" "$ATTIC_TOKEN" >> "$HOME/.config/nix/netrc"
+
       - name: Build ${{ matrix.name }}
         if: ${{ !matrix.noop }}
+        shell: bash
+        env:
+          # Newline-separated "<output name>\t<flake attribute>" rows for every
+          # output this job owns. Empty when the caller has not opted into
+          # `build-max-jobs`, in which case the job builds its single matrix
+          # entry exactly as it always did. Passed through `env` rather than
+          # interpolated into the script so names are data, never shell syntax.
+          BATCH_TSV: ${{ matrix.batchTsv }}
+          BATCH_FALLBACK_NAME: ${{ matrix.name }}
+          BATCH_FALLBACK_ATTR: ${{ matrix.attrPath }}
         run: |
-          nix build -L --no-link --keep-going --show-trace \
-            '.#${{ matrix.attrPath }}'
+          # DELIBERATELY NOT `set -e`. A batch must attempt EVERY output even
+          # after one fails; stopping at the first failure would report a
+          # single broken output and hide the rest, which is exactly the signal
+          # the per-output fan-out existed to provide. The aggregated verdict is
+          # applied at the end, and any failure fails the job.
+          set -uo pipefail
+
+          read -r -a build_cmd <<< "${CI_MATRIX_BUILD_COMMAND:-nix build -L --no-link --keep-going --show-trace}"
+
+          rows="$BATCH_TSV"
+          if [[ -z "${rows//[[:space:]]/}" ]]; then
+            printf -v rows '%s\t%s' "$BATCH_FALLBACK_NAME" "$BATCH_FALLBACK_ATTR"
+          fi
+
+          summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          {
+            printf '### %s\n\n' "$BATCH_FALLBACK_NAME"
+            printf '| flake output | attribute | result |\n'
+            printf '| --- | --- | --- |\n'
+          } >> "$summary"
+
+          total=0
+          passed=0
+          failed_names=()
+
+          while IFS=$'\t' read -r out_name out_attr || [[ -n "${out_name:-}" ]]; do
+            [[ -n "${out_attr:-}" ]] || continue
+            total=$((total + 1))
+            echo "::group::Build $out_name (.#$out_attr)"
+            if "${build_cmd[@]}" ".#$out_attr"; then
+              result='✅ pass'
+              passed=$((passed + 1))
+            else
+              result='❌ FAIL'
+              failed_names+=("$out_name")
+            fi
+            echo "::endgroup::"
+            # The backticks are literal markdown code spans in a printf FORMAT
+            # string, not command substitution.
+            # shellcheck disable=SC2016
+            printf '| `%s` | `%s` | %s |\n' "$out_name" "$out_attr" "$result" >> "$summary"
+          done <<< "$rows"
+
+          # A job that resolved no outputs has proved nothing; never let an
+          # empty batch masquerade as a green build.
+          if [[ "$total" -eq 0 ]]; then
+            echo "::error title=Empty build batch::No flake outputs resolved for '$BATCH_FALLBACK_NAME'; refusing to report success for zero work."
+            exit 1
+          fi
+
+          echo "Attempted $total flake output(s): $passed passed, ${#failed_names[@]} failed."
+
+          if [[ "${#failed_names[@]}" -gt 0 ]]; then
+            for out_name in "${failed_names[@]}"; do
+              echo "::error title=Flake output build failed::$out_name"
+            done
+            exit 1
+          fi
 
       # Cache push runs only when the caller requests deployment cache
       # publication.
@@ -613,10 +1015,50 @@ jobs:
           if-no-files-found: warn
           retention-days: 1
 
+      # In-house S3 mirror of the same artifact, over the NetBird VPN, using a
+      # bucket-scoped CI credential (the Attic-token analog). STRICTLY
+      # NON-BLOCKING: every failure is swallowed so a store/VPN hiccup can
+      # never fail CI. Skipped entirely when the credential is absent (e.g.
+      # forks / repos not yet onboarded). Object key namespaces by run + job so
+      # a fetch is deterministic, and the store's `ci-artifacts` lifecycle
+      # (retention-days: 1) reaps it just like the GitHub artifact.
+      - name: Upload CI artifacts to S3 (non-blocking mirror)
+        if: ${{ always() && inputs.push-deployment-caches && !matrix.noop && matrix.deploymentTarget }}
+        continue-on-error: true
+        shell: bash
+        env:
+          MCL_S3_ARTIFACTS_ENDPOINT: ${{ vars.MCL_S3_ARTIFACTS_ENDPOINT }}
+          MCL_S3_ARTIFACTS_BUCKET: ${{ vars.MCL_S3_ARTIFACTS_BUCKET }}
+          MCL_S3_ARTIFACTS_REGION: ${{ vars.MCL_S3_ARTIFACTS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.MCL_S3_ARTIFACTS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MCL_S3_ARTIFACTS_SECRET_ACCESS_KEY }}
+          AWS_EC2_METADATA_DISABLED: 'true'
+          AWS_REQUEST_CHECKSUM_CALCULATION: WHEN_REQUIRED
+          AWS_RESPONSE_CHECKSUM_VALIDATION: WHEN_REQUIRED
+          S3_OBJECT_PREFIX: deployment-cache-push/${{ github.run_id }}/${{ strategy.job-index }}
+        run: |
+          set -u
+          if [[ -z "${AWS_ACCESS_KEY_ID:-}" || -z "${AWS_SECRET_ACCESS_KEY:-}" || -z "${MCL_S3_ARTIFACTS_ENDPOINT:-}" ]]; then
+            echo "S3 artifact store not configured for this repo; skipping mirror."
+            exit 0
+          fi
+          [[ -f .result/deployment-cache-push-events.jsonl ]] || { echo "no artifact to mirror."; exit 0; }
+          region="${MCL_S3_ARTIFACTS_REGION:-garage}"
+          bucket="${MCL_S3_ARTIFACTS_BUCKET:-ci-artifacts}"
+          if nix shell nixpkgs#awscli2 -c \
+              aws --endpoint-url "$MCL_S3_ARTIFACTS_ENDPOINT" --region "$region" \
+                  s3 cp .result/deployment-cache-push-events.jsonl \
+                  "s3://$bucket/$S3_OBJECT_PREFIX/deployment-cache-push-events.jsonl"; then
+            echo "Mirrored deployment-cache-push-events.jsonl to s3://$bucket/$S3_OBJECT_PREFIX/"
+          else
+            echo "::warning title=S3 artifact mirror::upload failed (non-blocking); continuing"
+          fi
+
   results:
     runs-on: ${{ fromJSON(inputs.results-runner) }}
     name: Final Results
-    needs: [compute-mcl-ref, build, shard-matrix, merge-matrices]
+    needs:
+      [compute-mcl-ref, build, shard-matrix, merge-matrices, plan-build-matrix]
     if: always()
     permissions:
       contents: read
@@ -624,12 +1066,12 @@ jobs:
       pull-requests: write
     steps:
       - name: Setup Nix
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
         with:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
-          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
           nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
 
@@ -637,6 +1079,8 @@ jobs:
         env:
           IS_INITIAL: 'false'
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
+          ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
+          ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           PRECALC_MATRIX: ${{
             needs.merge-matrices.result == 'success' &&
             needs.merge-matrices.outputs.full_matrix ||
@@ -645,7 +1089,7 @@ jobs:
         run: ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} print-table
 
       - name: Update GitHub Comment
-        uses: metacraft-labs/nixos-modules/.github/sticky-comment@main
+        uses: metacraft-labs/devops-modules/.github/sticky-comment@dev
         with:
           path: comment.md
 

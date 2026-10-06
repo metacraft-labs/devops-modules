@@ -1,0 +1,829 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  scripts/github-inventory [options]
+
+Options:
+  --owner OWNER       GitHub organization owner (required; or set GITHUB_OWNER).
+  --repo REPO         Inventory one repository. May be passed more than once.
+    Use the short repo name or owner/repo.
+  --all-repos         Inventory every accessible organization repository.
+    This is the default when --repo is not provided.
+  --output-dir DIR    Write the inventory dump to DIR.
+  -h, --help          Show this help text.
+
+Environment:
+  GH_TOKEN or GITHUB_TOKEN   Optional GitHub token. Otherwise the script uses
+    the authenticated gh CLI session.
+  GITHUB_OWNER        Default owner when --owner is not given.
+
+The script is read-only. It calls GitHub API GET endpoints, writes raw JSON and
+a redacted markdown inventory under .result by default, and never writes or
+prints secret values. GitHub secret APIs return names and metadata only.
+USAGE
+}
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Missing required command: ${cmd}" >&2
+    exit 1
+  fi
+}
+
+safe_name() {
+  local value="$1"
+  value="${value//\//_}"
+  value="${value//:/_}"
+  value="${value//@/_}"
+  printf '%s' "$value" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+urlencode() {
+  jq -rn --arg value "$1" '$value | @uri'
+}
+
+json_array_from_args() {
+  if (($# == 0)); then
+    printf '[]'
+  else
+    printf '%s\n' "$@" | jq -R -s 'split("\n")[:-1]'
+  fi
+}
+
+join_by() {
+  local sep="$1"
+  shift
+  local first=1 item
+  for item in "$@"; do
+    if ((first)); then
+      first=0
+    else
+      printf '%s' "$sep"
+    fi
+    printf '%s' "$item"
+  done
+}
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+run_id="$(date -u +%Y%m%dT%H%M%SZ)"
+github_host="${GITHUB_HOST:-github.com}"
+owner="${GITHUB_OWNER:-}"
+output_dir="${root}/.result/github-inventory/${run_id}"
+all_repos=0
+repos=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --owner)
+      if [[ $# -lt 2 ]]; then
+        echo "--owner requires a value." >&2
+        exit 2
+      fi
+      owner="$2"
+      shift 2
+      ;;
+    --repo)
+      if [[ $# -lt 2 ]]; then
+        echo "--repo requires a value." >&2
+        exit 2
+      fi
+      repos+=("${2#${owner}/}")
+      shift 2
+      ;;
+    --all-repos)
+      all_repos=1
+      shift
+      ;;
+    --output-dir)
+      if [[ $# -lt 2 ]]; then
+        echo "--output-dir requires a value." >&2
+        exit 2
+      fi
+      output_dir="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -z "$owner" ]]; then
+  echo "A GitHub owner is required: pass --owner OWNER or set GITHUB_OWNER." >&2
+  usage >&2
+  exit 2
+fi
+
+if ((all_repos)) && ((${#repos[@]} > 0)); then
+  echo "--all-repos cannot be combined with --repo." >&2
+  exit 2
+fi
+
+if ((${#repos[@]} == 0)); then
+  all_repos=1
+fi
+
+require_cmd gh
+require_cmd jq
+
+if [[ -n "${GITHUB_TOKEN:-}" && -z "${GH_TOKEN:-}" ]]; then
+  export GH_TOKEN="$GITHUB_TOKEN"
+fi
+
+auth_source=""
+if [[ -n "${GH_TOKEN:-}" ]]; then
+  auth_source="env:GH_TOKEN"
+elif gh auth status --hostname "$github_host" >/dev/null 2>&1; then
+  auth_source="gh:${github_host}"
+else
+  cat >&2 <<EOF
+GitHub CLI is not authenticated and GH_TOKEN/GITHUB_TOKEN is not set.
+Run:
+
+  gh auth login --hostname ${github_host}
+
+Use an organization-admin token for complete governance inventory.
+EOF
+  exit 1
+fi
+
+raw_dir="${output_dir}/raw"
+warning_file="${output_dir}/warnings.log"
+mkdir -p "$raw_dir"
+: > "$warning_file"
+
+warn() {
+  local message="$1"
+  printf 'WARNING: %s\n' "$message" >&2
+  printf '%s\n' "$message" >> "$warning_file"
+}
+
+gh_request() {
+  local endpoint="$1"
+  local output="$2"
+  local mode="${3:-get}"
+  local missing_ok="${4:-0}"
+  local tmp err status message
+  tmp="$(mktemp)"
+  err="$(mktemp)"
+
+  local args=(
+    api
+    --hostname "$github_host"
+    -H "Accept: application/vnd.github+json"
+    -H "X-GitHub-Api-Version: 2022-11-28"
+  )
+  if [[ "$mode" == "paginate" ]]; then
+    args+=(--paginate --slurp)
+  fi
+  args+=("$endpoint")
+
+  set +e
+  gh "${args[@]}" >"$tmp" 2>"$err"
+  status=$?
+  set -e
+
+  if ((status != 0)); then
+    message="$(sed '/^[[:space:]]*$/d' "$err" | head -n 1)"
+    if ! ((missing_ok)) || ! grep -Eiq 'HTTP (404|409|422)|Not Found|Conflict|Validation Failed' "$err"; then
+      warn "GET ${endpoint} failed: ${message:-gh exited ${status}}"
+    fi
+    jq -n \
+      --arg endpoint "$endpoint" \
+      --arg message "${message:-gh exited ${status}}" \
+      '{success: false, errors: [{message: $message}], result: null, request: {endpoint: $endpoint}}' \
+      >"$output"
+    rm -f "$tmp" "$err"
+    return 1
+  fi
+
+  if [[ "$mode" == "paginate" ]]; then
+    if ! jq --arg endpoint "$endpoint" '
+      def merge_collection($pages; $key):
+        if all($pages[]; (has($key) and (.[$key] | type == "array"))) then
+          ($pages[0] + {($key): ([$pages[] | .[$key][]?])})
+        else
+          empty
+        end;
+      def is_wrapped_object_collection:
+        type == "object"
+        and (
+          has("total_count")
+          or has("repositories")
+          or has("secrets")
+          or has("variables")
+          or has("environments")
+          or has("runner_groups")
+          or has("teams")
+          or has("members")
+          or has("keys")
+          or has("hooks")
+          or has("rulesets")
+          or has("custom_roles")
+        );
+      def combined:
+        if type != "array" then .
+        elif length == 0 then []
+        elif all(.[]; type == "array") then add
+        elif all(.[]; type == "object") and (all(.[]; (is_wrapped_object_collection | not))) then .
+        else
+          . as $pages
+          | (
+              reduce [
+                "repositories",
+                "secrets",
+                "variables",
+                "environments",
+                "runner_groups",
+                "teams",
+                "members",
+                "keys",
+                "hooks",
+                "rulesets",
+                "custom_roles"
+              ][] as $key (null;
+                if . != null then .
+                else (try merge_collection($pages; $key) catch null)
+                end
+              )
+            ) // .[0]
+        end;
+      {success: true, errors: [], result: combined, pages: (if type == "array" then . else [.] end), request: {endpoint: $endpoint}}
+    ' "$tmp" >"$output"; then
+      warn "GET ${endpoint} returned invalid JSON"
+      rm -f "$tmp" "$err"
+      return 1
+    fi
+  else
+    if ! jq --arg endpoint "$endpoint" \
+      '{success: true, errors: [], result: ., request: {endpoint: $endpoint}}' \
+      "$tmp" >"$output"; then
+      warn "GET ${endpoint} returned invalid JSON"
+      rm -f "$tmp" "$err"
+      return 1
+    fi
+  fi
+
+  rm -f "$tmp" "$err"
+}
+
+# Some GitHub endpoints answer with a bare status code and no body: 204 means
+# "on", 404 means "off". `gh api` reports the 404 as a failure, so the plain
+# gh_request wrapper would record it as an error rather than as a fact. Capture
+# the boolean instead.
+gh_boolean_request() {
+  local endpoint="$1"
+  local output="$2"
+  local status
+
+  set +e
+  gh api --hostname "$github_host" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "$endpoint" >/dev/null 2>&1
+  status=$?
+  set -e
+
+  jq -n \
+    --arg endpoint "$endpoint" \
+    --argjson enabled "$( ((status == 0)) && echo true || echo false)" \
+    '{success: true, errors: [], result: {enabled: $enabled}, request: {endpoint: $endpoint}}' \
+    >"$output"
+}
+
+inventory_rows_from_file() {
+  local file="$1"
+  shift
+  if [[ -s "$file" ]]; then
+    jq -r "$@" "$file"
+  fi
+}
+
+write_metadata() {
+  jq -n \
+    --arg generated_at "$run_id" \
+    --arg host "$github_host" \
+    --arg owner "$owner" \
+    --arg auth_source "$auth_source" \
+    --arg all_repos "$all_repos" \
+    --argjson repos "$(json_array_from_args "${repos[@]}")" \
+    '{
+      generated_at_utc: $generated_at,
+      github_host: $host,
+      owner: $owner,
+      auth_source: $auth_source,
+      all_repos: ($all_repos == "1"),
+      requested_repositories: $repos
+    }' >"${output_dir}/metadata.json"
+}
+
+write_inventory_markdown() {
+  local inventory="${output_dir}/inventory.md"
+  local file repo safe env env_safe branch branch_safe team_slug team_safe
+  local requested_repos
+
+  if ((all_repos)); then
+    requested_repos="all accessible ${owner} repositories"
+  else
+    requested_repos="$(join_by ', ' "${repos[@]}")"
+  fi
+
+  {
+    echo "# GitHub Governance Inventory"
+    echo
+    echo "- Generated UTC: ${run_id}"
+    echo "- GitHub host: ${github_host}"
+    echo "- Owner: ${owner}"
+    echo "- Auth source: ${auth_source}"
+    echo "- Requested repositories: ${requested_repos}"
+    echo "- Raw JSON directory: raw/"
+    echo
+    echo "Secret rows list names and metadata only. GitHub does not expose secret values."
+    echo
+    echo "## Import Inventory"
+    echo
+    echo "| resource_type | logical_name | provider_resource_id | in_scope | managed_by | expected_milestone | notes |"
+    echo "| --- | --- | --- | --- | --- | --- | --- |"
+  } >"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/org.json" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result
+    | "| github_organization_settings | \(.login | md) | \(.login | md) | review | existing | M5 | plan=\(.plan.name // "unknown" | md) two_factor_requirement_enabled=\(if .two_factor_requirement_enabled == null then "unknown" else (.two_factor_requirement_enabled | tostring) end) |"
+  ' >>"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/members.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result[]?
+    | "| github_membership | \(.login | md) | \($owner)/\(.login | md) | review | existing | M5 | type=\(.type // "unknown" | md) site_admin=\(.site_admin // false | tostring) |"
+  ' >>"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/outside-collaborators.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result[]?
+    | "| github_outside_collaborator | \(.login | md) | \($owner)/\(.login | md) | review | existing | M5 | type=\(.type // "unknown" | md) |"
+  ' >>"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/org-security-managers.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result[]?
+    | "| github_organization_security_manager | \(.slug // .name | md) | \(.slug // .name | md) | review | existing | M5 | team |"
+  ' >>"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/org-code-security-configurations.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result[]?
+    | "| (unmanageable) code_security_configuration | \(.name | md) | \($owner)/\(.id | tostring) | deferred | manual | - | enforcement=\(.enforcement // "unknown" | md) target=\(.target_type // "unknown" | md) no resource in provider 6.12.1 |"
+  ' >>"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/teams.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result[]?
+    | "| github_team | \(.slug // .name | md) | \($owner)/\(.slug // .name | md) | review | existing | M5 | privacy=\(.privacy // "unknown" | md) permission=\(.permission // "unknown" | md) parent=\(.parent.slug // "none" | md) |"
+  ' >>"$inventory"
+
+  if [[ -s "${raw_dir}/teams.json" ]]; then
+    while IFS= read -r team_slug; do
+      [[ -n "$team_slug" ]] || continue
+      team_safe="$(safe_name "$team_slug")"
+      inventory_rows_from_file "${raw_dir}/team-members-${team_safe}.json" \
+        --arg owner "$owner" --arg team "$team_slug" '
+          def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+          select(.success)
+          | .result[]?
+          | "| github_team_membership | \($team | md):\(.login | md) | \($owner)/\($team | md)/\(.login | md) | review | existing | M5 | type=\(.type // "unknown" | md) |"
+        ' >>"$inventory"
+      inventory_rows_from_file "${raw_dir}/team-repos-${team_safe}.json" \
+        --arg owner "$owner" --arg team "$team_slug" '
+          def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+          select(.success)
+          | .result[]?
+          | "| github_team_repository | \($team | md):\(.name | md) | \($owner)/\($team | md)/\(.name | md) | review | existing | M5 | permissions=\((.permissions // {}) | keys | join(",")) |"
+        ' >>"$inventory"
+    done < <(jq -r 'select(.success) | .result[]?.slug // empty' "${raw_dir}/teams.json")
+  fi
+
+  inventory_rows_from_file "${raw_dir}/org-actions-variables.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result.variables[]?
+    | "| github_actions_organization_variable | \(.name | md) | \($owner)/\(.name | md) | review | existing | M5 | visibility=\(.visibility // "unknown" | md) selected_repositories_url=\((.selected_repositories_url != null) | tostring) |"
+  ' >>"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/org-actions-secrets.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result.secrets[]?
+    | "| github_actions_organization_secret | \(.name | md) | \($owner)/\(.name | md) | review | existing | M3 | visibility=\(.visibility // "unknown" | md) updated_at=\(.updated_at // "unknown" | md) selected_repositories_url=\((.selected_repositories_url != null) | tostring) |"
+  ' >>"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/org-dependabot-secrets.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result.secrets[]?
+    | "| github_dependabot_organization_secret | \(.name | md) | \($owner)/\(.name | md) | review | existing | M3 | visibility=\(.visibility // "unknown" | md) updated_at=\(.updated_at // "unknown" | md) |"
+  ' >>"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/org-runner-groups.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result.runner_groups[]?
+    | "| github_actions_organization_runner_group | \(.name | md) | \($owner)/\(.id | tostring | md) | review | existing | M5 | visibility=\(.visibility // "unknown" | md) default=\(.default // false | tostring) runners_url=\((.runners_url != null) | tostring) |"
+  ' >>"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/org-rulesets.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result[]?
+    | "| github_organization_ruleset | \(.name // .id | md) | \($owner)/\(.id | tostring | md) | review | existing | M5 | target=\(.target // "unknown" | md) enforcement=\(.enforcement // "unknown" | md) |"
+  ' >>"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/org-actions-permissions.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result
+    | "| github_actions_organization_permissions | \($owner | md) | \($owner | md) | review | existing | M5 | enabled_repositories=\(.enabled_repositories // "unknown" | md) allowed_actions=\(.allowed_actions // "unknown" | md) |"
+  ' >>"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/org-custom-repository-roles.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result.custom_roles[]?
+    | "| github_organization_custom_repository_role | \(.name | md) | \($owner)/\(.id | tostring | md) | review | existing | M5 | base_role=\(.base_role // "unknown" | md) permissions=\((.permissions // []) | join(",")) |"
+  ' >>"$inventory"
+
+  inventory_rows_from_file "${raw_dir}/org-hooks.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result[]?
+    | "| github_organization_webhook | \(.id | tostring | md) | \($owner)/\(.id | tostring | md) | review | existing | M5 | active=\(if .active == null then "unknown" else (.active | tostring) end) events=\((.events // []) | join(",")) redacted_url=true |"
+  ' >>"$inventory"
+
+  while IFS= read -r repo; do
+    [[ -n "$repo" ]] || continue
+    safe="$(safe_name "$repo")"
+
+    inventory_rows_from_file "${raw_dir}/repo-${safe}.json" --arg owner "$owner" '
+    def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+    select(.success)
+    | .result
+      | "| github_repository | \(.name | md) | \($owner)/\(.name | md) | review | existing | M5 | private=\(if .private == null then "unknown" else (.private | tostring) end) default_branch=\(.default_branch // "unknown" | md) archived=\(if .archived == null then "unknown" else (.archived | tostring) end) visibility=\(.visibility // "unknown" | md) |"
+    ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/repo-collaborators-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result[]?
+        | "| github_repository_collaborator | \($repo | md):\(.login | md) | \($owner)/\($repo | md)/\(.login | md) | review | existing | M5 | affiliation=direct role=\(.role_name // "unknown" | md) |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/repo-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        def status($k): (.security_and_analysis[$k].status // "absent");
+        select(.success)
+        | .result
+        | select(.security_and_analysis != null)
+        | "| github_repository.security_and_analysis | \($repo | md) | \($owner)/\($repo | md) | review | existing | M5 | secret_scanning=\(status("secret_scanning") | md) push_protection=\(status("secret_scanning_push_protection") | md) code_security=\(status("code_security") | md) visibility=\(.visibility // "unknown" | md) |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/vulnerability-alerts-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result
+        | "| github_repository_vulnerability_alerts | \($repo | md) | \($owner)/\($repo | md) | review | existing | M5 | enabled=\(.enabled | tostring) |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/automated-security-fixes-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result
+        | "| github_repository_dependabot_security_updates | \($repo | md) | \($owner)/\($repo | md) | review | existing | M5 | enabled=\(.enabled // false | tostring) paused=\(.paused // false | tostring) |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/private-vulnerability-reporting-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result
+        | "| (unmanageable) private_vulnerability_reporting | \($repo | md) | \($owner)/\($repo | md) | deferred | manual | - | enabled=\(.enabled // false | tostring) no resource in provider 6.12.1 |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/repo-teams-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result[]?
+        | "| github_team_repository | \(.slug // .name | md):\($repo | md) | \($owner)/\(.slug // .name | md)/\($repo | md) | review | existing | M5 | permission=\(.permission // "unknown" | md) |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/repo-rulesets-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result[]?
+        | "| github_repository_ruleset | \($repo | md):\(.name // .id | md) | \($owner)/\($repo | md)/\(.id | tostring | md) | review | existing | M5 | target=\(.target // "unknown" | md) enforcement=\(.enforcement // "unknown" | md) |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/repo-actions-permissions-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result
+        | "| github_actions_repository_permissions | \($repo | md) | \($owner)/\($repo | md) | review | existing | M5 | enabled=\(if .enabled == null then "unknown" else (.enabled | tostring) end) allowed_actions=\(.allowed_actions // "unknown" | md) |"
+      ' >>"$inventory"
+
+    if [[ -s "${raw_dir}/protected-branches-${safe}.json" ]]; then
+      while IFS= read -r branch; do
+        [[ -n "$branch" ]] || continue
+        branch_safe="$(safe_name "$branch")"
+        inventory_rows_from_file "${raw_dir}/branch-protection-${safe}-${branch_safe}.json" \
+          --arg owner "$owner" --arg repo "$repo" --arg branch "$branch" '
+            def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+            select(.success)
+          | .result
+          | "| github_branch_protection | \($repo | md):\($branch | md) | \($owner)/\($repo | md):\($branch | md) | review | existing | M5 | enforce_admins=\(if .enforce_admins.enabled == null then "unknown" else (.enforce_admins.enabled | tostring) end) required_status_checks=\((.required_status_checks.contexts // []) | length) |"
+        ' >>"$inventory"
+      done < <(jq -r 'select(.success) | .result[]?.name // empty' "${raw_dir}/protected-branches-${safe}.json")
+    fi
+
+    inventory_rows_from_file "${raw_dir}/environments-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result.environments[]?
+        | "| github_repository_environment | \($repo | md):\(.name | md) | \($owner)/\($repo | md):\(.name | md) | review | existing | M5 | protected_branches=\(if .deployment_branch_policy.protected_branches == null then "unknown" else (.deployment_branch_policy.protected_branches | tostring) end) custom_branch_policies=\(if .deployment_branch_policy.custom_branch_policies == null then "unknown" else (.deployment_branch_policy.custom_branch_policies | tostring) end) |"
+      ' >>"$inventory"
+
+    if [[ -s "${raw_dir}/environments-${safe}.json" ]]; then
+      while IFS= read -r env; do
+        [[ -n "$env" ]] || continue
+        env_safe="$(safe_name "$env")"
+        inventory_rows_from_file "${raw_dir}/environment-vars-${safe}-${env_safe}.json" \
+          --arg owner "$owner" --arg repo "$repo" --arg env "$env" '
+            def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+            select(.success)
+            | .result.variables[]?
+            | "| github_actions_environment_variable | \($repo | md):\($env | md):\(.name | md) | \($owner)/\($repo | md):\($env | md):\(.name | md) | review | existing | M5 | updated_at=\(.updated_at // "unknown" | md) |"
+          ' >>"$inventory"
+        inventory_rows_from_file "${raw_dir}/environment-secrets-${safe}-${env_safe}.json" \
+          --arg owner "$owner" --arg repo "$repo" --arg env "$env" '
+            def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+            select(.success)
+            | .result.secrets[]?
+            | "| github_actions_environment_secret | \($repo | md):\($env | md):\(.name | md) | \($owner)/\($repo | md):\($env | md):\(.name | md) | review | existing | M3 | updated_at=\(.updated_at // "unknown" | md) |"
+          ' >>"$inventory"
+      done < <(jq -r 'select(.success) | .result.environments[]?.name // empty' "${raw_dir}/environments-${safe}.json")
+    fi
+
+    inventory_rows_from_file "${raw_dir}/repo-actions-variables-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result.variables[]?
+        | "| github_actions_variable | \($repo | md):\(.name | md) | \($owner)/\($repo | md):\(.name | md) | review | existing | M5 | updated_at=\(.updated_at // "unknown" | md) |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/repo-actions-secrets-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result.secrets[]?
+        | "| github_actions_secret | \($repo | md):\(.name | md) | \($owner)/\($repo | md):\(.name | md) | review | existing | M3 | updated_at=\(.updated_at // "unknown" | md) |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/repo-dependabot-secrets-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result.secrets[]?
+        | "| github_dependabot_secret | \($repo | md):\(.name | md) | \($owner)/\($repo | md):\(.name | md) | review | existing | M3 | updated_at=\(.updated_at // "unknown" | md) |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/labels-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result[]?
+        | "| github_issue_label | \($repo | md):\(.name | md) | \($owner)/\($repo | md):\(.name | md) | review | existing | M5 | color=\(.color // "unknown" | md) default=\(.default // false | tostring) |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/topics-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result.names[]?
+        | "| github_repository_topics | \($repo | md):\(md) | \($owner)/\($repo | md) | review | existing | M5 | topic=\(md) |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/deploy-keys-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result[]?
+        | "| github_repository_deploy_key | \($repo | md):\(.title | md) | \($owner)/\($repo | md):\(.id | tostring | md) | review | existing | M5 | read_only=\(if .read_only == null then "unknown" else (.read_only | tostring) end) verified=\(if .verified == null then "unknown" else (.verified | tostring) end) |"
+      ' >>"$inventory"
+
+    inventory_rows_from_file "${raw_dir}/hooks-${safe}.json" \
+      --arg owner "$owner" --arg repo "$repo" '
+        def md: tostring | gsub("[\r\n]"; " ") | gsub("\\|"; "\\|");
+        select(.success)
+        | .result[]?
+        | "| github_repository_webhook | \($repo | md):\(.id | tostring | md) | \($owner)/\($repo | md):\(.id | tostring | md) | review | existing | M5 | active=\(if .active == null then "unknown" else (.active | tostring) end) events=\((.events // []) | join(",")) redacted_url=true |"
+      ' >>"$inventory"
+  done <"${output_dir}/repo-names.txt"
+
+  {
+    echo
+    echo "## Warnings"
+    echo
+    if [[ -s "$warning_file" ]]; then
+      sed 's/^/- /' "$warning_file"
+    else
+      echo "- None"
+    fi
+  } >>"$inventory"
+}
+
+write_metadata
+
+echo "Writing GitHub governance inventory to ${output_dir}" >&2
+
+# Ruleset list endpoints omit rules/conditions/bypass_actors; fetch each ruleset
+# by id and consolidate the details so the governance model can be built offline.
+fetch_ruleset_details() {
+  local list_file="$1" url_prefix="$2" out_file="$3"
+  [[ -s "$list_file" ]] || return 0
+  local tmpdir rid
+  tmpdir="$(mktemp -d)"
+  while IFS= read -r rid; do
+    [[ -n "$rid" ]] || continue
+    gh_request "${url_prefix}/${rid}" "${tmpdir}/${rid}.json" || true
+  done < <(jq -r '(.result // .) | if type=="array" then .[] else empty end | .id // empty' "$list_file" 2>/dev/null)
+  if compgen -G "${tmpdir}/*.json" >/dev/null 2>&1; then
+    jq -s '{result: [ .[] | (.result // .) ]}' "${tmpdir}"/*.json > "$out_file" 2>/dev/null || true
+  fi
+  rm -rf "$tmpdir"
+}
+
+gh_request "/orgs/${owner}" "${raw_dir}/org.json" || true
+gh_request "/orgs/${owner}/members?role=all&per_page=100" "${raw_dir}/members.json" paginate || true
+gh_request "/orgs/${owner}/members?role=admin&per_page=100" "${raw_dir}/members-admins.json" paginate || true
+gh_request "/orgs/${owner}/outside_collaborators?per_page=100" "${raw_dir}/outside-collaborators.json" paginate || true
+gh_request "/orgs/${owner}/teams?per_page=100" "${raw_dir}/teams.json" paginate || true
+gh_request "/orgs/${owner}/actions/variables?per_page=100" "${raw_dir}/org-actions-variables.json" paginate || true
+gh_request "/orgs/${owner}/actions/secrets?per_page=100" "${raw_dir}/org-actions-secrets.json" paginate || true
+gh_request "/orgs/${owner}/dependabot/secrets?per_page=100" "${raw_dir}/org-dependabot-secrets.json" paginate || true
+gh_request "/orgs/${owner}/actions/runner-groups?per_page=100" "${raw_dir}/org-runner-groups.json" paginate || true
+gh_request "/orgs/${owner}/rulesets?per_page=100" "${raw_dir}/org-rulesets.json" paginate || true
+fetch_ruleset_details "${raw_dir}/org-rulesets.json" "/orgs/${owner}/rulesets" "${raw_dir}/org-rulesets-detailed.json"
+gh_request "/orgs/${owner}/hooks?per_page=100" "${raw_dir}/org-hooks.json" paginate || true
+gh_request "/orgs/${owner}/actions/permissions" "${raw_dir}/org-actions-permissions.json" || true
+gh_request "/orgs/${owner}/actions/permissions/selected-actions" "${raw_dir}/org-actions-selected-actions.json" get 1 || true
+gh_request "/orgs/${owner}/actions/permissions/workflow" "${raw_dir}/org-actions-workflow-permissions.json" get 1 || true
+gh_request "/orgs/${owner}/custom-repository-roles" "${raw_dir}/org-custom-repository-roles.json" paginate 1 || true
+# Code security configurations are the mechanism GitHub steers organizations
+# toward, and provider 6.12.1 has no resource for them. Capture them anyway, so
+# the report says whether they have started being used out of band.
+gh_request "/orgs/${owner}/code-security/configurations" "${raw_dir}/org-code-security-configurations.json" paginate 1 || true
+gh_request "/orgs/${owner}/security-managers" "${raw_dir}/org-security-managers.json" paginate 1 || true
+
+if [[ -s "${raw_dir}/teams.json" ]]; then
+  while IFS= read -r team_slug; do
+    [[ -n "$team_slug" ]] || continue
+    team_safe="$(safe_name "$team_slug")"
+    team_path="$(urlencode "$team_slug")"
+    gh_request "/orgs/${owner}/teams/${team_path}/members?role=all&per_page=100" \
+      "${raw_dir}/team-members-${team_safe}.json" paginate || true
+    gh_request "/orgs/${owner}/teams/${team_path}/repos?per_page=100" \
+      "${raw_dir}/team-repos-${team_safe}.json" paginate || true
+  done < <(jq -r 'select(.success) | .result[]?.slug // empty' "${raw_dir}/teams.json")
+fi
+
+if ((all_repos)); then
+  gh_request "/orgs/${owner}/repos?type=all&sort=full_name&per_page=100" "${raw_dir}/repos.json" paginate || true
+  jq -r 'select(.success) | .result[]?.name // empty' "${raw_dir}/repos.json" | sort -u >"${output_dir}/repo-names.txt"
+else
+  printf '%s\n' "${repos[@]}" | sort -u >"${output_dir}/repo-names.txt"
+  repo_files=()
+  while IFS= read -r repo; do
+    [[ -n "$repo" ]] || continue
+    safe="$(safe_name "$repo")"
+    file="${raw_dir}/repo-${safe}.json"
+    gh_request "/repos/${owner}/${repo}" "$file" || true
+    repo_files+=("$file")
+  done <"${output_dir}/repo-names.txt"
+  if ((${#repo_files[@]} > 0)); then
+    jq -s '{success: true, errors: [], result: [.[].result? | select(. != null)], request: {endpoint: "selected repositories"}}' \
+      "${repo_files[@]}" >"${raw_dir}/repos.json"
+  else
+    jq -n '{success: true, errors: [], result: [], request: {endpoint: "selected repositories"}}' >"${raw_dir}/repos.json"
+  fi
+fi
+
+while IFS= read -r repo; do
+  [[ -n "$repo" ]] || continue
+  safe="$(safe_name "$repo")"
+  repo_path="${owner}/${repo}"
+  encoded_repo="$(urlencode "$repo")"
+
+  if [[ ! -s "${raw_dir}/repo-${safe}.json" ]]; then
+    gh_request "/repos/${owner}/${encoded_repo}" "${raw_dir}/repo-${safe}.json" || true
+  fi
+
+  gh_request "/repos/${owner}/${encoded_repo}/branches?protected=true&per_page=100" "${raw_dir}/protected-branches-${safe}.json" paginate || true
+  gh_request "/repos/${owner}/${encoded_repo}/rulesets?per_page=100" "${raw_dir}/repo-rulesets-${safe}.json" paginate || true
+  fetch_ruleset_details "${raw_dir}/repo-rulesets-${safe}.json" "/repos/${owner}/${encoded_repo}/rulesets" "${raw_dir}/repo-rulesets-detailed-${safe}.json"
+  gh_request "/repos/${owner}/${encoded_repo}/environments?per_page=100" "${raw_dir}/environments-${safe}.json" paginate || true
+  gh_request "/repos/${owner}/${encoded_repo}/actions/variables?per_page=100" "${raw_dir}/repo-actions-variables-${safe}.json" paginate || true
+  gh_request "/repos/${owner}/${encoded_repo}/actions/secrets?per_page=100" "${raw_dir}/repo-actions-secrets-${safe}.json" paginate || true
+  gh_request "/repos/${owner}/${encoded_repo}/dependabot/secrets?per_page=100" "${raw_dir}/repo-dependabot-secrets-${safe}.json" paginate || true
+  # Collaborators are captured under THREE distinct affiliations, and the
+  # distinction is load-bearing rather than decorative.
+  #
+  # `affiliation=direct` is the only one that corresponds to a
+  # `github_repository_collaborator` resource: a grant held on the repository
+  # itself. `affiliation=all` returns EFFECTIVE access — direct grants plus
+  # team-derived plus organization-owner-derived — and an adoption transform
+  # that reads it as if it were direct will invent collaborator rows for access
+  # that is really a team grant. Those rows cannot be imported (there is no
+  # direct collaboration to import), and if they were created instead, removing
+  # someone from a team would no longer revoke their access. Keep the effective
+  # set under a name that cannot be mistaken for a resource inventory.
+  gh_request "/repos/${owner}/${encoded_repo}/collaborators?affiliation=direct&per_page=100" "${raw_dir}/repo-collaborators-${safe}.json" paginate || true
+  gh_request "/repos/${owner}/${encoded_repo}/collaborators?affiliation=outside&per_page=100" "${raw_dir}/repo-outside-collaborators-${safe}.json" paginate || true
+  gh_request "/repos/${owner}/${encoded_repo}/collaborators?affiliation=all&per_page=100" "${raw_dir}/repo-effective-access-${safe}.json" paginate || true
+  # Free security posture. `security_and_analysis` already rides the per-repo
+  # GET above (admin tokens only); these two are separate endpoints that the
+  # repository object does not carry.
+  gh_boolean_request "/repos/${owner}/${encoded_repo}/vulnerability-alerts" "${raw_dir}/vulnerability-alerts-${safe}.json"
+  gh_request "/repos/${owner}/${encoded_repo}/automated-security-fixes" "${raw_dir}/automated-security-fixes-${safe}.json" get 1 || true
+  gh_request "/repos/${owner}/${encoded_repo}/private-vulnerability-reporting" "${raw_dir}/private-vulnerability-reporting-${safe}.json" get 1 || true
+  gh_request "/repos/${owner}/${encoded_repo}/teams?per_page=100" "${raw_dir}/repo-teams-${safe}.json" paginate || true
+  gh_request "/repos/${owner}/${encoded_repo}/labels?per_page=100" "${raw_dir}/labels-${safe}.json" paginate || true
+  gh_request "/repos/${owner}/${encoded_repo}/topics" "${raw_dir}/topics-${safe}.json" || true
+  gh_request "/repos/${owner}/${encoded_repo}/hooks?per_page=100" "${raw_dir}/hooks-${safe}.json" paginate || true
+  gh_request "/repos/${owner}/${encoded_repo}/keys?per_page=100" "${raw_dir}/deploy-keys-${safe}.json" paginate || true
+  gh_request "/repos/${owner}/${encoded_repo}/actions/permissions" "${raw_dir}/repo-actions-permissions-${safe}.json" || true
+  gh_request "/repos/${owner}/${encoded_repo}/actions/permissions/access" "${raw_dir}/repo-actions-access-${safe}.json" get 1 || true
+  gh_request "/repos/${owner}/${encoded_repo}/actions/permissions/selected-actions" "${raw_dir}/repo-actions-selected-actions-${safe}.json" get 1 || true
+  gh_request "/repos/${owner}/${encoded_repo}/pages" "${raw_dir}/pages-${safe}.json" get 1 || true
+
+  if [[ -s "${raw_dir}/protected-branches-${safe}.json" ]]; then
+    while IFS= read -r branch; do
+      [[ -n "$branch" ]] || continue
+      branch_safe="$(safe_name "$branch")"
+      branch_path="$(urlencode "$branch")"
+      gh_request "/repos/${owner}/${encoded_repo}/branches/${branch_path}/protection" \
+        "${raw_dir}/branch-protection-${safe}-${branch_safe}.json" get 1 || true
+    done < <(jq -r 'select(.success) | .result[]?.name // empty' "${raw_dir}/protected-branches-${safe}.json")
+  fi
+
+  if [[ -s "${raw_dir}/environments-${safe}.json" ]]; then
+    while IFS= read -r env; do
+      [[ -n "$env" ]] || continue
+      env_safe="$(safe_name "$env")"
+      env_path="$(urlencode "$env")"
+      gh_request "/repos/${owner}/${encoded_repo}/environments/${env_path}" \
+        "${raw_dir}/environment-${safe}-${env_safe}.json" || true
+      gh_request "/repos/${owner}/${encoded_repo}/environments/${env_path}/variables?per_page=100" \
+        "${raw_dir}/environment-vars-${safe}-${env_safe}.json" paginate 1 || true
+      gh_request "/repos/${owner}/${encoded_repo}/environments/${env_path}/secrets?per_page=100" \
+        "${raw_dir}/environment-secrets-${safe}-${env_safe}.json" paginate 1 || true
+    done < <(jq -r 'select(.success) | .result.environments[]?.name // empty' "${raw_dir}/environments-${safe}.json")
+  fi
+
+  printf 'Inventoried %s\n' "$repo_path" >&2
+done <"${output_dir}/repo-names.txt"
+
+write_inventory_markdown
+
+cat <<EOF
+GitHub governance inventory written to:
+  ${output_dir}
+
+Review:
+  ${output_dir}/inventory.md
+
+Raw JSON:
+  ${raw_dir}
+EOF

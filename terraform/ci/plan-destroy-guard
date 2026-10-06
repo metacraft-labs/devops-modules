@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Refuse to auto-apply a Terraform/OpenTofu plan that destroys anything.
+
+Usage:
+  plan-destroy-guard PLAN_JSON [--authorized REASON] [--summary FILE]
+
+PLAN_JSON is the output of `tofu show -json <planfile>` -- the SAME saved plan
+the apply step is about to execute, so what is judged is exactly what runs.
+
+Exit status:
+  0  the plan destroys nothing, or it does and REASON authorizes it
+  3  the plan destroys or replaces something and nothing authorized it
+  2  usage error, or PLAN_JSON is unreadable / not a plan
+
+Why this exists (2026-09-23): an apply-on-push pipeline re-applied every root
+after a CI-only change. One root carried a pending, never-reviewed change that
+wrapped a Cloudflare DNS record in `count`. Without a `moved` block that is a
+DESTROY of `X` plus a CREATE of `X[0]` -- same zone, same name. The destroy
+landed, the create failed, and the identity provider's hostname was gone. A
+plan-time gate on the pull request cannot catch this, because the change that
+applied it was not the change that introduced it.
+
+Every destructive action is listed. Two shapes get a specific diagnosis because
+each has a zero-downtime fix that is not "approve the destroy":
+
+  unmoved-address  a DELETE of one address and a CREATE of another that are the
+                   same object (same base address, or -- for DNS records -- the
+                   same zone/name/type). Fix: a `moved {}` block (or, across
+                   resource types, `removed { lifecycle { destroy = false } }`
+                   plus an `import {}` of the live object).
+  dns-replace      a replace of a DNS record in place. The provider cannot
+                   create a same-name record before deleting the old one, so a
+                   replace is a gap in resolution, and a failed create makes the
+                   gap permanent. See terraform/ci/README.md, "Same-name DNS
+                   record replacement".
+
+Pure standard library: runs under any python3 with no environment.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+
+# DNS record resource types and the attributes that identify one record at the
+# provider. Two plan entries with equal identities are the same live record.
+DNS_IDENTITY = {
+    "cloudflare_record": ("zone_id", "name", "type"),
+    "cloudflare_dns_record": ("zone_id", "name", "type"),
+    "aws_route53_record": ("zone_id", "name", "type"),
+    "google_dns_record_set": ("managed_zone", "name", "type"),
+}
+
+_INDEX_SUFFIX = re.compile(r"\[[^\[\]]*\]$")
+
+
+def base_address(address: str) -> str:
+    """`a.b["k"]` / `a.b[0]` -> `a.b`. Module path indices are kept."""
+    return _INDEX_SUFFIX.sub("", address)
+
+
+def _norm_name(value) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return value.strip().rstrip(".").lower()
+
+
+def _names_equal(a: str | None, b: str | None) -> bool:
+    """Cloudflare stores the FQDN while configs often carry the short label.
+
+    Treat `login` and `login.example.com` as the same record name.
+    """
+    if a is None or b is None:
+        return False
+    if a == b:
+        return True
+    return a.startswith(b + ".") or b.startswith(a + ".")
+
+
+def dns_identity(change: dict, side: str):
+    """(type, zone, name, record-type) of a DNS record on one side of a change."""
+    rtype = change.get("type")
+    attrs = DNS_IDENTITY.get(rtype)
+    if attrs is None:
+        return None
+    values = (change.get("change") or {}).get(side) or {}
+    zone_attr, name_attr, type_attr = attrs
+    zone = values.get(zone_attr)
+    name = _norm_name(values.get(name_attr))
+    rec_type = values.get(type_attr)
+    if zone is None or name is None:
+        return None
+    return (rtype, zone, name, rec_type)
+
+
+def dns_same_record(a, b) -> bool:
+    if a is None or b is None:
+        return False
+    return a[0] == b[0] and a[1] == b[1] and a[3] == b[3] and _names_equal(a[2], b[2])
+
+
+def classify(plan: dict) -> list[dict]:
+    """Return one finding per destructive resource change."""
+    changes = [
+        rc
+        for rc in plan.get("resource_changes", [])
+        if rc.get("mode", "managed") == "managed"
+    ]
+
+    deletes = []  # pure deletes
+    creates = []  # pure creates
+    findings = []
+
+    for rc in changes:
+        actions = (rc.get("change") or {}).get("actions", [])
+        if actions == ["delete"]:
+            deletes.append(rc)
+        elif actions == ["create"]:
+            creates.append(rc)
+        elif "delete" in actions and "create" in actions:
+            kind = "dns-replace" if rc.get("type") in DNS_IDENTITY else "replace"
+            order = (
+                "create-before-destroy"
+                if actions.index("create") < actions.index("delete")
+                else "destroy-before-create"
+            )
+            findings.append(
+                {
+                    "kind": kind,
+                    "address": rc.get("address", "?"),
+                    "detail": order,
+                    "reasons": rc.get("action_reason", ""),
+                }
+            )
+
+    paired_creates = set()
+    for rc in deletes:
+        addr = rc.get("address", "?")
+        match = None
+        before_id = dns_identity(rc, "before")
+        for i, cr in enumerate(creates):
+            if i in paired_creates or cr.get("type") != rc.get("type"):
+                continue
+            same_base = base_address(cr.get("address", "")) == base_address(addr)
+            same_dns = dns_same_record(before_id, dns_identity(cr, "after"))
+            if same_base or same_dns:
+                match = (i, cr, "same base address" if same_base else "same DNS record")
+                break
+        if match is None:
+            findings.append({"kind": "delete", "address": addr, "detail": "", "reasons": rc.get("action_reason", "")})
+        else:
+            i, cr, why = match
+            paired_creates.add(i)
+            findings.append(
+                {
+                    "kind": "unmoved-address",
+                    "address": addr,
+                    "detail": f"-> {cr.get('address', '?')} ({why})",
+                    "to": cr.get("address", "?"),
+                    "reasons": rc.get("action_reason", ""),
+                }
+            )
+    return findings
+
+
+ADVICE = {
+    "unmoved-address": (
+        "The same object is being destroyed at one address and created at "
+        "another. This is almost never intended: add `moved {{ from = {frm} "
+        "to = {to} }}` so the object keeps its identity and nothing is "
+        "destroyed. Across resource types, use `removed {{ from = {frm} "
+        "lifecycle {{ destroy = false }} }}` plus `import {{ to = {to} id = ... }}`."
+    ),
+    "dns-replace": (
+        "A DNS record cannot be created before its same-name predecessor is "
+        "deleted, so this replace is a resolution gap, and a failed create makes "
+        "the gap permanent. Follow the two-step procedure in "
+        "terraform/ci/README.md (\"Same-name DNS record replacement\")."
+    ),
+}
+
+
+def render(findings: list[dict], authorized: str | None) -> str:
+    lines = ["### Destructive changes in this plan", ""]
+    lines.append("| kind | address | detail |")
+    lines.append("| --- | --- | --- |")
+    for f in findings:
+        lines.append(f"| `{f['kind']}` | `{f['address']}` | {f['detail']} |")
+    lines.append("")
+    for f in findings:
+        advice = ADVICE.get(f["kind"])
+        if advice:
+            lines.append(
+                f"- `{f['address']}`: "
+                + advice.format(frm=f["address"], to=f.get("to", "<new address>"))
+            )
+    lines.append("")
+    if authorized:
+        lines.append(f"**Authorized:** {authorized}")
+    else:
+        lines.append(
+            "**Refused.** Nothing was applied. A destroy is applied only when it "
+            "is authorized explicitly: dispatch the workflow with "
+            "`allow_destroy: true`, or land the change through a pull request "
+            "carrying the `allow-destroy` label."
+        )
+    return "\n".join(lines) + "\n"
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("plan_json")
+    parser.add_argument("--authorized", default="", help="why a destroy is permitted; empty = not permitted")
+    parser.add_argument("--summary", default="", help="append the markdown report to this file")
+    args = parser.parse_args(argv)
+
+    try:
+        with open(args.plan_json, encoding="utf-8") as handle:
+            plan = json.load(handle)
+    except (OSError, ValueError) as exc:
+        print(f"plan-destroy-guard: cannot read plan JSON: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(plan, dict) or "format_version" not in plan:
+        # Fail closed: an empty or foreign document must not read as "no destroys".
+        print("plan-destroy-guard: input is not a `tofu show -json` plan", file=sys.stderr)
+        return 2
+
+    findings = classify(plan)
+    if not findings:
+        print("plan-destroy-guard: no destroy or replace actions.")
+        return 0
+
+    report = render(findings, args.authorized or None)
+    print(report)
+    if args.summary:
+        with open(args.summary, "a", encoding="utf-8") as handle:
+            handle.write(report)
+    for f in findings:
+        level = "warning" if args.authorized else "error"
+        print(f"::{level}::plan-destroy-guard: {f['kind']} {f['address']} {f['detail']}".rstrip())
+    return 0 if args.authorized else 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

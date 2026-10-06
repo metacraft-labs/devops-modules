@@ -60,13 +60,13 @@ assert_file_exists() {
 }
 
 # ---------------------------------------------------------------
-# Test 1: `mcl secret edit` — create a new secret
+# Test 1: `mcl-devops secret edit` — create a new secret
 # ---------------------------------------------------------------
-echo "=== Test 1: mcl secret edit (create new secret) ==="
+echo "=== Test 1: mcl-devops secret edit (create new secret) ==="
 
 export CLEARTEXT_INPUT="$MCL_SECRET_TMP_DIR/cleartext-input"
 echo -n "super-secret-password" > "$CLEARTEXT_INPUT"
-mcl secret \
+mcl-devops secret \
   --machine test-secret-machine \
   edit \
   --service test-svc \
@@ -80,12 +80,12 @@ decrypted=$(age --decrypt \
 assert_eq "$decrypted" "super-secret-password" "decrypted content matches original"
 
 # ---------------------------------------------------------------
-# Test 2: `mcl secret edit` — edit an existing secret
+# Test 2: `mcl-devops secret edit` — edit an existing secret
 # ---------------------------------------------------------------
-echo "=== Test 2: mcl secret edit (edit existing secret) ==="
+echo "=== Test 2: mcl-devops secret edit (edit existing secret) ==="
 
 echo -n "updated-password" > "$CLEARTEXT_INPUT"
-mcl secret \
+mcl-devops secret \
   --machine test-secret-machine \
   edit \
   --service test-svc \
@@ -97,18 +97,18 @@ decrypted=$(age --decrypt \
 assert_eq "$decrypted" "updated-password" "edited content matches"
 
 # ---------------------------------------------------------------
-# Test 3: Create a second secret, then `mcl secret re-encrypt`
+# Test 3: Create a second secret, then `mcl-devops secret re-encrypt`
 # ---------------------------------------------------------------
-echo "=== Test 3: mcl secret re-encrypt ==="
+echo "=== Test 3: mcl-devops secret re-encrypt ==="
 
 echo -n "my-api-key-123" > "$CLEARTEXT_INPUT"
-mcl secret \
+mcl-devops secret \
   --machine test-secret-machine \
   edit \
   --service test-svc \
   --secret api-key
 
-mcl secret \
+mcl-devops secret \
   --machine test-secret-machine \
   re-encrypt \
   --service test-svc
@@ -119,18 +119,18 @@ assert_eq "$d1" "updated-password" "password preserved after re-encrypt"
 assert_eq "$d2" "my-api-key-123" "api-key preserved after re-encrypt"
 
 # ---------------------------------------------------------------
-# Test 4: `mcl secret re-encrypt-all`
+# Test 4: `mcl-devops secret re-encrypt-all`
 # ---------------------------------------------------------------
-echo "=== Test 4: mcl secret re-encrypt-all ==="
+echo "=== Test 4: mcl-devops secret re-encrypt-all ==="
 
 echo -n "other-token-value" > "$CLEARTEXT_INPUT"
-mcl secret \
+mcl-devops secret \
   --machine test-secret-machine \
   edit \
   --service other-svc \
   --secret token
 
-mcl secret \
+mcl-devops secret \
   --machine test-secret-machine \
   re-encrypt-all
 
@@ -142,40 +142,40 @@ assert_eq "$d2" "my-api-key-123" "api-key preserved after re-encrypt-all"
 assert_eq "$d3" "other-token-value" "token preserved after re-encrypt-all"
 
 # ---------------------------------------------------------------
-# Test 5: `mcl secret list` (single machine, tree output)
+# Test 5: `mcl-devops secret list` (single machine, tree output)
 # ---------------------------------------------------------------
-echo "=== Test 5: mcl secret list (single machine, tree) ==="
-list_output=$(mcl secret --machine test-secret-machine list)
+echo "=== Test 5: mcl-devops secret list (single machine, tree) ==="
+list_output=$(mcl-devops secret --machine test-secret-machine list)
 assert_eq "$(echo "$list_output" | grep -c 'test-svc\|other-svc')" "2" "list shows both services"
 assert_eq "$(echo "$list_output" | grep -c '  - password\|  - api-key\|  - token')" "3" "list shows all 3 secrets"
 
 # ---------------------------------------------------------------
-# Test 6: `mcl secret list` (single machine, JSON output)
+# Test 6: `mcl-devops secret list` (single machine, JSON output)
 # ---------------------------------------------------------------
-echo "=== Test 6: mcl secret list (single machine, JSON) ==="
-list_json=$(mcl secret --machine test-secret-machine list --json)
+echo "=== Test 6: mcl-devops secret list (single machine, JSON) ==="
+list_json=$(mcl-devops secret --machine test-secret-machine list --json)
 assert_eq "$(echo "$list_json" | jq -r '.services | keys | sort | join(",")')" \
   "other-svc,test-svc" "JSON has expected service keys"
 assert_eq "$(echo "$list_json" | jq -r '.services."test-svc" | sort | join(",")')" \
   "api-key,password" "JSON test-svc has expected secrets"
 
 # ---------------------------------------------------------------
-# Test 7: `mcl secret list` (all machines, tree output)
+# Test 7: `mcl-devops secret list` (all machines, tree output)
 # ---------------------------------------------------------------
-echo "=== Test 7: mcl secret list (all machines) ==="
-all_output=$(mcl secret list)
+echo "=== Test 7: mcl-devops secret list (all machines) ==="
+all_output=$(mcl-devops secret list)
 assert_eq "$(echo "$all_output" | grep -c 'test-secret-machine')" "1" "list all shows machine name"
 assert_eq "$(echo "$all_output" | grep -c '  test-svc:\|  other-svc:')" "2" "list all shows services indented"
 
 # ---------------------------------------------------------------
-# Test 8: `mcl secret list` is resilient to a machine that fails to
+# Test 8: `mcl-devops secret list` is resilient to a machine that fails to
 #         evaluate. `broken-machine` throws while forcing its secrets;
 #         the whole-fleet eval must not abort — it should surface an
 #         ERROR marker for that machine and still list the healthy ones.
 # ---------------------------------------------------------------
-echo "=== Test 8: mcl secret list (resilient to broken machine) ==="
+echo "=== Test 8: mcl-devops secret list (resilient to broken machine) ==="
 broken_stderr="$MCL_SECRET_TMP_DIR/broken-stderr"
-broken_output=$(mcl secret list 2>"$broken_stderr")
+broken_output=$(mcl-devops secret list 2>"$broken_stderr")
 assert_eq "$(echo "$broken_output" | grep -c '^broken-machine:')" "1" \
   "broken machine appears in list"
 assert_eq "$(echo "$broken_output" | grep -c 'ERROR (see stderr for details)')" "1" \
@@ -186,19 +186,19 @@ assert_eq "$(grep -c 'broken-machine' "$broken_stderr")" "1" \
   "broken machine error logged to stderr"
 
 # JSON output must carry the per-machine error too.
-broken_json=$(mcl secret list --json 2>/dev/null)
+broken_json=$(mcl-devops secret list --json 2>/dev/null)
 assert_eq "$(echo "$broken_json" | jq -r '."broken-machine".error')" \
   "evaluation failed" "JSON list marks broken machine with an error"
 
 # ---------------------------------------------------------------
-# Test 9: `mcl secret list` hides VMs (machines ending in `-vm`) by
+# Test 9: `mcl-devops secret list` hides VMs (machines ending in `-vm`) by
 #         default and reveals them with `--include-vms`.
 # ---------------------------------------------------------------
-echo "=== Test 9: mcl secret list (VM filtering) ==="
-default_list=$(mcl secret list 2>/dev/null)
+echo "=== Test 9: mcl-devops secret list (VM filtering) ==="
+default_list=$(mcl-devops secret list 2>/dev/null)
 assert_eq "$(echo "$default_list" | grep -c '^test-secret-machine-vm:')" "0" \
   "VM hidden by default"
-include_list=$(mcl secret list --include-vms 2>/dev/null)
+include_list=$(mcl-devops secret list --include-vms 2>/dev/null)
 assert_eq "$(echo "$include_list" | grep -c '^test-secret-machine-vm:')" "1" \
   "VM shown with --include-vms"
 

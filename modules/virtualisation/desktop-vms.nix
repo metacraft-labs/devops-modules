@@ -828,10 +828,12 @@
               package = mkDefault pkgs.qemu_kvm;
               runAsRoot = mkDefault true;
               swtpm.enable = mkDefault true;
-              ovmf = {
-                enable = mkDefault true;
-                packages = mkDefault [ ovmfPackage ];
-              };
+              # virtualisation.libvirtd.qemu.ovmf was removed in NixOS 26.05 —
+              # all OVMF images distributed with QEMU are now available by
+              # default. The VMs here don't rely on libvirt's firmware auto-
+              # selection anyway: each domain references the Secure-Boot/TPM
+              # OVMF explicitly via ovmfCodePath/ovmfVarsPath (see above), which
+              # still come from the ovmfPackage override.
               # VirtIO-FS requires memory backing access
               verbatimConfig = ''
                 memory_backing_dir = "/dev/shm"

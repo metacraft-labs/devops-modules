@@ -1,0 +1,35 @@
+# RC4 fixture (gate t_ci_runs_on_capability): a representative set of jobs
+# spanning the capability dimensions the taxonomy routes on. Each job's runs-on
+# is a MINIMAL capability label set, and the two jobs that genuinely need a
+# narrowing capability declare it with a file-scoped `# cap-justify:` line — so
+# this whole file PASSES the over-constrained linter while still exercising
+# v3-only, gpu, generic-linux and windows routing.
+#
+# cap-justify: x86-64-v3 (AVX2 codepath is under test on this leg)
+# cap-justify: gpu (Vulkan/visual-replay tests need a real GPU)
+name: representative-matrix
+
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  generic-linux:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - run: just test
+
+  v3-only:
+    runs-on: [self-hosted, linux, x64, x86-64-v3]
+    steps:
+      - run: just test-avx2
+
+  gpu:
+    runs-on: [self-hosted, linux, x64, gpu]
+    steps:
+      - run: just test-visual-replay
+
+  windows:
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - run: just test

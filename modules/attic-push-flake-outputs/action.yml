@@ -27,6 +27,14 @@ inputs:
     description: Extra arguments appended to attic push.
     required: false
     default: ''
+  push-attempts:
+    description: Maximum attempts for each Attic output push.
+    required: false
+    default: '3'
+  push-retry-delay-seconds:
+    description: Base delay in seconds between Attic push attempts. The delay is multiplied by the failed attempt number.
+    required: false
+    default: '5'
 
 runs:
   using: composite
@@ -38,6 +46,8 @@ runs:
         INPUT_CACHE: ${{ inputs.cache }}
         INPUT_TOKEN: ${{ inputs.token }}
         INPUT_ATTRIBUTES: ${{ inputs.attributes }}
+        INPUT_PUSH_ATTEMPTS: ${{ inputs.push-attempts }}
+        INPUT_PUSH_RETRY_DELAY_SECONDS: ${{ inputs.push-retry-delay-seconds }}
       run: |
         set -euo pipefail
 
@@ -62,6 +72,24 @@ runs:
           exit 127
         }
 
+        case "$INPUT_PUSH_ATTEMPTS" in
+          '' | *[!0-9]*)
+            echo "attic-push-flake-outputs: push-attempts must be a positive integer" >&2
+            exit 64
+            ;;
+        esac
+        if [ "$INPUT_PUSH_ATTEMPTS" -lt 1 ]; then
+          echo "attic-push-flake-outputs: push-attempts must be a positive integer" >&2
+          exit 64
+        fi
+
+        case "$INPUT_PUSH_RETRY_DELAY_SECONDS" in
+          '' | *[!0-9]*)
+            echo "attic-push-flake-outputs: push-retry-delay-seconds must be a non-negative integer" >&2
+            exit 64
+            ;;
+        esac
+
     - name: Push flake outputs to Attic
       shell: bash
       env:
@@ -72,6 +100,8 @@ runs:
         INPUT_ATTRIBUTES: ${{ inputs.attributes }}
         INPUT_EXTRA_NIX_ARGS: ${{ inputs.extra-nix-args }}
         INPUT_EXTRA_ATTIC_PUSH_ARGS: ${{ inputs.extra-attic-push-args }}
+        INPUT_PUSH_ATTEMPTS: ${{ inputs.push-attempts }}
+        INPUT_PUSH_RETRY_DELAY_SECONDS: ${{ inputs.push-retry-delay-seconds }}
       run: |
         set -euo pipefail
 
@@ -90,6 +120,35 @@ runs:
         fi
 
         attic login --set-default attic-push-flake-outputs "$INPUT_ENDPOINT" "$token"
+
+        push_with_retry() {
+          local output_path="$1"
+          local attempt=1
+          local status
+          local delay
+
+          while true; do
+            set +e
+            attic push ${INPUT_EXTRA_ATTIC_PUSH_ARGS} "$INPUT_CACHE" "$output_path"
+            status=$?
+            set -e
+
+            if [ "$status" -eq 0 ]; then
+              return 0
+            fi
+            if [ "$attempt" -ge "$INPUT_PUSH_ATTEMPTS" ]; then
+              echo "::error::Attic push failed for ${output_path} after ${attempt} attempts"
+              return "$status"
+            fi
+
+            delay=$((10#$INPUT_PUSH_RETRY_DELAY_SECONDS * attempt))
+            echo "::warning::Attic push failed for ${output_path} (attempt ${attempt}/${INPUT_PUSH_ATTEMPTS}); retrying in ${delay}s"
+            if [ "$delay" -gt 0 ]; then
+              sleep "$delay"
+            fi
+            attempt=$((attempt + 1))
+          done
+        }
 
         while IFS= read -r attr; do
           case "$attr" in
@@ -118,7 +177,7 @@ runs:
           echo "::group::Push ${flake_attr} outputs to ${INPUT_CACHE}"
           while IFS= read -r output_path; do
             [ -n "$output_path" ] || continue
-            attic push ${INPUT_EXTRA_ATTIC_PUSH_ARGS} "$INPUT_CACHE" "$output_path"
+            push_with_retry "$output_path"
           done < "$workdir/outputs"
           echo "::endgroup::"
         done < "$workdir/attributes"

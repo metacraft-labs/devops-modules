@@ -1,0 +1,30 @@
+# RC4 fixture (gate t_ci_runs_on_capability): the over-constrained shapes the
+# linter MUST flag — the starvation-amplifier the taxonomy calls out. NO
+# `# cap-justify:` line appears, so every narrowing capability here is a
+# violation.
+name: over-constrained-runs-on
+
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  # 1. A bare legacy ephemeral class name — pins to one machine; must become a
+  #    capability label set.
+  legacy-class:
+    runs-on: eph-linux-x64
+    steps:
+      - run: just test
+
+  # 2. A generic job that needlessly demands a GPU — served only by GPU hosts
+  #    even though it does not use one.
+  needless-gpu:
+    runs-on: [self-hosted, linux, x64, gpu]
+    steps:
+      - run: just test
+
+  # 3. A job pinning a micro-arch level it does not need.
+  needless-v3:
+    runs-on: [self-hosted, linux, x64, x86-64-v3]
+    steps:
+      - run: just test

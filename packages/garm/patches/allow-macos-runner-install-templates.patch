@@ -1,0 +1,80 @@
+diff --git a/cmd/garm-cli/cmd/templates.go b/cmd/garm-cli/cmd/templates.go
+--- a/cmd/garm-cli/cmd/templates.go
++++ b/cmd/garm-cli/cmd/templates.go
+@@ -83 +83 @@ var templateCreateCmd = &cobra.Command{
+-		case commonParams.Linux, commonParams.Windows:
++		case commonParams.Linux, commonParams.Windows, commonParams.MacOS:
+@@ -85 +85 @@ var templateCreateCmd = &cobra.Command{
+-			return fmt.Errorf("invalid OS type: %q (supported: %s)", osType, strings.Join([]string{string(params.GithubEndpointType), string(params.GiteaEndpointType)}, ", "))
++			return fmt.Errorf("invalid OS type: %q (supported: %s)", osType, strings.Join([]string{string(commonParams.Linux), string(commonParams.Windows), string(commonParams.MacOS)}, ", "))
+diff --git a/params/requests.go b/params/requests.go
+--- a/params/requests.go
++++ b/params/requests.go
+@@ -952 +952 @@ func (c *CreateTemplateParams) Validate() error {
+-	case commonParams.Linux, commonParams.Windows:
++	case commonParams.Linux, commonParams.Windows, commonParams.MacOS:
+diff --git a/internal/templates/templates.go b/internal/templates/templates.go
+--- a/internal/templates/templates.go
++++ b/internal/templates/templates.go
+@@ -54 +54 @@ func GetTemplateContent(osType commonParams.OSType, forge params.EndpointType) (
+-		case commonParams.Linux, commonParams.Windows:
++		case commonParams.Linux, commonParams.Windows, commonParams.MacOS:
+diff --git a/internal/templates/userdata/macos_wrapper.tmpl b/internal/templates/userdata/macos_wrapper.tmpl
+new file mode 100644
+--- /dev/null
++++ b/internal/templates/userdata/macos_wrapper.tmpl
+@@ -0,0 +1,12 @@
++#!/bin/sh
++
++set -eu
++
++METADATA_URL="{{ .MetadataURL }}"
++BEARER_TOKEN="{{ .CallbackToken }}"
++
++curl -H "Authorization: Bearer $BEARER_TOKEN" --retry 5 --retry-delay 5 --retry-connrefused --fail "$METADATA_URL/install-script/" -o /tmp/real-install.sh
++chmod +x /tmp/real-install.sh
++
++/tmp/real-install.sh
++rm -f /tmp/real-install.sh
+diff --git a/internal/templates/templates_test.go b/internal/templates/templates_test.go
+--- a/internal/templates/templates_test.go
++++ b/internal/templates/templates_test.go
+@@ -17,0 +18 @@ import (
++	"context"
+@@ -69,0 +71,31 @@ func TestInstallTemplatesRenderForceInsecure(t *testing.T) {
++
++func TestRenderMacOSRunnerInstallWrapper(t *testing.T) {
++	t.Parallel()
++
++	wrapper, err := RenderRunnerInstallWrapper(
++		context.Background(),
++		commonParams.MacOS,
++		"http://garm.example.test/api/v1/metadata",
++		"http://garm.example.test/api/v1/callbacks/status",
++		"instance-token",
++	)
++	if err != nil {
++		t.Fatalf("RenderRunnerInstallWrapper(macos) returned error: %v", err)
++	}
++
++	body := string(wrapper)
++	for _, want := range []string{
++		"#!/bin/sh",
++		"BEARER_TOKEN=\"instance-token\"",
++		"http://garm.example.test/api/v1/metadata",
++		"$METADATA_URL/install-script/",
++		"/tmp/real-install.sh",
++	} {
++		if !strings.Contains(body, want) {
++			t.Fatalf("macOS wrapper missing %q:\n%s", want, body)
++		}
++	}
++	if strings.Contains(body, "linux_wrapper.tmpl") || strings.Contains(body, "powershell") {
++		t.Fatalf("macOS wrapper rendered unexpected non-macOS content:\n%s", body)
++	}
++}
+diff --git a/vendor/github.com/cloudbase/garm-provider-common/params/params.go b/vendor/github.com/cloudbase/garm-provider-common/params/params.go
+--- a/vendor/github.com/cloudbase/garm-provider-common/params/params.go
++++ b/vendor/github.com/cloudbase/garm-provider-common/params/params.go
+@@ -32,0 +33 @@ const (
++	MacOS   OSType = "macos"

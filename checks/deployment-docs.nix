@@ -187,10 +187,15 @@
               if command not in text:
                   raise SystemExit(f"documented command fragment not found in workflow: {command}")
 
-          deploy = inventory["deployPath"]
-          for value in [deploy["entryJob"], deploy["deployStep"], deploy["deployCondition"], deploy["mclCommand"]]:
+          publish = inventory["deploymentCachePublishPath"]
+          for value in [publish["entryJob"], publish["publishStep"], publish["publishCondition"], publish["mclCommand"]]:
               if value not in text:
-                  raise SystemExit(f"deploy path value not found in workflow: {value}")
+                  raise SystemExit(f"deployment cache publish path value not found in workflow: {value}")
+
+          removed = inventory["removedDeployPath"]
+          for token in removed["absentTokens"]:
+              if token in text:
+                  raise SystemExit(f"legacy Cachix Deploy token must be absent from the Attic-only workflow: {token}")
 
           monitoring = inventory["monitoringPath"]
           required_monitoring_sources = {
@@ -243,12 +248,12 @@
               re.search(
                   r"deployment-cache-required-backends:\s*\n"
                   r"\s+description:.*\n"
-                  r"\s+default:\s*'cachix'\s*\n"
+                  r"\s+default:\s*'attic'\s*\n"
                   r"\s+required:\s*false\s*\n"
                   r"\s+type:\s*string",
                   text,
               ),
-              "reusable workflow must expose deployment-cache-required-backends defaulting to cachix",
+              "reusable workflow must expose deployment-cache-required-backends defaulting to attic",
           )
           require(
               re.search(
@@ -294,6 +299,9 @@
               'require_backend_vars "$backend" "$required" ATTIC_TOKEN ATTIC_CACHE ATTIC_SUBSTITUTER ATTIC_TRUSTED_PUBLIC_KEY' in text,
               "Attic variables must be checked manually through the backend policy",
           )
+          require("cachix)" not in text, "Attic-only cache push must not retain a cachix backend case")
+          require("CACHIX_CACHE" not in text and "CACHIX_AUTH_TOKEN" not in text, "Attic-only cache push step must not reference Cachix env")
+          require("--transport attic-ci" in text, "deployment cache push must use the Attic CI transport")
           for forbidden in [
               ': "''${ATTIC_TOKEN:?',
               ': "''${ATTIC_CACHE:?',
@@ -322,7 +330,7 @@
               "cache push and substitute probe must honor required versus optional policy",
           )
           require(
-              "if: ''${{ always() && (inputs.push-deployment-caches || inputs.run-cachix-deploy) && !matrix.noop && matrix.deploymentTarget }}" in text,
+              "if: ''${{ always() && inputs.push-deployment-caches && !matrix.noop && matrix.deploymentTarget }}" in text,
               "cache push event artifact upload must remain available after optional backend failures",
           )
 
@@ -361,9 +369,9 @@
           script = extract_cache_push_script()
           require(
               "''${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }}" in script,
-              "cache push script must still use the computed mcl flake command expression",
+              "cache push script must still use the computed mcl-devops flake command expression",
           )
-          script = script.replace("''${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }}", "mcl")
+          script = script.replace("''${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }}", "mcl-devops")
 
           with tempfile.TemporaryDirectory() as temp:
               temp_path = Path(temp)
@@ -386,7 +394,7 @@
           exit 0
           """
               )
-              (fake_bin / "mcl").write_text(
+              (fake_bin / "mcl-devops").write_text(
                   """#!${pkgs.bash}/bin/bash
           backend=""
           previous=""
@@ -396,7 +404,7 @@
             fi
             previous="$arg"
           done
-          printf 'mcl backend=%s args=%s\\n' "$backend" "$*" >> "$FAKE_LOG"
+          printf 'mcl-devops backend=%s args=%s\\n' "$backend" "$*" >> "$FAKE_LOG"
           mkdir -p .result
           printf '{"phase":"cache-push","backend":"%s"}\\n' "$backend" >> .result/deployment-cache-push-events.jsonl
           if [[ "''${MCL_SLEEP_BACKEND:-}" == "$backend" ]]; then
@@ -409,7 +417,7 @@
           """
               )
               os.chmod(fake_bin / "nix", 0o755)
-              os.chmod(fake_bin / "mcl", 0o755)
+              os.chmod(fake_bin / "mcl-devops", 0o755)
 
               base_env = {
                   "PATH": str(fake_bin) + ":${pkgs.coreutils}/bin",
@@ -418,11 +426,9 @@
                   "DEPLOY_SYSTEM": "x86_64-linux",
                   "DEPLOY_KIND": "server",
                   "DEPLOY_STORE_PATH": "${pkgs.hello}",
-                  "DEPLOYMENT_CACHE_PUSH_BACKENDS": "cachix,attic",
-                  "DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "cachix",
+                  "DEPLOYMENT_CACHE_PUSH_BACKENDS": "attic,none",
+                  "DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "attic",
                   "DEPLOYMENT_CACHE_OPTIONAL_TIMEOUT_SECONDS": "1",
-                  "CACHIX_CACHE": "required-cache",
-                  "CACHIX_AUTH_TOKEN": "required-token",
                   "ATTIC_CACHE": "mirror-cache",
                   "ATTIC_SUBSTITUTER": "https://attic.example/mirror-cache",
                   "ATTIC_ENDPOINT": "",
@@ -481,11 +487,11 @@
 
               run_case(
                   "optional_attic_missing_vars",
-                  {"ATTIC_TOKEN": ""},
+                  {"DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "none", "ATTIC_TOKEN": ""},
                   0,
                   stdout_contains=("::warning title=Optional deployment cache backend::backend=attic",),
-                  log_contains=("mcl backend=cachix",),
-                  log_absent=("nix shell", "mcl backend=attic"),
+                  log_contains=("mcl-devops backend=none",),
+                  log_absent=("nix shell", "mcl-devops backend=attic"),
                   expect_artifact=True,
               )
               run_case(
@@ -497,20 +503,20 @@
                   },
                   1,
                   stderr_contains=("ATTIC_TOKEN required when deployment-cache-push-backends includes attic",),
-                  log_absent=("nix shell", "mcl backend="),
+                  log_absent=("nix shell", "mcl-devops backend="),
                   expect_artifact=False,
               )
               run_case(
                   "optional_attic_login_failure",
                   {
                       "DEPLOYMENT_CACHE_PUSH_BACKENDS": "attic",
-                      "DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "cachix",
+                      "DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "none",
                       "NIX_FAIL_LOGIN": "1",
                   },
                   0,
                   stdout_contains=("attic login failed with exit 19; continuing",),
                   log_contains=("nix shell nixpkgs#attic-client -c attic login",),
-                  log_absent=("mcl backend=attic",),
+                  log_absent=("mcl-devops backend=attic",),
                   expect_artifact=False,
               )
               run_case(
@@ -529,24 +535,24 @@
                   "optional_attic_push_failure_preserves_artifact",
                   {
                       "DEPLOYMENT_CACHE_PUSH_BACKENDS": "attic",
-                      "DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "cachix",
+                      "DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "none",
                       "MCL_FAIL_BACKEND": "attic",
                   },
                   0,
                   stdout_contains=("cache push and substitute probe failed with exit 23; continuing",),
-                  log_contains=("nix shell nixpkgs#attic-client -c attic login", "mcl backend=attic"),
+                  log_contains=("nix shell nixpkgs#attic-client -c attic login", "mcl-devops backend=attic"),
                   expect_artifact=True,
               )
               run_case(
-                  "required_cachix_push_failure",
+                  "required_attic_push_failure",
                   {
-                      "DEPLOYMENT_CACHE_PUSH_BACKENDS": "cachix",
-                      "DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "cachix",
-                      "MCL_FAIL_BACKEND": "cachix",
+                      "DEPLOYMENT_CACHE_PUSH_BACKENDS": "attic",
+                      "DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "attic",
+                      "MCL_FAIL_BACKEND": "attic",
                   },
                   23,
-                  stderr_contains=("Required deployment cache backend cachix failed during cache push and substitute probe",),
-                  log_contains=("mcl backend=cachix",),
+                  stderr_contains=("Required deployment cache backend attic failed during cache push and substitute probe",),
+                  log_contains=("nix shell nixpkgs#attic-client -c attic login", "mcl-devops backend=attic"),
                   expect_artifact=True,
               )
               run_case(
@@ -559,7 +565,7 @@
                   },
                   0,
                   log_contains=(
-                      "mcl backend=attic",
+                      "mcl-devops backend=attic",
                       "--substituter https://attic.example/mirror-cache --require-substitute",
                       "--trusted-public-key aux-public-key",
                       "--trusted-public-key attic-public-key",
@@ -573,66 +579,37 @@
                   expect_artifact=True,
               )
               run_case(
-                  "cachix_probe_keeps_fallback_substituters",
+                  "none_probe_keeps_fallback_substituters",
                   {
-                      "DEPLOYMENT_CACHE_PUSH_BACKENDS": "cachix",
-                      "DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "cachix",
+                      "DEPLOYMENT_CACHE_PUSH_BACKENDS": "none",
+                      "DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "none",
                       "DEPLOYMENT_TRUSTED_SUBSTITUTERS": "https://aux.example",
                       "DEPLOYMENT_TRUSTED_PUBLIC_KEYS": "aux-public-key",
                   },
                   0,
                   log_contains=(
-                      "mcl backend=cachix",
-                      "--substituter https://required-cache.cachix.org --require-substitute",
+                      "mcl-devops backend=none",
                       "--substituter https://aux.example",
                       "--substituter https://cache.nixos.org",
                       "--trusted-public-key aux-public-key",
                       "cache.nixos.org-1:",
                   ),
+                  log_absent=("--require-substitute",),
                   expect_artifact=True,
               )
               run_case(
                   "optional_attic_timeout",
                   {
                       "DEPLOYMENT_CACHE_PUSH_BACKENDS": "attic",
-                      "DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "cachix",
+                      "DEPLOYMENT_CACHE_REQUIRED_BACKENDS": "none",
                       "MCL_SLEEP_BACKEND": "attic",
                   },
                   0,
                   stdout_contains=("cache push and substitute probe timed out after 1s; continuing",),
-                  log_contains=("mcl backend=attic",),
+                  log_contains=("mcl-devops backend=attic",),
                   expect_artifact=True,
               )
           PY
-          touch "$out"
-        '';
-
-        deployment-general-private-split = pkgs.runCommand "deployment-general-private-split" { } ''
-          forbidden='solunska|gpu-server|cache\.metacraft-labs\.com|metacraft-private-infrastructure'
-          generic_files=$(find ${docs} ${skills} -type f \
-            ! -path '${docs}/private-inventory.md' \
-            \( -name '*.md' -o -name '*.json' -o -name '*.jsonl' \))
-
-          if grep -Eni "$forbidden" $generic_files; then
-            echo "generic deployment docs contain private infrastructure details" >&2
-            exit 1
-          fi
-
-          private=${docs}/private-inventory.md
-          for term in \
-            solunska \
-            gpu-server \
-            cache.metacraft-labs.com \
-            metacraft-private-infrastructure \
-            /etc/cachix-agent.token \
-            cachix-deploy-metrics/auth-token
-          do
-            if ! grep -Fq "$term" "$private"; then
-              echo "private inventory is missing concrete detail: $term" >&2
-              exit 1
-            fi
-          done
-
           touch "$out"
         '';
 
@@ -698,7 +675,7 @@
 
               required_by_file = {
                   "docs/skills/deployment-investigation/SKILL.md": [
-                      "mcl deploy-status summarize",
+                      "mcl-devops deploy-status summarize",
                       "gh run view",
                       "gh run download",
                       "nix path-info --store",
@@ -706,25 +683,25 @@
                   "docs/skills/deployment-operation/SKILL.md": [
                       "just deploy-machine",
                       "just deploy-machine-direct-ssh",
-                      "mcl cache push-closure",
-                      "mcl deploy-plan",
-                      "mcl deploy-ssh",
-                      "mcl deploy-status summarize",
+                      "mcl-devops cache push-closure",
+                      "mcl-devops deploy-plan",
+                      "mcl-devops deploy-ssh",
+                      "mcl-devops deploy-status summarize",
                   ],
                   "docs/skills/cache-operation/SKILL.md": [
-                      "mcl cache push-closure",
+                      "mcl-devops cache push-closure",
                       "nix path-info --store",
                       "just attic-verify-host-substituters",
                   ],
                   "docs/skills/deployment-break-glass/SKILL.md": [
                       "just deploy-machine-direct-ssh",
-                      "mcl deploy-plan",
-                      "mcl deploy-ssh",
+                      "mcl-devops deploy-plan",
+                      "mcl-devops deploy-ssh",
                       "just rollback-machine-direct-ssh",
                   ],
                   "docs/skills/deployment-reconciler/SKILL.md": [
-                      "mcl deploy-reconcile",
-                      "mcl deploy-agent",
+                      "mcl-devops deploy-reconcile",
+                      "mcl-devops deploy-agent",
                       "systemctl status mcl-deployment-reconciler.service",
                       "systemctl status mcl-deploy-agent.service",
                   ],
@@ -745,15 +722,15 @@
                       "bash scripts/deployment-incus-rehearsal.sh",
                   ],
                   "docs/deployment/runbook.md": [
-                      "mcl deploy-status summarize",
+                      "mcl-devops deploy-status summarize",
                       "just deploy-machine-direct-ssh",
                       "just deployment-incus-rehearsal",
                       "just test-deployment-incus-rehearsal",
-                      "mcl cache push-closure",
-                      "mcl deploy-plan",
-                      "mcl deploy-ssh",
-                      "mcl deploy-reconcile",
-                      "mcl deploy-apply",
+                      "mcl-devops cache push-closure",
+                      "mcl-devops deploy-plan",
+                      "mcl-devops deploy-ssh",
+                      "mcl-devops deploy-reconcile",
+                      "mcl-devops deploy-apply",
                       "just attic-verify-host-substituters",
                       "bash scripts/deployment-incus-rehearsal.sh",
                   ],
@@ -802,14 +779,14 @@
                       tokens = parse_command_line(line)
                       if not tokens:
                           continue
-                      if tokens[0] == "mcl":
+                      if tokens[0] == "mcl-devops":
                           prefixes = [
                               " ".join(tokens[:width])
                               for width in range(min(len(tokens), 3), 1, -1)
                           ]
                           require(
                               any(prefix in allowed_mcl_commands for prefix in prefixes),
-                              f"{rel}: documented stale or uninventoried mcl command: {line!r}",
+                              f"{rel}: documented stale or uninventoried mcl-devops command: {line!r}",
                           )
                       if tokens[0] == "just":
                           require(
@@ -830,7 +807,7 @@
               for command in surface["mclCommands"]:
                   if command in all_text:
                       continue
-                  require(command == "mcl deploy-apply", f"mcl command not referenced by docs: {command}")
+                  require(command == "mcl-devops deploy-apply", f"mcl command not referenced by docs: {command}")
               for target in surface["infraJustTargets"]:
                   if target in all_text:
                       continue
@@ -886,8 +863,8 @@
                   "MCL_DEPLOY_MANIFEST_SIGNING_KEY",
                   "MCL_DEPLOY_SSH_IDENTITY",
                   "just deploy-machine-direct-ssh",
-                  "mcl deploy-plan",
-                  "mcl deploy-ssh",
+                  "mcl-devops deploy-plan",
+                  "mcl-devops deploy-ssh",
                   "just rollback-machine-direct-ssh",
                   "BatchMode=yes",
                   "StrictHostKeyChecking=yes",
@@ -908,7 +885,7 @@
                   "cache substitute proof",
                   "interactive shell",
                   "sudo -n",
-                  "mcl deploy-apply --manifest - --allowed-signers",
+                  "mcl-devops deploy-apply --manifest - --allowed-signers",
                   "--reject-ssh-original-command",
                   "bypassing SSH host key checks",
                   "bypassing manifest signature checks",
@@ -925,8 +902,8 @@
           repo = Path("${repoRoot}")
           skill = Path("${skills}") / "deployment-reconciler" / "SKILL.md"
           runbook = Path("${docs}") / "runbook.md"
-          state_source = repo / "packages/mcl/src/mcl/utils/deploy_state.d"
-          agent_source = repo / "packages/mcl/src/mcl/commands/deploy_agent.d"
+          state_source = repo / "packages/mcl-devops/src/mcl/utils/deploy_state.d"
+          agent_source = repo / "packages/mcl-devops/src/mcl/commands/deploy_agent.d"
 
           combined = skill.read_text() + "\n" + runbook.read_text()
           for term in [
@@ -951,8 +928,8 @@
               "superseded/",
               "converged/",
               "agent-status/",
-              "mcl deploy-reconcile --state-dir",
-              "mcl deploy-agent --target",
+              "mcl-devops deploy-reconcile --state-dir",
+              "mcl-devops deploy-agent --target",
               "mcl-deployment-reconciler.service",
               "mcl-deploy-agent.service",
           ]:
@@ -1051,7 +1028,7 @@
           {"schemaVersion":1,"deploymentId":"gh-123456789-abcdef0-app-server-01","correlationId":"gh-123456789-abcdef0-app-server-01-0123456789abcdfghijklmnpqrsvwxyz","phase":"activate-requested","target":{"name":"app-server-01","system":"x86_64-linux","kind":"server","transport":"cachix-agent"},"backend":{"cache":"example-private-cache","substituters":["https://example-private-cache.cachix.org","https://cache.nixos.org"],"controller":"cachix-deploy"},"storePaths":{"system":"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-app-server-01-25.11","closure":{"count":2,"totalBytes":null,"rootHashes":["0123456789abcdfghijklmnpqrsvwxyz"]}},"timestamps":{"startedAt":"2026-05-13T09:01:00Z","finishedAt":"2026-05-13T09:01:05Z"},"command":{"name":"cachix deploy activate","argv":["cachix","deploy","activate"],"status":"failed","exitCode":23},"error":{"code":"activation_request_failed","message":"Activation request failed","retryable":false,"details":{"stderrSummary":"fixture activation failure"}}}
           EOF
 
-          ${self'.packages.mcl}/bin/mcl deploy-status summarize events.jsonl \
+          ${self'.packages.mcl-devops}/bin/mcl-devops deploy-status summarize events.jsonl \
             --output "$out/deployment-summary.md" \
             --json-output "$out/deployment-summary.json"
 

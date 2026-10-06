@@ -40,7 +40,7 @@ let
 
         configPath = mkOption {
           type = types.str;
-          example = "./machines/server/solunska-server";
+          example = "./machines/server/example-site-server";
           description = ''
             The configuration path for this host relative to the repo root.
           '';

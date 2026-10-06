@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""Generate credential-free OpenTofu import blocks for a Cloudflare root.
+
+Company-agnostic: reads a consumer repo's reviewed import-id data model
+(terraform/<config>/import-ids.json) and emits `import {}` blocks that adopt the
+existing Cloudflare resources into Terraform state. Nothing is hardcoded — the
+root config and repo root are parameters. Pairs with the root's Terranix
+default.nix (the mapper) and the cloudflare-import CI harness.
+
+The import-id data model is a per-repo file (each org's zones/records differ),
+captured once from the read-only M1 inventory:
+
+    {
+      "version": 1,
+      "imports": [
+        { "to": "cloudflare_dns_record.this[\"apex\"]", "id": "<zone_id>/<record_id>" },
+        { "to": "cloudflare_r2_bucket.this[\"downloads\"]", "id": "<account_id>/downloads/default" }
+      ]
+    }
+
+The `to` address matches the Terranix `for_each` key in default.nix; the `id` is
+the Cloudflare composite id. The generator is shared; the data is per-repo — the
+same engine/config split as github-governance-import-blocks.
+
+The generated imports.tf is meant to live under .result/ and NOT be committed:
+its presence makes OpenTofu's mocked test context attempt provider imports, so
+keeping it ephemeral preserves offline tests. The one-time adoption is enforced
+by the import-only apply gate, not by deleting files.
+"""
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+
+# Convenience aliases that group the resource types most orgs share. These are
+# NOT an exhaustive taxonomy — orgs manage wildly different Cloudflare surfaces
+# (load balancers, rulesets, Zero Trust, D1, Queues, KV, …). --scope therefore
+# also accepts ANY concrete `cloudflare_<type>` so a novel resource class can be
+# imported selectively; the reviewed data model (import-ids.json) is the source
+# of truth for what actually exists, and `--scope all` always emits everything.
+SCOPE_ALIASES = {
+    "dns": {"cloudflare_dns_record"},
+    "pages": {"cloudflare_pages_project", "cloudflare_pages_domain"},
+    "r2": {
+        "cloudflare_r2_bucket",
+        "cloudflare_r2_custom_domain",
+        "cloudflare_r2_managed_domain",
+    },
+    "workers": {"cloudflare_workers_script", "cloudflare_workers_route"},
+    "zones": {"cloudflare_zone"},
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate credential-free OpenTofu import blocks for a reviewed "
+            "Cloudflare root."
+        )
+    )
+    parser.add_argument(
+        "--config",
+        default=os.environ.get("ROOT_CONFIG"),
+        help="root config under terraform/, e.g. cloudflare/<name>-prod (or set ROOT_CONFIG)",
+    )
+    parser.add_argument(
+        "--root-dir",
+        default=os.environ.get("REPO_ROOT", os.getcwd()),
+        help="consumer repo root (defaults to $REPO_ROOT or CWD)",
+    )
+    parser.add_argument(
+        "--scope",
+        default="all",
+        metavar="SCOPE",
+        help=(
+            "resource scope to emit: 'all', a convenience alias "
+            f"({', '.join(sorted(SCOPE_ALIASES))}), or any concrete "
+            "cloudflare_<type>. Defaults to all"
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        help="output path; defaults to .result/terraform/<config>/imports.tf under --root-dir",
+    )
+    parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="write import blocks to stdout instead of the output file",
+    )
+    args = parser.parse_args()
+    if not args.config:
+        parser.error("--config (or ROOT_CONFIG) is required")
+    return args
+
+
+def load_import_ids(root: Path, config: str) -> list[dict]:
+    data_path = root / "terraform" / config / "import-ids.json"
+    if not data_path.is_file():
+        sys.exit(f"error: import-id data model not found: {data_path}")
+    with open(data_path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    imports = data.get("imports")
+    if not isinstance(imports, list):
+        sys.exit(f"error: {data_path} must contain an 'imports' array.")
+    return imports
+
+
+def hcl_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def import_block(address: str, import_id: str) -> str:
+    return f"import {{\n  to = {address}\n  id = {hcl_string(import_id)}\n}}\n\n"
+
+
+def resource_type(address: str) -> str:
+    # cloudflare_dns_record.this["apex"] -> cloudflare_dns_record
+    return address.split(".", 1)[0].strip()
+
+
+def validate_scope(scope: str) -> None:
+    if scope == "all" or scope in SCOPE_ALIASES:
+        return
+    if scope.startswith("cloudflare_"):
+        return
+    sys.exit(
+        f"error: unknown --scope '{scope}'. Use 'all', an alias "
+        f"({', '.join(sorted(SCOPE_ALIASES))}), or a concrete cloudflare_<type>."
+    )
+
+
+def include(scope: str, address: str) -> bool:
+    if scope == "all":
+        return True
+    rtype = resource_type(address)
+    if scope in SCOPE_ALIASES:
+        return rtype in SCOPE_ALIASES[scope]
+    # Otherwise scope is a concrete cloudflare_<type>.
+    return rtype == scope
+
+
+def generate_blocks(imports: list[dict], scope: str, config: str) -> tuple[list[str], dict[str, int]]:
+    blocks: list[str] = [
+        "# Generated by cloudflare-import-blocks (nixos-modules).\n",
+        "# Do not commit this file; regenerate it for the reviewed import workflow.\n",
+        f"# Source model: terraform/{config}/import-ids.json\n\n",
+    ]
+    seen: set[str] = set()
+    type_counts: dict[str, int] = {}
+    for entry in imports:
+        address = entry.get("to")
+        import_id = entry.get("id")
+        if not address or not import_id:
+            sys.exit(f"error: each import entry needs a 'to' and an 'id': {entry!r}")
+        if not address.startswith("cloudflare_"):
+            sys.exit(f"error: import target is not a cloudflare_ resource: {address}")
+        if not include(scope, address):
+            continue
+        if address in seen:
+            sys.exit(f"error: duplicate import target address: {address}")
+        seen.add(address)
+        rtype = resource_type(address)
+        type_counts[rtype] = type_counts.get(rtype, 0) + 1
+        blocks.append(import_block(address, import_id))
+    return blocks, type_counts
+
+
+def block_count(blocks: list[str]) -> int:
+    return sum(1 for block in blocks if block.startswith("import {"))
+
+
+def format_breakdown(type_counts: dict[str, int]) -> str:
+    if not type_counts:
+        return "  (no resources matched this scope)"
+    return "\n".join(
+        f"  {rtype}: {count}" for rtype, count in sorted(type_counts.items())
+    )
+
+
+def write_output(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}.tmp.", dir=str(path.parent), text=True
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(contents)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        finally:
+            raise
+
+
+def main() -> int:
+    args = parse_args()
+    validate_scope(args.scope)
+    root = Path(args.root_dir).resolve()
+    output = (
+        Path(args.output)
+        if args.output
+        else root / ".result" / "terraform" / args.config / "imports.tf"
+    )
+
+    imports = load_import_ids(root, args.config)
+    blocks, type_counts = generate_blocks(imports, args.scope, args.config)
+    contents = "".join(blocks)
+    count = block_count(blocks)
+    breakdown = format_breakdown(type_counts)
+
+    if args.stdout:
+        sys.stdout.write(contents)
+        print(
+            f"Generated {count} Cloudflare import block(s) for scope '{args.scope}':\n"
+            f"{breakdown}",
+            file=sys.stderr,
+        )
+    else:
+        write_output(output, contents)
+        print(f"Generated {count} Cloudflare import block(s) for scope '{args.scope}':")
+        print(f"  {output}")
+        print(breakdown)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

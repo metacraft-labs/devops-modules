@@ -1,0 +1,56 @@
+# devops-modules AS A PRE-COMMIT HOOK REPOSITORY.
+#
+# This file makes the hooks below addressable by any repo on any OS, with no
+# flake and no /nix/store, via:
+#
+#     repos:
+#       - repo: https://github.com/metacraft-labs/devops-modules
+#         rev: <commit-sha-or-tag>
+#         hooks:
+#           - id: ban-added-ct-recordings
+#
+# This is LAYER 1 (individual hooks, each usable on its own) in its portable
+# form; `git-hooks/hooks.nix` is the same layer for flake consumers. The MCL
+# Standard Hook Set that assembles them is LAYER 2, published as
+# `git-hooks/mcl-standard-hooks.yaml` (portable) and
+# `git-hooks/standard-hooks.nix` (flake).
+#
+# `check-added-large-files` is deliberately NOT redeclared here. It already
+# exists, maintained, in `pre-commit/pre-commit-hooks`, and a second
+# implementation of a rule is exactly what this campaign spends its time
+# removing. The standard-set YAML points at upstream for it.
+
+- id: ban-added-ct-recordings
+  name: ban added .ct recordings
+  description: >-
+    Refuse CodeTracer recordings (*.ct files and *.ct/ directories) that a
+    commit ADDS. Recordings are derived artefacts: a committed one pins a
+    recorder version that nothing tracks, so it goes stale silently and then
+    fails as a content mismatch rather than as "the recorder changed".
+    Record on the fly in the test instead.
+
+    This cannot be folded into check-added-large-files. Measured in
+    `codetracer` at 547497aa: of its 20 tracked .ct files, 19 are between
+    36 KB and 516 KB -- under a 1 MB ceiling -- and only nginx.ct (2.09 MB)
+    exceeds it. A size gate waves through 19 of 20, because the objection is
+    that a recording is DERIVED, not that it is big.
+  # `--preset ct-recordings` keeps the refusal wording and the 19-of-20
+  # measurement in ONE place (mcl_git_hooks/ban_added_paths.py PRESETS), so
+  # this entry and the flake entry in git-hooks/hooks.nix cannot disagree.
+  entry: mcl-ban-added-paths --preset ct-recordings --
+  language: python
+  # Both shapes. Measured, they are not interchangeable: every `.ct` in
+  # codetracer is a FILE, so a pattern written as `\.ct/` matches zero of its
+  # 20 recordings. A rule written with only one shape in mind does not fire.
+  files: \.ct($|/)
+  types: [file]
+
+- id: ban-added-paths
+  name: ban added paths
+  description: >-
+    The generic mechanism behind ban-added-ct-recordings, for a repo that needs
+    the same shape of rule over a different path set. Supply `files:` and
+    `args: [--message, "...", --explain, "..."]` in your own config.
+  entry: mcl-ban-added-paths
+  language: python
+  types: [file]

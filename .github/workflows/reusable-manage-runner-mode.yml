@@ -1,0 +1,375 @@
+# Sovereign-CI-Fleet S2 (gate `t_runner_mode_manager`) — the runner-mode
+# MANAGING SERVICE.
+#
+# Poll an org's GitHub Actions billing usage + budget and write the
+# AUTHORITATIVE org Actions variable `CI_RUNNER_MODE ∈ {github-hosted,
+# self-hosted}` that S1's `reusable-choose-runner.yml` consumes. While included
+# minutes remain above a buffer AND the org is under its billing budget, the
+# org rides free GitHub-hosted minutes (`github-hosted`); as minutes near
+# exhaustion — or the budget is reached — it flips to `self-hosted` (the RC4
+# capability-label fleet), and flips back after the monthly reset restores the
+# allowance. See reprobuild-specs/Sovereign-CI-Fleet.md ("The runner-mode
+# switch") and metacraft-dev-guidelines/policies/ci-workflow-standards.md.
+#
+# Campaign: Sovereign-CI-Fleet-And-GOSTI-Substrate, milestone S2. This is the
+# evolution of RD3's `reusable-sync-hosted-minutes.yml`: that cron wrote the
+# advisory `GH_HOSTED_OK` signal from remaining minutes ALONE; S2 writes the
+# authoritative `CI_RUNNER_MODE` from usage AND budget, fail-safe, with
+# Prometheus signals. The two coexist (GH_HOSTED_OK stays a lower-priority RD3
+# fallback beneath the switch), so this is a NEW file rather than an edit.
+#
+# FAIL-SAFE (non-negotiable): on ANY billing read/parse/HTTP error, unreachable
+# endpoint, or ambiguous data, the decision resolves to `self-hosted`. The org
+# budget is a HARD $0 with prevent_further_usage (RD1), so the fleet must never
+# be left in a billable mode by an outage in this service — self-hosted is the
+# only safe default.
+#
+# This is a REUSABLE workflow (workflow_call). A `schedule:` trigger must live
+# in the repo it runs in, so an ops repo wraps it, per org:
+#
+#   # .github/workflows/manage-runner-mode.yml  (in an ops repo, per org)
+#   name: manage-runner-mode
+#   on:
+#     schedule: [{ cron: '*/30 * * * *' }]
+#     workflow_dispatch:
+#   jobs:
+#     manage:
+#       uses: metacraft-labs/devops-modules/.github/workflows/reusable-manage-runner-mode.yml@dev
+#       with:
+#         org: metacraft-labs
+#         min_minutes_remaining: 300
+#         included_minutes: 3000        # Team plan monthly allowance
+#         max_billed_amount: 0          # hard $0 cap; any overage -> self-hosted
+#         # runner: '["self-hosted","linux","x64"]'   # used when the ops repo is private
+#         # metrics_textfile: /var/lib/node_exporter/textfile/ci-runner-mode.prom
+#       secrets:
+#         billing_token: ${{ secrets.ORG_BILLING_READ_TOKEN }}
+#         variables_token: ${{ secrets.ORG_VARIABLES_WRITE_TOKEN }}
+#
+# An org on an ENTERPRISE plan shares ONE included pool with every other org of
+# its enterprise (e.g. agent-harbor + blocksense-network in schelling-point-labs:
+# 50,000 minutes, pooled). Its org-scoped report shows only its own share, so it
+# fails safe unless the enterprise scope is read:
+#
+#       with:
+#         org: agent-harbor
+#         enterprise: schelling-point-labs
+#         included_minutes: 50000       # Enterprise pool, shared by all its orgs
+#       secrets:
+#         billing_token: ${{ secrets.ENTERPRISE_BILLING_READ_TOKEN }}
+#         variables_token: ${{ secrets.ORG_VARIABLES_WRITE_TOKEN }}
+#
+# (One wrapper per org that should get the variable; each reads the same pool.)
+#
+# WHERE IT RUNS: the job runs on free `ubuntu-latest` only when the wrapping ops
+# repo is PUBLIC. In a private repo a hosted job cannot even START once the
+# included pool is exhausted (the $0 budget blocks it), which would freeze
+# CI_RUNNER_MODE at `github-hosted` exactly when it must flip — so a private
+# wrapper runs on the self-hosted `runner` label array instead.
+# Tokens (operator prerequisite):
+#   * billing_token   — billing READ for the scope that owns the pool.
+#                       Org scope: a GOVERNANCE-APP installation token (org
+#                       billing:read — verified 2026-09-15 that an App install
+#                       token drives `GET /organizations/{org}/settings/billing/usage`
+#                       -> 200) or a classic PAT (admin:org). Enterprise scope
+#                       (`enterprise:` set): a classic PAT of an enterprise
+#                       owner / billing manager with `manage_billing:enterprise`
+#                       (an org App installation cannot read enterprise billing).
+#                       Both dimensions (included-pool draw AND billed overage)
+#                       come from the enhanced usage report; the classic
+#                       `/orgs/{org}/settings/billing/actions` endpoint returns
+#                       HTTP 410 since GitHub's billing-platform migration.
+#   * variables_token — org VARIABLES write (fine-grained: Organization
+#                       "Variables" read/write). Writes CI_RUNNER_MODE.
+#     GITHUB_TOKEN cannot do either, so both are required secrets.
+#
+# Prometheus signals (see the `metrics` step): a decision gauge, remaining
+# minutes, billed amount, a fail-safe flag, and a last-SUCCESS timestamp that is
+# the dead-man's-switch for a STUCK service (repeated billing-read failures stop
+# advancing it). Paging on staleness / persistent fail-safe is owned by the
+# alerting fleet — wire an alert against these series in
+# ../../modules/alertmanager-fleet-routing rather than here.
+
+name: manage-runner-mode
+
+on:
+  workflow_call:
+    inputs:
+      org:
+        description: 'The organization whose billing drives CI_RUNNER_MODE.'
+        type: string
+        required: true
+      min_minutes_remaining:
+        description: 'Flip to self-hosted once remaining included minutes drop below this buffer.'
+        type: number
+        default: 300
+      included_minutes:
+        description: >-
+          Monthly included-minutes POOL, in Linux-equivalent minutes: Team org =
+          3000; Enterprise = 50000, shared by every org of the enterprise (set
+          `enterprise` too). The pool is a dollar allowance (this x the Linux
+          per-minute price) drawn down by each SKU's gross price.
+        type: number
+        default: 3000
+      enterprise:
+        description: >-
+          Enterprise slug whose POOLED billing to read (enterprise-plan orgs).
+          Empty = org scope; an enterprise-plan org read at org scope fails safe.
+        type: string
+        default: ''
+      runner:
+        description: >-
+          Self-hosted label array (JSON) this job runs on when the calling repo
+          is NOT public (a private repo's hosted job cannot start once the pool
+          is exhausted). A public caller always uses free ubuntu-latest.
+        type: string
+        default: '["self-hosted","linux","x64"]'
+      max_billed_amount:
+        description: >-
+          Hard billed-amount cap in USD for the current cycle. Once the scope
+          has been net-billed MORE than this for Actions MINUTES, flip to
+          self-hosted (budget dimension). Artifact/cache storage overage is
+          excluded: runner choice cannot change it (it has its own $0 budget).
+          Default 0 enforces the $0 policy: any minutes overage flips.
+        type: number
+        default: 0
+      metrics_textfile:
+        description: >-
+          Optional node-exporter textfile-collector path to write the Prometheus
+          signals to (self-hosted runner with a textfile dir). Empty = print only.
+        type: string
+        default: ''
+      pushgateway_url:
+        description: 'Optional Prometheus Pushgateway base URL (alternative metrics sink).'
+        type: string
+        default: ''
+    secrets:
+      billing_token:
+        description: 'Org billing-READ token (governance-App install token or classic PAT).'
+        required: true
+      variables_token:
+        description: 'Org variables-WRITE token (may equal billing_token if it has both scopes).'
+        required: true
+    outputs:
+      mode:
+        description: 'The CI_RUNNER_MODE written this run: github-hosted or self-hosted.'
+        value: ${{ jobs.manage.outputs.mode }}
+      failsafe:
+        description: '"1" if the decision fell back to the fail-safe self-hosted default, else "0".'
+        value: ${{ jobs.manage.outputs.failsafe }}
+
+jobs:
+  manage:
+    # The poll must be able to run exactly when the pool is exhausted: free
+    # ubuntu-latest in a PUBLIC caller, else the self-hosted `runner` array (a
+    # private repo's hosted job is blocked by the $0 budget once the pool is
+    # spent, which would freeze the switch at github-hosted). An absent
+    # visibility (e.g. a schedule payload without `repository`) -> self-hosted.
+    runs-on: ${{ fromJSON(github.event.repository.visibility == 'public' && '["ubuntu-latest"]' || inputs.runner) }}
+    outputs:
+      mode: ${{ steps.decide.outputs.mode }}
+      failsafe: ${{ steps.decide.outputs.failsafe }}
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ secrets.billing_token }}
+          ORG: ${{ inputs.org }}
+          MIN_REMAIN: ${{ inputs.min_minutes_remaining }}
+          INCLUDED_MINUTES: ${{ inputs.included_minutes }}
+          BILLING_ENTERPRISE: ${{ inputs.enterprise }}
+          MAX_BILLED: ${{ inputs.max_billed_amount }}
+        run: |
+          # No `set -e` at top level: a compute failure must NOT fail the job,
+          # it must resolve fail-safe to self-hosted. billing_remaining() runs
+          # in a subshell and turns every failure into a non-zero status.
+          set -uo pipefail
+
+          # >>> billing-remaining — SHARED, keep byte-identical in reusable-manage-runner-mode.yml,
+          # reusable-choose-runner.yml and reusable-sync-hosted-minutes.yml (t_runner_mode_manager
+          # fails if the three copies drift).
+          #
+          # billing_remaining: print "<remaining>|<billed>" for the CURRENT billing month and
+          # exit 0, or exit non-zero on ANY unreachable / unparseable / ambiguous read, so
+          # the caller fails safe to self-hosted.
+          #   remaining — included Actions minutes left in the pool, in LINUX-EQUIVALENT
+          #               minutes (integer, may be negative once exhausted).
+          #   billed    — USD net-billed for Actions MINUTES this month (overage).
+          # Env: ORG; INCLUDED_MINUTES (the pool: Team org 3000, Enterprise 50000);
+          #      BILLING_ENTERPRISE (optional enterprise slug — the POOLED scope).
+          #
+          # The classic GET /orgs/{org}/settings/billing/actions endpoint returns HTTP 410
+          # since GitHub's enhanced-billing migration. The enhanced usage report is the
+          # source now; it has no "included minutes remaining" field, so it is DERIVED:
+          #   * The included allowance is a DOLLAR pool — INCLUDED_MINUTES x the Linux
+          #     2-core per-minute price — drawn down by each SKU's gross price, not by the
+          #     old 1x/2x/10x minute multipliers. (Measured on live data 2026-09: an
+          #     enterprise pool stopped jobs at $300.87 gross = 50000 x $0.006 after 34005
+          #     raw minutes, having run on past the point a 2x Windows multiplier would
+          #     have exhausted it; a Team org stopped at exactly $18.00 = 3000 x $0.006.)
+          #   * The report's discount mixes the (free, unlimited) public-repo usage with
+          #     the included-pool usage, so the pool draw is the GROSS of every minutes
+          #     row NOT in a public repo. A repo that is not listed as public (private,
+          #     internal, deleted, renamed) counts against the pool: conservative.
+          #   * An enterprise-plan org draws on a pool SHARED by every org of its
+          #     enterprise, and its org-scoped report shows only its own share — so an
+          #     org scope on an enterprise-plan org is ambiguous and fails safe; read the
+          #     enterprise scope (BILLING_ENTERPRISE) instead.
+          billing_remaining() (
+            set -uo pipefail
+            hdr='X-GitHub-Api-Version: 2022-11-28'
+            [ "${INCLUDED_MINUTES:-}" -ge 0 ] 2>/dev/null \
+              || { echo "billing: INCLUDED_MINUTES='${INCLUDED_MINUTES:-}' is not a non-negative integer" >&2; exit 1; }
+            year="$(date -u +%Y)" || exit 1
+            month="$(date -u +%m)" || exit 1
+            month="${month#0}"
+            if [ -n "${BILLING_ENTERPRISE:-}" ]; then
+              path="/enterprises/${BILLING_ENTERPRISE}/settings/billing/usage?year=${year}&month=${month}"
+            else
+              plan="$(gh api -H "$hdr" "/orgs/${ORG}" --jq '.plan.name // ""')" || exit 1
+              if [ "$plan" = "enterprise" ]; then
+                echo "billing: ${ORG} is on an enterprise plan (pooled minutes); set the enterprise scope" >&2
+                exit 1
+              fi
+              path="/organizations/${ORG}/settings/billing/usage?year=${year}&month=${month}"
+            fi
+            usage="$(gh api -H "$hdr" "$path")" || exit 1
+            printf '%s' "$usage" | jq -e '.usageItems | type == "array"' >/dev/null \
+              || { echo "billing: usage report has no usageItems array" >&2; exit 1; }
+            orgs="$(printf '%s' "$usage" | jq -r --arg org "$ORG" \
+              '[.usageItems[] | select((.unitType // "" | ascii_downcase) == "minutes")
+                | (.organizationName // $org)] | unique | .[]')" || exit 1
+            public='[]'
+            for o in $orgs; do
+              names="$(gh api --paginate -H "$hdr" "/orgs/${o}/repos?type=public&per_page=100" \
+                --jq '.[].name')" || exit 1
+              public="$(printf '%s\n' "$names" | jq -R -s --arg o "$o" --argjson acc "$public" \
+                '$acc + [split("\n")[] | select(length > 0) | "\($o)/\(.)"]')" || exit 1
+            done
+            printf '%s' "$usage" | jq -e -r --arg org "$ORG" --argjson pub "$public" \
+              --argjson inc "$INCLUDED_MINUTES" '
+              ($pub | map({(.): true}) | add // {}) as $public
+              | [.usageItems[]
+                 | select((.product // "" | ascii_downcase) == "actions"
+                          and (.unitType // "" | ascii_downcase) == "minutes")] as $rows
+              | if ($rows | all((.grossAmount | type) == "number"
+                                and (.netAmount | type) == "number"))
+                then . else error("minutes row without numeric amounts") end
+              | ([$rows[] | select(.sku == "Actions Linux") | .pricePerUnit
+                  | select(type == "number" and . > 0)] | first // 0.006) as $linux
+              | ([$rows[]
+                  | select($public["\(.organizationName // $org)/\(.repositoryName // "")"] | not)
+                  | .grossAmount] | add // 0) as $drawn
+              | ([$rows[] | .netAmount] | add // 0) as $billed
+              | "\(($inc - ($drawn / $linux * 1000 | round) / 1000) | floor)|\($billed)"'
+          )
+          # <<< billing-remaining
+
+          # NB: call it in a PLAIN assignment (not `if billing_remaining`): bash
+          # disables `set -e` inside a function invoked in a tested context. The
+          # function also checks every step explicitly (`|| exit 1`), so a
+          # mid-read failure surfaces as a non-zero status either way.
+          result="$(billing_remaining)"
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            remaining="${result%%|*}"
+            billed="${result#*|}"
+            failsafe=0
+            if awk -v b="$billed" -v cap="$MAX_BILLED" 'BEGIN { exit !(b > cap) }'; then
+              mode="self-hosted"
+              reason="over budget: billed ${billed} USD > ${MAX_BILLED} USD cap"
+            elif [ "$remaining" -lt "$MIN_REMAIN" ]; then
+              mode="self-hosted"
+              reason="near exhaustion: ${remaining}m remaining < ${MIN_REMAIN}m buffer"
+            else
+              mode="github-hosted"
+              reason="healthy: ${remaining}m remaining >= ${MIN_REMAIN}m buffer, billed ${billed} USD <= ${MAX_BILLED} USD cap"
+            fi
+          else
+            mode="self-hosted"
+            remaining=-1
+            billed=-1
+            failsafe=1
+            reason="fail-safe: billing unreachable / unparseable / ambiguous"
+          fi
+
+          {
+            printf 'mode=%s\n' "$mode"
+            printf 'remaining=%s\n' "$remaining"
+            printf 'billed=%s\n' "$billed"
+            printf 'failsafe=%s\n' "$failsafe"
+          } >> "$GITHUB_OUTPUT"
+          printf 'manage-runner-mode: org=%s -> CI_RUNNER_MODE=%s (%s)\n' \
+            "$ORG" "$mode" "$reason"
+
+      - id: metrics
+        env:
+          ORG: ${{ inputs.org }}
+          MODE: ${{ steps.decide.outputs.mode }}
+          REMAINING: ${{ steps.decide.outputs.remaining }}
+          BILLED: ${{ steps.decide.outputs.billed }}
+          FAILSAFE: ${{ steps.decide.outputs.failsafe }}
+          TEXTFILE: ${{ inputs.metrics_textfile }}
+          PUSHGATEWAY_URL: ${{ inputs.pushgateway_url }}
+        run: |
+          set -uo pipefail
+          now="$(date +%s)"
+          if [ "$MODE" = "self-hosted" ]; then self=1; else self=0; fi
+
+          # last-SUCCESS timestamp is the STUCK-state dead-man's-switch: only a
+          # non-fail-safe run advances it, so repeated billing-read failures let
+          # it go stale for the alerting fleet to page on. Preserve the previous
+          # value across a fail-safe run rather than resetting it to zero.
+          last_success=0
+          if [ -n "$TEXTFILE" ] && [ -f "$TEXTFILE" ]; then
+            prev="$(grep '^ci_runner_mode_last_success_timestamp_seconds' "$TEXTFILE" \
+              | awk '{ print $2 }' | tail -1)"
+            [ -n "${prev:-}" ] && last_success="$prev"
+          fi
+          if [ "$FAILSAFE" = "0" ]; then last_success="$now"; fi
+
+          render() {
+            printf '# HELP ci_runner_mode_self_hosted 1 if CI_RUNNER_MODE is self-hosted, 0 if github-hosted.\n'
+            printf '# TYPE ci_runner_mode_self_hosted gauge\n'
+            printf 'ci_runner_mode_self_hosted{org="%s"} %s\n' "$ORG" "$self"
+            printf '# HELP ci_runner_mode The active runner mode (label = the written value).\n'
+            printf '# TYPE ci_runner_mode gauge\n'
+            printf 'ci_runner_mode{org="%s",mode="%s"} 1\n' "$ORG" "$MODE"
+            printf '# HELP ci_runner_mode_included_minutes_remaining Remaining included Actions minutes, Linux-equivalent; negative once exhausted (-1 with failsafe_active=1 on fail-safe).\n'
+            printf '# TYPE ci_runner_mode_included_minutes_remaining gauge\n'
+            printf 'ci_runner_mode_included_minutes_remaining{org="%s"} %s\n' "$ORG" "$REMAINING"
+            printf '# HELP ci_runner_mode_billed_amount_usd USD net-billed for Actions minutes this cycle (-1 on fail-safe).\n'
+            printf '# TYPE ci_runner_mode_billed_amount_usd gauge\n'
+            printf 'ci_runner_mode_billed_amount_usd{org="%s"} %s\n' "$ORG" "$BILLED"
+            printf '# HELP ci_runner_mode_failsafe_active 1 if this run fell back to the fail-safe self-hosted default.\n'
+            printf '# TYPE ci_runner_mode_failsafe_active gauge\n'
+            printf 'ci_runner_mode_failsafe_active{org="%s"} %s\n' "$ORG" "$FAILSAFE"
+            printf '# HELP ci_runner_mode_last_run_timestamp_seconds Unix time of the last poll (any outcome).\n'
+            printf '# TYPE ci_runner_mode_last_run_timestamp_seconds gauge\n'
+            printf 'ci_runner_mode_last_run_timestamp_seconds{org="%s"} %s\n' "$ORG" "$now"
+            printf '# HELP ci_runner_mode_last_success_timestamp_seconds Unix time of the last SUCCESSFUL billing read (stuck-state dead-man switch).\n'
+            printf '# TYPE ci_runner_mode_last_success_timestamp_seconds gauge\n'
+            printf 'ci_runner_mode_last_success_timestamp_seconds{org="%s"} %s\n' "$ORG" "$last_success"
+          }
+
+          if [ -n "$TEXTFILE" ]; then
+            render > "${TEXTFILE}.$$" && mv "${TEXTFILE}.$$" "$TEXTFILE"
+            printf 'manage-runner-mode: wrote Prometheus textfile %s\n' "$TEXTFILE"
+          elif [ -n "$PUSHGATEWAY_URL" ]; then
+            render | curl -sf --data-binary @- \
+              "${PUSHGATEWAY_URL}/metrics/job/manage_runner_mode/org/${ORG}"
+            printf 'manage-runner-mode: pushed Prometheus metrics to %s\n' "$PUSHGATEWAY_URL"
+          else
+            printf 'manage-runner-mode: no metrics sink configured; preview:\n'
+            render
+          fi
+
+      - name: Write CI_RUNNER_MODE org variable
+        env:
+          GH_TOKEN: ${{ secrets.variables_token }}
+          ORG: ${{ inputs.org }}
+          MODE: ${{ steps.decide.outputs.mode }}
+        run: |
+          set -euo pipefail
+          # create-or-update the org-visible variable (idempotent).
+          gh variable set CI_RUNNER_MODE --org "$ORG" --visibility all --body "$MODE"
+          printf 'manage-runner-mode: CI_RUNNER_MODE set to %s for org %s\n' "$MODE" "$ORG"

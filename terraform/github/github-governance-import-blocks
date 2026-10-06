@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""Generate credential-free OpenTofu import blocks for GitHub governance.
+
+Company-agnostic: reads a consumer repo's reviewed governance model
+(terraform/<root-config>/governance.nix, or bootstrap/ for a Layer-0 root) and
+emits `import {}` blocks that adopt
+the existing GitHub resources into Terraform state. Nothing is hardcoded — the
+owner, the governance root config, and the repo root are parameters. Pairs with
+governance.nix (the mapper) and the github-governance-import CI harness.
+
+The generated imports.tf is meant to live under .result/ and NOT be committed:
+its presence makes OpenTofu's mocked test context attempt provider imports, so
+keeping it ephemeral preserves offline tests. The one-time adoption is enforced
+by the import-only apply gate, not by deleting files.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+SCOPES = {
+    "all",
+    "organization",
+    "memberships",
+    "teams",
+    "team-memberships",
+    "repositories",
+    "branch-defaults",
+    "collaborators",
+    "team-repositories",
+    "branch-protections",
+    "environments",
+    "actions-repository-permissions",
+    "actions-variables",
+    "issue-labels",
+    "runner-groups",
+    "custom-roles",
+    "repository-rulesets",
+    "organization-rulesets",
+    "vulnerability-alerts",
+    "dependabot-security-updates",
+}
+
+# `security_and_analysis` is deliberately absent: it is a nested block on
+# github_repository, so it rides the repositories import and needs no import
+# block of its own.
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Generate credential-free OpenTofu import blocks for reviewed "
+            "GitHub governance resources."
+        )
+    )
+    parser.add_argument(
+        "--owner",
+        default=os.environ.get("GITHUB_OWNER"),
+        help="GitHub organization login (or set GITHUB_OWNER)",
+    )
+    parser.add_argument(
+        "--root-config",
+        default=os.environ.get("GOVERNANCE_ROOT_CONFIG"),
+        help=(
+            "governance root config, e.g. github/<org>-governance-prod "
+            "(or set GOVERNANCE_ROOT_CONFIG)"
+        ),
+    )
+    parser.add_argument(
+        "--root-dir",
+        default=os.environ.get("GOVERNANCE_REPO_ROOT", os.getcwd()),
+        help="consumer repo root (defaults to $GOVERNANCE_REPO_ROOT or CWD)",
+    )
+    parser.add_argument(
+        "--scope",
+        default="all",
+        choices=sorted(SCOPES),
+        help="resource scope to emit; defaults to all non-secret governance resources",
+    )
+    parser.add_argument(
+        "--output",
+        help=(
+            "output path; defaults to "
+            ".result/<layer>/<root-config>/imports.tf under --root-dir"
+        ),
+    )
+    parser.add_argument(
+        "--stdout",
+        action="store_true",
+        help="write import blocks to stdout instead of the output file",
+    )
+    args = parser.parse_args()
+    if not args.owner:
+        parser.error("--owner (or GITHUB_OWNER) is required")
+    if not args.root_config:
+        parser.error("--root-config (or GOVERNANCE_ROOT_CONFIG) is required")
+    return args
+
+
+def governance_layer(root: Path, root_config: str) -> str:
+    """Which layer holds this governance root.
+
+    A governance root is Layer 1+ by default and lives under terraform/, where
+    the shared terraform-ci-matrix finds it and every plan/apply runs through
+    the PR workflow. Only what the CI/CD pipeline itself depends on to run
+    belongs under bootstrap/ (see docs/Terraform-Root-Layering.md). Both are
+    resolved so a consumer can move a root between layers without a flag day.
+    """
+    for layer in ("terraform", "bootstrap"):
+        if (root / layer / root_config / "governance.nix").is_file():
+            return layer
+    # Nothing found: keep the historical path so the error names the old
+    # location a legacy consumer is most likely still using.
+    return "bootstrap"
+
+
+def load_governance(root: Path, root_config: str) -> dict:
+    layer = governance_layer(root, root_config)
+    governance_path = root / layer / root_config / "governance.nix"
+    result = subprocess.run(
+        ["nix", "eval", "--json", "--file", str(governance_path)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+def resource_key(value: str) -> str:
+    for old in ["/", ":", ".", "-", " ", "|", "(", ")", ","]:
+        value = value.replace(old, "_")
+    return value
+
+
+def hcl_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def import_block(address: str, import_id: str) -> str:
+    return f"import {{\n  to = {address}\n  id = {hcl_string(import_id)}\n}}\n\n"
+
+
+def include_scope(selected: str, scope: str) -> bool:
+    return selected == "all" or selected == scope
+
+
+def generate_blocks(
+    governance: dict, scope: str, owner: str, root_config: str, layer: str = "bootstrap"
+) -> list[str]:
+    blocks: list[str] = [
+        "# Generated by github-governance-import-blocks (nixos-modules).\n",
+        "# Do not commit this file; regenerate it for the reviewed import workflow.\n",
+        f"# Source model: {layer}/{root_config}/governance.nix\n\n",
+    ]
+
+    if include_scope(scope, "organization"):
+        blocks.append(
+            import_block("github_actions_organization_permissions.default", owner)
+        )
+
+    if include_scope(scope, "memberships"):
+        for member in governance["memberships"]:
+            username = member["username"]
+            blocks.append(
+                import_block(
+                    f"github_membership.{resource_key(f'member:{username}')}",
+                    f"{owner}:{username}",
+                )
+            )
+
+    if include_scope(scope, "repositories"):
+        for repo in governance["repositories"]:
+            name = repo["name"]
+            blocks.append(
+                import_block(
+                    f"github_repository.{resource_key(f'repo:{name}')}",
+                    name,
+                )
+            )
+
+    if include_scope(scope, "branch-defaults"):
+        for repo in governance["repositories"]:
+            name = repo["name"]
+            blocks.append(
+                import_block(
+                    f"github_branch_default.{resource_key(f'branch-default:{name}')}",
+                    name,
+                )
+            )
+
+    if include_scope(scope, "collaborators"):
+        for collaborator in governance["outsideCollaborators"]:
+            repository = collaborator["repository"]
+            username = collaborator["username"]
+            blocks.append(
+                import_block(
+                    "github_repository_collaborator."
+                    f"{resource_key(f'repo-collaborator:{repository}:{username}')}",
+                    f"{repository}:{username}",
+                )
+            )
+
+    if include_scope(scope, "vulnerability-alerts"):
+        for row in governance.get("vulnerabilityAlerts", []):
+            repository = row["repository"]
+            blocks.append(
+                import_block(
+                    "github_repository_vulnerability_alerts."
+                    f"{resource_key(f'vulnerability-alerts:{repository}')}",
+                    repository,
+                )
+            )
+
+    if include_scope(scope, "dependabot-security-updates"):
+        for row in governance.get("dependabotSecurityUpdates", []):
+            repository = row["repository"]
+            blocks.append(
+                import_block(
+                    "github_repository_dependabot_security_updates."
+                    f"{resource_key(f'dependabot-security-updates:{repository}')}",
+                    repository,
+                )
+            )
+
+    if include_scope(scope, "teams"):
+        for team in governance.get("teams", []):
+            slug = team["slug"]
+            blocks.append(
+                import_block(
+                    f"github_team.{resource_key(f'team:{slug}')}",
+                    slug,
+                )
+            )
+
+    if include_scope(scope, "team-memberships"):
+        for m in governance.get("teamMemberships", []):
+            team_slug = m["teamSlug"]
+            username = m["username"]
+            blocks.append(
+                import_block(
+                    "github_team_membership."
+                    f"{resource_key(f'team-membership:{team_slug}:{username}')}",
+                    f"{team_slug}:{username}",
+                )
+            )
+
+    if include_scope(scope, "team-repositories"):
+        for grant in governance["teamRepositories"]:
+            team_slug = grant["teamSlug"]
+            repository = grant["repository"]
+            blocks.append(
+                import_block(
+                    "github_team_repository."
+                    f"{resource_key(f'team-repository:{team_slug}:{repository}')}",
+                    f"{team_slug}:{repository}",
+                )
+            )
+
+    if include_scope(scope, "branch-protections"):
+        for branch in governance["branchProtections"]:
+            # A branch protection's import id is derivable (`<repo>:<pattern>`)
+            # rather than a server-assigned id, so "does this exist on GitHub
+            # yet?" cannot be inferred from a missing id the way it is for
+            # rulesets, runner groups and custom roles. Entries that are
+            # declared but not yet created say so with `exists = false`; they
+            # get no import block, and the first apply creates them. Importing
+            # one of those would fail the whole plan with "could not find a
+            # branch protection rule with the pattern '<pattern>'".
+            if branch.get("exists") is False:
+                continue
+            repository = branch["repository"]
+            pattern = branch["pattern"]
+            blocks.append(
+                import_block(
+                    "github_branch_protection."
+                    f"{resource_key(f'branch-protection:{repository}:{pattern}')}",
+                    f"{repository}:{pattern}",
+                )
+            )
+
+    if include_scope(scope, "environments"):
+        for environment in governance["repositoryEnvironments"]:
+            repository = environment["repository"]
+            name = environment["environment"]
+            blocks.append(
+                import_block(
+                    "github_repository_environment."
+                    f"{resource_key(f'environment:{repository}:{name}')}",
+                    f"{repository}:{name}",
+                )
+            )
+
+    if include_scope(scope, "actions-repository-permissions"):
+        for permissions in governance["actionsRepositoryPermissions"]:
+            repository = permissions["repository"]
+            blocks.append(
+                import_block(
+                    "github_actions_repository_permissions."
+                    f"{resource_key(f'actions-repository-permissions:{repository}')}",
+                    repository,
+                )
+            )
+
+    if include_scope(scope, "actions-variables"):
+        for variable in governance["actionsVariables"]:
+            repository = variable["repository"]
+            name = variable["name"]
+            blocks.append(
+                import_block(
+                    "github_actions_variable."
+                    f"{resource_key(f'actions-variable:{repository}:{name}')}",
+                    f"{repository}:{name}",
+                )
+            )
+
+    if include_scope(scope, "issue-labels"):
+        for label in governance["issueLabels"]:
+            repository = label["repository"]
+            name = label["name"]
+            blocks.append(
+                import_block(
+                    f"github_issue_label.{resource_key(f'label:{repository}:{name}')}",
+                    f"{repository}:{name}",
+                )
+            )
+
+    if include_scope(scope, "runner-groups"):
+        for rg in governance.get("runnerGroups", []):
+            if rg.get("id") is None:
+                continue
+            addr = "github_actions_runner_group." + resource_key("runner-group:" + rg["name"])
+            blocks.append(import_block(addr, str(rg["id"])))
+
+    if include_scope(scope, "custom-roles"):
+        for role in governance.get("customRepositoryRoles", []):
+            if role.get("id") is None:
+                continue
+            addr = "github_organization_custom_role." + resource_key("custom-role:" + role["name"])
+            blocks.append(import_block(addr, str(role["id"])))
+
+    if include_scope(scope, "repository-rulesets"):
+        for rs in governance.get("repositoryRulesets", []):
+            if rs.get("id") is None:
+                continue
+            addr = "github_repository_ruleset." + resource_key("repository-ruleset:" + rs["repository"] + ":" + rs["name"])
+            blocks.append(import_block(addr, rs["repository"] + ":" + str(rs["id"])))
+
+    if include_scope(scope, "organization-rulesets"):
+        for rs in governance.get("organizationRulesets", []):
+            if rs.get("id") is None:
+                continue
+            addr = "github_organization_ruleset." + resource_key("organization-ruleset:" + rs["name"])
+            blocks.append(import_block(addr, str(rs["id"])))
+
+    return blocks
+
+
+def block_count(blocks: list[str]) -> int:
+    return sum(1 for block in blocks if block.startswith("import {"))
+
+
+def write_output(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{path.name}.tmp.", dir=str(path.parent), text=True
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(contents)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        finally:
+            raise
+
+
+def main() -> int:
+    args = parse_args()
+    root = Path(args.root_dir).resolve()
+    layer = governance_layer(root, args.root_config)
+    output = (
+        Path(args.output)
+        if args.output
+        else root / ".result" / layer / args.root_config / "imports.tf"
+    )
+
+    governance = load_governance(root, args.root_config)
+    blocks = generate_blocks(
+        governance, args.scope, args.owner, args.root_config, layer
+    )
+    contents = "".join(blocks)
+    count = block_count(blocks)
+
+    if args.stdout:
+        sys.stdout.write(contents)
+        print(
+            f"Generated {count} GitHub governance import block(s) "
+            f"for scope '{args.scope}'.",
+            file=sys.stderr,
+        )
+    else:
+        write_output(output, contents)
+        print(
+            f"Generated {count} GitHub governance import block(s) "
+            f"for scope '{args.scope}':"
+        )
+        print(f"  {output}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

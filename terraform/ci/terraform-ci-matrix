@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Company-agnostic Terraform CI matrix generator.
+#
+# Discovers managed Terraform roots (any directory under `terraform/` holding a
+# `metadata.json`), validates each metadata against the shared contract, and
+# emits the GitHub Actions matrix consumed by a repo's thin `terraform.yml`
+# caller (which invokes the reusable-terraform-ci workflow). Unlike a
+# company-specific version, this script hardcodes no provider names, credential
+# paths, or per-root smoke tests: everything comes from each root's
+# `metadata.json`. See `metadata.schema.json` for the contract.
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: terraform-ci-matrix [--pretty] [--github-output FILE] [--root-dir DIR]
+
+Options:
+  --pretty              Pretty-print the matrix for local troubleshooting.
+  --github-output FILE  Also write matrix=<json> to a GitHub Actions output file.
+  --root-dir DIR        Repository root. Defaults to $PWD.
+  -h, --help            Show this help text.
+USAGE
+}
+
+format="compact"
+github_output=""
+root_dir="$PWD"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pretty) format="pretty"; shift ;;
+    --github-output)
+      [[ $# -ge 2 ]] || { echo "--github-output requires a file path." >&2; exit 2; }
+      github_output="$2"; shift 2 ;;
+    --root-dir)
+      [[ $# -ge 2 ]] || { echo "--root-dir requires a directory." >&2; exit 2; }
+      root_dir="$(cd -- "$2" && pwd)"; shift 2 ;;
+    -h | --help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+# A root is `terraform/<segment>/.../<name>` — at least one level under terraform/.
+is_safe_terraform_root() {
+  [[ "$1" =~ ^terraform/[A-Za-z0-9._/-]+$ && "$1" != *".."* ]]
+}
+
+rows=()
+failures=0
+
+while IFS= read -r root; do
+  [[ -z "$root" ]] && continue
+  config="${root#terraform/}"
+  metadata_file="${root_dir}/${root}/metadata.json"
+
+  if ! is_safe_terraform_root "$root"; then
+    echo "Discovered unsafe Terraform root '${root}'." >&2
+    failures=$((failures + 1)); continue
+  fi
+
+  # Structural validation of the metadata contract. Company-agnostic: the only
+  # fixed rule is the state-key <-> sensitivity naming convention.
+  if ! jq -e --arg config "$config" '
+    def nonempty_string: type == "string" and length > 0;
+    def string_array: type == "array" and all(.[]; type == "string" and length > 0);
+    (.state_key | nonempty_string)
+    and (.backend_config_file | nonempty_string)
+    and (.state_sensitivity | IN("standard", "sensitive"))
+    and (.credential_mode | IN("aws-oidc", "agenix-token", "github-app", "none"))
+    and (.credential_mode != "github-app" or (.github_app_owner | nonempty_string))
+    and (
+      (has("backend_uses_aws_oidc") | not)
+      or (.backend_uses_aws_oidc | type == "boolean")
+    )
+    and (.enable_checkov | type == "boolean")
+    and (.provider_allowlist | string_array and length > 0)
+    # agenix-token roots must declare their env name and plan/apply secret paths.
+    and (
+      .credential_mode != "agenix-token"
+      or (
+        (.credentials_env_name | nonempty_string)
+        and (.agenix_plan_secret_path | nonempty_string)
+        and (.agenix_apply_secret_path | nonempty_string)
+      )
+    )
+    and (
+      (.state_sensitivity == "standard"  and .state_key == ("terraform/" + $config + ".tfstate"))
+      or
+      (.state_sensitivity == "sensitive" and .state_key == ("terraform-sensitive/" + $config + ".tfstate"))
+    )
+  ' "$metadata_file" >/dev/null 2>&1; then
+    echo "Terraform root '${root}' is missing or has invalid metadata.json." >&2
+    failures=$((failures + 1)); continue
+  fi
+
+  # Roots still in the import/adoption phase (methodology M5/M6) are driven by
+  # the provider-specific import workflow, not the steady-state matrix — their
+  # state is empty, so a steady-state plan/apply would try to (re)create live
+  # resources. Skip them until the import completes and the flag is removed.
+  if [[ "$(jq -r '.adoption_pending // false' "$metadata_file")" == true ]]; then
+    echo "Skipping '${root}' (adoption_pending: managed by the import workflow)." >&2
+    continue
+  fi
+
+  credential_mode="$(jq -r '.credential_mode' "$metadata_file")"
+  backend_uses_aws_oidc="$(jq -r '.backend_uses_aws_oidc // false' "$metadata_file")"
+  uses_aws_oidc=false
+  provider_credentials_ready=true
+  credentials_env_name=""
+  agenix_plan_secret_path=""
+  agenix_apply_secret_path=""
+  smoke_test_command="$(jq -r '.smoke_test_command // ""' "$metadata_file")"
+
+  case "$credential_mode" in
+    aws-oidc) : ;;
+    agenix-token)
+      credentials_env_name="$(jq -r '.credentials_env_name' "$metadata_file")"
+      agenix_plan_secret_path="$(jq -r '.agenix_plan_secret_path' "$metadata_file")"
+      agenix_apply_secret_path="$(jq -r '.agenix_apply_secret_path' "$metadata_file")"
+      # Only emit credentials when the encrypted secrets are actually present,
+      # so a root can be added before its CI keys are provisioned.
+      if [[ ! -f "${root_dir}/${agenix_plan_secret_path}" || ! -f "${root_dir}/${agenix_apply_secret_path}" ]]; then
+        credentials_env_name=""; agenix_plan_secret_path=""; agenix_apply_secret_path=""
+        provider_credentials_ready=false
+      fi ;;
+    none) : ;;
+  esac
+
+  # Provider and backend authentication are separate axes. Emit the one
+  # combined workflow switch only when every provider credential is ready, so
+  # an agenix-token root without provisioned key files remains offline-only.
+  if [[ "$provider_credentials_ready" == true \
+    && ( "$credential_mode" == "aws-oidc" || "$backend_uses_aws_oidc" == true ) ]]; then
+    uses_aws_oidc=true
+  fi
+
+  row="$(jq -c -n \
+    --arg root "$root" \
+    --arg config "$config" \
+    --argjson metadata "$(jq -c . "$metadata_file")" \
+    --argjson backend_uses_aws_oidc "$backend_uses_aws_oidc" \
+    --argjson uses_aws_oidc "$uses_aws_oidc" \
+    --arg credentials_env_name "$credentials_env_name" \
+    --arg agenix_plan_secret_path "$agenix_plan_secret_path" \
+    --arg agenix_apply_secret_path "$agenix_apply_secret_path" \
+    --arg smoke_test_command "$smoke_test_command" \
+    --arg github_app_owner "$(jq -r '.github_app_owner // ""' "$metadata_file")" \
+    '{
+      root: $root,
+      config: $config,
+      state_key: $metadata.state_key,
+      backend_config_file: $metadata.backend_config_file,
+      provider_allowlist: ($metadata.provider_allowlist | join(",")),
+      enable_checkov: $metadata.enable_checkov,
+      state_sensitivity: $metadata.state_sensitivity,
+      credential_mode: $metadata.credential_mode,
+      backend_uses_aws_oidc: $backend_uses_aws_oidc,
+      uses_aws_oidc: $uses_aws_oidc,
+      credentials_env_name: $credentials_env_name,
+      agenix_plan_secret_path: $agenix_plan_secret_path,
+      agenix_apply_secret_path: $agenix_apply_secret_path,
+      smoke_test_command: $smoke_test_command,
+      github_app_owner: $github_app_owner
+    }')"
+  rows+=("$row")
+done < <(cd "$root_dir" && find terraform -name metadata.json -exec dirname {} \; 2>/dev/null | sort)
+
+if ((failures > 0)); then
+  echo "Terraform CI matrix metadata check failed with ${failures} issue(s)." >&2
+  exit 1
+fi
+
+if ((${#rows[@]} == 0)); then
+  matrix='{"include":[]}'
+else
+  matrix="$(printf '%s\n' "${rows[@]}" | jq -s -c '{include: .}')"
+fi
+
+if [[ -n "$github_output" ]]; then
+  printf 'matrix=%s\n' "$matrix" >> "$github_output"
+fi
+
+if [[ "$format" == "pretty" ]]; then
+  jq . <<<"$matrix"
+else
+  printf '%s\n' "$matrix"
+fi

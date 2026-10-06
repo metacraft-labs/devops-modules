@@ -13,7 +13,7 @@
 #   {
 #     inputs = {
 #       nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-#       nixos-modules.url = "github:metacraft-labs/nixos-modules";
+#       nixos-modules.url = "github:metacraft-labs/devops-modules";
 #
 #       # Optional: Required only for macOS BaseSystem fetching
 #       osx-kvm = { url = "github:kholia/OSX-KVM"; flake = false; };

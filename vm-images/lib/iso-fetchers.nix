@@ -39,11 +39,17 @@
       version,
       codename,
       sha256,
+      # Immutable dated respin directory, e.g. "release-20260615". The
+      # default "release" is a ROLLING pointer that Canonical re-publishes
+      # in place (~weekly, on every point release / security respin), so its
+      # content -- and therefore this fixed-output hash -- is not
+      # reproducible. Pin a dated directory to make the FOD stable.
+      releaseDir ? "release",
     }:
     let
       # Construct the download URL for the release image
-      # Format: https://cloud-images.ubuntu.com/releases/{codename}/release/ubuntu-{version}-server-cloudimg-amd64.img
-      url = "https://cloud-images.ubuntu.com/releases/${codename}/release/ubuntu-${version}-server-cloudimg-amd64.img";
+      # Format: https://cloud-images.ubuntu.com/releases/{codename}/{releaseDir}/ubuntu-{version}-server-cloudimg-amd64.img
+      url = "https://cloud-images.ubuntu.com/releases/${codename}/${releaseDir}/ubuntu-${version}-server-cloudimg-amd64.img";
 
       # Image name for the derivation
       name = "ubuntu-${version}-server-cloudimg-amd64.img";

@@ -1,0 +1,44 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Terraform root metadata",
+  "description": "Per-root contract consumed by terraform-ci-matrix. Company-agnostic; identifiers are supplied by the consuming repo.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["state_key", "state_sensitivity", "backend_config_file", "credential_mode", "enable_checkov", "provider_allowlist"],
+  "properties": {
+    "state_key": { "type": "string", "description": "Backend state key. Must be terraform/<config>.tfstate (standard) or terraform-sensitive/<config>.tfstate (sensitive), where <config> is the root path minus the leading terraform/." },
+    "state_sensitivity": { "enum": ["standard", "sensitive"] },
+    "backend_config_file": { "type": "string", "description": "Path to the root's backends/*.hcl (state key only; never secrets)." },
+    "credential_mode": { "enum": ["aws-oidc", "agenix-token", "github-app", "none"], "description": "Provider credential mode. github-app mints a short-lived GitHub App installation token (exported as GITHUB_TOKEN) for the github provider. Backend authentication is declared independently by backend_uses_aws_oidc." },
+    "github_app_owner": { "type": "string", "description": "Required for github-app: org/user the minted installation token is scoped to (e.g. metacraft-labs)." },
+    "backend_uses_aws_oidc": { "type": "boolean", "default": false, "description": "Whether the Terraform state backend also requires the caller's AWS OIDC role. This is independent of provider credential_mode so, for example, an agenix-token provider can use an S3 backend." },
+    "credentials_env_name": { "type": "string", "description": "Required for agenix-token: env var the decrypted token is exported as (e.g. GITHUB_TOKEN, CLOUDFLARE_API_TOKEN)." },
+    "agenix_plan_secret_path": { "type": "string", "description": "Required for agenix-token: repo-relative path to the read-only (plan) agenix secret." },
+    "agenix_apply_secret_path": { "type": "string", "description": "Required for agenix-token: repo-relative path to the read-write (apply) agenix secret." },
+    "enable_checkov": { "type": "boolean" },
+    "provider_allowlist": { "type": "array", "minItems": 1, "items": { "type": "string" }, "description": "Exact terraform.required_providers source values permitted in this root." },
+    "smoke_test_command": { "type": "string", "description": "Optional post-apply smoke test command." },
+    "adoption_pending": { "type": "boolean", "default": false, "description": "When true, this root is in the import/adoption phase (methodology M5/M6) and is EXCLUDED from the steady-state CI matrix — it is driven by the provider-specific import workflow instead. Remove the flag once the import has populated state." },
+    "split_boundary": { "type": "object", "description": "Optional prose documenting why this root is a separate state boundary (see the root-layering runbook)." }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "credential_mode": { "const": "agenix-token" } },
+        "required": ["credential_mode"]
+      },
+      "then": {
+        "required": ["credentials_env_name", "agenix_plan_secret_path", "agenix_apply_secret_path"]
+      }
+    },
+    {
+      "if": {
+        "properties": { "credential_mode": { "const": "github-app" } },
+        "required": ["credential_mode"]
+      },
+      "then": {
+        "required": ["github_app_owner"]
+      }
+    }
+  ]
+}

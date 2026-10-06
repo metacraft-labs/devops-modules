@@ -4,7 +4,7 @@ The **shardSplit** flake module is a flake-parts module that automatically divid
 
 ### Module Location & Structure
 
-The module is defined in [`modules/shard-split/default.nix`](https://github.com/metacraft-labs/nixos-modules/blob/main/modules/shard-split/default.nix) and uses the [`lib/shard-attrs.nix`](https://github.com/metacraft-labs/nixos-modules/blob/main/lib/shard-attrs.nix) helper function.
+The module is defined in [`modules/shard-split/default.nix`](https://github.com/metacraft-labs/devops-modules/blob/dev/modules/shard-split/default.nix) and uses the [`lib/shard-attrs.nix`](https://github.com/metacraft-labs/devops-modules/blob/dev/lib/shard-attrs.nix) helper function.
 
 ### Configuration Options
 
@@ -147,7 +147,7 @@ The module generates four read-only output attributes under `config.flake.mcl.sh
 
 ### Shard Splitting Algorithm
 
-The [`shardAttrs`](https://github.com/metacraft-labs/nixos-modules/blob/main/lib/shard-attrs.nix#L1-L25) function implements the core sharding logic:
+The [`shardAttrs`](https://github.com/metacraft-labs/devops-modules/blob/dev/lib/shard-attrs.nix#L1-L25) function implements the core sharding logic:
 
 1. **Calculate shard count**: `ceil(attrCount / shardSize)`
 2. **Create fixed-width shard IDs**: Pad IDs to match the width of the highest shard number (e.g., "00", "01", "02" for 100+ shards)

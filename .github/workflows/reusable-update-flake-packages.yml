@@ -5,8 +5,8 @@ on:
   workflow_call:
     inputs:
       runner:
-        description: 'JSON-encoded list of runner labels'
-        default: '["self-hosted", "nixos", "x86-64-v2", "bare-metal"]'
+        description: 'JSON-encoded runner class (single-name self-hosted class, e.g. "eph-linux-x64")'
+        default: '["self-hosted", "linux", "x64"]'
         required: false
         type: string
 
@@ -33,13 +33,13 @@ on:
 
 jobs:
   updateFlakePackages:
-    runs-on: ${{ fromJSON(inputs.runner || '["self-hosted", "nixos", "x86-64-v2", "bare-metal"]') }}
+    runs-on: ${{ fromJSON(inputs.runner || '["self-hosted", "linux", "x64"]') }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6.0.2
 
       - name: Setup Nix
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        uses: metacraft-labs/devops-modules/.github/setup-nix@dev
         with:
           push-to-cache: false
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
@@ -58,4 +58,4 @@ jobs:
         uses: metacraft-labs/nix-update-action@main
         with:
           token: ${{ steps.generate-token.outputs.token }}
-          blacklist: 'ci-matrix,folder-size-metrics,mcl'
+          blacklist: 'ci-matrix,folder-size-metrics,mcl-devops'

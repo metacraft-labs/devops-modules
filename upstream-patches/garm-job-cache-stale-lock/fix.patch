@@ -1,0 +1,295 @@
+From 204d1b534d01fb9d6a7ff2b3f62e06780437290d Mon Sep 17 00:00:00 2001
+From: Metacraft Labs <info@metacraft-labs.com>
+Date: Mon, 28 Sep 2026 19:53:42 +0300
+Subject: [PATCH] Don't strand queued jobs when the job cache goes stale
+
+consumeQueuedJobs() trusts the pool manager's in-memory job cache, which
+is fed only by watcher notifications. A pass that cannot place a job
+locks it, fails, and unlocks it within about a millisecond. If the
+unlock notification is lost, or arrives before the lock's, the cache
+says "locked by us" while the store says unlocked.
+
+The 10 minute retry cannot repair that. UnlockJob() on an already
+unlocked row is a silent no-op that sends no notification, and the
+check that follows reads the same stale cached LockedBy and skips the
+job. It is skipped on every pass, even after capacity frees up, until
+the controller restarts.
+
+Write the manager's own lock and unlock through to the cache by
+re-reading the row from the store (refreshCachedJob). Once the 10
+minute path has unlocked the row, treat the local copy as unlocked and
+retry it in the same pass. If LockJob() or UnlockJob() reports that a
+cached job is gone from the store, drop it from the cache instead of
+retrying it forever or aborting the rest of the pass.
+
+Signed-off-by: Metacraft Labs <info@metacraft-labs.com>
+---
+ runner/pool/pool.go      |  38 ++++++++++++++
+ runner/pool/pool_test.go | 105 +++++++++++++++++++++++++++++++++++++++
+ runner/pool/util.go      |  48 ++++++++++++++++++
+ 3 files changed, 191 insertions(+)
+
+diff --git a/runner/pool/pool.go b/runner/pool/pool.go
+index c02d17b9..48f95f9a 100644
+--- a/runner/pool/pool.go
++++ b/runner/pool/pool.go
+@@ -2224,6 +2224,13 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+ 			// was spawned. Unlock it and try again. A different job may have picked up
+ 			// the runner.
+ 			if err := r.store.UnlockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
++				if errors.Is(err, runnerErrors.ErrNotFound) {
++					// The job is gone from the store, but the notification
++					// that would have removed it from our cache never
++					// arrived. Drop the ghost entry.
++					r.forgetCachedJob(job.ID)
++					continue
++				}
+ 				// nolint:golangci-lint,godox
+ 				// TODO: Implament a cache? Should we return here?
+ 				slog.With(slog.Any("error", err)).ErrorContext(
+@@ -2231,6 +2238,16 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+ 					"job_id", job.WorkflowJobID)
+ 				continue
+ 			}
++			// UnlockJob() is a silent no-op (no change, no watcher
++			// notification) when the record is already unlocked. If the
++			// notification of an earlier unlock was lost or reordered behind
++			// the lock that preceded it, our cached copy still says "locked
++			// by us" while the store says "unlocked", and nothing would ever
++			// correct it: the check below would skip this job forever. The
++			// store is the source of truth and it is now unlocked, so take
++			// that into the cache and retry the job in this pass.
++			job.LockedBy = uuid.Nil
++			r.refreshCachedJob(job)
+ 		}
+ 
+ 		if job.LockedBy.String() == r.ID() {
+@@ -2263,11 +2280,19 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+ 
+ 		runnerCreated := false
+ 		if err := r.store.LockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
++			if errors.Is(err, runnerErrors.ErrNotFound) {
++				// Deleted from the store; the delete notification never
++				// reached our cache. Drop the ghost entry.
++				r.forgetCachedJob(job.ID)
++				continue
++			}
+ 			slog.With(slog.Any("error", err)).ErrorContext(
+ 				r.ctx, "could not lock job",
+ 				"job_id", job.WorkflowJobID)
+ 			continue
+ 		}
++		// Write the lock through to the cache (see refreshCachedJob).
++		r.refreshCachedJob(job)
+ 
+ 		jobLabels := []string{
+ 			fmt.Sprintf("%s=%d", jobLabelPrefix, job.WorkflowJobID),
+@@ -2309,11 +2334,24 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+ 				r.ctx, "could not create a runner for job; unlocking",
+ 				"job_id", job.WorkflowJobID)
+ 			if err := r.store.UnlockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
++				if errors.Is(err, runnerErrors.ErrNotFound) {
++					// The job completed or was removed while we were
++					// trying to serve it. Nothing left to unlock, and no
++					// reason to abandon the rest of the queue.
++					r.forgetCachedJob(job.ID)
++					continue
++				}
+ 				slog.With(slog.Any("error", err)).ErrorContext(
+ 					r.ctx, "failed to unlock job",
+ 					"job_id", job.WorkflowJobID)
+ 				return fmt.Errorf("error unlocking job: %w", err)
+ 			}
++			// Write the unlock through to the cache rather than relying on
++			// the watcher notification alone. If that notification is lost,
++			// or overtaken by the notification of the lock we took above,
++			// the cache keeps the job "locked by us" and this manager would
++			// not look at it again for at least 10 minutes.
++			r.refreshCachedJob(job)
+ 		}
+ 	}
+ 	return nil
+diff --git a/runner/pool/pool_test.go b/runner/pool/pool_test.go
+index c28636af..5865d23e 100644
+--- a/runner/pool/pool_test.go
++++ b/runner/pool/pool_test.go
+@@ -791,6 +791,111 @@ func (s *PoolStressTestSuite) TestPersistJobToDB_AllowsForwardTransitions() {
+ 	}
+ }
+ 
++// seedJobCache replaces the manager's in-memory job cache with the given jobs,
++// keyed the way the watcher keys them in production (the job record ID).
++func (s *PoolStressTestSuite) seedJobCache(jobs ...params.Job) {
++	s.mgr.mux.Lock()
++	defer s.mgr.mux.Unlock()
++	for k := range s.mgr.jobs {
++		delete(s.mgr.jobs, k)
++	}
++	for _, j := range jobs {
++		s.mgr.jobs[j.ID] = j
++	}
++}
++
++func (s *PoolStressTestSuite) queuedJobByWorkflowID(workflowJobID int64) params.Job {
++	queued, err := s.store.ListJobsByStatus(s.adminCtx, params.JobStatusQueued)
++	s.Require().NoError(err)
++	for _, j := range queued {
++		if j.WorkflowJobID == workflowJobID {
++			return j
++		}
++	}
++	s.FailNow("queued job not found", "workflow_job_id %d", workflowJobID)
++	return params.Job{}
++}
++
++// TestConsumeQueuedJobsRecoversFromStaleLockInCache reproduces a queued job
++// being abandoned forever. The manager locks the job, fails to place it (the
++// pools are at capacity) and unlocks it. If the watcher notification for the
++// unlock is lost, or delivered before the notification for the lock, the cached
++// copy keeps "locked by us" while the store says "unlocked". The 10 minute
++// retry then calls UnlockJob, which is a no-op on an unlocked record and sends
++// no notification, so the cache is never corrected and the job is skipped on
++// every pass, even after capacity frees up.
++func (s *PoolStressTestSuite) TestConsumeQueuedJobsRecoversFromStaleLockInCache() {
++	s.setupProviderMocks()
++	s.mgr.controllerInfo.MinimumJobAgeBackoff = 0
++
++	_, err := s.store.CreateOrUpdateJob(s.adminCtx, params.Job{
++		WorkflowJobID:   8001,
++		Action:          "queued",
++		Status:          "queued",
++		Labels:          []string{"self-hosted", "linux", "x64"},
++		RepositoryName:  "test-repo",
++		RepositoryOwner: "test-owner",
++		RepoID:          garmTesting.Ptr(mustParseUUID(s.entity.ID)),
++	})
++	s.Require().NoError(err)
++
++	// The store has the job queued and unlocked. The cache holds the copy
++	// from the reordered lock notification: locked by us, last touched more
++	// than 10 minutes ago.
++	stored := s.queuedJobByWorkflowID(8001)
++	s.Require().Equal(uuid.Nil, stored.LockedBy)
++	cached := stored
++	cached.LockedBy = mustParseUUID(s.mgr.ID())
++	cached.UpdatedAt = time.Now().UTC().Add(-11 * time.Minute)
++	s.seedJobCache(cached)
++
++	s.Require().NoError(s.mgr.consumeQueuedJobs())
++
++	instances, err := s.store.ListPoolInstances(s.adminCtx, s.pool.ID, false)
++	s.Require().NoError(err)
++	s.Len(instances, 1, "a runner must be created for the job once its stale cached lock has expired")
++
++	s.Equal(mustParseUUID(s.mgr.ID()), s.queuedJobByWorkflowID(8001).LockedBy,
++		"the job must be locked in the store by the pass that served it")
++}
++
++// TestConsumeQueuedJobsDropsGhostJobs checks that a cached job which no longer
++// exists in the store (its delete notification was lost) is dropped from the
++// cache, and does not stop the pass from serving the jobs after it.
++func (s *PoolStressTestSuite) TestConsumeQueuedJobsDropsGhostJobs() {
++	s.setupProviderMocks()
++	s.mgr.controllerInfo.MinimumJobAgeBackoff = 0
++
++	_, err := s.store.CreateOrUpdateJob(s.adminCtx, params.Job{
++		WorkflowJobID:   8202,
++		Action:          "queued",
++		Status:          "queued",
++		Labels:          []string{"self-hosted", "linux", "x64"},
++		RepositoryName:  "test-repo",
++		RepositoryOwner: "test-owner",
++		RepoID:          garmTesting.Ptr(mustParseUUID(s.entity.ID)),
++	})
++	s.Require().NoError(err)
++	real := s.queuedJobByWorkflowID(8202)
++
++	ghost := real
++	ghost.ID = real.ID + 1000
++	ghost.WorkflowJobID = 8201
++	ghost.UpdatedAt = time.Now().UTC().Add(-time.Minute)
++	s.seedJobCache(ghost, real)
++
++	s.Require().NoError(s.mgr.consumeQueuedJobs())
++
++	s.mgr.mux.Lock()
++	_, ghostCached := s.mgr.jobs[ghost.ID]
++	s.mgr.mux.Unlock()
++	s.False(ghostCached, "a job missing from the store must be dropped from the cache")
++
++	instances, err := s.store.ListPoolInstances(s.adminCtx, s.pool.ID, false)
++	s.Require().NoError(err)
++	s.Len(instances, 1, "the real job must still be served")
++}
++
+ func mustParseUUID(s string) uuid.UUID {
+ 	u, err := uuid.Parse(s)
+ 	if err != nil {
+diff --git a/runner/pool/util.go b/runner/pool/util.go
+index eef79a6c..94849b17 100644
+--- a/runner/pool/util.go
++++ b/runner/pool/util.go
+@@ -16,6 +16,7 @@ package pool
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"log/slog"
+ 	"net/http"
+@@ -109,6 +110,53 @@ func (r *basePoolManager) getQueuedJobs() []params.Job {
+ 	return ret
+ }
+ 
++// refreshCachedJob re-reads a job this manager has just written to (locked or
++// unlocked) and stores the result in the in-memory cache.
++//
++// The cache is otherwise fed only by watcher notifications. If one of those
++// is lost, or arrives after a later one, the cache disagrees with the store,
++// and consumeQueuedJobs() trusts the cache. Writing our own changes through
++// keeps it correct regardless. The copy comes from the store, so its
++// timestamps are the store's. A job that is no longer in the cache (the
++// watcher retired it) is never re-added.
++func (r *basePoolManager) refreshCachedJob(job params.Job) {
++	fresh, err := r.store.GetJobByID(r.ctx, job.WorkflowJobID)
++	if err != nil {
++		if errors.Is(err, runnerErrors.ErrNotFound) {
++			r.forgetCachedJob(job.ID)
++			return
++		}
++		slog.With(slog.Any("error", err)).WarnContext(
++			r.ctx, "failed to refresh cached job",
++			"job_id", job.WorkflowJobID)
++		return
++	}
++
++	r.mux.Lock()
++	defer r.mux.Unlock()
++	if _, ok := r.jobs[fresh.ID]; !ok {
++		return
++	}
++	if r.jobUpdateIsStale(fresh) {
++		return
++	}
++	if params.JobStatus(fresh.Status) == params.JobStatusCompleted {
++		r.retireJob(fresh)
++		return
++	}
++	r.jobs[fresh.ID] = fresh
++}
++
++// forgetCachedJob removes a job from the in-memory cache after the store
++// reported that it no longer exists.
++func (r *basePoolManager) forgetCachedJob(id int64) {
++	r.mux.Lock()
++	defer r.mux.Unlock()
++
++	delete(r.jobs, id)
++	r.jobTombstones[id] = time.Now()
++}
++
+ func (r *basePoolManager) waitForToolsOrCancel() (hasTools, stopped bool) {
+ 	ticker := time.NewTicker(1 * time.Second)
+ 	defer ticker.Stop()
+-- 
+2.53.0

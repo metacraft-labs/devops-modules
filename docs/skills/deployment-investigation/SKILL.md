@@ -1,6 +1,6 @@
 ---
 name: deployment-investigation
-description: Use when investigating a failed, stuck, superseded, or ambiguous deployment across GitHub Actions, deployment event artifacts, mcl status summaries, target journals, cache health, and post-switch health checks.
+description: Use when investigating a failed, stuck, superseded, or ambiguous deployment across GitHub Actions, deployment event artifacts, mcl-devops status summaries, target journals, cache health, and post-switch health checks.
 ---
 
 # Deployment Investigation
@@ -18,7 +18,7 @@ description: Use when investigating a failed, stuck, superseded, or ambiguous de
 ```sh
 gh run view "$RUN_ID" --log
 gh run download "$RUN_ID" --dir .result/deployment-artifacts
-mcl deploy-status summarize .result/deployment-artifacts/events.jsonl \
+mcl-devops deploy-status summarize .result/deployment-artifacts/events.jsonl \
   --output .result/deployment-summary.md \
   --json-output .result/deployment-summary.json
 ssh "$TARGET" 'sudo journalctl -u mcl-deploy-agent.service -u mcl-deployment-reconciler.service -b --no-pager -n 200'
@@ -27,7 +27,7 @@ nix path-info --store "$SUBSTITUTER" --recursive "$SYSTEM_PATH" \
   --option trusted-public-keys "$TRUSTED_PUBLIC_KEY"
 ```
 
-Use `mcl deploy-status summarize` first when an event JSONL artifact exists.
+Use `mcl-devops deploy-status summarize` first when an event JSONL artifact exists.
 Use target journals next only for phases that reached the target:
 `agent-restore`, `switch`, `healthcheck`, `rollback`, or `complete`.
 

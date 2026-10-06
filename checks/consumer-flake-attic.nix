@@ -60,11 +60,14 @@
               diff -u migrated.once fixture/flake.nix
               attic-migrate-flake --check fixture
 
-              grep -q 'https://cache.metacraft-labs.com/metacraft-public' fixture/flake.nix
-              grep -q 'https://cache.metacraft-labs.com/metacraft-codetracer' fixture/flake.nix
-              grep -q 'metacraft-public:UtS6PK+p0uZaJK3i/jD2DQOjTpddhQUQmNQDQih5N4Q=' fixture/flake.nix
-              grep -q 'metacraft-codetracer:9OV9wCDX560bt5/MrD4dlqnPpCitAEjpoqhNfQpWY3U=' fixture/flake.nix
-              ! grep -q 'metacraft-private-infrastructure:' fixture/flake.nix
+              # Both Cachix caches now collapse into the single private Attic cache.
+              grep -q 'https://cache.metacraft-labs.com/metacraft-private-infrastructure' fixture/flake.nix
+              grep -q 'metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE=' fixture/flake.nix
+              # None of the four former --public Attic buckets may be injected.
+              ! grep -q 'cache.metacraft-labs.com/metacraft-public' fixture/flake.nix
+              ! grep -q 'cache.metacraft-labs.com/metacraft-codetracer' fixture/flake.nix
+              ! grep -q 'metacraft-public:UtS6PK' fixture/flake.nix
+              ! grep -q 'metacraft-codetracer:9OV9wCDX' fixture/flake.nix
               grep -q 'knownCachixOutsideNixConfig = "https://mcl-public-cache.cachix.org"' fixture/flake.nix
               grep -q 'unknownCachixOutsideNixConfig = "https://surprise.cachix.org"' fixture/flake.nix
               ! grep -q 'mcl-public-cache.cachix.org-1:' fixture/flake.nix
@@ -92,50 +95,52 @@
               import textwrap
               from pathlib import Path
 
+              # Public-Attic-Cache-Decommission: every former public Cachix cache
+              # migrates into the SINGLE private Attic cache. No public buckets remain.
+              PRIVATE_CACHE = "metacraft-private-infrastructure"
+              PRIVATE_KEY = "metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE="
+              STALE = [
+                  "metacraft-public:",
+                  "metacraft-codetracer:",
+                  "blocksense-public:",
+                  "agent-harbor:",
+                  "/metacraft-public",
+                  "/metacraft-codetracer",
+                  "/blocksense-public",
+                  "/agent-harbor",
+              ]
+
               inventory = json.loads(Path("${inventory}").read_text())
               migration = inventory["atticMigration"]
               base_url = migration["baseUrl"].rstrip("/")
               caches = migration["cachixCaches"]
               assert caches, "no Attic migration Cachix caches declared"
 
-              required_mappings = {
-                  "nix-blockchain-development.cachix.org": (
-                      "metacraft-public",
-                      "metacraft-public:UtS6PK+p0uZaJK3i/jD2DQOjTpddhQUQmNQDQih5N4Q=",
-                  ),
-                  "blocksense-infra.cachix.org": (
-                      "blocksense-public",
-                      "blocksense-public:OOgTc0ye1FONCiVHMrbpScc/HP+lX3uoU0EfwzX6ypE=",
-                  ),
+              required_hosts = {
+                  "nix-blockchain-development.cachix.org",
+                  "blocksense-infra.cachix.org",
               }
               caches_by_host = {cache["host"]: cache for cache in caches}
-              for host, (bucket, public_key) in required_mappings.items():
+              for host in required_hosts:
                   assert host in caches_by_host, f"{host} missing from Attic migration inventory"
                   cache = caches_by_host[host]
-                  assert cache["bucket"] == bucket, cache
-                  assert cache["publicKey"] == public_key, cache
+                  assert cache["bucket"] == PRIVATE_CACHE, cache
+                  assert cache["publicKey"] == PRIVATE_KEY, cache
 
               repo_buckets = {
                   repo["bucket"]
                   for root in inventory["roots"]
                   for repo in root["repositories"]
               }
+              assert repo_buckets == {PRIVATE_CACHE}, repo_buckets
               mapped_buckets = {cache["bucket"] for cache in caches}
-              missing_buckets = repo_buckets - mapped_buckets
-              assert not missing_buckets, f"repository bucket(s) lack migration mapping: {sorted(missing_buckets)}"
+              assert mapped_buckets == {PRIVATE_CACHE}, mapped_buckets
 
-              public_keys_by_bucket = {}
               for cache in caches:
                   for field in ("host", "bucket", "publicKey"):
                       assert cache.get(field), f"migration cache lacks {field}: {cache}"
-                  expected_prefix = f"{cache['bucket']}:"
-                  assert cache["publicKey"].startswith(expected_prefix), cache
-                  previous = public_keys_by_bucket.setdefault(cache["bucket"], cache["publicKey"])
-                  assert previous == cache["publicKey"], cache
-
-              public_keys = set(public_keys_by_bucket.values())
-              assert len(public_keys) == len(public_keys_by_bucket), public_keys_by_bucket
-              assert not any(key.startswith("metacraft-private-infrastructure:") for key in public_keys)
+                  assert cache["bucket"] == PRIVATE_CACHE, cache
+                  assert cache["publicKey"] == PRIVATE_KEY, cache
 
               with tempfile.TemporaryDirectory() as temp:
                   temp_path = Path(temp)
@@ -155,14 +160,13 @@
 
                       subprocess.run(["attic-migrate-flake", str(case)], check=True)
                       migrated = (case / "flake.nix").read_text()
-                      expected_url = f"{base_url}/{cache['bucket']}"
+                      expected_url = f"{base_url}/{PRIVATE_CACHE}"
                       assert expected_url in migrated, (cache, migrated)
-                      assert cache["publicKey"] in migrated, (cache, migrated)
+                      assert PRIVATE_KEY in migrated, (cache, migrated)
                       assert f"https://{cache['host']}" not in migrated, (cache, migrated)
                       assert f"{cache['host']}-1:" not in migrated, (cache, migrated)
-                      assert "metacraft-private-infrastructure:" not in migrated, (cache, migrated)
-                      for other_key in public_keys - {cache["publicKey"]}:
-                          assert other_key not in migrated, (cache, other_key, migrated)
+                      for stale in STALE:
+                          assert stale not in migrated, (cache, stale, migrated)
               PY
 
               touch "$out"
@@ -194,6 +198,9 @@
                   "nix build",
                   "--print-out-paths",
                   "attic push",
+                  "push_with_retry",
+                  "push-attempts",
+                  "push-retry-delay-seconds",
                   "missing required input",
               ]
               for needle in required:
@@ -223,6 +230,7 @@
                   fake_bin = temp_path / "bin"
                   fake_bin.mkdir()
                   fake_attic_log = temp_path / "attic.log"
+                  fake_attic_counter = temp_path / "attic-counter"
                   fake_nix_log = temp_path / "nix.log"
 
                   (fake_bin / "attic").write_text("""#!${pkgs.bash}/bin/bash
@@ -231,8 +239,16 @@
               if [ "''${FAKE_ATTIC_FAIL_PATH:-}" != "" ] && [ "$1" = "push" ]; then
                 last="''${!#}"
                 if [ "$last" = "$FAKE_ATTIC_FAIL_PATH" ]; then
-                  echo "fake attic push failed for $last" >&2
-                  exit 23
+                  count=0
+                  if [ -s "$FAKE_ATTIC_COUNTER" ]; then
+                    count=$(cat "$FAKE_ATTIC_COUNTER")
+                  fi
+                  if [ "$count" -lt "''${FAKE_ATTIC_FAIL_COUNT:-999}" ]; then
+                    count=$((count + 1))
+                    printf '%s\\n' "$count" > "$FAKE_ATTIC_COUNTER"
+                    echo "fake attic push failed for $last" >&2
+                    exit 23
+                  fi
                 fi
               fi
               """)
@@ -269,14 +285,17 @@
                   base_env.update({
                       "PATH": f"{fake_bin}:{base_env['PATH']}",
                       "FAKE_ATTIC_LOG": str(fake_attic_log),
+                      "FAKE_ATTIC_COUNTER": str(fake_attic_counter),
                       "FAKE_NIX_LOG": str(fake_nix_log),
                       "INPUT_ENDPOINT": "https://cache.metacraft-labs.test",
-                      "INPUT_CACHE": "metacraft-public",
+                      "INPUT_CACHE": "metacraft-private-infrastructure",
                       "INPUT_TOKEN": "",
                       "INPUT_FLAKE": ".",
                       "INPUT_ATTRIBUTES": "packages.x86_64-linux.foo, checks.x86_64-linux.bar\ngithub:metacraft/example#prebuilt packages.x86_64-linux.foo",
                       "INPUT_EXTRA_NIX_ARGS": "",
                       "INPUT_EXTRA_ATTIC_PUSH_ARGS": "--jobs 2",
+                      "INPUT_PUSH_ATTEMPTS": "3",
+                      "INPUT_PUSH_RETRY_DELAY_SECONDS": "0",
                       "ATTIC_TOKEN": "test-token",
                   })
 
@@ -292,16 +311,27 @@
                   assert result.returncode == 64, result
                   assert "missing required input(s): token or ATTIC_TOKEN" in result.stderr, result.stderr
 
+                  invalid_attempts_env = base_env.copy()
+                  invalid_attempts_env["INPUT_PUSH_ATTEMPTS"] = "0"
+                  result = subprocess.run(
+                      ["${pkgs.bash}/bin/bash", str(script_paths[0])],
+                      env=invalid_attempts_env,
+                      text=True,
+                      capture_output=True,
+                  )
+                  assert result.returncode == 64, result
+                  assert "push-attempts must be a positive integer" in result.stderr, result.stderr
+
                   subprocess.run(["${pkgs.bash}/bin/bash", str(script_paths[0])], env=base_env, check=True)
                   subprocess.run(["${pkgs.bash}/bin/bash", str(script_paths[1])], env=base_env, check=True)
 
                   attic_log = fake_attic_log.read_text().splitlines()
                   assert attic_log[0] == "login --set-default attic-push-flake-outputs https://cache.metacraft-labs.test test-token", attic_log
                   assert attic_log[1:] == [
-                      "push --jobs 2 metacraft-public /nix/store/bar",
-                      "push --jobs 2 metacraft-public /nix/store/prebuilt",
-                      "push --jobs 2 metacraft-public /nix/store/foo-one",
-                      "push --jobs 2 metacraft-public /nix/store/foo-two",
+                      "push --jobs 2 metacraft-private-infrastructure /nix/store/bar",
+                      "push --jobs 2 metacraft-private-infrastructure /nix/store/prebuilt",
+                      "push --jobs 2 metacraft-private-infrastructure /nix/store/foo-one",
+                      "push --jobs 2 metacraft-private-infrastructure /nix/store/foo-two",
                   ], attic_log
 
                   nix_log = fake_nix_log.read_text()
@@ -313,6 +343,24 @@
                       assert f"--print-out-paths {attr}" in nix_log.replace("\n", " "), nix_log
 
                   fake_attic_log.write_text("")
+                  fake_attic_counter.write_text("")
+                  fake_nix_log.write_text("")
+                  transient_env = base_env.copy()
+                  transient_env["INPUT_ATTRIBUTES"] = "packages.x86_64-linux.foo"
+                  transient_env["FAKE_ATTIC_FAIL_PATH"] = "/nix/store/foo-two"
+                  transient_env["FAKE_ATTIC_FAIL_COUNT"] = "2"
+                  subprocess.run(
+                      ["${pkgs.bash}/bin/bash", str(script_paths[1])],
+                      env=transient_env,
+                      check=True,
+                  )
+                  transient_log = fake_attic_log.read_text().splitlines()
+                  assert transient_log.count(
+                      "push --jobs 2 metacraft-private-infrastructure /nix/store/foo-two"
+                  ) == 3, transient_log
+
+                  fake_attic_log.write_text("")
+                  fake_attic_counter.write_text("")
                   fake_nix_log.write_text("")
                   fail_env = base_env.copy()
                   fail_env["INPUT_ATTRIBUTES"] = "packages.x86_64-linux.foo"
@@ -325,6 +373,11 @@
                   )
                   assert result.returncode == 23, result
                   assert "fake attic push failed for /nix/store/foo-two" in result.stderr, result.stderr
+                  fail_log = fake_attic_log.read_text().splitlines()
+                  assert fail_log.count(
+                      "push --jobs 2 metacraft-private-infrastructure /nix/store/foo-two"
+                  ) == 3, fail_log
+                  assert "after 3 attempts" in result.stdout, result.stdout
               PY
 
               touch "$out"

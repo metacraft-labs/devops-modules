@@ -1,0 +1,380 @@
+diff --git a/database/sql/instances.go b/database/sql/instances.go
+index 06d5b31d..3294c5c6 100644
+--- a/database/sql/instances.go
++++ b/database/sql/instances.go
+@@ -31,6 +31,7 @@ import (
+ 	runnerErrors "github.com/cloudbase/garm-provider-common/errors"
+ 	commonParams "github.com/cloudbase/garm-provider-common/params"
+ 	"github.com/cloudbase/garm/database/common"
++	"github.com/cloudbase/garm/internal/capacity"
+ 	garmErrors "github.com/cloudbase/garm/internal/errors"
+ 	"github.com/cloudbase/garm/params"
+ )
+@@ -47,11 +48,16 @@ func (s *sqlDatabase) CreateInstance(ctx context.Context, poolID string, param p
+ 		if err != nil {
+ 			return fmt.Errorf("error fetching pool: %w", err)
+ 		}
+-		var cnt int64
+-		q := tx.Model(&Instance{}).Where("pool_id = ?", pool.ID).Count(&cnt)
++		// Instances on the deletion lane do not hold a slot, up to
++		// MaxRunners of them (capacity.Occupied). This is the transactional
++		// check behind the pool manager's own, and it must agree with it:
++		// otherwise stuck deletes still starve the pool here.
++		var statuses []commonParams.InstanceStatus
++		q := tx.Model(&Instance{}).Where("pool_id = ?", pool.ID).Pluck("status", &statuses)
+ 		if q.Error != nil {
+ 			return fmt.Errorf("error fetching instance count: %w", q.Error)
+ 		}
++		cnt := int64(capacity.OccupiedStatuses(statuses, pool.MaxRunners))
+ 		var maxRunners int64
+ 		if pool.MaxRunners > math.MaxInt64 {
+ 			maxRunners = math.MaxInt64
+diff --git a/database/sql/instances_test.go b/database/sql/instances_test.go
+index 75d585a5..1349bd7a 100644
+--- a/database/sql/instances_test.go
++++ b/database/sql/instances_test.go
+@@ -388,9 +388,9 @@ func (s *InstancesTestSuite) TestCreateInstanceDBCreateErr() {
+ 		WithArgs(pool.ID, 1).
+ 		WillReturnRows(sqlmock.NewRows([]string{"id", "max_runners"}).AddRow(pool.ID, 4))
+ 	s.Fixtures.SQLMock.
+-		ExpectQuery(regexp.QuoteMeta("SELECT count(*) FROM `instances` WHERE pool_id = ? AND `instances`.`deleted_at` IS NULL")).
++		ExpectQuery(regexp.QuoteMeta("SELECT `status` FROM `instances` WHERE pool_id = ? AND `instances`.`deleted_at` IS NULL")).
+ 		WithArgs(pool.ID).
+-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
++		WillReturnRows(sqlmock.NewRows([]string{"status"}))
+ 	s.Fixtures.SQLMock.
+ 		ExpectExec("INSERT INTO `pools`").
+ 		WillReturnResult(sqlmock.NewResult(1, 1))
+diff --git a/internal/capacity/capacity.go b/internal/capacity/capacity.go
+new file mode 100644
+index 00000000..0cc8e2c8
+--- /dev/null
++++ b/internal/capacity/capacity.go
+@@ -0,0 +1,90 @@
++// Copyright 2026 Cloudbase Solutions SRL
++//
++//	Licensed under the Apache License, Version 2.0 (the "License"); you may
++//	not use this file except in compliance with the License. You may obtain
++//	a copy of the License at
++//
++//	     http://www.apache.org/licenses/LICENSE-2.0
++//
++//	Unless required by applicable law or agreed to in writing, software
++//	distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++//	WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++//	License for the specific language governing permissions and limitations
++//	under the License.
++
++// Package capacity decides which instances occupy a runner slot of a pool or
++// scale set, i.e. which ones count against its MaxRunners.
++package capacity
++
++import (
++	commonParams "github.com/cloudbase/garm-provider-common/params"
++
++	garmErrors "github.com/cloudbase/garm/internal/errors"
++	"github.com/cloudbase/garm/params"
++)
++
++// Occupied returns how many of instances count against maxRunners.
++//
++// An instance on the deletion lane (pending_delete, pending_force_delete,
++// deleting, deleted) has already been removed from the forge. It can never
++// take a job again. It stays in the table only until the provider confirms
++// the teardown. If that teardown keeps failing, counting the row would
++// quietly shrink the pool: a provider whose deletes stall for hours (a busy
++// storage backend, for example) would leave a pool of N runners with none it
++// can use.
++//
++// Such instances therefore do not count, up to maxRunners of them. Deleting
++// instances beyond that DO count. That bounds what a pool can hold on its
++// provider at 2 x maxRunners even when no delete ever succeeds, so a provider
++// whose deletes are permanently broken cannot turn "exclude deleting
++// instances" into unbounded creation.
++func Occupied(instances []params.Instance, maxRunners uint) int {
++	live, deleting := Split(instances)
++	return live + excessDeleting(deleting, maxRunners)
++}
++
++// OccupiedStatuses is Occupied over bare instance statuses, for callers that
++// read only the status column (the database's own MaxRunners check).
++func OccupiedStatuses(statuses []commonParams.InstanceStatus, maxRunners uint) int {
++	live, deleting := 0, 0
++	for _, s := range statuses {
++		if IsBeingDeleted(s) {
++			deleting++
++		} else {
++			live++
++		}
++	}
++	return live + excessDeleting(deleting, maxRunners)
++}
++
++// Live returns how many instances are not on the deletion lane.
++func Live(instances []params.Instance) int {
++	live, _ := Split(instances)
++	return live
++}
++
++// Split returns how many instances are not on the deletion lane (live) and
++// how many are (deleting).
++func Split(instances []params.Instance) (live, deleting int) {
++	for _, inst := range instances {
++		if IsBeingDeleted(inst.Status) {
++			deleting++
++		} else {
++			live++
++		}
++	}
++	return live, deleting
++}
++
++// IsBeingDeleted reports whether an instance status is on the deletion lane.
++func IsBeingDeleted(s commonParams.InstanceStatus) bool {
++	return garmErrors.InstanceIsBeingDeleted(s)
++}
++
++func excessDeleting(deleting int, maxRunners uint) int {
++	allowance := int(min(maxRunners, uint(1<<31-1)))
++	if deleting > allowance {
++		return deleting - allowance
++	}
++	return 0
++}
+diff --git a/internal/capacity/capacity_test.go b/internal/capacity/capacity_test.go
+new file mode 100644
+index 00000000..2699f8cb
+--- /dev/null
++++ b/internal/capacity/capacity_test.go
+@@ -0,0 +1,110 @@
++// Copyright 2026 Cloudbase Solutions SRL
++//
++//	Licensed under the Apache License, Version 2.0 (the "License"); you may
++//	not use this file except in compliance with the License. You may obtain
++//	a copy of the License at
++//
++//	     http://www.apache.org/licenses/LICENSE-2.0
++//
++//	Unless required by applicable law or agreed to in writing, software
++//	distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++//	WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++//	License for the specific language governing permissions and limitations
++//	under the License.
++
++package capacity
++
++import (
++	"testing"
++
++	commonParams "github.com/cloudbase/garm-provider-common/params"
++
++	"github.com/cloudbase/garm/params"
++)
++
++func instances(statuses ...commonParams.InstanceStatus) []params.Instance {
++	out := make([]params.Instance, 0, len(statuses))
++	for _, s := range statuses {
++		out = append(out, params.Instance{Status: s})
++	}
++	return out
++}
++
++func repeat(s commonParams.InstanceStatus, n int) []commonParams.InstanceStatus {
++	out := make([]commonParams.InstanceStatus, n)
++	for i := range out {
++		out[i] = s
++	}
++	return out
++}
++
++func TestOccupied(t *testing.T) {
++	running := commonParams.InstanceRunning
++	creating := commonParams.InstanceCreating
++	pendingCreate := commonParams.InstancePendingCreate
++	errored := commonParams.InstanceError
++	pendingDelete := commonParams.InstancePendingDelete
++	deleting := commonParams.InstanceDeleting
++
++	cases := []struct {
++		name       string
++		statuses   []commonParams.InstanceStatus
++		maxRunners uint
++		want       int
++		wantLive   int
++	}{
++		{"empty", nil, 4, 0, 0},
++		{"live states all count", []commonParams.InstanceStatus{running, creating, pendingCreate, errored}, 4, 4, 4},
++		{
++			// The reported failure: a 4-runner pool whose 4 rows are stuck
++			// deleting must still be able to create runners.
++			"stuck deletes do not fill the pool",
++			[]commonParams.InstanceStatus{pendingDelete, deleting, deleting, commonParams.InstancePendingForceDelete},
++			4, 0, 0,
++		},
++		{"mixed", []commonParams.InstanceStatus{running, running, deleting, pendingDelete}, 4, 2, 2},
++		{
++			// Bound: at most maxRunners deleting rows are exempt, so a
++			// provider that never completes a delete holds <= 2 x maxRunners.
++			"deleting beyond the allowance counts",
++			repeat(deleting, 6),
++			4, 2, 0,
++		},
++		{"zero max exempts nothing", []commonParams.InstanceStatus{deleting, running}, 0, 2, 1},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			inst := instances(tc.statuses...)
++			if got := Occupied(inst, tc.maxRunners); got != tc.want {
++				t.Fatalf("Occupied = %d, want %d", got, tc.want)
++			}
++			if got := OccupiedStatuses(tc.statuses, tc.maxRunners); got != tc.want {
++				t.Fatalf("OccupiedStatuses = %d, want %d", got, tc.want)
++			}
++			if got := Live(inst); got != tc.wantLive {
++				t.Fatalf("Live = %d, want %d", got, tc.wantLive)
++			}
++		})
++	}
++}
++
++// With the bound, a pool can never hold more than 2 x maxRunners instances
++// on its provider, however many deletes fail.
++func TestOccupiedBoundsProviderFootprint(t *testing.T) {
++	const maxRunners = 3
++	var inst []params.Instance
++	for step := 0; step < 100; step++ {
++		if Occupied(inst, maxRunners) < maxRunners {
++			inst = append(inst, params.Instance{Status: commonParams.InstanceRunning})
++			continue
++		}
++		// Every running instance finishes its job and its delete never
++		// completes.
++		for i := range inst {
++			inst[i].Status = commonParams.InstanceDeleting
++		}
++	}
++	if len(inst) > 2*maxRunners {
++		t.Fatalf("provider footprint %d exceeds 2 x maxRunners (%d)", len(inst), 2*maxRunners)
++	}
++}
+diff --git a/runner/pool/pool.go b/runner/pool/pool.go
+index e2988f8d..4068c9f5 100644
+--- a/runner/pool/pool.go
++++ b/runner/pool/pool.go
+@@ -39,6 +39,7 @@ import (
+ 	"github.com/cloudbase/garm/cache"
+ 	dbCommon "github.com/cloudbase/garm/database/common"
+ 	"github.com/cloudbase/garm/database/watcher"
++	"github.com/cloudbase/garm/internal/capacity"
+ 	garmErrors "github.com/cloudbase/garm/internal/errors"
+ 	"github.com/cloudbase/garm/locking"
+ 	"github.com/cloudbase/garm/metrics"
+@@ -1440,12 +1441,15 @@ func (r *basePoolManager) addRunnerToPool(pool params.Pool, aditionalLabels []st
+ 		return fmt.Errorf("pool %s is disabled", pool.ID)
+ 	}
+ 
+-	poolInstanceCount, err := r.store.PoolInstanceCount(r.ctx, pool.ID)
++	// Instances on the deletion lane do not hold a slot (bounded, see
++	// capacity.Occupied): a provider whose deletes stall must not starve the
++	// pool of runners.
++	poolInstances, err := r.store.ListPoolInstances(r.ctx, pool.ID, false)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to list pool instances: %w", err)
+ 	}
+ 
+-	if poolInstanceCount >= int64(pool.MaxRunners) {
++	if uint(capacity.Occupied(poolInstances, pool.MaxRunners)) >= pool.MaxRunners {
+ 		return runnerErrors.NewNoCapacityError("max workers (%d) reached for pool %s", pool.MaxRunners, pool.ID)
+ 	}
+ 
+@@ -1465,7 +1469,8 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
+ 		return fmt.Errorf("failed to ensure minimum idle workers for pool %s: %w", pool.ID, err)
+ 	}
+ 
+-	if uint(len(existingInstances)) >= pool.MaxRunners {
++	occupied := capacity.Occupied(existingInstances, pool.MaxRunners)
++	if uint(occupied) >= pool.MaxRunners {
+ 		slog.DebugContext(
+ 			r.ctx, "max workers reached for pool, skipping idle worker creation",
+ 			"max_runners", pool.MaxRunners,
+@@ -1475,6 +1480,11 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
+ 
+ 	idleOrPendingWorkers := []params.Instance{}
+ 	for _, inst := range existingInstances {
++		// An instance being deleted keeps whatever runner status it had
++		// (often `pending`), but it will never take a job: it is not idle.
++		if capacity.IsBeingDeleted(inst.Status) {
++			continue
++		}
+ 		if inst.RunnerStatus != params.RunnerActive && inst.RunnerStatus != params.RunnerTerminated {
+ 			idleOrPendingWorkers = append(idleOrPendingWorkers, inst)
+ 		}
+@@ -1485,7 +1495,7 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
+ 		// get the needed delta.
+ 		required = pool.MinIdleRunnersAsInt() - len(idleOrPendingWorkers)
+ 
+-		projectedInstanceCount := len(existingInstances) + required
++		projectedInstanceCount := occupied + required
+ 
+ 		var projected uint
+ 		if projectedInstanceCount > 0 {
+diff --git a/workers/scaleset/scaleset.go b/workers/scaleset/scaleset.go
+index 418756c0..602b1aa9 100644
+--- a/workers/scaleset/scaleset.go
++++ b/workers/scaleset/scaleset.go
+@@ -28,6 +28,7 @@ import (
+ 	"github.com/cloudbase/garm/cache"
+ 	dbCommon "github.com/cloudbase/garm/database/common"
+ 	"github.com/cloudbase/garm/database/watcher"
++	"github.com/cloudbase/garm/internal/capacity"
+ 	garmErrors "github.com/cloudbase/garm/internal/errors"
+ 	"github.com/cloudbase/garm/locking"
+ 	"github.com/cloudbase/garm/params"
+@@ -931,7 +932,9 @@ func (w *Worker) waitForToolsOrCancel() (hasTools, stopped bool) {
+ }
+ 
+ func (w *Worker) handleScaleDown() {
+-	delta := w.runnerCount() - w.targetRunners()
++	// Only live runners can be scaled down. Deleting runners beyond the
++	// allowance in runnerCount() must not make this remove idle ones.
++	delta := w.liveRunnerCount() - w.targetRunners()
+ 	if delta <= 0 {
+ 		return
+ 	}
+@@ -1005,7 +1008,7 @@ func (w *Worker) handleScaleDown() {
+ 			removed++
+ 		case commonParams.InstancePendingDelete, commonParams.InstancePendingForceDelete,
+ 			commonParams.InstanceDeleting, commonParams.InstanceDeleted:
+-			removed++
++			// Already excluded from liveRunnerCount(), so not part of delta.
+ 			continue
+ 		default:
+ 			slog.WarnContext(w.ctx, "runner is not in a valid state; skipping", "runner_name", runner.Name, "runner_status", runner.Status)
+@@ -1024,8 +1027,26 @@ func (w *Worker) targetRunners() int {
+ 	return int(targetRunners)
+ }
+ 
++// runnerCount is how many runners hold a slot against MaxRunners. Runners on
++// the deletion lane are already gone from GitHub and cannot take a job, so
++// they do not, up to MaxRunners of them (capacity.Occupied): a provider whose
++// deletes stall for hours must not leave the scale set with no usable runner.
+ func (w *Worker) runnerCount() int {
+-	return len(w.runners)
++	return capacity.Occupied(w.runnerList(), w.scaleSet.MaxRunners)
++}
++
++// liveRunnerCount is how many runners are not on the deletion lane: the ones
++// a scale-down can still act on.
++func (w *Worker) liveRunnerCount() int {
++	return capacity.Live(w.runnerList())
++}
++
++func (w *Worker) runnerList() []params.Instance {
++	out := make([]params.Instance, 0, len(w.runners))
++	for _, r := range w.runners {
++		out = append(out, r)
++	}
++	return out
+ }
+ 
+ func (w *Worker) handleAutoScale() {

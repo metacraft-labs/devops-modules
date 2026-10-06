@@ -62,12 +62,14 @@
             ++ config.pre-commit.settings.enabledPackages
             ++ [ config.pre-commit.settings.package ];
 
+          # The guarded, Reprobuild-aware installer every consumer uses; see
+          # `mcl.gitHooks.installationScript` in checks/pre-commit.nix.
           shellHook = ''
             export REPO_ROOT="$PWD"
-            export PATH="$REPO_ROOT/packages/mcl/build:$PATH"
+            export PATH="$REPO_ROOT/packages/mcl-devops/build:$PATH"
             figlet -t "Metacraft Nixos Modules"
           ''
-          + config.pre-commit.installationScript;
+          + config.mcl.gitHooks.installationScript;
         };
     };
 }

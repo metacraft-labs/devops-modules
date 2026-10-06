@@ -19,10 +19,10 @@ description: Use when central deployment automation is unavailable and an approv
 
 ```sh
 just deploy-machine-direct-ssh "$TARGET" "$SSH_HOST" deploy
-mcl deploy-plan --target "$TARGET" --desired-system-path "$SYSTEM_PATH" \
+mcl-devops deploy-plan --target "$TARGET" --desired-system-path "$SYSTEM_PATH" \
   --git-revision "$GIT_REVISION" --sequence "$SEQUENCE" \
   --signing-key "$MCL_DEPLOY_MANIFEST_SIGNING_KEY" --output "$MANIFEST"
-mcl deploy-ssh "$TARGET" --manifest "$MANIFEST" --ssh-host "$SSH_HOST" \
+mcl-devops deploy-ssh "$TARGET" --manifest "$MANIFEST" --ssh-host "$SSH_HOST" \
   --ssh-user deploy --identity-file "$MCL_DEPLOY_SSH_IDENTITY" \
   --ssh-option BatchMode=yes --ssh-option StrictHostKeyChecking=yes
 bash scripts/deployment-incus-rehearsal.sh break-glass --check-env
@@ -33,8 +33,8 @@ just rollback-machine-direct-ssh "$TARGET" "$SSH_HOST" deploy
 ssh "$SSH_HOST" 'sudo journalctl -u sshd.service -u ssh.service -b --no-pager -n 120'
 ```
 
-Use the wrapper when possible. Use the explicit `mcl deploy-plan` and
-`mcl deploy-ssh` sequence when the wrapper cannot express the recovery
+Use the wrapper when possible. Use the explicit `mcl-devops deploy-plan` and
+`mcl-devops deploy-ssh` sequence when the wrapper cannot express the recovery
 condition.
 
 ## Workflow
@@ -54,7 +54,7 @@ The deploy SSH key is not a shell. The target module installs an authorized key
 with a forced command and restrictions:
 `restrict,no-agent-forwarding,no-X11-forwarding,no-port-forwarding,no-pty`.
 The forced command runs `sudo -n` for the root apply wrapper only. The wrapper
-executes `mcl deploy-apply --manifest - --allowed-signers ... --target ...`
+executes `mcl-devops deploy-apply --manifest - --allowed-signers ... --target ...`
 and includes `--reject-ssh-original-command`, so arbitrary
 `SSH_ORIGINAL_COMMAND` content is rejected. The manifest signature and target
 match are verified before restore, switch, health check, or rollback.

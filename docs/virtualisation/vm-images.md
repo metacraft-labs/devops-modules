@@ -19,7 +19,7 @@ Unlike the [Desktop VMs](./desktop-vms.md) NixOS module (for running VMs locally
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nixos-modules.url = "github:metacraft-labs/nixos-modules";
+    nixos-modules.url = "github:metacraft-labs/devops-modules";
 
     # Required for macOS VM building
     osx-kvm = { url = "github:kholia/OSX-KVM"; flake = false; };
@@ -300,7 +300,9 @@ jobs:
   build-vm:
     runs-on: ubuntu-latest
     steps:
-      - uses: cachix/install-nix-action@v24
+      - uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          determinate: false
 
       - name: Build VM image
         run: |
@@ -321,8 +323,8 @@ VM images are large but reproducible. Use binary caches:
 # In flake.nix
 {
   nixConfig = {
-    extra-substituters = [ "https://your-cache.cachix.org" ];
-    extra-trusted-public-keys = [ "your-cache.cachix.org-1:..." ];
+    extra-substituters = [ "https://cache.metacraft-labs.com/your-cache" ];
+    extra-trusted-public-keys = [ "your-cache:..." ];
   };
 }
 ```

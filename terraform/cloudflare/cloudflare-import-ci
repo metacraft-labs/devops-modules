@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: cloudflare-import-ci plan|apply
+
+Runs a Cloudflare import-block plan/apply in CI. Company-agnostic: the root
+config comes from $ROOT_CONFIG (e.g. cloudflare/<name>-prod). The apply mode is
+only for the protected workflow_dispatch path and refuses any non-import action.
+
+Mirrors github-governance-import-ci: it renders the Terranix root, regenerates
+credential-free import blocks into .result/ (never committed), plans with
+-detailed-exitcode, counts import/add/change/destroy/replace, and refuses any
+plan that is not import-only.
+
+Environment:
+  ROOT_CONFIG           Root under terraform/, e.g. cloudflare/<name>-prod
+  BACKEND_CONFIG_FILE   Repo-relative backend hcl (S3 state key only)
+  CREDENTIALS_ENV_NAME  Provider token env var (e.g. CLOUDFLARE_API_TOKEN)
+  CLOUDFLARE_TOKEN_PATH File containing the decrypted provider token
+  IMPORT_SCOPE          all|dns|pages|r2|workers|zones (default all)
+  APPLY_CONFIRM         apply-reviewed-imports (required in apply mode)
+  GITHUB_OUTPUT         GitHub Actions output file
+USAGE
+}
+
+require_env() {
+  local name="$1"
+  if [ -z "${!name:-}" ]; then
+    echo "::error::${name} is required." >&2
+    exit 1
+  fi
+}
+
+mode="${1:-}"
+case "$mode" in
+  plan | apply) ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+workspace="${GITHUB_WORKSPACE:-$root}"
+
+require_env ROOT_CONFIG
+require_env BACKEND_CONFIG_FILE
+require_env CREDENTIALS_ENV_NAME
+require_env CLOUDFLARE_TOKEN_PATH
+require_env GITHUB_OUTPUT
+
+if [ "$mode" = "apply" ] && [ "${APPLY_CONFIRM:-}" != "apply-reviewed-imports" ]; then
+  echo "::error::Set confirm_apply to apply-reviewed-imports before running import apply mode." >&2
+  exit 1
+fi
+
+cd "$workspace"
+
+src_root="$workspace/terraform/$ROOT_CONFIG"
+result_root="$workspace/.result/terraform/$ROOT_CONFIG"
+scope="${IMPORT_SCOPE:-all}"
+mkdir -p "$result_root"
+
+# Render the Terranix root into .result and generate the credential-free import
+# blocks alongside it. Both live under .result/ and are never committed.
+nix develop --accept-flake-config --command just build-terranix "$ROOT_CONFIG" >/dev/null
+nix shell --accept-flake-config --inputs-from "$workspace" nixpkgs#python3 --command \
+  python3 "$root/terraform/cloudflare/cloudflare-import-blocks" \
+  --config "$ROOT_CONFIG" --root-dir "$workspace" \
+  --scope "$scope" --output "$result_root/imports.tf"
+
+cp "$src_root"/*.tftest.hcl "$result_root"/ 2>/dev/null || true
+cp "$src_root/.terraform.lock.hcl" "$result_root"/
+
+cd "$result_root"
+backend_path="$workspace/$BACKEND_CONFIG_FILE"
+tofu_bin="$(nix develop --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
+provider_token="$(cat "$CLOUDFLARE_TOKEN_PATH")"
+
+run_tofu() {
+  env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "${CREDENTIALS_ENV_NAME}=${provider_token}" "$tofu_bin" "$@"
+}
+
+run_tofu init -input=false -reconfigure \
+  -backend-config="$(realpath --relative-to="$PWD" "$backend_path")"
+
+plan_dir="$workspace/.result/cloudflare-import-${mode}"
+mkdir -p "$plan_dir"
+plan_bin="$plan_dir/cloudflare-import.tfplan"
+plan_text="$plan_dir/plan.txt"
+plan_stderr="$plan_dir/plan.stderr"
+plan_json="$plan_dir/plan.json"
+counts_file="$plan_dir/counts.env"
+plan_diffs="$plan_dir/diffs.md"
+
+plan_args=(
+  -input=false
+  -no-color
+  -detailed-exitcode
+  -out="$plan_bin"
+)
+if [ "$mode" = "plan" ]; then
+  plan_args+=(-lock=false)
+fi
+
+set +e
+run_tofu plan "${plan_args[@]}" >"$plan_text" 2>"$plan_stderr"
+plan_exit=$?
+set -e
+
+cat "$plan_text"
+cat "$plan_stderr" >&2
+
+if [ "$plan_exit" -eq 1 ]; then
+  exit 1
+fi
+
+if [ "$plan_exit" -eq 0 ]; then
+  echo "changes=false" >> "$GITHUB_OUTPUT"
+elif [ "$plan_exit" -eq 2 ]; then
+  echo "changes=true" >> "$GITHUB_OUTPUT"
+else
+  echo "::error::Unexpected tofu plan exit code: $plan_exit" >&2
+  exit "$plan_exit"
+fi
+
+run_tofu show -json "$plan_bin" >"$plan_json"
+echo "binary_plan_path=$(realpath --relative-to="$workspace" "$plan_bin")" >> "$GITHUB_OUTPUT"
+echo "text_plan_path=$(realpath --relative-to="$workspace" "$plan_text")" >> "$GITHUB_OUTPUT"
+echo "json_plan_path=$(realpath --relative-to="$workspace" "$plan_json")" >> "$GITHUB_OUTPUT"
+
+nix shell --accept-flake-config --inputs-from "$workspace" nixpkgs#python3 --command \
+  python3 - "$plan_json" "$GITHUB_OUTPUT" "$counts_file" "$plan_diffs" <<'PY'
+import json
+import sys
+
+plan_path, output_path, counts_path, diffs_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+counts = {
+    "to_import": 0,
+    "to_add": 0,
+    "to_change": 0,
+    "to_destroy": 0,
+    "to_replace": 0,
+}
+
+with open(plan_path, encoding="utf-8") as handle:
+    plan = json.load(handle)
+
+for change in plan.get("resource_changes", []):
+    actions = change.get("change", {}).get("actions", [])
+    importing = change.get("change", {}).get("importing") or change.get("importing")
+    if importing:
+        counts["to_import"] += 1
+    if actions == ["no-op"]:
+        continue
+    if set(actions) >= {"create", "delete"}:
+        counts["to_replace"] += 1
+    elif "create" in actions:
+        counts["to_add"] += 1
+    elif "update" in actions:
+        counts["to_change"] += 1
+    elif "delete" in actions:
+        counts["to_destroy"] += 1
+
+with open(output_path, "a", encoding="utf-8") as output:
+    for key, value in counts.items():
+        print(f"{key}={value}", file=output)
+
+with open(counts_path, "w", encoding="utf-8") as counts_file:
+    for key, value in counts.items():
+        print(f"{key}={value}", file=counts_file)
+
+
+def _trunc(text, limit=80):
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _fmt(value):
+    if value is None:
+        return "`null`"
+    rendered = value if isinstance(value, str) else json.dumps(value)
+    return "`" + _trunc(rendered) + "`"
+
+
+items = []
+for change in plan.get("resource_changes", []):
+    inner = change.get("change", {})
+    actions = inner.get("actions", [])
+    if actions == ["no-op"]:
+        continue
+    if set(actions) >= {"create", "delete"}:
+        kind = "replace"
+    elif actions == ["delete"]:
+        kind = "delete"
+    elif actions == ["create"]:
+        kind = "create"
+    elif "update" in actions:
+        kind = "update"
+    else:
+        continue
+    before = inner.get("before") or {}
+    after = inner.get("after") or {}
+    attrs = []
+    if kind in ("update", "replace"):
+        for key in sorted(set(before) | set(after)):
+            if before.get(key) != after.get(key):
+                attrs.append((key, before.get(key), after.get(key)))
+    items.append((kind, change.get("address", ""), attrs))
+
+lines = []
+if not items:
+    lines.append("_No differences — this plan is import-only (safe to apply)._")
+else:
+    lines.append(f"**{len(items)} action(s) need review** — imports omitted:")
+    for key, label in (("delete", "Destroy"), ("replace", "Replace"), ("update", "Update"), ("create", "Create")):
+        group = [entry for entry in items if entry[0] == key]
+        if not group:
+            continue
+        lines.append(f"\n#### {label} ({len(group)})")
+        for _kind, address, attrs in group:
+            lines.append(f"- `{address}`")
+            for attr, before_value, after_value in attrs:
+                lines.append(f"  - `{attr}`: {_fmt(before_value)} → {_fmt(after_value)}")
+
+with open(diffs_path, "w", encoding="utf-8") as diffs_file:
+    diffs_file.write("\n".join(lines) + "\n")
+PY
+
+echo "diffs_path=$(realpath --relative-to="$workspace" "$plan_diffs")" >> "$GITHUB_OUTPUT"
+
+# shellcheck disable=SC1090
+source "$counts_file"
+
+if [ "$mode" = "apply" ]; then
+  if [ "${to_import:-0}" -le 0 ]; then
+    echo "::error::Import apply mode requires at least one import action." >&2
+    exit 1
+  fi
+
+  for key in to_add to_change to_destroy to_replace; do
+    value="${!key:-0}"
+    if [ "$value" -ne 0 ]; then
+      echo "::error::Import apply mode only permits import actions; ${key}=${value}." >&2
+      exit 1
+    fi
+  done
+
+  run_tofu apply -input=false -no-color "$plan_bin"
+  echo "Applied reviewed Cloudflare import plan with ${to_import} import(s)."
+fi

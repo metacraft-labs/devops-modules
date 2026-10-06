@@ -1,0 +1,733 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  scripts/cloudflare-inventory [options]
+
+Options:
+  --login              Run Wrangler browser login before reading its token.
+  --no-wrangler        Do not fall back to Wrangler auth.
+  --all-zones          Inventory every accessible zone instead of only the
+    zones named by --zone / CF_ZONES.
+  --account-id ID      Inventory account-scoped resources for this account.
+    May be passed more than once.
+  --zone NAME          Inventory this zone (required; or set CF_ZONES,
+    space-separated). May be passed more than once.
+  --output-dir DIR     Write the inventory dump to DIR.
+  -h, --help           Show this help text.
+
+Environment:
+  CLOUDFLARE_API_TOKEN              Preferred auth source for API tokens.
+  CF_WRANGLER_SCOPES   Optional scopes passed to wrangler login.
+  CF_WRANGLER_CMD         Wrangler command. Defaults to wrangler.
+  CF_ACCOUNT_ID        Optional account ID when --account-id is not used.
+
+The script is read-only. It calls Cloudflare API GET endpoints, writes raw JSON
+and a markdown import inventory under .result by default, and never writes or
+prints credentials.
+USAGE
+}
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Missing required command: ${cmd}" >&2
+    exit 1
+  fi
+}
+
+safe_name() {
+  local value="$1"
+  value="${value//\//_}"
+  value="${value//:/_}"
+  value="${value//@/_}"
+  printf '%s' "$value" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+urlencode() {
+  jq -rn --arg value "$1" '$value | @uri'
+}
+
+join_by() {
+  local sep="$1"
+  shift
+  local first=1 item
+  for item in "$@"; do
+    if ((first)); then
+      first=0
+    else
+      printf '%s' "$sep"
+    fi
+    printf '%s' "$item"
+  done
+}
+
+json_array_from_args() {
+  if (($# == 0)); then
+    printf '[]'
+  else
+    printf '%s\n' "$@" | jq -R -s 'split("\n")[:-1]'
+  fi
+}
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+run_id="$(date -u +%Y%m%dT%H%M%SZ)"
+api_base="${CLOUDFLARE_API_BASE:-https://api.cloudflare.com/client/v4}"
+output_dir="${root}/.result/cloudflare-inventory/${run_id}"
+login_first=0
+use_wrangler=1
+all_zones=0
+zones=()
+account_ids=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --login)
+      login_first=1
+      shift
+      ;;
+    --no-wrangler)
+      use_wrangler=0
+      shift
+      ;;
+    --all-zones)
+      all_zones=1
+      shift
+      ;;
+    --account-id)
+      if [[ $# -lt 2 ]]; then
+        echo "--account-id requires a value." >&2
+        exit 2
+      fi
+      account_ids+=("$2")
+      shift 2
+      ;;
+    --zone)
+      if [[ $# -lt 2 ]]; then
+        echo "--zone requires a value." >&2
+        exit 2
+      fi
+      zones+=("$2")
+      shift 2
+      ;;
+    --output-dir)
+      if [[ $# -lt 2 ]]; then
+        echo "--output-dir requires a value." >&2
+        exit 2
+      fi
+      output_dir="$2"
+      shift 2
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if ((all_zones)) && ((${#zones[@]} > 0)); then
+  echo "--all-zones cannot be combined with --zone." >&2
+  exit 2
+fi
+
+if ((! all_zones)) && ((${#zones[@]} == 0)); then
+  read -r -a zones <<<"${CF_ZONES:-}"
+fi
+
+if ((! all_zones)) && ((${#zones[@]} == 0)); then
+  echo "No zones given: pass --zone NAME (repeatable), set CF_ZONES, or use --all-zones." >&2
+  exit 2
+fi
+
+if ((${#account_ids[@]} == 0)) && [[ -n "${CF_ACCOUNT_ID:-}" ]]; then
+  account_ids+=("${CF_ACCOUNT_ID}")
+fi
+
+require_cmd curl
+require_cmd jq
+
+raw_dir="${output_dir}/raw"
+warning_file="${output_dir}/warnings.log"
+mkdir -p "$raw_dir"
+: > "$warning_file"
+
+warn() {
+  local message="$1"
+  printf 'WARNING: %s\n' "$message" >&2
+  printf '%s\n' "$message" >> "$warning_file"
+}
+
+wrangler_cmd=()
+read -r -a wrangler_cmd <<<"${CF_WRANGLER_CMD:-wrangler}"
+
+run_wrangler() {
+  "${wrangler_cmd[@]}" "$@"
+}
+
+wrangler_login() {
+  local scopes="${CF_WRANGLER_SCOPES:-}"
+  if [[ -n "$scopes" ]]; then
+    run_wrangler login --scopes "$scopes"
+  else
+    run_wrangler login
+  fi
+}
+
+declare -a auth_headers=()
+auth_source=""
+
+load_wrangler_auth() {
+  local auth_json auth_type token key email
+
+  if ! command -v "${wrangler_cmd[0]}" >/dev/null 2>&1; then
+    cat >&2 <<EOF
+No CLOUDFLARE_API_TOKEN is set and Wrangler was not found.
+
+Install Wrangler or set CF_WRANGLER_CMD, then run:
+
+  scripts/cloudflare-inventory --login
+
+EOF
+    exit 1
+  fi
+
+  if ((login_first)); then
+    wrangler_login
+  fi
+
+  if ! auth_json="$(run_wrangler auth token --json 2>/dev/null)"; then
+    if [[ -t 0 && -t 1 ]]; then
+      printf 'No Wrangler Cloudflare auth token is available. Start browser login now? [y/N] ' >&2
+      local answer
+      read -r answer
+      case "$answer" in
+        y | Y | yes | YES)
+          wrangler_login
+          auth_json="$(run_wrangler auth token --json)"
+          ;;
+        *)
+          echo "Cloudflare authentication is required." >&2
+          exit 1
+          ;;
+      esac
+    else
+      echo "Cloudflare authentication is required. Run with --login or set CLOUDFLARE_API_TOKEN." >&2
+      exit 1
+    fi
+  fi
+
+  auth_type="$(jq -r '.type // empty' <<<"$auth_json")"
+  case "$auth_type" in
+    api_token | oauth)
+      token="$(jq -r '.token // empty' <<<"$auth_json")"
+      if [[ -z "$token" || "$token" == "null" ]]; then
+        echo "Wrangler returned ${auth_type} auth without a token." >&2
+        exit 1
+      fi
+      auth_headers=(-H "Authorization: Bearer ${token}")
+      auth_source="wrangler:${auth_type}"
+      ;;
+    api_key)
+      key="$(jq -r '.key // empty' <<<"$auth_json")"
+      email="$(jq -r '.email // empty' <<<"$auth_json")"
+      if [[ -z "$key" || -z "$email" || "$key" == "null" || "$email" == "null" ]]; then
+        echo "Wrangler returned API key auth without key/email." >&2
+        exit 1
+      fi
+      auth_headers=(-H "X-Auth-Email: ${email}" -H "X-Auth-Key: ${key}")
+      auth_source="wrangler:api_key"
+      ;;
+    *)
+      echo "Unsupported Wrangler auth token type: ${auth_type:-<empty>}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+if [[ -n "${CLOUDFLARE_API_TOKEN:-}" ]]; then
+  auth_headers=(-H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}")
+  auth_source="env:CLOUDFLARE_API_TOKEN"
+elif ((use_wrangler)); then
+  load_wrangler_auth
+else
+  echo "CLOUDFLARE_API_TOKEN is required when --no-wrangler is used." >&2
+  exit 1
+fi
+
+cf_request() {
+  local path="$1"
+  local output="$2"
+  local tmp err status message url
+
+  tmp="$(mktemp)"
+  err="$(mktemp)"
+  url="${api_base}${path}"
+
+  set +e
+  status="$(curl -sS -o "$tmp" -w '%{http_code}' "${auth_headers[@]}" "$url" 2>"$err")"
+  local curl_status=$?
+  set -e
+
+  if ((curl_status != 0)); then
+    message="$(sed '/^[[:space:]]*$/d' "$err" | head -n 1)"
+    warn "GET ${path} failed: ${message:-curl exited ${curl_status}}"
+    jq -n \
+      --arg path "$path" \
+      --arg message "${message:-curl exited ${curl_status}}" \
+      '{success: false, errors: [{message: $message}], messages: [], result: null, request: {path: $path}}' \
+      > "$output"
+    rm -f "$tmp" "$err"
+    return 1
+  fi
+
+  if [[ ! "$status" =~ ^2 ]]; then
+    message="$(jq -r '[.errors[]?.message] | join("; ")' "$tmp" 2>/dev/null || true)"
+    warn "GET ${path} returned HTTP ${status}${message:+: ${message}}"
+    jq -n \
+      --arg path "$path" \
+      --arg status "$status" \
+      --arg message "${message:-HTTP ${status}}" \
+      '{success: false, errors: [{message: $message}], messages: [], result: null, request: {path: $path, http_status: $status}}' \
+      > "$output"
+    rm -f "$tmp" "$err"
+    return 1
+  fi
+
+  if ! jq . "$tmp" > "$output"; then
+    warn "GET ${path} returned invalid JSON"
+    rm -f "$tmp" "$err"
+    return 1
+  fi
+
+  if jq -e 'has("success") and (.success == false)' "$output" >/dev/null; then
+    message="$(jq -r '[.errors[]?.message] | join("; ")' "$output" 2>/dev/null || true)"
+    warn "GET ${path} returned success=false${message:+: ${message}}"
+    rm -f "$tmp" "$err"
+    return 1
+  fi
+
+  rm -f "$tmp" "$err"
+}
+
+append_page_query() {
+  local path="$1" page="$2" per_page="$3"
+  if [[ "$path" == *\?* ]]; then
+    printf '%s&page=%s&per_page=%s' "$path" "$page" "$per_page"
+  else
+    printf '%s?page=%s&per_page=%s' "$path" "$page" "$per_page"
+  fi
+}
+
+cf_collect_array() {
+  local path="$1"
+  local output="$2"
+  local page=1 per_page=50 total_pages=1 page_path page_file next_file
+
+  jq -n '{success: true, errors: [], messages: [], result: [], result_info: {}}' > "$output"
+
+  while :; do
+    page_file="$(mktemp)"
+    next_file="$(mktemp)"
+    page_path="$(append_page_query "$path" "$page" "$per_page")"
+
+    if ! cf_request "$page_path" "$page_file"; then
+      cp "$page_file" "$output"
+      rm -f "$page_file" "$next_file"
+      return 1
+    fi
+
+    jq -s '
+      .[0] as $acc
+      | .[1] as $page
+      | $acc + {
+          result: (
+            ($acc.result // [])
+            + (if ($page.result | type) == "array" then $page.result else [] end)
+          ),
+          result_info: ($page.result_info // {})
+        }
+    ' "$output" "$page_file" > "$next_file"
+    mv "$next_file" "$output"
+
+    total_pages="$(jq -r '.result_info.total_pages // 1' "$page_file")"
+    rm -f "$page_file"
+
+    if ! [[ "$total_pages" =~ ^[0-9]+$ ]] || ((page >= total_pages)); then
+      break
+    fi
+    page=$((page + 1))
+  done
+}
+
+record_metadata() {
+  jq -n \
+    --arg generated_at "$run_id" \
+    --arg auth_source "$auth_source" \
+    --arg all_zones "$all_zones" \
+    --argjson zones "$(json_array_from_args "${zones[@]}")" \
+    --argjson account_ids "$(json_array_from_args "${account_ids[@]}")" \
+    '{
+      generated_at_utc: $generated_at,
+      auth_source: $auth_source,
+      all_zones: ($all_zones == "1"),
+      requested_zones: $zones,
+      requested_account_ids: $account_ids
+    }' > "${output_dir}/metadata.json"
+}
+
+dedupe_account_ids() {
+  local seen_file="$1"
+  shift
+  printf '%s\n' "$@" \
+    | sed '/^[[:space:]]*$/d' \
+    | sort -u \
+    > "$seen_file"
+}
+
+inventory_rows_from_file() {
+  local file="$1"
+  shift
+  if [[ -s "$file" ]]; then
+    jq -r "$@" "$file"
+  fi
+}
+
+write_inventory_markdown() {
+  local inventory="${output_dir}/inventory.md"
+  local zones_file="${raw_dir}/zones.json"
+  local accounts_file="${raw_dir}/accounts.json"
+  local file account_id zone_id zone_name project_name bucket_name safe project_file
+  local requested_zones
+
+  if ((all_zones)); then
+    requested_zones="all accessible zones"
+  else
+    requested_zones="$(join_by ', ' "${zones[@]}")"
+  fi
+
+  {
+    echo "# Cloudflare Inventory"
+    echo
+    echo "- Generated UTC: ${run_id}"
+    echo "- Auth source: ${auth_source}"
+    echo "- Requested zones: ${requested_zones}"
+    echo "- Raw JSON directory: raw/"
+    echo
+    echo "## Import Inventory"
+    echo
+    echo "| resource_type | logical_name | provider_resource_id | in_scope | managed_by | expected_milestone | notes |"
+    echo "| --- | --- | --- | --- | --- | --- | --- |"
+  } > "$inventory"
+
+  inventory_rows_from_file "$accounts_file" '
+    .result[]?
+    | "| cloudflare_account | \(.name // .id) | \(.id) | discovery | existing | M5 | type=\(.type // "unknown") |"
+  ' >> "$inventory"
+
+  inventory_rows_from_file "$zones_file" '
+    .result[]?
+    | "| cloudflare_zone | \(.name) | \(.id) | yes | existing | M5 | account=\(.account.id // "unknown") status=\(.status // "unknown") |"
+  ' >> "$inventory"
+
+  if [[ -s "$zones_file" ]]; then
+    while IFS=$'\t' read -r zone_id zone_name; do
+      safe="$(safe_name "$zone_name")"
+      file="${raw_dir}/dns-records-${safe}.json"
+      inventory_rows_from_file "$file" \
+        --arg zone_id "$zone_id" --arg zone_name "$zone_name" '
+          .result[]?
+          | "| cloudflare_dns_record | \($zone_name):\(.type):\(.name) | \($zone_id)/\(.id) | review | existing | M5 | proxied=\(.proxied // false) ttl=\(.ttl // "auto") |"
+        ' >> "$inventory"
+
+      file="${raw_dir}/workers-routes-${safe}.json"
+      inventory_rows_from_file "$file" \
+        --arg zone_id "$zone_id" --arg zone_name "$zone_name" '
+          .result[]?
+          | "| cloudflare_workers_route | \($zone_name):\(.pattern) | \($zone_id)/\(.id) | review | existing | M6 | script=\(.script // "none") |"
+        ' >> "$inventory"
+
+      file="${raw_dir}/rulesets-zone-${safe}.json"
+      inventory_rows_from_file "$file" \
+        --arg zone_id "$zone_id" --arg zone_name "$zone_name" '
+          .result[]?
+          | "| cloudflare_ruleset | \($zone_name):\(.phase // .name // .id) | \($zone_id)/\(.id) | review | existing | M6 | kind=\(.kind // "unknown") |"
+        ' >> "$inventory"
+    done < <(jq -r '.result[]? | [.id, .name] | @tsv' "$zones_file")
+  fi
+
+  for file in "${raw_dir}"/pages-projects-*.json; do
+    [[ -e "$file" ]] || continue
+    account_id="${file##*/pages-projects-}"
+    account_id="${account_id%.json}"
+    inventory_rows_from_file "$file" \
+      --arg account_id "$account_id" '
+        .result[]?
+        | "| cloudflare_pages_project | \(.name) | \($account_id)/\(.name) | review | existing | M5 | subdomain=\(.subdomain // "unknown") |"
+      ' >> "$inventory"
+
+    while IFS= read -r project_name; do
+      safe="$(safe_name "$project_name")"
+      project_file="${raw_dir}/pages-domains-${account_id}-${safe}.json"
+      inventory_rows_from_file "$project_file" \
+        --arg account_id "$account_id" --arg project_name "$project_name" '
+          .result[]?
+          | "| cloudflare_pages_domain | \($project_name):\(.name) | \($account_id)/\($project_name)/\(.name) | review | existing | M5 | status=\(.status // "unknown") |"
+        ' >> "$inventory"
+    done < <(jq -r '.result[]?.name // empty' "$file")
+  done
+
+  for file in "${raw_dir}"/r2-buckets-*.json; do
+    [[ -e "$file" ]] || continue
+    account_id="${file##*/r2-buckets-}"
+    account_id="${account_id%.json}"
+    inventory_rows_from_file "$file" \
+      --arg account_id "$account_id" '
+        (
+          if (.result | type) == "array" then .result
+          elif (.result.buckets? | type) == "array" then .result.buckets
+          else []
+          end
+        )[]?
+        | "| cloudflare_r2_bucket | \(.name) | \($account_id)/\(.name) | review | existing | M5 | jurisdiction=\(.jurisdiction // "default") storage_class=\(.storage_class // "unknown") |"
+      ' >> "$inventory"
+
+    while IFS= read -r bucket_name; do
+      safe="$(safe_name "$bucket_name")"
+      project_file="${raw_dir}/r2-bucket-custom-domains-${account_id}-${safe}.json"
+      inventory_rows_from_file "$project_file" \
+        --arg account_id "$account_id" --arg bucket_name "$bucket_name" '
+          (
+            if (.result | type) == "array" then .result
+            elif (.result.domains? | type) == "array" then .result.domains
+            elif (.result.domain? // null) != null then [.result]
+            else []
+            end
+          )[]?
+          | "| cloudflare_r2_custom_domain | \($bucket_name):\(.domain // .name) | \($account_id)/\($bucket_name)/\(.domain // .name) | review | existing | M5 | status=\(.status // "unknown") enabled=\(if .enabled == null then "unknown" else (.enabled | tostring) end) |"
+        ' >> "$inventory"
+
+      project_file="${raw_dir}/r2-bucket-managed-domain-${account_id}-${safe}.json"
+      inventory_rows_from_file "$project_file" \
+        --arg account_id "$account_id" --arg bucket_name "$bucket_name" '
+          (
+            if (.result | type) == "array" then .result
+            elif (.result.domain? // null) != null then [.result]
+            else []
+            end
+          )[]?
+          | "| cloudflare_r2_managed_domain | \($bucket_name):\(.domain // .name) | \($account_id)/\($bucket_name)/\(.domain // .name) | review | existing | M5 | enabled=\(if .enabled == null then "unknown" else (.enabled | tostring) end) |"
+        ' >> "$inventory"
+    done < <(jq -r '
+      (
+        if (.result | type) == "array" then .result
+        elif (.result.buckets? | type) == "array" then .result.buckets
+        else []
+        end
+      )[]?.name // empty
+    ' "$file")
+  done
+
+  for file in "${raw_dir}"/rulesets-account-*.json; do
+    [[ -e "$file" ]] || continue
+    account_id="${file##*/rulesets-account-}"
+    account_id="${account_id%.json}"
+    inventory_rows_from_file "$file" \
+      --arg account_id "$account_id" '
+        .result[]?
+        | "| cloudflare_ruleset | account:\(.phase // .name // .id) | \($account_id)/\(.id) | review | existing | M6 | kind=\(.kind // "unknown") |"
+      ' >> "$inventory"
+  done
+
+  for file in "${raw_dir}"/workers-scripts-*.json; do
+    [[ -e "$file" ]] || continue
+    account_id="${file##*/workers-scripts-}"
+    account_id="${account_id%.json}"
+    inventory_rows_from_file "$file" \
+      --arg account_id "$account_id" '
+        .result[]?
+        | (.id // .script_name // .name // empty) as $name
+        | select($name != "")
+        | "| cloudflare_worker_script | \($name) | \($account_id)/\($name) | review | existing | M6 | created_on=\(.created_on // "unknown") modified_on=\(.modified_on // "unknown") |"
+      ' >> "$inventory"
+  done
+
+  for file in "${raw_dir}"/kv-namespaces-*.json; do
+    [[ -e "$file" ]] || continue
+    account_id="${file##*/kv-namespaces-}"
+    account_id="${account_id%.json}"
+    inventory_rows_from_file "$file" \
+      --arg account_id "$account_id" '
+        .result[]?
+        | "| cloudflare_workers_kv_namespace | \(.title // .id) | \($account_id)/\(.id) | review | existing | M6 | supports_url_encoding=\(.supports_url_encoding // "unknown") |"
+      ' >> "$inventory"
+  done
+
+  for file in "${raw_dir}"/d1-databases-*.json; do
+    [[ -e "$file" ]] || continue
+    account_id="${file##*/d1-databases-}"
+    account_id="${account_id%.json}"
+    inventory_rows_from_file "$file" \
+      --arg account_id "$account_id" '
+        .result[]?
+        | (.uuid // .id // empty) as $id
+        | select($id != "")
+        | "| cloudflare_d1_database | \(.name // $id) | \($account_id)/\($id) | review | existing | M6 | created_at=\(.created_at // "unknown") |"
+      ' >> "$inventory"
+  done
+
+  for file in "${raw_dir}"/queues-*.json; do
+    [[ -e "$file" ]] || continue
+    account_id="${file##*/queues-}"
+    account_id="${account_id%.json}"
+    inventory_rows_from_file "$file" \
+      --arg account_id "$account_id" '
+        .result[]?
+        | (.queue_id // .id // .name // empty) as $id
+        | select($id != "")
+        | "| cloudflare_queue | \(.queue_name // .name // $id) | \($account_id)/\($id) | review | existing | M6 | created_on=\(.created_on // "unknown") |"
+      ' >> "$inventory"
+  done
+
+  {
+    echo
+    echo "## Warnings"
+    echo
+    if [[ -s "$warning_file" ]]; then
+      sed 's/^/- /' "$warning_file"
+    else
+      echo "- None"
+    fi
+  } >> "$inventory"
+}
+
+record_metadata
+
+echo "Writing Cloudflare inventory to ${output_dir}" >&2
+
+if ((${#account_ids[@]} == 0)); then
+  cf_collect_array "/accounts" "${raw_dir}/accounts.json" || true
+else
+  jq -n --argjson ids "$(json_array_from_args "${account_ids[@]}")" \
+    '{success: true, errors: [], messages: [], result: ($ids | map({id: .})), result_info: {}}' \
+    > "${raw_dir}/accounts.json"
+fi
+
+if ((all_zones)); then
+  cf_collect_array "/zones" "${raw_dir}/zones.json" || true
+else
+  zone_files=()
+  for zone in "${zones[@]}"; do
+    zone_file="${raw_dir}/zones-$(safe_name "$zone").json"
+    if cf_collect_array "/zones?name=$(urlencode "$zone")" "$zone_file"; then
+      zone_files+=("$zone_file")
+    fi
+  done
+
+  if ((${#zone_files[@]} > 0)); then
+    jq -s '{
+      success: true,
+      errors: [],
+      messages: [],
+      result: ([.[].result[]?] | unique_by(.id)),
+      result_info: {}
+    }' "${zone_files[@]}" > "${raw_dir}/zones.json"
+  else
+    jq -n '{success: true, errors: [], messages: [], result: [], result_info: {}}' > "${raw_dir}/zones.json"
+  fi
+fi
+
+if [[ -s "${raw_dir}/zones.json" ]]; then
+  mapfile -t zone_account_ids < <(jq -r '.result[]?.account.id // empty' "${raw_dir}/zones.json" | sort -u)
+else
+  zone_account_ids=()
+fi
+
+if [[ -s "${raw_dir}/accounts.json" ]]; then
+  mapfile -t listed_account_ids < <(jq -r '.result[]?.id // empty' "${raw_dir}/accounts.json" | sort -u)
+else
+  listed_account_ids=()
+fi
+
+account_id_file="${output_dir}/account-ids.txt"
+dedupe_account_ids "$account_id_file" "${account_ids[@]}" "${zone_account_ids[@]}" "${listed_account_ids[@]}"
+mapfile -t effective_account_ids < "$account_id_file"
+
+if [[ -s "${raw_dir}/zones.json" ]]; then
+  while IFS=$'\t' read -r zone_id zone_name; do
+    safe="$(safe_name "$zone_name")"
+    if [[ "$auth_source" == "wrangler:oauth" ]]; then
+      warn "Skipping DNS records for ${zone_name}: Wrangler OAuth scopes do not include DNS Records Read. Rerun with CLOUDFLARE_API_TOKEN for complete DNS import inventory."
+    else
+      cf_collect_array "/zones/${zone_id}/dns_records" "${raw_dir}/dns-records-${safe}.json" || true
+    fi
+    cf_request "/zones/${zone_id}/workers/routes" "${raw_dir}/workers-routes-${safe}.json" || true
+    if [[ "$auth_source" == "wrangler:oauth" ]]; then
+      warn "Skipping zone rulesets for ${zone_name}: Wrangler OAuth scopes do not include Rulesets Read. Rerun with CLOUDFLARE_API_TOKEN for complete routing inventory."
+    else
+      cf_request "/zones/${zone_id}/rulesets" "${raw_dir}/rulesets-zone-${safe}.json" || true
+    fi
+  done < <(jq -r '.result[]? | [.id, .name] | @tsv' "${raw_dir}/zones.json")
+fi
+
+for account_id in "${effective_account_ids[@]}"; do
+  pages_file="${raw_dir}/pages-projects-${account_id}.json"
+  if cf_request "/accounts/${account_id}/pages/projects" "$pages_file"; then
+    while IFS= read -r project_name; do
+      safe="$(safe_name "$project_name")"
+      cf_request \
+        "/accounts/${account_id}/pages/projects/$(urlencode "$project_name")/domains" \
+        "${raw_dir}/pages-domains-${account_id}-${safe}.json" || true
+    done < <(jq -r '.result[]?.name // empty' "$pages_file")
+  fi
+
+  cf_request "/accounts/${account_id}/workers/scripts" "${raw_dir}/workers-scripts-${account_id}.json" || true
+  cf_collect_array "/accounts/${account_id}/storage/kv/namespaces" "${raw_dir}/kv-namespaces-${account_id}.json" || true
+  cf_collect_array "/accounts/${account_id}/d1/database" "${raw_dir}/d1-databases-${account_id}.json" || true
+  cf_collect_array "/accounts/${account_id}/queues" "${raw_dir}/queues-${account_id}.json" || true
+
+  r2_file="${raw_dir}/r2-buckets-${account_id}.json"
+  if cf_request "/accounts/${account_id}/r2/buckets?per_page=1000" "$r2_file"; then
+    while IFS= read -r bucket_name; do
+      safe="$(safe_name "$bucket_name")"
+      cf_request \
+        "/accounts/${account_id}/r2/buckets/$(urlencode "$bucket_name")/domains/custom" \
+        "${raw_dir}/r2-bucket-custom-domains-${account_id}-${safe}.json" || true
+      cf_request \
+        "/accounts/${account_id}/r2/buckets/$(urlencode "$bucket_name")/domains/managed" \
+        "${raw_dir}/r2-bucket-managed-domain-${account_id}-${safe}.json" || true
+    done < <(jq -r '
+      (
+        if (.result | type) == "array" then .result
+        elif (.result.buckets? | type) == "array" then .result.buckets
+        else []
+        end
+      )[]?.name // empty
+    ' "$r2_file")
+  fi
+
+  if [[ "$auth_source" == "wrangler:oauth" ]]; then
+    warn "Skipping account rulesets for ${account_id}: Wrangler OAuth scopes do not include Rulesets Read. Rerun with CLOUDFLARE_API_TOKEN for complete routing inventory."
+  else
+    cf_request "/accounts/${account_id}/rulesets" "${raw_dir}/rulesets-account-${account_id}.json" || true
+  fi
+done
+
+write_inventory_markdown
+
+cat <<EOF
+Cloudflare inventory written to:
+  ${output_dir}
+
+Review:
+  ${output_dir}/inventory.md
+
+Raw JSON:
+  ${raw_dir}
+EOF

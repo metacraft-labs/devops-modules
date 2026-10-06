@@ -120,12 +120,12 @@ validate_topology() {
     and any(.roles[]; .role == "attic-cache")
     and any(.roles[]; .role == "monitoring")
     and any(.roles[]; .targetGroup == "home-lab-gpu" and .avahi == true)
-    and any(.roles[]; .targetGroup == "solunska" and .avahi == true)
+    and any(.roles[]; .targetGroup == "example-site" and .avahi == true)
     and any(.roles[]; .targetGroup == "hetzner" and .avahi == false)
     and any(.roles[]; .targetGroup == "workstation" and .avahi == false)
     and all(.roles[]; . as $role | (.networks | type == "array" and length > 0 and all(. as $network | $networkNames | index($network))))
     and all(.roles[]; . as $role | ((has("targetGroup") | not) or ($targetGroupNames | index($role.targetGroup))))
-    and all(.roles[] | select(.targetGroup == "home-lab-gpu" or .targetGroup == "solunska"); (.networks | index("home-lab")))
+    and all(.roles[] | select(.targetGroup == "home-lab-gpu" or .targetGroup == "example-site"); (.networks | index("home-lab")))
     and all(.roles[] | select(.targetGroup == "hetzner"); (.networks | index("hetzner")))
     and all(.roles[] | select(.targetGroup == "workstation"); (.networks | index("workstation")))
     and (controlsText("full-topology") | contains("runner") and contains("attic") and contains("monitoring") and contains("hetzner") and contains("workstation") and contains("deploy"))
@@ -184,7 +184,7 @@ attic-cache rehearsal plan:
   2. Start atticd in ${cache_container} on port 8080 and proxy it to 127.0.0.1:${host_port}.
   3. Create public Attic cache ${cache_name} with a deterministic test token.
   4. Build a small host fixture closure.
-  5. Run mcl cache push-closure with --backend attic, --substituter, and --require-substitute.
+  5. Run mcl-devops cache push-closure with --backend attic, --substituter, and --require-substitute.
   6. Restore the fixture from Attic inside ${client_container} using nix copy.
   7. Remove containers unless MCL_ATTIC_INCUS_KEEP=1 is set.
 EOF
@@ -338,7 +338,7 @@ run_attic_cache() {
   public_key="$("${attic_client_pkg}/bin/attic" cache info "$cache_name" 2>&1 | sed -n 's/.*Public Key: //p')"
   [[ -n "$public_key" ]] || die "failed to discover Attic public key"
 
-  nix "${nix_features[@]}" run "$repo_root#mcl" -- cache push-closure \
+  nix "${nix_features[@]}" run "$repo_root#mcl-devops" -- cache push-closure \
     --backend attic \
     --cache "$cache_name" \
     --target "$client_container" \
@@ -672,7 +672,7 @@ avahi="$(jq -r '.role.avahi // false' "$meta")"
 jq -e '.schemaVersion == 1 and (.role.name | length > 0) and (.role.role | length > 0)' "$meta" >/dev/null
 
 case "$target_group" in
-  home-lab-gpu | solunska)
+  home-lab-gpu | example-site)
     [[ "$avahi" == "true" ]] || {
       echo "expected Avahi enabled for target group $target_group" >&2
       exit 1
@@ -749,9 +749,9 @@ def event(event_type, **fields):
     events.append(record)
 
 runtime_commands = [
-    "mcl deploy-plan --synthetic-rehearsal",
-    "mcl deploy-reconcile --synthetic-rehearsal",
-    "mcl deploy-ssh --synthetic-rehearsal",
+    "mcl-devops deploy-plan --synthetic-rehearsal",
+    "mcl-devops deploy-reconcile --synthetic-rehearsal",
+    "mcl-devops deploy-ssh --synthetic-rehearsal",
 ]
 
 if scenario == "full-topology":
@@ -795,9 +795,9 @@ elif scenario == "full-topology-failures":
     event("cache-missing-object", cache="attic", storePath="/nix/store/synthetic-missing", exitCode=evidence["missingCacheObject"]["exitCode"])
     event("manifest-rejected", reason="invalid-signature", deploymentId=42, exitCode=evidence["invalidSignature"]["exitCode"])
     event("switch-failed", targetGroup="hetzner", deploymentId=43, exitCode=evidence["switchFailure"]["exitCode"])
-    event("healthcheck-failed", targetGroup="solunska", deploymentId=44, exitCode=evidence["healthCheckFailure"]["exitCode"])
-    event("rollback-started", targetGroup="solunska", fromDeploymentId=44)
-    event("rollback-complete", targetGroup="solunska", restoredDeploymentId=evidence["rollback"]["restoredDeploymentId"])
+    event("healthcheck-failed", targetGroup="example-site", deploymentId=44, exitCode=evidence["healthCheckFailure"]["exitCode"])
+    event("rollback-started", targetGroup="example-site", fromDeploymentId=44)
+    event("rollback-complete", targetGroup="example-site", restoredDeploymentId=evidence["rollback"]["restoredDeploymentId"])
     event("stale-desired-state-rejected", rejectedDeploymentId=evidence["staleDesiredState"]["rejectedDeploymentId"], currentDeploymentId=evidence["staleDesiredState"]["currentDeploymentId"])
     event("lock-contention", lock="controller", contender="second-reconciler", exitCode=evidence["lockContention"]["exitCode"])
     final = {

@@ -47,7 +47,7 @@
       "rolloutPolicy": "gpu-servers-first"
     },
     {
-      "name": "solunska",
+      "name": "example-site",
       "rolloutPolicy": "home-lab-control-services"
     },
     {
@@ -100,9 +100,9 @@
       "avahi": true
     },
     {
-      "name": "solunska-target",
+      "name": "example-site-target",
       "role": "target",
-      "targetGroup": "solunska",
+      "targetGroup": "example-site",
       "networks": [
         "control",
         "cache",

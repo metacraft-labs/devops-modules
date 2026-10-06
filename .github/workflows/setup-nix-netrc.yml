@@ -1,0 +1,90 @@
+# =============================================================================
+# The netrc `setup-nix` writes: what it CONTAINS, and what it makes curl SEND.
+#
+# WHY THIS IS ITS OWN WORKFLOW AND NOT A JOB IN `ci.yml`, which is where it
+# started. GitHub's `concurrency` is per RUN, not per job, so a free
+# `ubuntu-latest` job inside `ci.yml` cannot start until the whole `ci.yml` run
+# leaves `pending` -- and `ci.yml` is full of `[self-hosted, linux, x64]` jobs.
+# On the day this was written the org had ZERO idle Linux x64 runners and 566
+# queued runs, so the first attempt to land these suites sat `pending` behind a
+# superseded run of its own workflow that was itself waiting for a runner. A
+# guard that cannot run is not a guard.
+#
+# Both suites here need only `python3` and `curl`, both stock on
+# `ubuntu-latest`, and this repository is public, so that runner is free -- the
+# condition `reusable-public-runner-guard.yml` states. Nothing in this file
+# touches Nix, the private cache, or a secret.
+#
+# `write-netrc-test.sh` also runs in `ci.yml`'s `test-setup-nix-verification`
+# job, on real self-hosted Linux and macOS. That is not redundant: there it
+# runs on the platforms the action is actually used on (including the Bash 3.2
+# macOS still ships, which the parser in write-netrc.sh is written for); here
+# it runs where it cannot be blocked. Keep both.
+# =============================================================================
+
+name: setup-nix netrc
+
+on:
+  workflow_dispatch:
+  merge_group:
+  pull_request:
+    branches:
+      - dev
+      - main
+  push:
+    branches:
+      - dev
+      - main
+
+concurrency:
+  # Its own group, deliberately -- sharing `ci.yml`'s would reintroduce exactly
+  # the head-of-line block this file exists to escape.
+  group: ${{ github.workflow }}-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  netrc:
+    name: setup-nix netrc contracts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      # What the file MAKES CURL SEND, which is a different claim from what the
+      # file contains -- and the only one that can see the defect this guards.
+      # A `machine` name carrying a port or a path is well-formed netrc that
+      # matches nothing, so it is observationally identical to a missing entry:
+      # a grep-only suite goes green on the exact bug.
+      - name: Run the netrc wire contract test
+        shell: bash
+        run: bash .github/setup-nix/tests/netrc-wire-test.sh
+
+      # The file-semantics half: rotation, macdef parsing, atomic publication,
+      # permissions, CRLF.
+      - name: Run the netrc file contract test
+        shell: bash
+        run: bash .github/setup-nix/tests/write-netrc-test.sh
+
+      - name: Run the binary-cache preflight contract test
+        shell: bash
+        run: bash .github/setup-nix/tests/probe-substituters-test.sh
+
+  fallback-semantics:
+    # Runs the action itself end to end (install Nix, write nix.conf + netrc,
+    # probe the binary caches), then pins Nix's `fallback` semantics with the
+    # real nix it installed. See tests/fallback-semantics-test.sh.
+    name: setup-nix fallback semantics (real nix)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Setup Nix (this action, defaults)
+        uses: ./.github/setup-nix
+
+      - name: Run the fallback semantics test
+        shell: bash
+        run: bash .github/setup-nix/tests/fallback-semantics-test.sh

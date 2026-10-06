@@ -1,0 +1,154 @@
+diff --git a/runner/pool/common.go b/runner/pool/common.go
+index a41e034d..98760778 100644
+--- a/runner/pool/common.go
++++ b/runner/pool/common.go
+@@ -25,4 +25,9 @@ type forgeRunner struct {
+ 	Name   string         `json:"name,omitempty"`
+ 	Status string         `json:"status,omitempty"`
+ 	Labels []RunnerLabels `json:"labels,omitempty"`
++	// Busy is the forge's own "this runner is executing a job" flag. It is
++	// independent of Status: a runner running a job can be reported
++	// "offline" (its listener session lapsed) while still busy, and GitHub
++	// refuses to remove a busy runner. Nothing may reap a busy runner.
++	Busy bool `json:"busy,omitempty"`
+ }
+diff --git a/runner/pool/pool.go b/runner/pool/pool.go
+index 5e1b2654..e2988f8d 100644
+--- a/runner/pool/pool.go
++++ b/runner/pool/pool.go
+@@ -640,7 +640,23 @@ func (r *basePoolManager) cleanupOrphanedProviderRunners(runners []forgeRunner)
+ 			}
+ 		}
+ 
+-		if ok := runnerNames[instance.Name]; !ok {
++		if ok := runnerNames[instance.Name]; !ok && instance.RunnerStatus == params.RunnerActive && instance.AgentID != 0 {
++			// GARM recorded this runner as running a job, and it is missing
++			// from ONE listing of the forge's runners. A listing is not proof
++			// the runner is gone: the paginated API can drop a runner that
++			// moves between pages mid-listing, and the scale set API is
++			// undocumented. Marking it pending_delete directly would destroy
++			// the instance under a running job without the forge ever being
++			// asked. Ask it: DeleteRunner removes the runner from the forge
++			// first, which the forge refuses (422) while the runner is busy,
++			// and treats "not found" as gone. Only then is it marked for
++			// deletion.
++			if err := r.DeleteRunner(instance, false, false); err != nil {
++				slog.With(slog.Any("error", err)).WarnContext(
++					r.ctx, "active runner is missing from the forge's runner list but the forge did not release it; not deleting",
++					"runner_name", instance.Name)
++			}
++		} else if !ok {
+ 			// Set pending_delete on DB field. Allow consolidate() to remove it.
+ 			// We set force to true here. If we're recovering after a restart, the instance lock
+ 			// we attempt to acquire above, will succed. If it does and we get here, we need to
+@@ -676,6 +692,7 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+ 		runnersByName[run.Name] = run
+ 	}
+ 
++	var reapErrs []error
+ 	for _, instance := range dbInstances {
+ 		if instance.ScaleSetID != 0 {
+ 			// ignore scale set instances.
+@@ -707,18 +724,42 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+ 		//   * The runner managed to join github, but the setup process failed later and the runner
+ 		//     never started on the instance.
+ 		//   * A JIT config was created, but the runner never joined github.
+-		if runner, ok := runnersByName[instance.Name]; !ok || runner.Status == "offline" {
++		runner, ok := runnersByName[instance.Name]
++		if ok && runner.Busy {
++			// The forge says this runner is executing a job. None of the
++			// three cases above can be true of it, whatever its Status says:
++			// a runner that is mid-job can be reported "offline" when its
++			// listener session lapses (a starved or briefly partitioned
++			// host), and UpdatedAt is not refreshed while a job runs, so
++			// every job longer than the bootstrap timeout is exposed to this
++			// check. The job's own completion (webhook) or a later pass, once
++			// the forge clears Busy, retires the runner.
++			slog.InfoContext(
++				r.ctx, "not reaping runner: forge reports it busy",
++				"runner_name", instance.Name,
++				"forge_status", runner.Status,
++				"runner_status", instance.RunnerStatus)
++			continue
++		}
++		if !ok || runner.Status == "offline" {
+ 			slog.InfoContext(
+ 				r.ctx, "reaping timed-out/failed runner",
+ 				"runner_name", instance.Name)
+ 			if err := r.DeleteRunner(instance, false, false); err != nil {
++				// One runner the forge will not let go of (it answers 422
++				// for a runner that is running a job) must not stop the
++				// pass: keep reaping the rest, and report at the end.
+ 				slog.With(slog.Any("error", err)).ErrorContext(
+ 					r.ctx, "failed to update runner status",
+ 					"runner_name", instance.Name)
+-				return fmt.Errorf("error updating runner: %w", err)
++				reapErrs = append(reapErrs, fmt.Errorf("runner %s: %w", instance.Name, err))
++				continue
+ 			}
+ 		}
+ 	}
++	if len(reapErrs) > 0 {
++		return fmt.Errorf("error reaping %d runner(s): %w", len(reapErrs), errors.Join(reapErrs...))
++	}
+ 	return nil
+ }
+ 
+@@ -748,6 +789,15 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
+ 			// Runner is online. Ignore it.
+ 			continue
+ 		}
++		if runner.Busy {
++			// Offline but executing a job: its listener session lapsed, the
++			// job has not. The forge would refuse the removal (422) and fail
++			// this whole sweep with it; leave it until the job ends.
++			slog.DebugContext(
++				r.ctx, "runner is offline but busy; not treating it as orphaned",
++				"runner_name", runner.Name)
++			continue
++		}
+ 
+ 		dbInstance, err := r.store.GetInstance(r.ctx, runner.Name)
+ 		if err != nil {
+@@ -1911,15 +1961,18 @@ func (r *basePoolManager) runnerCleanup() (err error) {
+ 		return fmt.Errorf("failed to fetch github runners: %w", err)
+ 	}
+ 
++	// The two sweeps are independent: a reap error (one runner the forge
++	// would not release) must not skip the orphan sweep for the whole entity.
++	var errs []error
+ 	if err := r.reapTimedOutRunners(runners); err != nil {
+-		return fmt.Errorf("failed to reap timed out runners: %w", err)
++		errs = append(errs, fmt.Errorf("failed to reap timed out runners: %w", err))
+ 	}
+ 
+ 	if err := r.cleanupOrphanedRunners(runners); err != nil {
+-		return fmt.Errorf("failed to cleanup orphaned runners: %w", err)
++		errs = append(errs, fmt.Errorf("failed to cleanup orphaned runners: %w", err))
+ 	}
+ 
+-	return nil
++	return errors.Join(errs...)
+ }
+ 
+ func (r *basePoolManager) cleanupOrphanedRunners(runners []forgeRunner) error {
+diff --git a/runner/pool/util.go b/runner/pool/util.go
+index 1942933e..5aaa41d5 100644
+--- a/runner/pool/util.go
++++ b/runner/pool/util.go
+@@ -267,6 +267,7 @@ func (r *basePoolManager) listRunnersWithPagination() ([]forgeRunner, error) {
+ 			ID:     val.GetID(),
+ 			Name:   val.GetName(),
+ 			Status: val.GetStatus(),
++			Busy:   val.GetBusy(),
+ 			Labels: make([]RunnerLabels, len(val.Labels)),
+ 		}
+ 		for labelIdx, label := range val.Labels {
+@@ -301,6 +302,7 @@ func (r *basePoolManager) listRunnersWithScaleSetAPI() ([]forgeRunner, error) {
+ 			Name:   runner.Name,
+ 			ID:     runner.ID,
+ 			Status: string(runner.GetStatus()),
++			Busy:   runner.Busy,
+ 			Labels: make([]RunnerLabels, len(runner.Labels)),
+ 		}
+ 		for labelIDX, label := range runner.Labels {

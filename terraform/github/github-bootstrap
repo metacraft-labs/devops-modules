@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+# Company-agnostic GitHub Layer-0 bootstrap driver.
+#
+# Renders a consumer repo's bootstrap/<config>/default.nix (a Terranix GitHub
+# root — the CI-enabling repo settings and/or the org governance root), guards
+# the AWS account that owns the shared S3 state backend via STS, verifies the
+# GitHub token can administer the target repo, and runs plan/apply/outputs plus
+# the targeted governance-app-secrets bootstrap. Nothing company-specific is
+# hardcoded: the consumer supplies --root-dir and the config; the backend file
+# derives from the config (override via GITHUB_BOOTSTRAP_BACKEND_FILE), and the
+# org for the governance secret targets is read from the rendered outputs.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  github-bootstrap <plan|apply|outputs|secret-plan|secret-apply|governance-app-secrets-plan|governance-app-secrets-apply> <github/<name>> [--secret <owner/repo:NAME> | --group <rotationGroup>] [--root-dir DIR]
+
+Actions:
+  secret-plan / secret-apply     Targeted plan/apply for Terraform-managed GitHub
+                                 Actions secrets. Select ONE with
+                                 --secret <owner/repo:NAME>, a whole rotationGroup
+                                 with --group <name>, or every rendered managed
+                                 secret with --all-managed (the governance-secrets
+                                 CI flow). A full plan of a large governance root
+                                 refreshes every declared resource and blows
+                                 GitHub's hourly API rate limit, so these apply
+                                 targeted, without a full-tree refresh.
+
+Environment:
+  AWS_PROFILE                    AWS profile for the S3 state backend (set by the dev shell).
+  GITHUB_TOKEN                   GitHub token; falls back to `gh auth token`.
+  GITHUB_BOOTSTRAP_BACKEND_FILE  Repo-relative backend file. Defaults to backends/<config-slug>.hcl.
+
+Deployment facts live in the tracked Terraform/Nix files, not in operator
+environment variables.
+EOF
+}
+
+action="${1:-}"
+config="${2:-}"
+shift $(( $# >= 2 ? 2 : $# )) || true
+root="$PWD"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root-dir)
+      [[ $# -ge 2 ]] || { echo "--root-dir requires a directory." >&2; exit 2; }
+      root="$(cd -- "$2" && pwd)"; shift 2 ;;
+    --secret)
+      [[ $# -ge 2 ]] || { echo "--secret requires <owner/repo:NAME>." >&2; exit 2; }
+      secret="$2"; shift 2 ;;
+    --group)
+      [[ $# -ge 2 ]] || { echo "--group requires a rotationGroup name." >&2; exit 2; }
+      group="$2"; shift 2 ;;
+    --all-managed)
+      all_managed=1; shift ;;
+    --assume-yes|--yes)
+      assume_yes=1; shift ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+if [[ -z "$action" || "$action" == "-h" || "$action" == "--help" ]]; then
+  usage; exit 0
+fi
+case "$action" in
+  plan | apply | outputs | secret-plan | secret-apply | governance-app-secrets-plan | governance-app-secrets-apply) ;;
+  *) usage >&2; exit 2 ;;
+esac
+[[ -n "$config" ]] || { echo "A bootstrap config (e.g. github/<name>) is required." >&2; usage >&2; exit 2; }
+
+src="${root}/bootstrap/${config}"
+dst="${root}/.result/bootstrap/${config}"
+config_slug="$(printf '%s' "$config" | tr '/' '-')"
+backend="${root}/${GITHUB_BOOTSTRAP_BACKEND_FILE:-backends/${config_slug}.hcl}"
+profile="${AWS_PROFILE:-}"
+secret=""
+group=""
+all_managed=0
+assume_yes=0
+secret_target=""
+secret_targets=()
+identity_json=""
+expected_account_id=""
+actual_account_id=""
+aws_region=""
+github_access_check_repository=""
+
+render_config() {
+  terranix "${src}/default.nix" > "${dst}/config.tf.json"
+  jq . "${dst}/config.tf.json" >/dev/null
+}
+
+# Two credential modes: an operator supplies AWS_PROFILE (SSO/dev shell); CI
+# supplies ambient creds (GitHub OIDC role assumed into AWS_ACCESS_KEY_ID / a web
+# identity token). In ambient mode we use the creds already in the environment
+# instead of exporting them from a profile.
+ambient_aws=0
+if [[ -z "$profile" ]]; then
+  if [[ -n "${AWS_ACCESS_KEY_ID:-}" || -n "${AWS_WEB_IDENTITY_TOKEN_FILE:-}" ]]; then
+    ambient_aws=1
+  else
+    cat >&2 <<'EOF'
+Neither AWS_PROFILE nor ambient AWS credentials are set.
+For an operator: enter the repo dev shell or `export AWS_PROFILE=<admin-profile>`.
+For CI: assume the AWS OIDC role before invoking this tool.
+EOF
+    exit 1
+  fi
+fi
+
+if [[ ! -f "$backend" ]]; then
+  cat >&2 <<EOF
+Missing GitHub bootstrap backend config: ${backend}
+Run the AWS bootstrap first so the shared S3 state backend exists.
+EOF
+  exit 1
+fi
+
+if [[ ! -f "${src}/default.nix" ]]; then
+  echo "Bootstrap root '${config}' does not exist at ${src}" >&2
+  exit 1
+fi
+
+mkdir -p "$dst"
+render_config
+expected_account_id="$(jq -r '.output.expected_aws_account_id.value // ""' "${dst}/config.tf.json")"
+aws_region="$(jq -r '.output.aws_region.value // ""' "${dst}/config.tf.json")"
+github_access_check_repository="$(jq -r '
+  .output.github_access_check_repository.value
+  // .output.github_repository.value
+  // ""
+' "${dst}/config.tf.json")"
+
+if [[ -z "$expected_account_id" || -z "$aws_region" || -z "$github_access_check_repository" ]]; then
+  echo "GitHub bootstrap config is missing required deployment facts." >&2
+  exit 1
+fi
+
+sts_args=(--region "$aws_region" sts get-caller-identity --output json)
+((ambient_aws)) || sts_args+=(--profile "$profile")
+if ! identity_json="$(aws "${sts_args[@]}" 2>/dev/null)"; then
+  if ((ambient_aws)); then
+    echo "Ambient AWS credentials are not valid. Assume the AWS OIDC role first." >&2
+  else
+    echo "AWS profile '${profile}' is not authenticated. Run your dev shell's aws-login for ${profile}." >&2
+  fi
+  exit 1
+fi
+
+actual_account_id="$(jq -r '.Account' <<<"$identity_json")"
+if [[ "$actual_account_id" != "$expected_account_id" ]]; then
+  cat >&2 <<EOF
+AWS credentials are for account ${actual_account_id}, but GitHub bootstrap is
+pinned to backend account ${expected_account_id}.
+Refusing to use the wrong Terraform state backend.
+EOF
+  exit 1
+fi
+
+export AWS_REGION="$aws_region"
+export AWS_DEFAULT_REGION="$aws_region"
+if ((ambient_aws)); then
+  # Keep the ambient (OIDC-assumed) credentials already in the environment.
+  :
+else
+  export AWS_PROFILE="$profile"
+  export AWS_SDK_LOAD_CONFIG=1
+  unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN
+  unset AWS_ROLE_ARN AWS_WEB_IDENTITY_TOKEN_FILE
+  eval "$(aws --region "$aws_region" configure export-credentials --profile "$profile" --format env)"
+fi
+
+if [[ -n "${GH_TOKEN:-}" && -z "${GITHUB_TOKEN:-}" ]]; then
+  export GITHUB_TOKEN="$GH_TOKEN"
+fi
+
+if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+  if ! gh auth status --hostname github.com >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+GitHub CLI is not authenticated and GITHUB_TOKEN is not set.
+Run `gh auth login` with repository administration permissions, then retry.
+EOF
+    exit 1
+  fi
+  export GITHUB_TOKEN
+  GITHUB_TOKEN="$(gh auth token --hostname github.com)"
+fi
+
+export GH_TOKEN="${GH_TOKEN:-$GITHUB_TOKEN}"
+
+if ! gh repo view "$github_access_check_repository" --json nameWithOwner >/dev/null 2>&1; then
+  cat >&2 <<EOF
+GitHub token cannot access ${github_access_check_repository}.
+Use a token or gh login with repository administration permissions.
+EOF
+  exit 1
+fi
+
+cp "${src}"/*.tftest.hcl "$dst"/ 2>/dev/null || true
+if [[ -f "${src}/.terraform.lock.hcl" ]]; then
+  cp "${src}/.terraform.lock.hcl" "$dst"/
+fi
+
+cd "$dst"
+tofu init -input=false -reconfigure -backend-config="$backend"
+tofu fmt -check -recursive .
+tofu validate
+
+# Derive the governance App credential secret targets from the manifest, so this
+# works whether the org hosts them as organization secrets (paid orgs) or as
+# repository secrets (Free-plan orgs, where org secrets don't reach private
+# repos). The governance engine keys each secret resource as
+# secret_<providerId with / : . replaced by _>, under github_actions_secret
+# (repository) or github_actions_organization_secret (organization).
+governance_manifest="${src}/secrets/manifest.nix"
+mapfile -t governance_app_secret_targets < <(
+  nix eval --json --file "$governance_manifest" 2>/dev/null | jq -r '
+    .secrets[]
+    | select((.rotationGroup // "") == "github-governance-app")
+    | (
+        if .providerResource == "github_actions_secret" then "github_actions_secret"
+        elif .providerResource == "github_actions_organization_secret" then "github_actions_organization_secret"
+        else .providerResource end
+      ) as $type
+    | "\($type).secret_" + (.providerId | gsub("[/:.]"; "_"))
+  '
+)
+
+plan_governance_app_secrets() {
+  if [[ ! -f "${src}/root.nix" && ! "$config" == *governance* ]]; then
+    cat >&2 <<EOF
+The governance app secret bootstrap target is only valid for a governance root,
+not '${config}'.
+EOF
+    exit 2
+  fi
+
+  # Only this action needs the governance-app secrets. Checking for them at the
+  # top level made plain `plan`/`apply` fail for every root without a secrets
+  # manifest (e.g. a repo-settings Layer-0 root such as <org>-prod).
+  if [[ ${#governance_app_secret_targets[@]} -eq 0 ]]; then
+    echo "No github-governance-app secrets found in ${governance_manifest}." >&2
+    exit 2
+  fi
+  # Import blocks are intentionally excluded from this one-time targeted
+  # bootstrap. The only side effect should be writing the two app credentials
+  # that let normal governance CI authenticate with the dedicated GitHub App.
+  rm -f imports.tf
+
+  local target_args=()
+  local t
+  for t in "${governance_app_secret_targets[@]}"; do
+    target_args+=(-target="$t")
+  done
+  tofu plan -input=false -no-color -lock=false \
+    "${target_args[@]}" \
+    -out=github-governance-app-secrets.tfplan
+
+  cat <<'EOF'
+
+Saved targeted plan:
+  github-governance-app-secrets.tfplan
+
+Review it with:
+  tofu show -no-color github-governance-app-secrets.tfplan
+
+It should only create or update:
+  GH_GOVERNANCE_APP_ID
+  GH_GOVERNANCE_APP_PRIVATE_KEY
+EOF
+}
+
+# Resolve a single Terraform-managed GitHub Actions secret's resource address
+# from the manifest, using the same keying convention the governance engine and
+# the app-secret targeting above use: <type>.secret_<providerId with /:. -> _>,
+# where <type> is github_actions_secret (repository) or
+# github_actions_organization_secret (organization). The provider id is
+# <owner>/<repo>:<NAME>. Only secrets flagged manageWithTerraform are eligible.
+resolve_secret_target() {
+  local provider_id="$1"
+  if [[ "$provider_id" != */*:* ]]; then
+    echo "--secret must look like <owner>/<repo>:<SECRET_NAME> (got '${provider_id}')." >&2
+    exit 2
+  fi
+  secret_target="$(
+    nix eval --json --file "${src}/secrets/manifest.nix" 2>/dev/null | jq -r --arg pid "$provider_id" '
+      .secrets[]
+      | select(.providerId == $pid)
+      | select((.manageWithTerraform // false) == true)
+      | (
+          if .providerResource == "github_actions_secret" then "github_actions_secret"
+          elif .providerResource == "github_actions_organization_secret" then "github_actions_organization_secret"
+          else .providerResource end
+        ) as $type
+      | "\($type).secret_" + (.providerId | gsub("[/:.]"; "_"))
+    '
+  )"
+  if [[ -z "$secret_target" ]]; then
+    cat >&2 <<EOF
+'${provider_id}' is not a Terraform-managed secret in ${config}.
+It must appear in secrets/manifest.nix with manageWithTerraform = true (then
+re-run github-governance-secrets-render before applying it).
+EOF
+    exit 2
+  fi
+  if [[ "$(printf '%s\n' "$secret_target" | grep -c .)" -gt 1 ]]; then
+    echo "Ambiguous: '${provider_id}' matched multiple manifest entries:" >&2
+    printf '  %s\n' $secret_target >&2
+    exit 2
+  fi
+}
+
+# Resolve every Terraform-managed secret in a rotationGroup to its resource
+# address (same keying convention as above). Fans a per-repo secret across all
+# its repos in one targeted plan/apply. manageWithTerraform gate applies.
+resolve_group_targets() {
+  local grp="$1"
+  mapfile -t secret_targets < <(
+    nix eval --json --file "${src}/secrets/manifest.nix" 2>/dev/null | jq -r --arg grp "$grp" '
+      .secrets[]
+      | select((.rotationGroup // "") == $grp)
+      | select((.manageWithTerraform // false) == true)
+      | (
+          if .providerResource == "github_actions_secret" then "github_actions_secret"
+          elif .providerResource == "github_actions_organization_secret" then "github_actions_organization_secret"
+          else .providerResource end
+        ) as $type
+      | "\($type).secret_" + (.providerId | gsub("[/:.]"; "_"))
+    '
+  )
+  if [[ ${#secret_targets[@]} -eq 0 ]]; then
+    cat >&2 <<EOF
+No Terraform-managed secrets in rotationGroup '${grp}' for ${config}.
+Entries must have manageWithTerraform = true and be rendered
+(github-governance-secrets-render) before applying.
+EOF
+    exit 2
+  fi
+}
+
+# Resolve every RENDERED managed secret (the providerIds in
+# secrets/managed.generated.nix, which is exactly the set the governance root
+# emits github_actions_secret resources for) to its resource address. This is
+# the primitive the governance-secrets CI flow applies on merge: it reconciles
+# all managed secrets in one targeted, refresh-free plan.
+resolve_all_managed_targets() {
+  local managed_file="${src}/secrets/managed.generated.nix"
+  [[ -f "$managed_file" ]] || {
+    echo "Missing ${managed_file}; run github-governance-secrets-render first." >&2
+    exit 2
+  }
+  local managed_ids
+  managed_ids="$(nix eval --json --file "$managed_file" 2>/dev/null | jq -c '.providerIds // []')"
+  mapfile -t secret_targets < <(
+    nix eval --json --file "${src}/secrets/manifest.nix" 2>/dev/null | jq -r --argjson ids "$managed_ids" '
+      .secrets[]
+      | select([.providerId] | inside($ids))
+      | select((.manageWithTerraform // false) == true)
+      | (
+          if .providerResource == "github_actions_secret" then "github_actions_secret"
+          elif .providerResource == "github_actions_organization_secret" then "github_actions_organization_secret"
+          else .providerResource end
+        ) as $type
+      | "\($type).secret_" + (.providerId | gsub("[/:.]"; "_"))
+    '
+  )
+  if [[ ${#secret_targets[@]} -eq 0 ]]; then
+    echo "No rendered managed secrets found in ${managed_file}." >&2
+    exit 2
+  fi
+}
+
+# Targeted plan for one managed secret. A full plan of a large governance root
+# refreshes every declared resource against the GitHub API and blows the hourly
+# rate limit, so single-secret changes MUST be targeted and refresh-free. Import
+# blocks (if any) are stripped: they drive one-time imports of resources already
+# in state, whereas a managed secret is a plain create/update. -lock=false keeps
+# an interrupted plan from leaving a stale state lock behind.
+plan_managed_secret() {
+  local target_args=()
+  local selectors=$(( (all_managed) + (${#group} > 0 ? 1 : 0) + (${#secret} > 0 ? 1 : 0) ))
+  if [[ "$selectors" -gt 1 ]]; then
+    echo "Use exactly one of --secret, --group, or --all-managed." >&2; exit 2
+  elif ((all_managed)); then
+    resolve_all_managed_targets
+    local t
+    for t in "${secret_targets[@]}"; do target_args+=(-target="$t"); done
+  elif [[ -n "$group" ]]; then
+    resolve_group_targets "$group"
+    local t
+    for t in "${secret_targets[@]}"; do target_args+=(-target="$t"); done
+  elif [[ -n "$secret" ]]; then
+    resolve_secret_target "$secret"
+    secret_targets=("$secret_target")
+    target_args=(-target="$secret_target")
+  else
+    echo "secret-plan/secret-apply require --secret <owner/repo:NAME>, --group <name>, or --all-managed." >&2
+    exit 2
+  fi
+  rm -f imports.tf
+  tofu plan -input=false -no-color -lock=false -refresh=false \
+    "${target_args[@]}" \
+    -out=github-managed-secret.tfplan
+  cat <<EOF
+
+Saved targeted plan:
+  github-managed-secret.tfplan  (${#secret_targets[@]} target(s))
+
+Review it with:
+  tofu show -no-color github-managed-secret.tfplan
+EOF
+}
+
+case "$action" in
+  plan)
+    tofu plan -out=github-bootstrap.tfplan
+    ;;
+  apply)
+    tofu plan -out=github-bootstrap.tfplan
+    tofu apply github-bootstrap.tfplan
+    ;;
+  governance-app-secrets-plan)
+    plan_governance_app_secrets
+    ;;
+  governance-app-secrets-apply)
+    plan_governance_app_secrets
+    tofu show -no-color github-governance-app-secrets.tfplan
+    echo
+    read -r -p "Type 'apply-governance-app-secrets' to apply this targeted plan: " confirmation
+    if [[ "$confirmation" != "apply-governance-app-secrets" ]]; then
+      echo "Aborted."
+      exit 1
+    fi
+    tofu apply github-governance-app-secrets.tfplan
+    ;;
+  secret-plan)
+    plan_managed_secret
+    ;;
+  secret-apply)
+    plan_managed_secret
+    tofu show -no-color github-managed-secret.tfplan
+    echo
+    # In CI the reviewed-PR merge is the approval, so --assume-yes skips the
+    # interactive prompt. Operators omit it and type the confirmation.
+    if ((assume_yes)); then
+      echo "--assume-yes: applying the targeted plan."
+    else
+      read -r -p "Type 'apply-secret' to apply this targeted plan: " confirmation
+      if [[ "$confirmation" != "apply-secret" ]]; then
+        echo "Aborted."
+        exit 1
+      fi
+    fi
+    tofu apply github-managed-secret.tfplan
+    ;;
+  outputs)
+    tofu output
+    ;;
+esac

@@ -9,21 +9,85 @@ permissions:
 jobs:
   metacraft-cache:
     name: Reach Metacraft Attic Cache Over NetBird
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
+    env:
+      # The single NetBird+token-gated cache (Public-Attic-Cache-Decommission).
+      # It is `--private`: reads require both NetBird membership AND a token.
+      ATTIC_SUBSTITUTER: https://cache.metacraft-labs.com/metacraft-private-infrastructure
+      ATTIC_TRUSTED_PUBLIC_KEY: metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE=
     steps:
       - uses: actions/checkout@v6.0.2
 
+      # No netbird-cache-probe-url: the private cache returns 401 without a
+      # token, and the probe uses `curl -fsS` (fails on 4xx). Connectivity is
+      # exercised by the authenticated read below instead.
       - name: Setup Nix through NetBird
         uses: ./.github/setup-nix
         with:
           netbird-setup-key: ${{ secrets.NETBIRD_SETUP_KEY }}
-          netbird-cache-probe-url: https://cache.metacraft-labs.com/metacraft-public/nix-cache-info
-          substituters: https://cache.metacraft-labs.com/metacraft-public
-          trusted-public-keys: metacraft-public:UtS6PK+p0uZaJK3i/jD2DQOjTpddhQUQmNQDQih5N4Q=
+          substituters: ${{ env.ATTIC_SUBSTITUTER }}
+          trusted-public-keys: ${{ env.ATTIC_TRUSTED_PUBLIC_KEY }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-cache: metacraft-private-infrastructure
 
-      - name: Verify Nix can query the Attic cache
+      - name: Authenticate nix to the private Attic cache
+        shell: bash
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
         run: |
           set -euo pipefail
-          curl -fsS https://cache.metacraft-labs.com/metacraft-public/nix-cache-info
+          echo "::add-mask::$ATTIC_TOKEN"
+          h="${ATTIC_SUBSTITUTER#http://}"; h="${h#https://}"; h="${h%%/*}"
+          mkdir -p "$HOME/.config/nix"
+          touch "$HOME/.config/nix/netrc"
+          chmod 0600 "$HOME/.config/nix/netrc"
+          grep -q "^machine $h " "$HOME/.config/nix/netrc" 2>/dev/null || \
+            printf 'machine %s password %s\n' "$h" "$ATTIC_TOKEN" >> "$HOME/.config/nix/netrc"
+
+      - name: Verify an authenticated read of the private cache
+        shell: bash
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$ATTIC_TOKEN"
+          # Authed read must succeed (200). The identical endpoint WITHOUT a
+          # token is 401 — that is the defence-in-depth invariant.
+          for attempt in $(seq 1 30); do
+            if curl -fsS --connect-timeout 2 --max-time 5 \
+                -H "Authorization: Bearer $ATTIC_TOKEN" \
+                "$ATTIC_SUBSTITUTER/nix-cache-info" >/dev/null; then
+              echo "authenticated read of $ATTIC_SUBSTITUTER succeeded"
+              break
+            fi
+            echo "waiting for NetBird route to the private cache ($attempt/30)..."
+            sleep 2
+          done
+          curl -fsS -H "Authorization: Bearer $ATTIC_TOKEN" \
+            "$ATTIC_SUBSTITUTER/nix-cache-info"
           nix --extra-experimental-features 'nix-command flakes' store info \
-            --store https://cache.metacraft-labs.com/metacraft-public
+            --store "$ATTIC_SUBSTITUTER"
+
+      - name: Former public caches must not serve token-free reads (post Stage 4)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Public-Attic-Cache-Decommission invariant: once Stage 4 destroys the
+          # four `--public` buckets, every former public cache must return a
+          # non-200 (401/404) over NetBird with no token — a public cache must
+          # never silently reappear.
+          #
+          # Stage 4 (the irreversible `attic cache destroy`) has NOT run yet, so
+          # these still return 200. Keep this step INFORMATIONAL for now; do not
+          # fail CI on it. TODO(Stage 4): flip the guard below to enforce.
+          for cache in metacraft-public metacraft-codetracer blocksense-public agent-harbor; do
+            url="https://cache.metacraft-labs.com/$cache/nix-cache-info"
+            code="$(curl -s -o /dev/null -w '%{http_code}' \
+              --connect-timeout 5 --max-time 10 "$url" || echo 000)"
+            echo "former public cache $cache -> HTTP $code (want non-200 after Stage 4)"
+            # TODO(Stage 4): enforce once the buckets are destroyed:
+            # if [ "$code" = "200" ]; then
+            #   echo "ERROR: public cache $cache still serves token-free 200" >&2
+            #   exit 1
+            # fi
+          done

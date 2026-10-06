@@ -1,0 +1,13 @@
+diff --git a/runner/providers/v0.1.1/external.go b/runner/providers/v0.1.1/external.go
+index 3ff8aff..41822f8 100644
+--- a/runner/providers/v0.1.1/external.go
++++ b/runner/providers/v0.1.1/external.go
+@@ -265,7 +265,7 @@ func (e *external) ListInstances(ctx context.Context, poolID string, listInstanc
+ 	).Inc()
+ 
+ 	out, err := e.execWithTimeout(ctx, nil, asEnv)
+-	if err == nil {
++	if err != nil {
+ 		metrics.InstanceOperationFailedCount.WithLabelValues(
+ 			"ListInstances", // label: operation
+ 			e.cfg.Name,      // label: provider

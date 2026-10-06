@@ -16,11 +16,11 @@ description: Use when inspecting or repairing desired-state reconciliation, late
 ## Commands
 
 ```sh
-mcl deploy-reconcile --state-dir "$STATE_DIR" --event-log "$EVENTS_JSONL" --dry-run
-mcl deploy-reconcile --state-dir "$STATE_DIR" --target "$TARGET" \
+mcl-devops deploy-reconcile --state-dir "$STATE_DIR" --event-log "$EVENTS_JSONL" --dry-run
+mcl-devops deploy-reconcile --state-dir "$STATE_DIR" --target "$TARGET" \
   --target-host "$TARGET=$SSH_HOST" --ssh-user deploy \
   --identity-file "$MCL_DEPLOY_SSH_IDENTITY" --ssh-option BatchMode=yes
-mcl deploy-agent --target "$TARGET" --manifest-dir "$MANIFEST_DIR" \
+mcl-devops deploy-agent --target "$TARGET" --manifest-dir "$MANIFEST_DIR" \
   --trusted-manifest-public-key "$MCL_DEPLOY_MANIFEST_PUBLIC_KEY" --dry-run
 systemctl status mcl-deployment-reconciler.service mcl-deployment-reconciler.timer
 systemctl status mcl-deploy-agent.service mcl-deploy-agent.timer

@@ -29,7 +29,6 @@ the production deployment path.
 - [desired-state-schema.json](desired-state-schema.json): desired-state record
   JSON schema.
 
-Private operational observations from the current infrastructure repository are
-kept in [private-inventory.md](private-inventory.md). Generic docs should not
-copy private hostnames, domains, repository names, or escalation paths from that
-file.
+Generic docs must not include private hostnames, domains, repository names, or
+escalation paths; those operational details live in the private infrastructure
+repository, not in this shared repo.

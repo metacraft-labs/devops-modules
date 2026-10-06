@@ -5,38 +5,38 @@
     "cachixCaches": [
       {
         "host": "agent-harbor.cachix.org",
-        "bucket": "agent-harbor",
-        "publicKey": "agent-harbor:MjT3Kx9Dimt/yD8cTA4UwZbZV+b4esSFcnzIplbkJ1o="
+        "bucket": "metacraft-private-infrastructure",
+        "publicKey": "metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE="
       },
       {
         "host": "blocksense.cachix.org",
-        "bucket": "blocksense-public",
-        "publicKey": "blocksense-public:OOgTc0ye1FONCiVHMrbpScc/HP+lX3uoU0EfwzX6ypE="
+        "bucket": "metacraft-private-infrastructure",
+        "publicKey": "metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE="
       },
       {
         "host": "blocksense-infra.cachix.org",
-        "bucket": "blocksense-public",
-        "publicKey": "blocksense-public:OOgTc0ye1FONCiVHMrbpScc/HP+lX3uoU0EfwzX6ypE="
+        "bucket": "metacraft-private-infrastructure",
+        "publicKey": "metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE="
       },
       {
         "host": "metacraft-labs-codetracer.cachix.org",
-        "bucket": "metacraft-codetracer",
-        "publicKey": "metacraft-codetracer:9OV9wCDX560bt5/MrD4dlqnPpCitAEjpoqhNfQpWY3U="
+        "bucket": "metacraft-private-infrastructure",
+        "publicKey": "metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE="
       },
       {
         "host": "mcl-blockchain-packages.cachix.org",
-        "bucket": "metacraft-public",
-        "publicKey": "metacraft-public:UtS6PK+p0uZaJK3i/jD2DQOjTpddhQUQmNQDQih5N4Q="
+        "bucket": "metacraft-private-infrastructure",
+        "publicKey": "metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE="
       },
       {
         "host": "mcl-public-cache.cachix.org",
-        "bucket": "metacraft-public",
-        "publicKey": "metacraft-public:UtS6PK+p0uZaJK3i/jD2DQOjTpddhQUQmNQDQih5N4Q="
+        "bucket": "metacraft-private-infrastructure",
+        "publicKey": "metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE="
       },
       {
         "host": "nix-blockchain-development.cachix.org",
-        "bucket": "metacraft-public",
-        "publicKey": "metacraft-public:UtS6PK+p0uZaJK3i/jD2DQOjTpddhQUQmNQDQih5N4Q="
+        "bucket": "metacraft-private-infrastructure",
+        "publicKey": "metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE="
       }
     ]
   },
@@ -45,50 +45,146 @@
       "name": "metacraft",
       "path": "~/metacraft",
       "repositories": [
-        { "name": "infra", "bucket": "metacraft-public" },
-        { "name": "nixos-modules", "bucket": "metacraft-public" },
-        { "name": "codetracer", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-native-backend", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-native-recorder", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-browser-extension", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-ci", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-trace-format", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-visual-replay", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-cairo-recorder", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-cardano-recorder", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-circom-recorder", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-flow-recorder", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-fuel-recorder", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-leo-recorder", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-miden-recorder", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-move-recorder", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-polkavm-recorder", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-solana-recorder", "bucket": "metacraft-codetracer" },
-        { "name": "codetracer-ton-recorder", "bucket": "metacraft-codetracer" },
-        { "name": "nix-blockchain-development", "bucket": "metacraft-public" },
-        { "name": "nix-codetracer-toolchains", "bucket": "metacraft-codetracer" },
-        { "name": "ctfs-poc", "bucket": "metacraft-public" },
-        { "name": "tracing-formats-benchmarks", "bucket": "metacraft-public" },
-        { "name": "DendrETH", "bucket": "metacraft-public" }
+        {
+          "name": "infra",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "nixos-modules",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-native-backend",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-native-recorder",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-browser-extension",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-ci",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-trace-format",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-visual-replay",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-cairo-recorder",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-cardano-recorder",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-circom-recorder",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-flow-recorder",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-fuel-recorder",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-leo-recorder",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-miden-recorder",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-move-recorder",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-polkavm-recorder",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-solana-recorder",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "codetracer-ton-recorder",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "nix-blockchain-development",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "nix-codetracer-toolchains",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "ctfs-poc",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "tracing-formats-benchmarks",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "DendrETH",
+          "bucket": "metacraft-private-infrastructure"
+        }
       ]
     },
     {
       "name": "blocksense",
       "path": "~/blocksense",
       "repositories": [
-        { "name": "blocksense", "bucket": "blocksense-public" },
-        { "name": "infra", "bucket": "blocksense-public" },
-        { "name": "zkVMs-benchmarks", "bucket": "blocksense-public" },
-        { "name": "zk-wars-website", "bucket": "blocksense-public" }
+        {
+          "name": "blocksense",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "infra",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "zkVMs-benchmarks",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "zk-wars-website",
+          "bucket": "metacraft-private-infrastructure"
+        }
       ]
     },
     {
       "name": "agent-harbor",
       "path": "~/blocksense/agent-harbor",
       "repositories": [
-        { "name": "main", "bucket": "agent-harbor" },
-        { "name": "infra", "bucket": "agent-harbor" },
-        { "name": "rebase-staging", "bucket": "agent-harbor" }
+        {
+          "name": "main",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "infra",
+          "bucket": "metacraft-private-infrastructure"
+        },
+        {
+          "name": "rebase-staging",
+          "bucket": "metacraft-private-infrastructure"
+        }
       ]
     }
   ]

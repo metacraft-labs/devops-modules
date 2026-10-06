@@ -48,20 +48,22 @@
 
       # Ubuntu 24.04 LTS (noble) cloud image, x86_64.
       #
-      # Pinned to the upstream Ubuntu artifact at the noble *release* URL
-      # (https://cloud-images.ubuntu.com/releases/noble/release/), which
-      # Ubuntu re-publishes in place on every point release / security
-      # respin. The sha256 below is the build that was current as of
-      # 2026-06-04; if Ubuntu re-spins the image again, CI will fail
-      # with a fixed-output hash mismatch and the operator must
-      # `nix-prefetch-url` the URL and update the hex hash here.
+      # Pinned to an IMMUTABLE dated respin directory
+      # (https://cloud-images.ubuntu.com/releases/noble/release-20260615/),
+      # which Canonical never re-publishes in place -- unlike the rolling
+      # `release/` pointer, whose content (and thus this fixed-output hash)
+      # drifts on every point release / security respin. To move to a newer
+      # image, bump `releaseDir` and `sha256` together from the matching
+      # `.../release-YYYYMMDD/SHA256SUMS`. The sha256 below is Canonical's
+      # published checksum for the 2026-06-15 respin.
       #
-      # Same hash is duplicated in agent-harbor/nix/vm-recipes/default.nix
+      # Same image is duplicated in agent-harbor/nix/vm-recipes/default.nix
       # (ubuntu-cloud-image-2404). Bump in lockstep.
       ubuntu2404CloudImage = vmImages.fetchUbuntuCloudImage {
         version = "24.04";
         codename = "noble";
-        sha256 = "53fdde898feed8b027d94baa9cfe8229867f330a1d9c49dc7d84465ee7f229f7";
+        releaseDir = "release-20260615";
+        sha256 = "5fa5b05e5ec239858c4531485d6023b0896448c2df7c63b34f8dae6ea6051a44";
       };
 
       # The VM under test. Cloud-init seed gets:

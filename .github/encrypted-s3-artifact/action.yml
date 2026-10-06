@@ -1,0 +1,76 @@
+name: Encrypted S3 Artifact
+description: >-
+  Carry an exact CI artifact through S3 without exposing its plaintext or
+  depending on GitHub artifact quota. The caller supplies AWS credentials,
+  bucket topology, and an age identity; this action is cloud-account-agnostic.
+
+inputs:
+  mode:
+    description: upload or download
+    required: true
+  directory:
+    description: Directory archived on upload or populated on download
+    required: true
+  bucket:
+    description: S3 bucket name
+    required: true
+  object-key:
+    description: Immutable S3 object key
+    required: true
+  identity-file:
+    description: Path to an age identity used to derive the upload recipient or decrypt the download
+    required: true
+  kms-key-id:
+    description: KMS key ID or ARN required for upload SSE-KMS
+    required: false
+    default: ''
+  expected-run-id:
+    description: Source GitHub run ID required for download binding
+    required: false
+    default: ''
+  expected-bucket-owner:
+    description: Optional AWS account ID asserted on every S3 request
+    required: false
+    default: ''
+
+outputs:
+  ciphertext-sha256:
+    description: SHA-256 of the authenticated age ciphertext
+    value: ${{ steps.transfer.outputs.ciphertext-sha256 }}
+  source-run-id:
+    description: GitHub run ID bound into the immutable object metadata
+    value: ${{ steps.transfer.outputs.source-run-id }}
+  source-sha:
+    description: Git commit bound into the immutable object metadata
+    value: ${{ steps.transfer.outputs.source-sha }}
+  version-id:
+    description: S3 version ID selected for the transfer
+    value: ${{ steps.transfer.outputs.version-id }}
+
+runs:
+  using: composite
+  steps:
+    - id: transfer
+      name: ${{ inputs.mode }} encrypted S3 artifact
+      shell: bash
+      env:
+        ENCRYPTED_S3_ARTIFACT_MODE: ${{ inputs.mode }}
+        ENCRYPTED_S3_ARTIFACT_DIRECTORY: ${{ inputs.directory }}
+        ENCRYPTED_S3_ARTIFACT_BUCKET: ${{ inputs.bucket }}
+        ENCRYPTED_S3_ARTIFACT_OBJECT_KEY: ${{ inputs.object-key }}
+        ENCRYPTED_S3_ARTIFACT_IDENTITY_FILE: ${{ inputs.identity-file }}
+        ENCRYPTED_S3_ARTIFACT_KMS_KEY_ID: ${{ inputs.kms-key-id }}
+        ENCRYPTED_S3_ARTIFACT_EXPECTED_RUN_ID: ${{ inputs.expected-run-id }}
+        ENCRYPTED_S3_ARTIFACT_EXPECTED_BUCKET_OWNER: ${{ inputs.expected-bucket-owner }}
+      run: |
+        set -euo pipefail
+        nix develop --accept-flake-config --command \
+          bash "$GITHUB_ACTION_PATH/encrypted-s3-artifact" \
+            "$ENCRYPTED_S3_ARTIFACT_MODE" \
+            --directory "$ENCRYPTED_S3_ARTIFACT_DIRECTORY" \
+            --bucket "$ENCRYPTED_S3_ARTIFACT_BUCKET" \
+            --object-key "$ENCRYPTED_S3_ARTIFACT_OBJECT_KEY" \
+            --identity-file "$ENCRYPTED_S3_ARTIFACT_IDENTITY_FILE" \
+            --kms-key-id "$ENCRYPTED_S3_ARTIFACT_KMS_KEY_ID" \
+            --expected-run-id "$ENCRYPTED_S3_ARTIFACT_EXPECTED_RUN_ID" \
+            --expected-bucket-owner "$ENCRYPTED_S3_ARTIFACT_EXPECTED_BUCKET_OWNER"

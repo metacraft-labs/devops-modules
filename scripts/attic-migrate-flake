@@ -7,21 +7,30 @@ from pathlib import Path
 
 
 ATTIC_BASE_URL = "https://cache.metacraft-labs.com"
+
+# Public-Attic-Cache-Decommission: the four `--public` Attic buckets
+# (metacraft-public, metacraft-codetracer, blocksense-public, agent-harbor) are
+# being retired. Every former public Cachix cache now migrates into the SINGLE
+# private, NetBird+token-gated Attic cache. There is exactly one bucket and one
+# signing key. (The Cachix→Attic migration itself is over; this retarget keeps
+# the tool valid so any future run injects the private cache.)
+ATTIC_PRIVATE_CACHE = "metacraft-private-infrastructure"
+ATTIC_PRIVATE_PUBLIC_KEY = (
+    "metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE="
+)
+
 ATTIC_BUCKET_PUBLIC_KEYS = {
-    "agent-harbor": "agent-harbor:MjT3Kx9Dimt/yD8cTA4UwZbZV+b4esSFcnzIplbkJ1o=",
-    "blocksense-public": "blocksense-public:OOgTc0ye1FONCiVHMrbpScc/HP+lX3uoU0EfwzX6ypE=",
-    "metacraft-codetracer": "metacraft-codetracer:9OV9wCDX560bt5/MrD4dlqnPpCitAEjpoqhNfQpWY3U=",
-    "metacraft-public": "metacraft-public:UtS6PK+p0uZaJK3i/jD2DQOjTpddhQUQmNQDQih5N4Q=",
+    ATTIC_PRIVATE_CACHE: ATTIC_PRIVATE_PUBLIC_KEY,
 }
 
 DEFAULT_BUCKETS = {
-    "agent-harbor.cachix.org": "agent-harbor",
-    "blocksense.cachix.org": "blocksense-public",
-    "blocksense-infra.cachix.org": "blocksense-public",
-    "metacraft-labs-codetracer.cachix.org": "metacraft-codetracer",
-    "mcl-blockchain-packages.cachix.org": "metacraft-public",
-    "mcl-public-cache.cachix.org": "metacraft-public",
-    "nix-blockchain-development.cachix.org": "metacraft-public",
+    "agent-harbor.cachix.org": ATTIC_PRIVATE_CACHE,
+    "blocksense.cachix.org": ATTIC_PRIVATE_CACHE,
+    "blocksense-infra.cachix.org": ATTIC_PRIVATE_CACHE,
+    "metacraft-labs-codetracer.cachix.org": ATTIC_PRIVATE_CACHE,
+    "mcl-blockchain-packages.cachix.org": ATTIC_PRIVATE_CACHE,
+    "mcl-public-cache.cachix.org": ATTIC_PRIVATE_CACHE,
+    "nix-blockchain-development.cachix.org": ATTIC_PRIVATE_CACHE,
 }
 
 URL_RE = re.compile(r"https?://([A-Za-z0-9][A-Za-z0-9-]*\.cachix\.org)")

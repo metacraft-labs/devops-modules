@@ -1,0 +1,63 @@
+#+title: Cachix Decommissioning — Status
+#+options: toc:nil num:nil
+
+* Overview
+
+Goal: Metacraft infrastructure should rely on Cachix for *nothing*. This is
+about removing *our own use* of Cachix — NOT about removing Cachix support from
+the tooling.
+
+*Reusable Cachix capabilities stay.* ~nixos-modules~ is general-purpose; its
+Cachix features (the ~mcl-devops deploy-spec~ command and ~mcl.utils.cachix~, the
+~cachix-deploy-metrics~ package/module, the Cachix cache-push backend, the
+~deployment-cachix-fallback-simulation~ guardrail) remain available for anyone
+who wants them. Consumers instantiate policy; the library provides recipes.
+
+Third-party public Cachix caches (e.g. ~dlang-community.cachix.org~) may also
+still be used — they are not our account.
+
+What we remove is our *usage*: our Cachix Deploy activation path, our Cachix
+binary-cache push/substitution, our monitoring of the Cachix Deploy API, our
+~CACHIX_*~ CI secrets, and finally our Cachix account itself.
+
+* DONE  Binary cache → Attic
+  All Metacraft caching runs on the single NetBird-gated Attic cache
+  (~cache.metacraft-labs.com~). No Metacraft ~*.cachix.org~ push or substituter
+  remains.
+
+* DONE  Cachix Deploy usage removed
+  The production activation path is Attic-only (~mcl-devops deploy-ssh~ /
+  ~mcl-devops deploy-reconcile~ / the pull-agent + forced-command ssh-apply). The
+  Cachix Deploy recipes were removed in ~metacraft-labs/infra~; infra tests now
+  *enforce* that Cachix Deploy is not a production activation path or rollback
+  fallback.
+
+* DONE  Cachix Deploy monitoring usage removed
+  ~services.cachix-deploy-metrics~ is enabled on no host; Prometheus no longer
+  scrapes it (asserted ~== null~). Deployment observability is Attic/event-stream
+  based (~deployment-event-metrics~ → Prometheus → Loki → Grafana). The
+  ~cachix-deploy-metrics~ package/module remain in nixos-modules as a capability.
+
+* DONE  CACHIX_* CI secrets removed
+  No ~CACHIX_*~ secrets remain on the metacraft-labs org or the infra/nixos-modules
+  repos. ~scripts/attic-cache/configure-github-repo.sh~ deletes any legacy
+  ~CACHIX_*~ variables/secrets on every repo it configures. (A general-purpose
+  ~EXTRA_CACHIX_CACHES~ variable — a capability knob for third-party caches —
+  may remain; it is not our-account usage.)
+
+* DONE  Orphaned secret residue removed
+  ~metacraft-labs/infra~ PR #1173 removed the leftover agenix secret files from
+  the Cachix era (~cachix-agent.token~; per-host ~secrets/cachix-deploy~ and
+  ~cachix-deploy-metrics~ blobs; the ~default-vm-config~ equivalents). They were
+  wired to nothing.
+
+* DONE  Delete the Cachix account and caches
+  Done (2026-07-01, operator): the Metacraft Cachix caches were deleted and
+  the org/subscription cancelled. Nothing — capability, config, secret, or
+  account — now ties Metacraft to Cachix, while the reusable Cachix support in
+  nixos-modules stays intact for anyone who wants it. Cachix decommissioning is
+  complete.
+
+* Notes
+  - Independent of the deployment host rename tracked in the infra repo
+    (~docs/High-Mem-Server-Rename.milestones.org~).

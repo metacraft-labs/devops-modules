@@ -15,6 +15,18 @@ inputs:
     description: Substituters
     required: false
     default: ''
+  attic-token:
+    description: Attic token used to upload newly built store paths.
+    required: false
+    default: ''
+  attic-cache:
+    description: Attic cache name to upload newly built store paths to.
+    required: false
+    default: ''
+  attic-endpoint:
+    description: Attic server endpoint.
+    required: false
+    default: 'https://cache.metacraft-labs.com/'
   nix-github-token:
     description: GitHub token to add as access-token in nix.conf
     default: ''
@@ -31,6 +43,13 @@ inputs:
     description: Deprecated compatibility input; ignored by the Determinate Nix installer.
     default: ''
     required: false
+  experimental-features:
+    description: >-
+      Space-separated experimental features to enable. The action writes these
+      into nix.conf and then VERIFIES they are actually in effect, failing the
+      job if they are not (see `verify-nix-config.sh`).
+    required: false
+    default: 'nix-command flakes pipe-operators'
   use-direnv:
     description: Whether to use direnv to load the environment
     type: boolean
@@ -46,14 +65,48 @@ inputs:
     required: false
     default: false
   nix-cache-key:
-    description: The primary key to use for the Nix GHA cache
+    description: The primary key to use for the Nix GHA cache; defaults to the current commit so disabled caching does not eagerly evaluate hashFiles()
     required: false
-    default: nix-${{ runner.os }}-${{ hashFiles('**/flake.lock') }}
+    default: nix-${{ runner.os }}-${{ github.sha }}
   nix-cache-restore-prefixes:
     description: The fallback restore prefixes for the Nix GHA cache
     required: false
     default: |
       nix-${{ runner.os }}-
+  reclaim_hosted_runner_disk:
+    description: >-
+      Reclaim space from a fixed allowlist of preinstalled toolchains before
+      Nix setup. This opt-in is accepted only on GitHub-hosted Linux runners.
+    type: boolean
+    required: false
+    default: false
+  fallback:
+    description: >-
+      Value of Nix's `fallback` setting. Default `true` (unchanged behaviour).
+      With `true`: when a substituter errors (anything but "not found" — a
+      5xx, a timeout, a DNS failure that survives `download-attempts`), Nix
+      DISABLES that substituter for 60 seconds for the whole process and
+      builds whatever it could not fetch from source. With `false`: Nix never
+      disables a substituter, but ANY such error is rethrown and fails the
+      command — including while merely querying a substituter about a
+      derivation that is in no cache at all (Nix 2.28/2.31 `SubstitutionGoal`
+      and `querySubstitutablePathInfos` rethrow when fallback is off). So
+      `false` trades "may silently build the world" for "a transient cache
+      error (e.g. an Attic 500 burst) fails the job". Opt in for jobs that
+      must never build a large closure from source (e.g. terraform apply).
+    required: false
+    default: 'true'
+  substituter-preflight:
+    description: >-
+      Probe every configured substituter's `nix-cache-info` (with the netrc Nix
+      will use) before anything asks Nix to substitute. `fail`: any unusable
+      cache fails the job with the diagnosed cause (401 no/bad token, 403
+      network ACL, unreachable). `warn` (default): cache.nixos.org must be
+      usable; any other unusable cache produces a warning annotation and is
+      removed from this job's nix.conf so no nix command waits on it. `off`:
+      no probe. See probe-substituters.sh.
+    required: false
+    default: 'warn'
   netbird-setup-key:
     description: Optional NetBird setup key. When set on a Linux GitHub-hosted runner, the action joins NetBird before configuring Nix substituters.
     required: false
@@ -78,19 +131,198 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    - name: Reclaim GitHub-hosted runner disk for Nix
+      if: ${{ fromJSON(inputs.reclaim_hosted_runner_disk || 'false') }}
+      shell: bash
+      env:
+        SETUP_NIX_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        SETUP_NIX_RUNNER_OS: ${{ runner.os }}
+      run: bash "${{ github.action_path }}/reclaim-hosted-runner-disk.sh"
+
     - name: Log GH API rate limits
       env:
         GH_TOKEN: ${{ github.token }}
       shell: bash
       run: |
+        # -------------------------------------------------------------------
+        # WHY THIS STEP LOOKS LIKE THIS
+        #
+        # It used to be one line:
+        #
+        #     gh api /rate_limit | jq || true
+        #
+        # This is the FIRST step of the action, so it runs BEFORE Nix is
+        # provisioned -- and on these runner images `gh` and `jq` come FROM
+        # Nix, not from the image. Both invocations died with `command not
+        # found`, `|| true` swallowed the exit status, and the step reported
+        # `conclusion=success` on every job that provisions Nix while
+        # measuring nothing whatsoever.
+        #
+        # So the one instrument in the pipeline that reports an API budget
+        # has never emitted a single number, and its greenness said only that
+        # `|| true` works. A diagnostic that cannot fail cannot report.
+        #
+        # `curl` IS on the image, so this uses curl, and it parses the JSON
+        # with bash parameter expansion so the step acquires no dependency
+        # that Nix would have to supply first. It now FAILS when it cannot
+        # measure -- a missing curl, a non-200, or a response it cannot
+        # parse -- because "the instrument is broken" and "the budget is
+        # healthy" must never again be the same colour.
+        #
+        # WHAT THIS DOES NOT MEASURE -- stated here so the number is not
+        # misread by the next person who needs it:
+        #
+        #   `/rate_limit` reports REST API budgets ONLY. The buckets it
+        #   returns are core, search, graphql, code_search and
+        #   integration_manifest. GitHub exposes NO budget for git over
+        #   HTTPS, and `git clone` / `git fetch` / upload-pack traffic is
+        #   not metered by `core`.
+        #
+        #   Therefore a healthy `remaining` here is NOT evidence that a git
+        #   fetch will succeed, and an exhausted one is NOT the explanation
+        #   for a clone that failed. If you are chasing
+        #   `fatal: could not read Username for 'https://github.com'`, this
+        #   number can neither confirm nor refute it -- that failure is an
+        #   HTTP 401 on the `POST /<repo>/git-upload-pack` half of the fetch,
+        #   and it has to be measured there.
+        # -------------------------------------------------------------------
+        set -uo pipefail
+
         echo "::group::GH API rate limits"
-        gh api /rate_limit | jq || true
+
+        if ! command -v curl >/dev/null 2>&1; then
+          echo "::error::curl is not on this runner image, so the GH API rate limit cannot be read. This step measures nothing; do not treat other steps' success as evidence about API budgets."
+          echo "::endgroup::"
+          exit 1
+        fi
+
+        auth=()
+        if [ -n "${GH_TOKEN:-}" ]; then
+          # Through the environment and into a header array -- never onto a
+          # command line, where anything reading /proc could see it.
+          auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+        else
+          echo "NOTE: no GH_TOKEN in the environment; querying anonymously."
+        fi
+
+        # RETRY TRANSPORT FAILURES, BUT NEVER CREDENTIAL ONES.
+        #
+        # This step now fails the job when it cannot measure, and this action
+        # provisions Nix for many repositories -- so a single api.github.com
+        # hiccup must not redden every one of them. Three attempts with a
+        # short backoff separate "GitHub blinked" from "this is broken".
+        #
+        # 401/403 are NOT retried: bad or missing credentials will still be
+        # bad three seconds later, and retrying only delays the report.
+        body="$(mktemp)"
+        status="000"
+        for attempt in 1 2 3; do
+          status="$(curl -sS -o "${body}" -w '%{http_code}' --max-time 30 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            ${auth[@]+"${auth[@]}"} \
+            https://api.github.com/rate_limit 2>/dev/null)" || status="000"
+
+          case "${status}" in
+            200) break ;;
+            401|403) break ;;
+            *)
+              if [ "${attempt}" -lt 3 ]; then
+                echo "attempt ${attempt}: HTTP ${status} from /rate_limit; retrying"
+                sleep "$((attempt * 2))"
+              fi
+              ;;
+          esac
+        done
+
+        if [ "${status}" != "200" ]; then
+          # 401/403 is the case worth failing loudest on: the token this job
+          # was handed is absent, expired or malformed, and every later
+          # authenticated step will hit the same wall -- but silently.
+          echo "::error::GET /rate_limit returned HTTP ${status} after ${attempt} attempt(s); the API budget could not be read."
+          echo "--- response body (first 400 bytes) ---"
+          head -c 400 "${body}" 2>/dev/null || true
+          echo
+          rm -f "${body}"
+          echo "::endgroup::"
+          exit 1
+        fi
+
+        json="$(cat "${body}")"
+        rm -f "${body}"
+
+        # Whitespace-strip so this parses pretty-printed and compact JSON
+        # alike. Safe here specifically because every value in the `core`
+        # bucket is a number -- there is no string whose spaces matter.
+        compact="${json//[$' \t\n\r']/}"
+
+        core="${compact#*\"core\":\{}"
+        core="${core%%\}*}"
+
+        if [ "${core}" = "${compact}" ] || [ -z "${core}" ]; then
+          echo "::error::No \"core\" bucket in the /rate_limit response; this step could not parse what GitHub returned."
+          printf '%s\n' "${json}" | head -c 400
+          echo
+          echo "::endgroup::"
+          exit 1
+        fi
+
+        field() {
+          local rest="${core#*\"$1\":}"
+          printf '%s' "${rest%%,*}"
+        }
+
+        limit="$(field limit)"
+        remaining="$(field remaining)"
+        used="$(field used)"
+        reset="$(field reset)"
+
+        case "${limit}|${remaining}|${used}|${reset}" in
+          *[!0-9\|]* | *'||'* | '|'* | *'|')
+            echo "::error::/rate_limit returned a core bucket this step could not parse into numbers."
+            printf '  core = %s\n' "${core}" | head -c 300
+            echo
+            echo "::endgroup::"
+            exit 1
+            ;;
+        esac
+
+        reset_human="$(date -u -d "@${reset}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+          || date -u -r "${reset}" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+          || echo 'unix seconds')"
+
+        echo "core.limit     : ${limit}"
+        echo "core.remaining : ${remaining}"
+        echo "core.used      : ${used}"
+        echo "core.reset     : ${reset} (${reset_human})"
+
+        # The LIMIT says which identity GitHub billed this to, and that is
+        # worth more than the remaining count: it is the only cheap way to
+        # notice that a token was never sent or was silently ignored.
+        case "${limit}" in
+          60)    echo "IDENTITY: limit=60 -> UNAUTHENTICATED. The token was not sent or was rejected, and every API call in this job shares one budget with every other job on this runner's egress IP." ;;
+          5000)  echo "IDENTITY: limit=5000 -> authenticated as a user or GITHUB_TOKEN." ;;
+          15000) echo "IDENTITY: limit=15000 -> authenticated as a GitHub App installation." ;;
+          *)     echo "IDENTITY: limit=${limit} -> unrecognised tier; record this if it recurs." ;;
+        esac
+
+        if [ "${remaining}" -lt 100 ]; then
+          echo "::warning::Only ${remaining} of ${limit} REST API requests remain (resets at ${reset_human})."
+        fi
+
         echo "::endgroup::"
 
     - name: Check if Nix is available
       id: check-nix
       shell: bash
       run: |
+        if [[ -L /nix ]]; then
+          echo "symlinked_store=true" >> "$GITHUB_OUTPUT"
+          echo "Detected a symlinked /nix store"
+        else
+          echo "symlinked_store=false" >> "$GITHUB_OUTPUT"
+        fi
+
         if command -v nix &>/dev/null; then
           echo "has_nix=true" >> "$GITHUB_OUTPUT"
           echo "Nix is already installed: $(nix --version)"
@@ -104,6 +336,7 @@ runs:
       if: steps.check-nix.outputs.has_nix != 'true'
       with:
         determinate: false
+        extra-conf: ${{ steps.check-nix.outputs.symlinked_store == 'true' && 'allow-symlinked-store = true' || '' }}
 
     - name: Connect NetBird
       if: ${{ inputs.netbird-setup-key != '' && runner.os == 'Linux' }}
@@ -162,7 +395,22 @@ runs:
 
     - name: Configure Nix
       shell: bash
+      # Through the environment, never onto a command line, where anything
+      # able to read /proc could see it.
+      env:
+        SETUP_NIX_GITHUB_TOKEN: ${{ inputs.nix-github-token }}
+        # The cache credential belongs here and not only in the Attic step
+        # below: that step runs `attic login`, which configures the Attic CLI
+        # for UPLOADING and writes nothing Nix reads. Nix reads netrc, and
+        # netrc is written here. Without this the private substituter declared
+        # two lines down is read ANONYMOUSLY, answers 401, and every path not
+        # on cache.nixos.org is built from source.
+        SETUP_NIX_ATTIC_TOKEN: ${{ inputs.attic-token }}
+        SETUP_NIX_ATTIC_ENDPOINT: ${{ inputs.attic-endpoint }}
+        SETUP_NIX_SUBSTITUTERS: ${{ inputs.substituters }}
       run: |
+        if [[ -n "${SETUP_NIX_ATTIC_TOKEN:-}" ]]; then echo "::add-mask::$SETUP_NIX_ATTIC_TOKEN"; fi
+
         mkdir -p $HOME/.config/nix
 
         cat << EOF > "$HOME/.config/nix/nix.conf"
@@ -176,20 +424,128 @@ runs:
             ''
           }}
 
-          fallback = true
-          download-attempts = 2
-          connect-timeout = 5
+          # See the 'fallback' input for the exact trade-off in both values.
+          fallback = ${{ inputs.fallback == 'false' && 'false' || 'true' }}
+          download-attempts = 5
+          # connect-timeout is libcurl's CURLOPT_CONNECTTIMEOUT, and libcurl
+          # charges the time a transfer spends QUEUED for a free connection
+          # (http-connections is CURLMOPT_MAX_TOTAL_CONNECTIONS) against it.
+          # At 5s with an 8-connection pool, every narinfo/NAR queued behind
+          # eight busy NAR downloads failed with "Operation timed out after
+          # 5000 milliseconds with 0 bytes received" — no network fault at all
+          # — and with fallback on, that disabled cache.nixos.org.
+          #
+          # 16 connections = Nix's default max-substitution-jobs, so NAR
+          # downloads alone never queue; only narinfo lookups can wait behind
+          # them. It stays below Nix's own default of 25 to keep burst load
+          # on our Attic (which has shown 500 bursts) bounded. 20s (Nix 2.31
+          # ships 15) gives a queued lookup headroom while bounding a truly
+          # unreachable cache to ~20s x download-attempts per nix process;
+          # the "Probe binary caches" step removes caches it finds unusable
+          # from nix.conf so the common case never waits at all.
+          connect-timeout = 20
+          # Persistent self-hosted runners have observed a group of multiplexed
+          # cache.nixos.org NAR transfers make no progress until the job ceiling.
+          # Bound silent transfers and use HTTP/1.1 so Nix can retry an
+          # individual object instead of wedging the whole substitution.
+          stalled-download-timeout = 30
+          http2 = false
+          http-connections = 16
           narinfo-cache-negative-ttl = 120
           allow-import-from-derivation = true
-          experimental-features = nix-command flakes pipe-operators
+          experimental-features = ${{ inputs.experimental-features }}
 
           substituters = https://cache.nixos.org ${{inputs.substituters}}
           trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= ${{inputs.trusted-public-keys}}
           netrc-file = $HOME/.config/nix/netrc
         EOF
 
+        if [[ "${{ steps.check-nix.outputs.symlinked_store }}" == "true" ]]; then
+          echo "allow-symlinked-store = true" >> "$HOME/.config/nix/nix.conf"
+        fi
+
         touch "$HOME/.config/nix/netrc"
         chmod 0600 "$HOME/.config/nix/netrc"
+
+        # Two credentials, one file, neither of which `access-tokens` above can
+        # carry:
+        #
+        #   * github.com — `access-tokens` only reaches Nix's OWN GitHub/GitLab
+        #     fetchers (`github:` / `gitlab:` refs). A `type = "git"` input over
+        #     https is fetched by shelling out to git, which never sees it.
+        #   * the private Attic substituter declared in `substituters` above —
+        #     nothing wrote a credential for it at all, so `nix-cache-info`
+        #     answered 401 and everything not on cache.nixos.org was built from
+        #     source.
+        #
+        # See the header of write-netrc.sh for both, and the real failures they
+        # fix. Contract suites: tests/write-netrc-test.sh (file semantics) and
+        # tests/netrc-wire-test.sh (what curl actually SENDS; run by the
+        # `setup-nix netrc` workflow, which does not share ci.yml's concurrency
+        # group and so is not blocked behind the self-hosted pool).
+        bash "${{ github.action_path }}/write-netrc.sh"
+
+    # Writing nix.conf is not the same as the setting being IN EFFECT, and the
+    # gap between those two is where the defect of the third-party installer
+    # action this repo migrated away from lives: on the `eph-*` images Nix is
+    # already installed, that action aborts with "Nix is already installed" and
+    # exit 0, never applies `experimental-features`, and the job dies much later
+    # in an unrelated step with "nix-command is disabled".
+    #
+    # That action is named, with the full story, in the header of
+    # verify-nix-config.sh. It is deliberately NOT named in this file:
+    # checks/deployment-production-cutover.nix asserts that action.yml contains
+    # no occurrence of that vendor's name at all, to prove the migration to the
+    # Determinate installer is complete. That guard is a plain substring ban and
+    # cannot tell code from comments, so spelling the name here — even in a
+    # comment — fails the check. Keep the name in verify-nix-config.sh, which
+    # the guard does not read.
+    #
+    # This action writes nix.conf unconditionally so it does not no-op that way,
+    # but it should not merely CLAIM to have configured Nix either. Prove it, by
+    # functional probe, before any step that depends on it. See the header of
+    # verify-nix-config.sh for why the probes deliberately do not pass
+    # `--extra-experimental-features`.
+    - name: Verify the Nix configuration took effect
+      shell: bash
+      env:
+        SETUP_NIX_REQUIRED_EXPERIMENTAL_FEATURES: ${{ inputs.experimental-features }}
+      run: bash "${{ github.action_path }}/verify-nix-config.sh"
+
+    # Prove the caches Nix was just told about are READABLE, with the netrc it
+    # will use, before any step asks it to substitute. An unreadable cache is
+    # otherwise one warning line followed by a source build of the closure.
+    - name: Probe binary caches
+      if: ${{ inputs.substituter-preflight != 'off' }}
+      shell: bash
+      env:
+        SETUP_NIX_PROBE_SUBSTITUTERS: https://cache.nixos.org ${{ inputs.substituters }}
+        SETUP_NIX_PROBE_MODE: ${{ inputs.substituter-preflight }}
+      run: |
+        SETUP_NIX_PROBE_NETRC="$HOME/.config/nix/netrc" \
+        SETUP_NIX_PROBE_NIX_CONF="$HOME/.config/nix/nix.conf" \
+          bash "${{ github.action_path }}/probe-substituters.sh"
+
+    - name: Start Attic watch-store
+      if: ${{ inputs.attic-token != '' && inputs.attic-cache != '' }}
+      shell: bash
+      env:
+        ATTIC_TOKEN: ${{ inputs.attic-token }}
+        ATTIC_CACHE: ${{ inputs.attic-cache }}
+        ATTIC_ENDPOINT: ${{ inputs.attic-endpoint }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::$ATTIC_TOKEN"
+
+        attic=(nix shell --accept-flake-config nixpkgs#attic-client -c attic)
+        "${attic[@]}" login --set-default ci "$ATTIC_ENDPOINT" "$ATTIC_TOKEN"
+
+        log="${RUNNER_TEMP:-/tmp}/attic-watch-store.log"
+        nohup "${attic[@]}" watch-store \
+          --jobs 1 \
+          "$ATTIC_CACHE" >"$log" 2>&1 &
+        echo "$!" > "${RUNNER_TEMP:-/tmp}/attic-watch-store.pid"
+        echo "Attic watch-store started for $ATTIC_CACHE (log: $log)"
 
     - name: Reset Nix flake fetcher cache
       shell: bash
@@ -281,5 +637,19 @@ runs:
 
         direnv allow .
         echo "::group::Exporting Nix DevShell to GITHUB_ENV"
-        direnv export gha >> "$GITHUB_ENV"
+        # Dynamic loader search paths (LD_LIBRARY_PATH, LD_PRELOAD) must never be
+        # exported globally into GITHUB_ENV. On non-NixOS runners (e.g. Ubuntu GARM
+        # runners), host binaries (such as the Actions runner Node.js runtime)
+        # inherit these variables and attempt to load Nix store libraries compiled
+        # against newer glibc versions, causing immediate loader aborts:
+        # "version `GLIBC_...` not found (required by .../libstdc++.so.6)".
+        # Nix binaries use RPATH and do not need LD_LIBRARY_PATH.
+        direnv export gha | awk '
+          /^LD_LIBRARY_PATH=/ || /^LD_PRELOAD=/ { next }
+          /^LD_LIBRARY_PATH<</ { skip=1; sub(/^LD_LIBRARY_PATH<</, ""); delim=$0; next }
+          /^LD_PRELOAD<</ { skip=1; sub(/^LD_PRELOAD<</, ""); delim=$0; next }
+          skip && $0 == delim { skip=0; next }
+          skip { next }
+          { print }
+        ' >> "$GITHUB_ENV"
         echo "::endgroup::"

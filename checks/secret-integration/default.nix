@@ -1,4 +1,4 @@
-# Integration test for `mcl secret` — verifies edit, re-encrypt, and
+# Integration test for `mcl-devops secret` — verifies edit, re-encrypt, and
 # re-encrypt-all against a minimal nixosConfiguration that imports the
 # mcl secrets module.
 #
@@ -30,6 +30,7 @@ let
             sshKey = builtins.readFile ./test-keys/.ssh/id_ed25519.pub;
           };
           mcl.secrets.extraKeys = [ (builtins.readFile ./test-keys/.ssh/extra_id_ed25519.pub) ];
+          age.identityPaths = [ ./test-keys/.ssh/id_ed25519 ];
           boot.loader.grub.enable = false;
           fileSystems."/".device = "none";
           fileSystems."/".fsType = "tmpfs";
@@ -40,7 +41,7 @@ let
 in
 {
   # ---------------------------------------------------------------------------
-  # 1.  Define nixosConfigurations to test the mcl.secrets and `mcl secret`
+  # 1.  Define nixosConfigurations to test the mcl.secrets and `mcl-devops secret`
   #     command. Besides the primary machine, we add:
   #       - `broken-machine`: its `mcl.secrets.services` throws on evaluation,
   #         exercising the per-machine `tryEval` error path in `list` (the
@@ -61,13 +62,39 @@ in
     };
   };
 
-  # A machine whose secrets fail to evaluate. `mcl secret list` forces
-  # `attrNames services.<name>.secrets`, so a throwing `secrets` attrset
+  # A machine-shaped fixture whose secrets fail to evaluate. `mcl-devops secret list`
+  # forces `attrNames services.<name>.secrets`, so a throwing `secrets` attrset
   # triggers the `builtins.tryEval` guard and yields an `__error__` marker
   # instead of aborting the whole-fleet evaluation.
-  flake.nixosConfigurations.broken-machine = mkMachine {
-    mcl.secrets.services.broken-svc.secrets = throw "intentional eval failure for broken-machine";
-  };
+  #
+  # This is intentionally not a full nixosSystem. Routing the throw through the
+  # real module would pull it into `age.secrets` (which maps over
+  # `services.<name>.secrets`) and therefore into `system.build.toplevel`, so
+  # the machine could not be evaluated at all — the command-specific test must
+  # remain the only path that forces the secret error.
+  #
+  # Because it stands in for a nixosSystem, the fixture has to offer the same
+  # surface that consumers of a `nixosConfigurations` entry read. That is not
+  # just `config`: tooling that walks the flake's outputs (`nix flake show`,
+  # `nix flake check`) reads `pkgs.stdenv.system` to decide which system a
+  # machine belongs to. A fixture without `pkgs` makes those commands fail on
+  # the flake as a whole, so `pkgs` is part of the fixture's contract and is
+  # also what supplies its placeholder toplevel below.
+  flake.nixosConfigurations.broken-machine =
+    let
+      pkgs = inputs.nixpkgs.legacyPackages.x86_64-linux;
+    in
+    {
+      inherit pkgs;
+
+      config = {
+        system.build.toplevel = pkgs.runCommand "nixos-system-broken-machine-secret-fixture" { } ''
+          mkdir -p "$out"
+        '';
+
+        mcl.secrets.services.broken-svc.secrets = throw "intentional eval failure for broken-machine";
+      };
+    };
 
   # A valid machine whose name ends in `-vm`; `list` hides it unless
   # `--include-vms` is passed.
@@ -79,7 +106,7 @@ in
   };
 
   # ---------------------------------------------------------------------------
-  # 2.  A runnable test script that exercises `mcl secret` subcommands.
+  # 2.  A runnable test script that exercises `mcl-devops secret` subcommands.
   # ---------------------------------------------------------------------------
   perSystem =
     {
@@ -95,7 +122,7 @@ in
         secret-integration = pkgs.writeShellApplication {
           name = "test-mcl-secret";
           runtimeInputs = [
-            self'.packages.mcl
+            self'.packages.mcl-devops
             pkgs.age
             pkgs.openssh
             pkgs.nix

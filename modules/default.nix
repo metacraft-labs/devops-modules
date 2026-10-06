@@ -17,7 +17,22 @@
     ./mcl-disko
     ./pharos
     ./commands.nix
+    ./attic-cache-host
+    ./mcl-s3-artifact-store
+    ./mcl-repro-binary-cache
+    ./mcl-reprobuild
+    ./mcl-repro-deploy-agent
+    ./garm
+    ./garm-fleet-alerts
+    ./garm-fleet-external-checks
+    ./garm-webhook-endpoint
+    ./github-actions-fit-exporter
+    ./github-actions-fit-alerts
+    ./runner-label-taxonomy
+    ./vm-harness-serve
+    ./vm-harness-serve/darwin.nix
     ./virtualisation/desktop-vms.nix
     ./nix-topology
+    ./alertmanager-fleet-routing
   ];
 }

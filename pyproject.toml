@@ -1,0 +1,45 @@
+# This repository doubles as a pre-commit HOOK REPOSITORY.
+#
+# WHY A pyproject.toml LIVES IN A NIX MODULES REPO. Pre-commit configuration is
+# generally managed OUTSIDE flakes here, because flakes are not supported on
+# Windows: a hook set that exists only as a Nix module is unavailable to every
+# Windows developer, which makes it not actually mandatory. Measured across the
+# 159 workspace directories: 4 repos carry a real committed
+# `.pre-commit-config.yaml` (agent-harbor, codetracer-engine-godot,
+# reprobuild-cmake, reprobuild-specs) and 15 carry one as a symlink into
+# /nix/store generated at devShell entry, which on Windows produces nothing at
+# all.
+#
+# Declaring the hooks here (with `.pre-commit-hooks.yaml`) lets a repo with no
+# flake, on any OS, name the rule by its id and have pre-commit/prek fetch and
+# run it:
+#
+#     repos:
+#       - repo: https://github.com/metacraft-labs/devops-modules
+#         rev: <sha>
+#         hooks: [{ id: ban-added-ct-recordings }]
+#
+# `language: python` is what makes that portable: pre-commit and prek both
+# build an isolated environment for the hook repo, so the only host requirement
+# is the Python they already manage. `language: system` would need the script
+# already on PATH, which is exactly the Nix assumption being removed.
+[build-system]
+requires = [ "setuptools>=61" ]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcl-git-hooks"
+version = "1.0.0"
+description = "Metacraft Labs standard git hook implementations (portable, no Nix required)"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+mcl-ban-added-paths = "mcl_git_hooks.ban_added_paths:main"
+
+[tool.setuptools]
+# The package lives under `git-hooks/` rather than at the root so the Nix side
+# can name `git-hooks/mcl_git_hooks/ban_added_paths.py` as a plain file path
+# and run it with any python3, without an install step.
+package-dir = { "" = "git-hooks" }
+packages = [ "mcl_git_hooks" ]

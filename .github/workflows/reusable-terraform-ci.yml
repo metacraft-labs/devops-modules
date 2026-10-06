@@ -2,6 +2,11 @@ name: 'Terraform CI'
 
 on:
   workflow_call:
+    # The caller selects this file with a literal
+    # metacraft-labs/devops-modules/...@<ref> value. GitHub resolves that ref
+    # to job.workflow_sha for every called job; source-bearing steps below use
+    # that immutable identity rather than github.sha (which may be a synthetic
+    # pull-request merge) or a second caller-provided ref.
     inputs:
       mode:
         description: 'Workflow mode: "pr" (offline + plan), "apply" (apply on merge), "drift" (scheduled drift check)'
@@ -20,10 +25,40 @@ on:
         default: ''
 
       runner:
-        description: 'JSON-encoded runner labels for self-hosted runner'
+        # PERSISTENT-RUNNER / INFRA EXEMPTION (ci-workflow-standards coexistence
+        # model): Terraform plan/apply/drift jobs are infra-deploy jobs that
+        # touch remote state and cloud credentials, so they run on a persistent
+        # self-hosted runner rather than an ephemeral Nix class (eph-linux-x64). The
+        # default label array is retained deliberately; callers may override.
+        # If the `x86-64-v2` capability label is retired, infra should repoint
+        # this to the canonical persistent Linux class ([self-hosted, linux, nixos]).
+        #
+        # THE TERRAFORM LANE OVERRIDE. Every job below resolves `runs-on` as
+        # `fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner)`. `vars` in a
+        # called workflow is the CALLER repository's (then its org's), so an
+        # admitted repository opts into the lane by setting that repository
+        # variable to a JSON runs-on value (e.g. '"eph-linux-x64-terraform"'),
+        # with no edit to its terraform*.yml; unsetting it restores
+        # `inputs.runner`. It is a variable of its OWN on purpose: callers'
+        # own jobs must never read it, because a job a caller defines runs from
+        # `refs/pull/N/merge` on a PR and can never be admitted to the lane's
+        # workflow-restricted runner group; only jobs defined HERE (admitted by
+        # this file at the ref the caller pins) can. While the override is set
+        # `reclaim_hosted_runner_disk` is forced off: that step fails closed on
+        # any runner that is not GitHub-hosted. Fleet side: metacraft-labs/infra
+        # lib/infra-constants.nix `terraformLane`.
+        description: 'JSON-encoded runner labels for the persistent self-hosted runner (infra exemption)'
         type: string
         required: false
         default: '["self-hosted", "Linux", "x86-64-v2"]'
+
+      reclaim_hosted_runner_disk:
+        description: >-
+          Reclaim a fixed allowlist of GitHub-hosted Linux image toolchains
+          before Nix setup. Fails closed on every other runner class.
+        type: boolean
+        required: false
+        default: false
 
       provider_allowlist:
         description: 'Comma-separated list of allowed provider source prefixes for denylist check (e.g. "cloudflare,google")'
@@ -42,6 +77,41 @@ on:
         type: string
         required: false
         default: ''
+
+      destroy_guard:
+        # Apply mode only. The PR-time destroy/replace gates judge the plan of
+        # the PR's OWN change. An apply on push judges nothing: it applies
+        # whatever the root's plan is at that moment, including changes that
+        # landed earlier and never applied (a red pipeline, a skipped root).
+        # On 2026-09-23 a CI-only push to infra re-applied every root, and one
+        # carried a days-old unmoved Cloudflare record -- a destroy + create of
+        # the same name; the create failed and SSO went down. With this on, the
+        # apply job runs terraform/ci/plan-destroy-guard on the saved plan it
+        # is about to apply and refuses any destroy/replace nobody authorized.
+        description: >-
+          Refuse to apply a plan containing destroy or replace actions unless
+          authorized by `allow_destroy` or by a pull request associated with the
+          pushed commit that carries `destroy_label`.
+        type: boolean
+        required: false
+        default: false
+
+      allow_destroy:
+        description: >-
+          Authorize destroy/replace actions for this apply (destroy_guard). Wire
+          it to an explicit workflow_dispatch input, never to a computed value.
+        type: boolean
+        required: false
+        default: false
+
+      destroy_label:
+        description: >-
+          PR label that authorizes destroy/replace on the push that lands the
+          PR (destroy_guard). Same label the PR-time destroy gate requires.
+          Empty disables label authorization.
+        type: string
+        required: false
+        default: 'allow-destroy'
 
       environment_name:
         description: 'GitHub Environment used by apply jobs as the credential boundary for the target branch.'
@@ -109,12 +179,64 @@ on:
         required: false
         default: '3600'
 
+      github_app_owner:
+        description: 'Org/user for the github-app credential mode; the minted installation token is scoped here. Empty disables github-app minting.'
+        type: string
+        required: false
+        default: ''
+
+      nix_fallback:
+        description: >-
+          setup-nix `fallback`. Default 'true' (Nix builds from source what a
+          failing substituter could not provide, after disabling it for 60s).
+          'false' makes any substituter error fail the job instead — use it
+          where a silent source build of the devShell is worse than a retry.
+        type: string
+        required: false
+        default: 'true'
+      substituter_preflight:
+        description: >-
+          setup-nix `substituter-preflight` mode: `fail` stops the job when any
+          configured binary cache is unreadable (no/bad Attic token, network
+          ACL 403, unreachable) instead of letting Nix build the closure from
+          source; `warn` (default) only annotates non-upstream caches; `off`
+          skips the probe.
+        type: string
+        required: false
+        default: 'warn'
+
+      plan_timeout_minutes:
+        description: >-
+          Upper bound for the credentialed PR plan and the drift plan steps. A
+          plan that exceeds it fails the job instead of holding a runner for
+          hours (e.g. a provider sleeping on rate limits with its output
+          redirected).
+        type: number
+        required: false
+        default: 60
+
     secrets:
       AGENIX_CI_PRIVATE_KEY:
         description: 'SSH private key for agenix secret decryption'
         required: false
+      GH_APP_ID:
+        description: 'GitHub App id for the github-app credential mode (mints a short-lived installation token exported as GITHUB_TOKEN for the github provider).'
+        required: false
+      GH_APP_PRIVATE_KEY:
+        description: 'GitHub App private key (PEM) paired with GH_APP_ID.'
+        required: false
       NIX_GITHUB_TOKEN:
         description: 'GitHub token for Nix flake fetches'
+        required: false
+      ATTIC_PULL_TOKEN:
+        description: >-
+          Read-only Attic token for the private substituters in
+          vars.SUBSTITUTERS. Without it (or ATTIC_TOKEN) Nix reads a private
+          cache anonymously, gets 401, skips it, and builds every path only it
+          holds from source.
+        required: false
+      ATTIC_TOKEN:
+        description: 'Fallback Attic token when ATTIC_PULL_TOKEN is not provided (read access is all this workflow uses).'
         required: false
 
 permissions:
@@ -130,18 +252,125 @@ jobs:
   # All modes run on the configured self-hosted runner labels.
   # ---------------------------------------------------------------------------
   offline-checks:
-    runs-on: ${{ fromJSON(inputs.runner) }}
+    # TERRAFORM LANE override: the CALLER repository's `TERRAFORM_LANE_RUNNER`
+    # variable (a JSON runs-on value), when set, replaces `inputs.runner`.
+    # See the `runner` input.
+    runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}
+    env:
+      # TERRAFORM DEV SHELL override: when the CALLER repository's
+      # TERRAFORM_DEVSHELL_FLAKE variable names a flake directory (repo-relative,
+      # e.g. `shells/terraform`), every dev-shell and inputs-from call below
+      # uses that flake instead of the repository root flake, once the
+      # "Resolve the Terraform dev shell" step has found it in the checkout.
+      # See the `runner` input for why these overrides are repository variables.
+      TF_DEVSHELL_FLAKE_REQUESTED: ${{ vars.TERRAFORM_DEVSHELL_FLAKE }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Checkout called workflow source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .mcl/reusable-terraform-ci
+          persist-credentials: false
+
+      - name: Verify called workflow source
+        shell: bash
+        env:
+          EXPECTED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          EXPECTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          EXPECTED_WORKFLOW_SERVER_URL: ${{ github.server_url }}
+          WORKFLOW_SOURCE: ${{ github.workspace }}/.mcl/reusable-terraform-ci
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$EXPECTED_WORKFLOW_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Called workflow repository identity is empty or malformed."
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Called workflow SHA is not a full lowercase commit SHA."
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_WORKFLOW_SERVER_URL" =~ ^https?://[^/]+$ ]]; then
+            echo "::error::GitHub server URL is empty or malformed."
+            exit 1
+          fi
+          if [ ! -d "$WORKFLOW_SOURCE/.git" ]; then
+            echo "::error::Called workflow source is not a standalone Git checkout."
+            exit 1
+          fi
+
+          actual_sha="$(git -C "$WORKFLOW_SOURCE" rev-parse --verify 'HEAD^{commit}')"
+          if [ "$actual_sha" != "$EXPECTED_WORKFLOW_SHA" ]; then
+            echo "::error::Called workflow checkout is at $actual_sha, expected $EXPECTED_WORKFLOW_SHA."
+            exit 1
+          fi
+
+          expected_remote="${EXPECTED_WORKFLOW_SERVER_URL}/${EXPECTED_WORKFLOW_REPOSITORY}"
+          actual_remote="$(git -C "$WORKFLOW_SOURCE" remote get-url origin)"
+          actual_remote="${actual_remote%.git}"
+          if [ "$actual_remote" != "$expected_remote" ]; then
+            echo "::error::Called workflow checkout remote is $actual_remote, expected $expected_remote."
+            exit 1
+          fi
+
+          if [ -n "$(git -C "$WORKFLOW_SOURCE" status --porcelain=v1 --untracked-files=all)" ]; then
+            echo "::error::Called workflow checkout is not clean."
+            exit 1
+          fi
+
+          setup_file_count=0
+          while IFS= read -r -d '' setup_path; do
+            setup_file="$WORKFLOW_SOURCE/$setup_path"
+            if [ ! -f "$setup_file" ] || [ -L "$setup_file" ]; then
+              echo "::error::Called workflow Setup Nix source is missing or is not a regular file: $setup_path"
+              exit 1
+            fi
+            expected_blob="$(git -C "$WORKFLOW_SOURCE" rev-parse --verify "${EXPECTED_WORKFLOW_SHA}:${setup_path}")"
+            actual_blob="$(git -C "$WORKFLOW_SOURCE" hash-object --no-filters -- "$setup_file")"
+            if [ "$actual_blob" != "$expected_blob" ]; then
+              echo "::error::Called workflow Setup Nix source differs from $EXPECTED_WORKFLOW_SHA: $setup_path"
+              exit 1
+            fi
+            ((setup_file_count += 1))
+          done < <(git -C "$WORKFLOW_SOURCE" ls-tree -r --name-only -z "$EXPECTED_WORKFLOW_SHA" -- .github/setup-nix)
+          if [ "$setup_file_count" -eq 0 ]; then
+            echo "::error::Called workflow commit contains no Setup Nix action source."
+            exit 1
+          fi
+
       - name: Setup Nix
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        uses: ./.mcl/reusable-terraform-ci/.github/setup-nix
         with:
           push-to-cache: false
+          reclaim_hosted_runner_disk: ${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # Read-only: written to the netrc Nix uses for the private cache.
+          # No attic-cache is set, so nothing is pushed.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+          substituter-preflight: ${{ inputs.substituter_preflight }}
+          fallback: ${{ inputs.nix_fallback }}
+
+      - name: Resolve the Terraform dev shell
+        # TERRAFORM_DEVSHELL_FLAKE names a flake directory in the CALLER's
+        # checkout. A checkout that predates that directory (an older PR branch,
+        # or a re-run of an older commit) must not fail every Nix step, so it
+        # falls back to the repository flake. Only this step sets
+        # TF_DEVSHELL_FLAKE (no job-level value competes with GITHUB_ENV).
+        if: env.TF_DEVSHELL_FLAKE_REQUESTED != ''
+        run: |
+          dir="$GITHUB_WORKSPACE/$TF_DEVSHELL_FLAKE_REQUESTED"
+          if [ -f "$dir/flake.nix" ]; then
+            echo "TF_DEVSHELL_FLAKE=$dir" >> "$GITHUB_ENV"
+            echo "Terraform dev shell: $TF_DEVSHELL_FLAKE_REQUESTED"
+          else
+            echo "::notice::TERRAFORM_DEVSHELL_FLAKE=$TF_DEVSHELL_FLAKE_REQUESTED is not in this checkout; using the repository flake"
+          fi
 
       - name: Lockfile check
         run: |
@@ -158,21 +387,21 @@ jobs:
         if: inputs.terranix
         run: |
           cd ${{ inputs.working_directory }}
-          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from . --accept-flake-config)
-          nix develop --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
+          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from "${TF_DEVSHELL_FLAKE:-.}" --accept-flake-config)
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
 
       - name: Format check
-        run: nix develop --accept-flake-config --command tofu fmt -check -recursive ${{ inputs.working_directory }}/
+        run: nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command tofu fmt -check -recursive ${{ inputs.working_directory }}/
 
       - name: Init (offline)
         run: |
           cd ${{ inputs.working_directory }}
-          nix develop --accept-flake-config --command tofu init -backend=false
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command tofu init -backend=false
 
       - name: Validate
         run: |
           cd ${{ inputs.working_directory }}
-          nix develop --accept-flake-config --command tofu validate
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command tofu validate
 
       - name: Denylist check
         run: |
@@ -252,17 +481,17 @@ jobs:
         if: hashFiles(format('{0}/.tflint.hcl', inputs.working_directory)) != ''
         run: |
           cd ${{ inputs.working_directory }}
-          nix develop --accept-flake-config --command tflint --init
-          nix develop --accept-flake-config --command tflint
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command tflint --init
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command tflint
 
       - name: Checkov
         if: inputs.enable_checkov
-        run: nix develop --accept-flake-config --command checkov -d ${{ inputs.working_directory }}/
+        run: nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command checkov -d ${{ inputs.working_directory }}/
 
       - name: Unit tests
         run: |
           cd ${{ inputs.working_directory }}
-          nix develop --accept-flake-config --command tofu test
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command tofu test
 
   # ---------------------------------------------------------------------------
   # Job 2: Credentialed plan (PR mode only, same-repo PRs only)
@@ -274,18 +503,125 @@ jobs:
       && github.event.pull_request.head.repo.full_name == github.repository
       && (inputs.credentials_env_name != '' || inputs.agenix_plan_secret_path != '' || inputs.aws_plan_role_arn != '')
     needs: offline-checks
-    runs-on: ${{ fromJSON(inputs.runner) }}
+    # TERRAFORM LANE override: the CALLER repository's `TERRAFORM_LANE_RUNNER`
+    # variable (a JSON runs-on value), when set, replaces `inputs.runner`.
+    # See the `runner` input.
+    runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}
+    env:
+      # TERRAFORM DEV SHELL override: when the CALLER repository's
+      # TERRAFORM_DEVSHELL_FLAKE variable names a flake directory (repo-relative,
+      # e.g. `shells/terraform`), every dev-shell and inputs-from call below
+      # uses that flake instead of the repository root flake, once the
+      # "Resolve the Terraform dev shell" step has found it in the checkout.
+      # See the `runner` input for why these overrides are repository variables.
+      TF_DEVSHELL_FLAKE_REQUESTED: ${{ vars.TERRAFORM_DEVSHELL_FLAKE }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Checkout called workflow source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .mcl/reusable-terraform-ci
+          persist-credentials: false
+
+      - name: Verify called workflow source
+        shell: bash
+        env:
+          EXPECTED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          EXPECTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          EXPECTED_WORKFLOW_SERVER_URL: ${{ github.server_url }}
+          WORKFLOW_SOURCE: ${{ github.workspace }}/.mcl/reusable-terraform-ci
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$EXPECTED_WORKFLOW_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Called workflow repository identity is empty or malformed."
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Called workflow SHA is not a full lowercase commit SHA."
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_WORKFLOW_SERVER_URL" =~ ^https?://[^/]+$ ]]; then
+            echo "::error::GitHub server URL is empty or malformed."
+            exit 1
+          fi
+          if [ ! -d "$WORKFLOW_SOURCE/.git" ]; then
+            echo "::error::Called workflow source is not a standalone Git checkout."
+            exit 1
+          fi
+
+          actual_sha="$(git -C "$WORKFLOW_SOURCE" rev-parse --verify 'HEAD^{commit}')"
+          if [ "$actual_sha" != "$EXPECTED_WORKFLOW_SHA" ]; then
+            echo "::error::Called workflow checkout is at $actual_sha, expected $EXPECTED_WORKFLOW_SHA."
+            exit 1
+          fi
+
+          expected_remote="${EXPECTED_WORKFLOW_SERVER_URL}/${EXPECTED_WORKFLOW_REPOSITORY}"
+          actual_remote="$(git -C "$WORKFLOW_SOURCE" remote get-url origin)"
+          actual_remote="${actual_remote%.git}"
+          if [ "$actual_remote" != "$expected_remote" ]; then
+            echo "::error::Called workflow checkout remote is $actual_remote, expected $expected_remote."
+            exit 1
+          fi
+
+          if [ -n "$(git -C "$WORKFLOW_SOURCE" status --porcelain=v1 --untracked-files=all)" ]; then
+            echo "::error::Called workflow checkout is not clean."
+            exit 1
+          fi
+
+          setup_file_count=0
+          while IFS= read -r -d '' setup_path; do
+            setup_file="$WORKFLOW_SOURCE/$setup_path"
+            if [ ! -f "$setup_file" ] || [ -L "$setup_file" ]; then
+              echo "::error::Called workflow Setup Nix source is missing or is not a regular file: $setup_path"
+              exit 1
+            fi
+            expected_blob="$(git -C "$WORKFLOW_SOURCE" rev-parse --verify "${EXPECTED_WORKFLOW_SHA}:${setup_path}")"
+            actual_blob="$(git -C "$WORKFLOW_SOURCE" hash-object --no-filters -- "$setup_file")"
+            if [ "$actual_blob" != "$expected_blob" ]; then
+              echo "::error::Called workflow Setup Nix source differs from $EXPECTED_WORKFLOW_SHA: $setup_path"
+              exit 1
+            fi
+            ((setup_file_count += 1))
+          done < <(git -C "$WORKFLOW_SOURCE" ls-tree -r --name-only -z "$EXPECTED_WORKFLOW_SHA" -- .github/setup-nix)
+          if [ "$setup_file_count" -eq 0 ]; then
+            echo "::error::Called workflow commit contains no Setup Nix action source."
+            exit 1
+          fi
+
       - name: Setup Nix
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        uses: ./.mcl/reusable-terraform-ci/.github/setup-nix
         with:
           push-to-cache: false
+          reclaim_hosted_runner_disk: ${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # Read-only: written to the netrc Nix uses for the private cache.
+          # No attic-cache is set, so nothing is pushed.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+          substituter-preflight: ${{ inputs.substituter_preflight }}
+          fallback: ${{ inputs.nix_fallback }}
+
+      - name: Resolve the Terraform dev shell
+        # TERRAFORM_DEVSHELL_FLAKE names a flake directory in the CALLER's
+        # checkout. A checkout that predates that directory (an older PR branch,
+        # or a re-run of an older commit) must not fail every Nix step, so it
+        # falls back to the repository flake. Only this step sets
+        # TF_DEVSHELL_FLAKE (no job-level value competes with GITHUB_ENV).
+        if: env.TF_DEVSHELL_FLAKE_REQUESTED != ''
+        run: |
+          dir="$GITHUB_WORKSPACE/$TF_DEVSHELL_FLAKE_REQUESTED"
+          if [ -f "$dir/flake.nix" ]; then
+            echo "TF_DEVSHELL_FLAKE=$dir" >> "$GITHUB_ENV"
+            echo "Terraform dev shell: $TF_DEVSHELL_FLAKE_REQUESTED"
+          else
+            echo "::notice::TERRAFORM_DEVSHELL_FLAKE=$TF_DEVSHELL_FLAKE_REQUESTED is not in this checkout; using the repository flake"
+          fi
 
       - name: Decrypt provider credentials
         if: inputs.agenix_plan_secret_path != ''
@@ -310,8 +646,8 @@ jobs:
             exit 1
           fi
 
-          nix develop --accept-flake-config --command bash -euo pipefail -c \
-            'age -d -i "$1" "$2" > "$3"' \
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c \
+            "age -d -i \"\$1\" \"\$2\" > \"\$3\"" \
             bash "$RUNNER_TEMP/ci-key" "$AGENIX_SECRET_PATH" "$token_file" >/dev/null
 
           TOKEN="$(<"$token_file")"
@@ -330,6 +666,54 @@ jobs:
             printf '%s\n' "$TOKEN"
             printf '__MCL_TERRAFORM_SECRET__\n'
           } >> "$GITHUB_ENV"
+
+      # github-app credential mode: mint a short-lived installation token from
+      # the App (e.g. the governance App) and export it as GITHUB_TOKEN for the
+      # github provider. Preferred over a long-lived PAT — nothing new is stored,
+      # the token expires in ~1h, and it is scoped to github_app_owner.
+      # CREDENTIAL DEADLINE. Recorded BEFORE minting, so it errs early: the
+      # moment the first short-lived credential this job mints (the 1 h App
+      # installation token, the AWS OIDC session) stops working. Every tofu
+      # call that can take the state lock runs under
+      # terraform/ci/tofu-credential-deadline, which interrupts it (SIGINT)
+      # while the credentials still work, so tofu releases its own lock instead
+      # of stranding it (infra run 36860633451, 2026-10-01).
+      - name: Record credential deadline
+        env:
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
+          GITHUB_APP: ${{ inputs.github_app_owner != '' }}
+          AWS_DURATION: ${{ inputs.aws_plan_role_arn != '' && inputs.aws_role_duration_seconds || '' }}
+        run: |
+          set -euo pipefail
+          not_after="$(bash "$DEADLINE_SCRIPT" not-after --github-app "$GITHUB_APP" --aws-duration "$AWS_DURATION")"
+          echo "TF_CREDENTIALS_NOT_AFTER=$not_after" >> "$GITHUB_ENV"
+
+      - name: Mint GitHub App token
+        if: inputs.github_app_owner != ''
+        id: gh_app_token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.github_app_owner }}
+
+      - name: Export GITHUB_TOKEN for the github provider
+        if: inputs.github_app_owner != ''
+        run: |
+          echo "::add-mask::${{ steps.gh_app_token.outputs.token }}"
+          echo "GITHUB_TOKEN=${{ steps.gh_app_token.outputs.token }}" >> "$GITHUB_ENV"
+
+      # The App installation's ONE hourly REST bucket is shared by every job
+      # minting from it; reading it before and after tofu measures what this
+      # plan/apply cost. See terraform/ci/github-app-rate-budget.
+      - name: GitHub App API budget (before)
+        if: inputs.github_app_owner != ''
+        continue-on-error: true
+        env:
+          BUDGET_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-app-rate-budget
+        run: |
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$BUDGET_SCRIPT" --label before --save "$RUNNER_TEMP/gh-app-rate-budget.json"
 
       - name: Configure AWS credentials for plan
         if: inputs.aws_plan_role_arn != ''
@@ -351,14 +735,29 @@ jobs:
         if: inputs.terranix
         run: |
           cd ${{ inputs.working_directory }}
-          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from . --accept-flake-config)
-          nix develop --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
+          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from "${TF_DEVSHELL_FLAKE:-.}" --accept-flake-config)
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
+
+      # A github provider without a credential does not fail: it falls back to
+      # anonymous access (60 requests/hour) and sleeps until each rate-limit
+      # reset, silently. Refuse before init instead. See the script header.
+      - name: GitHub provider credential gate
+        env:
+          GATE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-provider-credential-gate
+          GITHUB_APP_OWNER: ${{ inputs.github_app_owner }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$GATE_SCRIPT" "$WORKING_DIRECTORY" --github-app-owner "$GITHUB_APP_OWNER"
 
       - name: Plan
         id: plan
+        timeout-minutes: ${{ inputs.plan_timeout_minutes }}
         env:
           BACKEND_CONFIG_FILE: ${{ inputs.backend_config_file }}
           WORKING_DIRECTORY: ${{ inputs.working_directory }}
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
         run: |
           set -euo pipefail
 
@@ -384,9 +783,15 @@ jobs:
             backend_args+=("-backend-config=$(realpath --relative-to="$PWD" "$backend_path")")
           done < <(printf '%s\n' "$backend_config_files" | tr ',' '\n')
 
-          tofu_bin="$(nix develop --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
+          tofu_bin="$(nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
           run_tofu() {
             env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
+          }
+          # Interrupted while the job's credentials still work; see the
+          # "Record credential deadline" step.
+          run_tofu_bounded() {
+            bash "$DEADLINE_SCRIPT" run --not-after "${TF_CREDENTIALS_NOT_AFTER:-}" -- \
+              env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
           }
 
           run_tofu init -input=false "${backend_args[@]}"
@@ -396,18 +801,19 @@ jobs:
           plan_stderr="$plan_dir/plan.stderr"
           plan_json="$plan_dir/plan.json"
 
+          # stdout is streamed (tee) so a slow or stuck refresh is visible in
+          # the job log while it happens, not only after tofu exits.
           set +e
-          run_tofu plan \
+          run_tofu_bounded plan \
             -input=false \
             -no-color \
             -lock=false \
             -detailed-exitcode \
             -out="$plan_bin" \
-            >"$plan_text" 2>"$plan_stderr"
-          plan_exit=$?
+            2>"$plan_stderr" | tee "$plan_text"
+          plan_exit=${PIPESTATUS[0]}
           set -e
 
-          cat "$plan_text"
           cat "$plan_stderr" >&2
 
           if [ "$plan_exit" -eq 1 ]; then
@@ -467,6 +873,15 @@ jobs:
               for key, value in counts.items():
                   print(f"{key}={value}", file=output)
           PY
+
+      - name: GitHub App API budget (after)
+        if: always() && inputs.github_app_owner != ''
+        continue-on-error: true
+        env:
+          BUDGET_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-app-rate-budget
+        run: |
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$BUDGET_SCRIPT" --label after --since "$RUNNER_TEMP/gh-app-rate-budget.json"
 
       - name: Post plan comment
         if: steps.plan.outputs.text_plan_path != ''
@@ -601,11 +1016,12 @@ jobs:
         if: steps.plan.outputs.json_plan_path != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          EXPECTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          EXPECTED_WORKFLOW_SERVER_URL: ${{ github.server_url }}
+          WORKFLOW_SOURCE: ${{ github.workspace }}/.mcl/reusable-terraform-ci
         run: |
-          # Fetch policy script from nixos-modules
-          WORKFLOW_REF="${{ github.action_ref || 'main' }}"
-          POLICY_SCRIPT_URL="https://raw.githubusercontent.com/metacraft-labs/nixos-modules/${WORKFLOW_REF}/scripts/tofu-plan-policy.py"
-          curl -fsSL "$POLICY_SCRIPT_URL" -o /tmp/tofu-plan-policy.py
+          set -euo pipefail
 
           PLAN_JSON="${{ steps.plan.outputs.json_plan_path }}"
           POLICY_ARGS=()
@@ -621,9 +1037,72 @@ jobs:
             POLICY_ARGS+=(--scope-expansion)
           fi
 
-          # Run policy check
+          # Consumer-controlled plan commands run after the first source check.
+          # Re-verify immediately before policy execution so they cannot replace
+          # the policy files or retarget the exact called-workflow checkout.
+          if [[ ! "$EXPECTED_WORKFLOW_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Called workflow repository identity is empty or malformed."
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Called workflow SHA is not a full lowercase commit SHA."
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_WORKFLOW_SERVER_URL" =~ ^https?://[^/]+$ ]]; then
+            echo "::error::GitHub server URL is empty or malformed."
+            exit 1
+          fi
+
+          actual_sha="$(git -C "$WORKFLOW_SOURCE" rev-parse --verify 'HEAD^{commit}')"
+          if [ "$actual_sha" != "$EXPECTED_WORKFLOW_SHA" ]; then
+            echo "::error::Called workflow checkout is at $actual_sha, expected $EXPECTED_WORKFLOW_SHA."
+            exit 1
+          fi
+
+          expected_remote="${EXPECTED_WORKFLOW_SERVER_URL}/${EXPECTED_WORKFLOW_REPOSITORY}"
+          actual_remote="$(git -C "$WORKFLOW_SOURCE" remote get-url origin)"
+          actual_remote="${actual_remote%.git}"
+          if [ "$actual_remote" != "$expected_remote" ]; then
+            echo "::error::Called workflow checkout remote is $actual_remote, expected $expected_remote."
+            exit 1
+          fi
+
+          policy_script_path="scripts/tofu-plan-policy.py"
+          policy_runner_path="scripts/tofu-plan-policy-ci"
+          for policy_path in "$policy_script_path" "$policy_runner_path"; do
+            policy_file="$WORKFLOW_SOURCE/$policy_path"
+            if [ ! -f "$policy_file" ] || [ -L "$policy_file" ]; then
+              echo "::error::Called workflow policy source is missing or is not a regular file: $policy_path"
+              exit 1
+            fi
+            expected_blob="$(git -C "$WORKFLOW_SOURCE" rev-parse --verify "${EXPECTED_WORKFLOW_SHA}:${policy_path}")"
+            if [ "$(git -C "$WORKFLOW_SOURCE" cat-file -t "$expected_blob")" != "blob" ]; then
+              echo "::error::Called workflow policy source is not a blob at $EXPECTED_WORKFLOW_SHA: $policy_path"
+              exit 1
+            fi
+            actual_blob="$(git -C "$WORKFLOW_SOURCE" hash-object --no-filters -- "$policy_file")"
+            if [ "$actual_blob" != "$expected_blob" ]; then
+              echo "::error::Called workflow policy source differs from $EXPECTED_WORKFLOW_SHA: $policy_path"
+              exit 1
+            fi
+          done
+
+          umask 077
+          policy_dir="$(mktemp -d "$RUNNER_TEMP/reusable-terraform-policy.XXXXXX")"
+          trap 'rm -rf "$policy_dir"' EXIT
+          POLICY_SCRIPT="$policy_dir/tofu-plan-policy.py"
+          POLICY_RUNNER="$policy_dir/tofu-plan-policy-ci"
+          git -C "$WORKFLOW_SOURCE" cat-file blob "${EXPECTED_WORKFLOW_SHA}:${policy_script_path}" > "$POLICY_SCRIPT"
+          git -C "$WORKFLOW_SOURCE" cat-file blob "${EXPECTED_WORKFLOW_SHA}:${policy_runner_path}" > "$POLICY_RUNNER"
+
+          if [ "$(git -C "$WORKFLOW_SOURCE" hash-object --no-filters -- "$POLICY_SCRIPT")" != "$(git -C "$WORKFLOW_SOURCE" rev-parse --verify "${EXPECTED_WORKFLOW_SHA}:${policy_script_path}")" ] \
+            || [ "$(git -C "$WORKFLOW_SOURCE" hash-object --no-filters -- "$POLICY_RUNNER")" != "$(git -C "$WORKFLOW_SOURCE" rev-parse --verify "${EXPECTED_WORKFLOW_SHA}:${policy_runner_path}")" ]; then
+            echo "::error::Materialized plan-policy source does not match the called workflow commit."
+            exit 1
+          fi
+
           nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
-            python3 /tmp/tofu-plan-policy.py "$PLAN_JSON" "${POLICY_ARGS[@]}"
+            bash "$POLICY_RUNNER" "$POLICY_SCRIPT" "$PLAN_JSON" "${POLICY_ARGS[@]}"
 
       - name: Sensitive-change gate
         if: inputs.sensitive_change_label != '' && steps.plan.outputs.changes == 'true'
@@ -650,19 +1129,126 @@ jobs:
       inputs.mode == 'apply'
       && (inputs.credentials_env_name != '' || inputs.agenix_apply_secret_path != '' || inputs.aws_apply_role_arn != '')
     needs: offline-checks
-    runs-on: ${{ fromJSON(inputs.runner) }}
+    # TERRAFORM LANE override: the CALLER repository's `TERRAFORM_LANE_RUNNER`
+    # variable (a JSON runs-on value), when set, replaces `inputs.runner`.
+    # See the `runner` input.
+    runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}
+    env:
+      # TERRAFORM DEV SHELL override: when the CALLER repository's
+      # TERRAFORM_DEVSHELL_FLAKE variable names a flake directory (repo-relative,
+      # e.g. `shells/terraform`), every dev-shell and inputs-from call below
+      # uses that flake instead of the repository root flake, once the
+      # "Resolve the Terraform dev shell" step has found it in the checkout.
+      # See the `runner` input for why these overrides are repository variables.
+      TF_DEVSHELL_FLAKE_REQUESTED: ${{ vars.TERRAFORM_DEVSHELL_FLAKE }}
     environment: ${{ inputs.environment_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Checkout called workflow source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .mcl/reusable-terraform-ci
+          persist-credentials: false
+
+      - name: Verify called workflow source
+        shell: bash
+        env:
+          EXPECTED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          EXPECTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          EXPECTED_WORKFLOW_SERVER_URL: ${{ github.server_url }}
+          WORKFLOW_SOURCE: ${{ github.workspace }}/.mcl/reusable-terraform-ci
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$EXPECTED_WORKFLOW_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Called workflow repository identity is empty or malformed."
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Called workflow SHA is not a full lowercase commit SHA."
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_WORKFLOW_SERVER_URL" =~ ^https?://[^/]+$ ]]; then
+            echo "::error::GitHub server URL is empty or malformed."
+            exit 1
+          fi
+          if [ ! -d "$WORKFLOW_SOURCE/.git" ]; then
+            echo "::error::Called workflow source is not a standalone Git checkout."
+            exit 1
+          fi
+
+          actual_sha="$(git -C "$WORKFLOW_SOURCE" rev-parse --verify 'HEAD^{commit}')"
+          if [ "$actual_sha" != "$EXPECTED_WORKFLOW_SHA" ]; then
+            echo "::error::Called workflow checkout is at $actual_sha, expected $EXPECTED_WORKFLOW_SHA."
+            exit 1
+          fi
+
+          expected_remote="${EXPECTED_WORKFLOW_SERVER_URL}/${EXPECTED_WORKFLOW_REPOSITORY}"
+          actual_remote="$(git -C "$WORKFLOW_SOURCE" remote get-url origin)"
+          actual_remote="${actual_remote%.git}"
+          if [ "$actual_remote" != "$expected_remote" ]; then
+            echo "::error::Called workflow checkout remote is $actual_remote, expected $expected_remote."
+            exit 1
+          fi
+
+          if [ -n "$(git -C "$WORKFLOW_SOURCE" status --porcelain=v1 --untracked-files=all)" ]; then
+            echo "::error::Called workflow checkout is not clean."
+            exit 1
+          fi
+
+          setup_file_count=0
+          while IFS= read -r -d '' setup_path; do
+            setup_file="$WORKFLOW_SOURCE/$setup_path"
+            if [ ! -f "$setup_file" ] || [ -L "$setup_file" ]; then
+              echo "::error::Called workflow Setup Nix source is missing or is not a regular file: $setup_path"
+              exit 1
+            fi
+            expected_blob="$(git -C "$WORKFLOW_SOURCE" rev-parse --verify "${EXPECTED_WORKFLOW_SHA}:${setup_path}")"
+            actual_blob="$(git -C "$WORKFLOW_SOURCE" hash-object --no-filters -- "$setup_file")"
+            if [ "$actual_blob" != "$expected_blob" ]; then
+              echo "::error::Called workflow Setup Nix source differs from $EXPECTED_WORKFLOW_SHA: $setup_path"
+              exit 1
+            fi
+            ((setup_file_count += 1))
+          done < <(git -C "$WORKFLOW_SOURCE" ls-tree -r --name-only -z "$EXPECTED_WORKFLOW_SHA" -- .github/setup-nix)
+          if [ "$setup_file_count" -eq 0 ]; then
+            echo "::error::Called workflow commit contains no Setup Nix action source."
+            exit 1
+          fi
+
       - name: Setup Nix
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        uses: ./.mcl/reusable-terraform-ci/.github/setup-nix
         with:
           push-to-cache: false
+          reclaim_hosted_runner_disk: ${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # Read-only: written to the netrc Nix uses for the private cache.
+          # No attic-cache is set, so nothing is pushed.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+          substituter-preflight: ${{ inputs.substituter_preflight }}
+          fallback: ${{ inputs.nix_fallback }}
+
+      - name: Resolve the Terraform dev shell
+        # TERRAFORM_DEVSHELL_FLAKE names a flake directory in the CALLER's
+        # checkout. A checkout that predates that directory (an older PR branch,
+        # or a re-run of an older commit) must not fail every Nix step, so it
+        # falls back to the repository flake. Only this step sets
+        # TF_DEVSHELL_FLAKE (no job-level value competes with GITHUB_ENV).
+        if: env.TF_DEVSHELL_FLAKE_REQUESTED != ''
+        run: |
+          dir="$GITHUB_WORKSPACE/$TF_DEVSHELL_FLAKE_REQUESTED"
+          if [ -f "$dir/flake.nix" ]; then
+            echo "TF_DEVSHELL_FLAKE=$dir" >> "$GITHUB_ENV"
+            echo "Terraform dev shell: $TF_DEVSHELL_FLAKE_REQUESTED"
+          else
+            echo "::notice::TERRAFORM_DEVSHELL_FLAKE=$TF_DEVSHELL_FLAKE_REQUESTED is not in this checkout; using the repository flake"
+          fi
 
       - name: Lockfile existence gate
         run: |
@@ -694,8 +1280,8 @@ jobs:
             exit 1
           fi
 
-          nix develop --accept-flake-config --command bash -euo pipefail -c \
-            'age -d -i "$1" "$2" > "$3"' \
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c \
+            "age -d -i \"\$1\" \"\$2\" > \"\$3\"" \
             bash "$RUNNER_TEMP/ci-key" "$AGENIX_SECRET_PATH" "$token_file" >/dev/null
 
           TOKEN="$(<"$token_file")"
@@ -715,6 +1301,50 @@ jobs:
             printf '__MCL_TERRAFORM_SECRET__\n'
           } >> "$GITHUB_ENV"
 
+      # CREDENTIAL DEADLINE. Recorded BEFORE minting, so it errs early: the
+      # moment the first short-lived credential this job mints (the 1 h App
+      # installation token, the AWS OIDC session) stops working. Every tofu
+      # call that can take the state lock runs under
+      # terraform/ci/tofu-credential-deadline, which interrupts it (SIGINT)
+      # while the credentials still work, so tofu releases its own lock instead
+      # of stranding it (infra run 36860633451, 2026-10-01).
+      - name: Record credential deadline
+        env:
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
+          GITHUB_APP: ${{ inputs.github_app_owner != '' }}
+          AWS_DURATION: ${{ inputs.aws_apply_role_arn != '' && inputs.aws_role_duration_seconds || '' }}
+        run: |
+          set -euo pipefail
+          not_after="$(bash "$DEADLINE_SCRIPT" not-after --github-app "$GITHUB_APP" --aws-duration "$AWS_DURATION")"
+          echo "TF_CREDENTIALS_NOT_AFTER=$not_after" >> "$GITHUB_ENV"
+
+      - name: Mint GitHub App token
+        if: inputs.github_app_owner != ''
+        id: gh_app_token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.github_app_owner }}
+
+      - name: Export GITHUB_TOKEN for the github provider
+        if: inputs.github_app_owner != ''
+        run: |
+          echo "::add-mask::${{ steps.gh_app_token.outputs.token }}"
+          echo "GITHUB_TOKEN=${{ steps.gh_app_token.outputs.token }}" >> "$GITHUB_ENV"
+
+      # The App installation's ONE hourly REST bucket is shared by every job
+      # minting from it; reading it before and after tofu measures what this
+      # plan/apply cost. See terraform/ci/github-app-rate-budget.
+      - name: GitHub App API budget (before)
+        if: inputs.github_app_owner != ''
+        continue-on-error: true
+        env:
+          BUDGET_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-app-rate-budget
+        run: |
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$BUDGET_SCRIPT" --label before --save "$RUNNER_TEMP/gh-app-rate-budget.json"
+
       - name: Configure AWS credentials for apply
         if: inputs.aws_apply_role_arn != ''
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
@@ -728,14 +1358,38 @@ jobs:
         if: inputs.terranix
         run: |
           cd ${{ inputs.working_directory }}
-          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from . --accept-flake-config)
-          nix develop --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
+          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from "${TF_DEVSHELL_FLAKE:-.}" --accept-flake-config)
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
 
-      - name: Apply
-        id: apply
+      # A github provider without a credential does not fail: it falls back to
+      # anonymous access (60 requests/hour) and sleeps until each rate-limit
+      # reset, silently. Refuse before init instead. See the script header.
+      - name: GitHub provider credential gate
+        env:
+          GATE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-provider-credential-gate
+          GITHUB_APP_OWNER: ${{ inputs.github_app_owner }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$GATE_SCRIPT" "$WORKING_DIRECTORY" --github-app-owner "$GITHUB_APP_OWNER"
+
+      # The apply is TWO tofu runs — refresh+plan, then apply of the saved plan
+      # — each taking the state lock. A large root's refresh can use most of a
+      # 1 h credential by itself, so the apply does not inherit what is left:
+      # the plan step saves the plan, fresh credentials are minted, and only
+      # then is the saved plan applied (each run under its own deadline).
+      - name: Plan for apply
+        id: apply_plan
         env:
           BACKEND_CONFIG_FILE: ${{ inputs.backend_config_file }}
           WORKING_DIRECTORY: ${{ inputs.working_directory }}
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
+          DESTROY_GUARD: ${{ inputs.destroy_guard }}
+          ALLOW_DESTROY: ${{ inputs.allow_destroy }}
+          DESTROY_LABEL: ${{ inputs.destroy_label }}
+          GUARD_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/plan-destroy-guard
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -761,9 +1415,14 @@ jobs:
             backend_args+=("-backend-config=$(realpath --relative-to="$PWD" "$backend_path")")
           done < <(printf '%s\n' "$backend_config_files" | tr ',' '\n')
 
-          tofu_bin="$(nix develop --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
+          tofu_bin="$(nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
           run_tofu() {
             env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
+          }
+
+          run_tofu_bounded() {
+            bash "$DEADLINE_SCRIPT" run --not-after "${TF_CREDENTIALS_NOT_AFTER:-}" -- \
+              env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
           }
 
           run_tofu init -input=false "${backend_args[@]}"
@@ -771,11 +1430,9 @@ jobs:
           plan_bin="$apply_dir/plan.tfplan"
           plan_text="$apply_dir/plan.txt"
           plan_stderr="$apply_dir/plan.stderr"
-          apply_text="$apply_dir/apply.txt"
-          apply_stderr="$apply_dir/apply.stderr"
 
           set +e
-          run_tofu plan \
+          run_tofu_bounded plan \
             -input=false \
             -no-color \
             -lock-timeout=300s \
@@ -790,19 +1447,124 @@ jobs:
 
           if [ "$plan_exit" -eq 0 ]; then
             echo "No changes to apply."
+            echo "changes=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$plan_exit" -ne 2 ]; then
             exit "$plan_exit"
           fi
 
+          # Destroy guard: judge the SAVED plan -- exactly what the apply below
+          # executes -- and refuse destroy/replace nobody authorized.
+          if [ "$DESTROY_GUARD" = "true" ]; then
+            plan_json="$apply_dir/plan.json"
+            run_tofu show -json "$plan_bin" > "$plan_json"
+
+            authorized=""
+            if [ "$ALLOW_DESTROY" = "true" ]; then
+              authorized="allow_destroy=true (${GITHUB_EVENT_NAME} by @${GITHUB_ACTOR})"
+            elif [ "$GITHUB_EVENT_NAME" = "push" ] && [ -n "$DESTROY_LABEL" ]; then
+              # A PR whose base is the pushed branch, containing the pushed
+              # commit, labelled by a human. Any API failure leaves this empty,
+              # i.e. fails closed (refused, then dispatch with allow_destroy).
+              labelled_pr="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                --jq "[.[] | select(.base.ref == \"${GITHUB_REF_NAME}\") | select(any(.labels[]; .name == \"${DESTROY_LABEL}\")) | .number] | first // empty" \
+                2>/dev/null || true)"
+              if [ -n "$labelled_pr" ]; then
+                authorized="PR #${labelled_pr} carries the '${DESTROY_LABEL}' label"
+              fi
+            fi
+
+            set +e
+            nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+              python3 "$GUARD_SCRIPT" "$plan_json" \
+                --authorized "$authorized" \
+                --summary "$GITHUB_STEP_SUMMARY"
+            guard_exit=$?
+            set -e
+            rm -f "$plan_json"
+
+            if [ "$guard_exit" -ne 0 ]; then
+              echo "failure-reason=destroy-refused" >> "$GITHUB_OUTPUT"
+              echo "::error::Refusing to apply ${WORKING_DIRECTORY}: the plan destroys or replaces resources and nothing authorized it. Nothing was applied."
+              exit 1
+            fi
+          fi
+
+          echo "changes=true" >> "$GITHUB_OUTPUT"
+          echo "plan_bin=$plan_bin" >> "$GITHUB_OUTPUT"
+
+      # CREDENTIAL DEADLINE. Recorded BEFORE minting, so it errs early: the
+      # moment the first short-lived credential this job mints (the 1 h App
+      # installation token, the AWS OIDC session) stops working. Every tofu
+      # call that can take the state lock runs under
+      # terraform/ci/tofu-credential-deadline, which interrupts it (SIGINT)
+      # while the credentials still work, so tofu releases its own lock instead
+      # of stranding it (infra run 36860633451, 2026-10-01).
+      - name: Record credential deadline (apply)
+        if: steps.apply_plan.outputs.changes == 'true'
+        env:
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
+          GITHUB_APP: ${{ inputs.github_app_owner != '' }}
+          AWS_DURATION: ${{ inputs.aws_apply_role_arn != '' && inputs.aws_role_duration_seconds || '' }}
+        run: |
+          set -euo pipefail
+          not_after="$(bash "$DEADLINE_SCRIPT" not-after --github-app "$GITHUB_APP" --aws-duration "$AWS_DURATION")"
+          echo "TF_CREDENTIALS_NOT_AFTER=$not_after" >> "$GITHUB_ENV"
+
+      - name: Re-mint GitHub App token for apply
+        if: steps.apply_plan.outputs.changes == 'true' && inputs.github_app_owner != ''
+        id: gh_app_token_apply
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.github_app_owner }}
+
+      - name: Export the re-minted GITHUB_TOKEN
+        if: steps.apply_plan.outputs.changes == 'true' && inputs.github_app_owner != ''
+        run: |
+          echo "::add-mask::${{ steps.gh_app_token_apply.outputs.token }}"
+          echo "GITHUB_TOKEN=${{ steps.gh_app_token_apply.outputs.token }}" >> "$GITHUB_ENV"
+
+      - name: Refresh AWS credentials for apply
+        if: steps.apply_plan.outputs.changes == 'true' && inputs.aws_apply_role_arn != ''
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          role-to-assume: ${{ inputs.aws_apply_role_arn }}
+          role-session-name: terraform-apply-${{ github.run_id }}
+          role-duration-seconds: ${{ inputs.aws_role_duration_seconds }}
+
+      - name: Apply
+        id: apply
+        if: steps.apply_plan.outputs.changes == 'true'
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
+          PLAN_BIN: ${{ steps.apply_plan.outputs.plan_bin }}
+        run: |
+          set -euo pipefail
+
+          apply_id="$(printf '%s' "$WORKING_DIRECTORY" | tr '/[:space:]' '--')"
+          apply_dir="$GITHUB_WORKSPACE/.result/terraform-apply/$apply_id"
+          apply_text="$apply_dir/apply.txt"
+          apply_stderr="$apply_dir/apply.stderr"
+
+          cd "$WORKING_DIRECTORY"
+
+          # `.terraform/` from the plan step's init is still here; the backend
+          # reads the refreshed AWS credentials from the environment.
+          tofu_bin="$(nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
+
           set +e
-          run_tofu apply \
+          bash "$DEADLINE_SCRIPT" run --not-after "${TF_CREDENTIALS_NOT_AFTER:-}" -- \
+            env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" apply \
             -input=false \
             -no-color \
             -auto-approve \
             -lock-timeout=300s \
-            "$plan_bin" \
+            "$PLAN_BIN" \
             >"$apply_text" 2>"$apply_stderr"
           apply_exit=$?
           set -e
@@ -814,6 +1576,15 @@ jobs:
             echo "failure-reason=apply-failed" >> "$GITHUB_OUTPUT"
             exit "$apply_exit"
           fi
+
+      - name: GitHub App API budget (after)
+        if: always() && inputs.github_app_owner != ''
+        continue-on-error: true
+        env:
+          BUDGET_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-app-rate-budget
+        run: |
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$BUDGET_SCRIPT" --label after --since "$RUNNER_TEMP/gh-app-rate-budget.json"
 
       - name: Post-apply smoke tests
         if: inputs.smoke_test_command != ''
@@ -832,18 +1603,126 @@ jobs:
     if: >-
       inputs.mode == 'drift'
       && (inputs.credentials_env_name != '' || inputs.agenix_plan_secret_path != '' || inputs.aws_plan_role_arn != '' || inputs.aws_drift_role_arn != '')
-    runs-on: ${{ fromJSON(inputs.runner) }}
+    needs: offline-checks
+    # TERRAFORM LANE override: the CALLER repository's `TERRAFORM_LANE_RUNNER`
+    # variable (a JSON runs-on value), when set, replaces `inputs.runner`.
+    # See the `runner` input.
+    runs-on: ${{ fromJSON(vars.TERRAFORM_LANE_RUNNER || inputs.runner) }}
+    env:
+      # TERRAFORM DEV SHELL override: when the CALLER repository's
+      # TERRAFORM_DEVSHELL_FLAKE variable names a flake directory (repo-relative,
+      # e.g. `shells/terraform`), every dev-shell and inputs-from call below
+      # uses that flake instead of the repository root flake, once the
+      # "Resolve the Terraform dev shell" step has found it in the checkout.
+      # See the `runner` input for why these overrides are repository variables.
+      TF_DEVSHELL_FLAKE_REQUESTED: ${{ vars.TERRAFORM_DEVSHELL_FLAKE }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Checkout called workflow source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .mcl/reusable-terraform-ci
+          persist-credentials: false
+
+      - name: Verify called workflow source
+        shell: bash
+        env:
+          EXPECTED_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          EXPECTED_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          EXPECTED_WORKFLOW_SERVER_URL: ${{ github.server_url }}
+          WORKFLOW_SOURCE: ${{ github.workspace }}/.mcl/reusable-terraform-ci
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$EXPECTED_WORKFLOW_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Called workflow repository identity is empty or malformed."
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Called workflow SHA is not a full lowercase commit SHA."
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_WORKFLOW_SERVER_URL" =~ ^https?://[^/]+$ ]]; then
+            echo "::error::GitHub server URL is empty or malformed."
+            exit 1
+          fi
+          if [ ! -d "$WORKFLOW_SOURCE/.git" ]; then
+            echo "::error::Called workflow source is not a standalone Git checkout."
+            exit 1
+          fi
+
+          actual_sha="$(git -C "$WORKFLOW_SOURCE" rev-parse --verify 'HEAD^{commit}')"
+          if [ "$actual_sha" != "$EXPECTED_WORKFLOW_SHA" ]; then
+            echo "::error::Called workflow checkout is at $actual_sha, expected $EXPECTED_WORKFLOW_SHA."
+            exit 1
+          fi
+
+          expected_remote="${EXPECTED_WORKFLOW_SERVER_URL}/${EXPECTED_WORKFLOW_REPOSITORY}"
+          actual_remote="$(git -C "$WORKFLOW_SOURCE" remote get-url origin)"
+          actual_remote="${actual_remote%.git}"
+          if [ "$actual_remote" != "$expected_remote" ]; then
+            echo "::error::Called workflow checkout remote is $actual_remote, expected $expected_remote."
+            exit 1
+          fi
+
+          if [ -n "$(git -C "$WORKFLOW_SOURCE" status --porcelain=v1 --untracked-files=all)" ]; then
+            echo "::error::Called workflow checkout is not clean."
+            exit 1
+          fi
+
+          setup_file_count=0
+          while IFS= read -r -d '' setup_path; do
+            setup_file="$WORKFLOW_SOURCE/$setup_path"
+            if [ ! -f "$setup_file" ] || [ -L "$setup_file" ]; then
+              echo "::error::Called workflow Setup Nix source is missing or is not a regular file: $setup_path"
+              exit 1
+            fi
+            expected_blob="$(git -C "$WORKFLOW_SOURCE" rev-parse --verify "${EXPECTED_WORKFLOW_SHA}:${setup_path}")"
+            actual_blob="$(git -C "$WORKFLOW_SOURCE" hash-object --no-filters -- "$setup_file")"
+            if [ "$actual_blob" != "$expected_blob" ]; then
+              echo "::error::Called workflow Setup Nix source differs from $EXPECTED_WORKFLOW_SHA: $setup_path"
+              exit 1
+            fi
+            ((setup_file_count += 1))
+          done < <(git -C "$WORKFLOW_SOURCE" ls-tree -r --name-only -z "$EXPECTED_WORKFLOW_SHA" -- .github/setup-nix)
+          if [ "$setup_file_count" -eq 0 ]; then
+            echo "::error::Called workflow commit contains no Setup Nix action source."
+            exit 1
+          fi
+
       - name: Setup Nix
-        uses: metacraft-labs/nixos-modules/.github/setup-nix@main
+        uses: ./.mcl/reusable-terraform-ci/.github/setup-nix
         with:
           push-to-cache: false
+          reclaim_hosted_runner_disk: ${{ vars.TERRAFORM_LANE_RUNNER == '' && inputs.reclaim_hosted_runner_disk }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # Read-only: written to the netrc Nix uses for the private cache.
+          # No attic-cache is set, so nothing is pushed.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+          substituter-preflight: ${{ inputs.substituter_preflight }}
+          fallback: ${{ inputs.nix_fallback }}
+
+      - name: Resolve the Terraform dev shell
+        # TERRAFORM_DEVSHELL_FLAKE names a flake directory in the CALLER's
+        # checkout. A checkout that predates that directory (an older PR branch,
+        # or a re-run of an older commit) must not fail every Nix step, so it
+        # falls back to the repository flake. Only this step sets
+        # TF_DEVSHELL_FLAKE (no job-level value competes with GITHUB_ENV).
+        if: env.TF_DEVSHELL_FLAKE_REQUESTED != ''
+        run: |
+          dir="$GITHUB_WORKSPACE/$TF_DEVSHELL_FLAKE_REQUESTED"
+          if [ -f "$dir/flake.nix" ]; then
+            echo "TF_DEVSHELL_FLAKE=$dir" >> "$GITHUB_ENV"
+            echo "Terraform dev shell: $TF_DEVSHELL_FLAKE_REQUESTED"
+          else
+            echo "::notice::TERRAFORM_DEVSHELL_FLAKE=$TF_DEVSHELL_FLAKE_REQUESTED is not in this checkout; using the repository flake"
+          fi
 
       - name: Decrypt provider credentials
         if: inputs.agenix_plan_secret_path != ''
@@ -868,8 +1747,8 @@ jobs:
             exit 1
           fi
 
-          nix develop --accept-flake-config --command bash -euo pipefail -c \
-            'age -d -i "$1" "$2" > "$3"' \
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c \
+            "age -d -i \"\$1\" \"\$2\" > \"\$3\"" \
             bash "$RUNNER_TEMP/ci-key" "$AGENIX_SECRET_PATH" "$token_file" >/dev/null
 
           TOKEN="$(<"$token_file")"
@@ -889,6 +1768,38 @@ jobs:
             printf '__MCL_TERRAFORM_SECRET__\n'
           } >> "$GITHUB_ENV"
 
+      # CREDENTIAL DEADLINE. Recorded BEFORE minting, so it errs early: the
+      # moment the first short-lived credential this job mints (the 1 h App
+      # installation token, the AWS OIDC session) stops working. Every tofu
+      # call that can take the state lock runs under
+      # terraform/ci/tofu-credential-deadline, which interrupts it (SIGINT)
+      # while the credentials still work, so tofu releases its own lock instead
+      # of stranding it (infra run 36860633451, 2026-10-01).
+      - name: Record credential deadline
+        env:
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
+          GITHUB_APP: ${{ inputs.github_app_owner != '' }}
+          AWS_DURATION: ${{ (inputs.aws_drift_role_arn || inputs.aws_plan_role_arn) != '' && inputs.aws_role_duration_seconds || '' }}
+        run: |
+          set -euo pipefail
+          not_after="$(bash "$DEADLINE_SCRIPT" not-after --github-app "$GITHUB_APP" --aws-duration "$AWS_DURATION")"
+          echo "TF_CREDENTIALS_NOT_AFTER=$not_after" >> "$GITHUB_ENV"
+
+      - name: Mint GitHub App token
+        if: inputs.github_app_owner != ''
+        id: gh_app_token
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        with:
+          app-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.github_app_owner }}
+
+      - name: Export GITHUB_TOKEN for the github provider
+        if: inputs.github_app_owner != ''
+        run: |
+          echo "::add-mask::${{ steps.gh_app_token.outputs.token }}"
+          echo "GITHUB_TOKEN=${{ steps.gh_app_token.outputs.token }}" >> "$GITHUB_ENV"
+
       - name: Configure AWS credentials for drift
         if: inputs.aws_plan_role_arn != '' || inputs.aws_drift_role_arn != ''
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
@@ -898,27 +1809,94 @@ jobs:
           role-session-name: terraform-drift-${{ github.run_id }}
           role-duration-seconds: ${{ inputs.aws_role_duration_seconds }}
 
-      - name: Init
+      - name: Terranix
+        if: inputs.terranix
         run: |
           cd ${{ inputs.working_directory }}
-          tofu_bin="$(nix develop --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
-          env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" init \
-            ${{ inputs.backend_config_file != '' && format('-backend-config=../{0}', inputs.backend_config_file) || '' }}
+          NIXPKGS=$(nix eval --raw nixpkgs#path --inputs-from "${TF_DEVSHELL_FLAKE:-.}" --accept-flake-config)
+          nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -c "terranix --pkgs '$NIXPKGS' > config.tf.json"
+
+      # A github provider without a credential does not fail: it falls back to
+      # anonymous access (60 requests/hour) and sleeps until each rate-limit
+      # reset, silently. Refuse before init instead. See the script header.
+      - name: GitHub provider credential gate
+        env:
+          GATE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/github-provider-credential-gate
+          GITHUB_APP_OWNER: ${{ inputs.github_app_owner }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          nix shell --accept-flake-config --inputs-from "$GITHUB_WORKSPACE" nixpkgs#python3 --command \
+            python3 "$GATE_SCRIPT" "$WORKING_DIRECTORY" --github-app-owner "$GITHUB_APP_OWNER"
+
+      - name: Init
+        env:
+          BACKEND_CONFIG_FILE: ${{ inputs.backend_config_file }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+
+          backend_config_files="${BACKEND_CONFIG_FILE:-}"
+
+          cd "$WORKING_DIRECTORY"
+
+          backend_args=()
+          while IFS= read -r backend_config_file; do
+            [ -n "$backend_config_file" ] || continue
+            if [[ "$backend_config_file" = /* ]]; then
+              backend_path="$backend_config_file"
+            else
+              backend_path="$GITHUB_WORKSPACE/$backend_config_file"
+            fi
+            if [ ! -f "$backend_path" ]; then
+              echo "::error::Backend config file does not exist: $backend_path"
+              exit 1
+            fi
+            backend_args+=("-backend-config=$(realpath --relative-to="$PWD" "$backend_path")")
+          done < <(printf '%s\n' "$backend_config_files" | tr ',' '\n')
+
+          tofu_bin="$(nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
+          env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" init -input=false "${backend_args[@]}"
 
       - name: Detect drift
         id: drift
+        timeout-minutes: ${{ inputs.plan_timeout_minutes }}
+        env:
+          DEADLINE_SCRIPT: ${{ github.workspace }}/.mcl/reusable-terraform-ci/terraform/ci/tofu-credential-deadline
         run: |
+          set -euo pipefail
+
           cd ${{ inputs.working_directory }}
-          tofu_bin="$(nix develop --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
-          env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" plan -detailed-exitcode 2>&1 | tee /tmp/drift-plan.txt || {
-            exit_code=$?
-            if [ "$exit_code" -eq 2 ]; then
-              echo "drift_detected=true" >> "$GITHUB_OUTPUT"
-              echo "::warning::Infrastructure drift detected!"
-            else
-              exit $exit_code
-            fi
+          tofu_bin="$(nix develop ${TF_DEVSHELL_FLAKE:+"$TF_DEVSHELL_FLAKE"} --accept-flake-config --command bash -euo pipefail -c 'command -v tofu' | tail -n 1)"
+          # Drift's plan takes the state lock, so it runs under the credential
+          # deadline too (see "Record credential deadline").
+          run_tofu() {
+            bash "$DEADLINE_SCRIPT" run --not-after "${TF_CREDENTIALS_NOT_AFTER:-}" -- \
+              env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE "$tofu_bin" "$@"
           }
+
+          set +e
+          run_tofu plan \
+            -input=false \
+            -no-color \
+            -detailed-exitcode \
+            > /tmp/drift-plan.txt 2>&1
+          plan_exit=$?
+          set -e
+
+          cat /tmp/drift-plan.txt
+
+          if [ "$plan_exit" -eq 0 ]; then
+            exit 0
+          fi
+
+          if [ "$plan_exit" -eq 2 ]; then
+            echo "drift_detected=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Infrastructure drift detected!"
+            exit 0
+          fi
+
+          exit "$plan_exit"
 
       - name: Open drift issue
         if: steps.drift.outputs.drift_detected == 'true'
@@ -926,14 +1904,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           PLAN_OUTPUT="$(cat /tmp/drift-plan.txt)"
-          gh issue create \
-            --title "Infrastructure drift detected in ${{ inputs.working_directory }}" \
+          issue_args=(
+            --title "Infrastructure drift detected in ${{ inputs.working_directory }}"
             --body "Scheduled drift detection found changes. Review the plan output and reconcile.
 
           \`\`\`
           $PLAN_OUTPUT
-          \`\`\`" \
-            --label "drift"
+          \`\`\`"
+          )
+
+          if gh label view drift >/dev/null 2>&1 \
+            || gh label create drift --color d73a4a --description "Automated Terraform drift detection" \
+            || gh label view drift >/dev/null 2>&1; then
+            issue_args+=(--label drift)
+          else
+            echo "::warning::Unable to create the drift label; opening the drift issue without it"
+          fi
+
+          gh issue create "${issue_args[@]}"
 
       - name: Cleanup credentials
         if: always()

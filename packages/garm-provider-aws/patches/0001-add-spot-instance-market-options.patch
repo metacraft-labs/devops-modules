@@ -1,0 +1,550 @@
+diff --git a/internal/client/aws.go b/internal/client/aws.go
+index 6d2fce8..e585e15 100644
+--- a/internal/client/aws.go
++++ b/internal/client/aws.go
+@@ -263,7 +263,7 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
+ 	}
+ 	root_volume := *images.Images[0].RootDeviceName
+ 
+-	resp, err := a.client.RunInstances(ctx, &ec2.RunInstancesInput{
++	runInput := &ec2.RunInstancesInput{
+ 		ImageId:            aws.String(spec.BootstrapParams.Image),
+ 		InstanceType:       types.InstanceType(spec.BootstrapParams.Flavor),
+ 		MaxCount:           aws.Int32(1),
+@@ -273,6 +273,12 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
+ 		UserData:           aws.String(udata),
+ 		KeyName:            spec.SSHKeyName,
+ 		IamInstanceProfile: spec.IAMInstanceProfile,
++		// Metacraft Labs downstream patch: an OS-initiated power-off (the
++		// in-guest TTL backstop, or a runner that shuts its VM down after its
++		// job) TERMINATES the instance. The EC2 default is "stop", which leaves a
++		// stopped, EBS-billed instance that ListInstances still reports and that
++		// GARM's reconcile then tries to Start again.
++		InstanceInitiatedShutdownBehavior: types.ShutdownBehaviorTerminate,
+ 		BlockDeviceMappings: []types.BlockDeviceMapping{
+ 			{
+ 				DeviceName: aws.String(root_volume),
+@@ -311,11 +317,99 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
+ 					},
+ 				},
+ 			},
++			// Metacraft Labs downstream patch: tag the root volume with the same
++			// ownership keys, so a cloud-side reconcile can attribute (and
++			// account for) every billable resource a runner launch creates.
++			{
++				ResourceType: types.ResourceTypeVolume,
++				Tags: []types.Tag{
++					{
++						Key:   aws.String("Name"),
++						Value: aws.String(spec.BootstrapParams.Name),
++					},
++					{
++						Key:   aws.String("GARM_POOL_ID"),
++						Value: aws.String(spec.BootstrapParams.PoolID),
++					},
++					{
++						Key:   aws.String("GARM_CONTROLLER_ID"),
++						Value: aws.String(spec.ControllerID),
++					},
++				},
++			},
+ 		},
+-	})
++	}
++
++	// Spot support (Metacraft Labs downstream patch). When the pool's
++	// extra-specs request market_type=spot, attach InstanceMarketOptions so
++	// EC2 launches a Spot instance. On a Spot capacity/price failure, and only
++	// when on_demand_fallback is set, retry the SAME launch on-demand (with
++	// InstanceMarketOptions cleared) so a burst still succeeds — at on-demand
++	// cost — rather than starving the queue.
++	if spec.UsesSpot() {
++		applySpotMarketOptions(runInput, spec)
++	}
++
++	resp, err := a.client.RunInstances(ctx, runInput)
++	if err != nil && spec.UsesSpot() && spec.OnDemandFallback && isSpotCapacityError(err) {
++		runInput.InstanceMarketOptions = nil
++		resp, err = a.client.RunInstances(ctx, runInput)
++	}
+ 	if err != nil {
+ 		return "", fmt.Errorf("failed to create instance: %w", err)
+ 	}
+ 
+ 	return *resp.Instances[0].InstanceId, nil
+ }
++
++// applySpotMarketOptions sets EC2 InstanceMarketOptions (MarketType=spot plus
++// SpotOptions) on the RunInstances input from the runner spec. Added by the
++// Metacraft Labs downstream spot patch.
++func applySpotMarketOptions(input *ec2.RunInstancesInput, spec *spec.RunnerSpec) {
++	spotOpts := &types.SpotMarketOptions{}
++	if spec.SpotMaxPrice != "" {
++		spotOpts.MaxPrice = aws.String(spec.SpotMaxPrice)
++	}
++	switch strings.ToLower(spec.SpotInstanceType) {
++	case "persistent":
++		spotOpts.SpotInstanceType = types.SpotInstanceTypePersistent
++	default: // "one-time" or empty — the correct default for ephemeral runners.
++		spotOpts.SpotInstanceType = types.SpotInstanceTypeOneTime
++	}
++	switch strings.ToLower(spec.SpotInstanceInterruptionBehavior) {
++	case "stop":
++		spotOpts.InstanceInterruptionBehavior = types.InstanceInterruptionBehaviorStop
++	case "hibernate":
++		spotOpts.InstanceInterruptionBehavior = types.InstanceInterruptionBehaviorHibernate
++	default: // "terminate" or empty — the correct default for ephemeral runners.
++		spotOpts.InstanceInterruptionBehavior = types.InstanceInterruptionBehaviorTerminate
++	}
++	input.InstanceMarketOptions = &types.InstanceMarketOptionsRequest{
++		MarketType:  types.MarketTypeSpot,
++		SpotOptions: spotOpts,
++	}
++}
++
++// isSpotCapacityError reports whether err looks like an EC2 Spot
++// capacity/price rejection that an on-demand retry could satisfy. Added by the
++// Metacraft Labs downstream spot patch. Matched on the error string so it works
++// with both smithy API errors and wrapped errors without importing extra
++// modelled error types.
++func isSpotCapacityError(err error) bool {
++	if err == nil {
++		return false
++	}
++	msg := strings.ToLower(err.Error())
++	for _, s := range []string{
++		"insufficientinstancecapacity",
++		"insufficient capacity",
++		"spotmaxpricetoolow",
++		"maxspotinstancecountexceeded",
++		"unfulfillablecapacity",
++	} {
++		if strings.Contains(msg, s) {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/internal/client/spot_test.go b/internal/client/spot_test.go
+new file mode 100644
+index 0000000..52f4ef5
+--- /dev/null
++++ b/internal/client/spot_test.go
+@@ -0,0 +1,293 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2024 Cloudbase Solutions SRL
++//
++//    Licensed under the Apache License, Version 2.0 (the "License"); you may
++//    not use this file except in compliance with the License. You may obtain
++//    a copy of the License at
++//
++//         http://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++//    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++//    License for the specific language governing permissions and limitations
++//    under the License.
++
++// Metacraft Labs downstream spot patch — coverage for the EC2
++// InstanceMarketOptions (spot) support and the on-demand fallback policy added
++// to CreateRunningInstance. Drives the provider's OWN ClientInterface mock (the
++// seam upstream tests already use) to capture the RunInstancesInput and assert
++// what the provider renders — the same technique as aws_test.go's
++// TestCreateRunningInstance. No real AWS is touched. The mock is justified: it
++// is the provider's already-existing test seam for the EC2 API, and there is no
++// hermetic way to observe a real RunInstances request otherwise.
++package client
++
++import (
++	"context"
++	"errors"
++	"testing"
++
++	"github.com/aws/aws-sdk-go-v2/aws"
++	"github.com/aws/aws-sdk-go-v2/service/ec2"
++	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
++	"github.com/cloudbase/garm-provider-aws/config"
++	"github.com/cloudbase/garm-provider-aws/internal/spec"
++	"github.com/cloudbase/garm-provider-common/params"
++	"github.com/stretchr/testify/mock"
++	"github.com/stretchr/testify/require"
++)
++
++func spotTestCli(mockClient *MockComputeClient) *AwsCli {
++	return &AwsCli{
++		cfg: &config.Config{
++			Region:   "us-west-2",
++			SubnetID: "subnet-1234567890abcdef0",
++			Credentials: config.Credentials{
++				CredentialType: config.AWSCredentialTypeStatic,
++				StaticCredentials: config.StaticCredentials{
++					AccessKeyID:     "AccessKeyID",
++					SecretAccessKey: "SecretAccessKey",
++					SessionToken:    "SessionToken",
++				},
++			},
++		},
++		client: mockClient,
++	}
++}
++
++func spotRunnerSpec() *spec.RunnerSpec {
++	spec.DefaultToolFetch = func(osType params.OSType, osArch params.OSArch, tools []params.RunnerApplicationDownload) (params.RunnerApplicationDownload, error) {
++		return params.RunnerApplicationDownload{
++			OS:           aws.String("linux"),
++			Architecture: aws.String("amd64"),
++			DownloadURL:  aws.String("MockURL"),
++			Filename:     aws.String("garm-runner"),
++		}, nil
++	}
++	return &spec.RunnerSpec{
++		Region: "us-west-2",
++		Tools: params.RunnerApplicationDownload{
++			OS:           aws.String("linux"),
++			Architecture: aws.String("amd64"),
++			DownloadURL:  aws.String("MockURL"),
++			Filename:     aws.String("garm-runner"),
++		},
++		BootstrapParams: params.BootstrapInstance{
++			Name:   "instance-name",
++			OSType: "linux",
++			Image:  "ami-12345678",
++			Flavor: "t3.medium",
++			PoolID: "poolID",
++		},
++		SubnetID:     "subnet-1234567890abcdef0",
++		ControllerID: "controllerID",
++	}
++}
++
++func describeImagesOK(mockClient *MockComputeClient) {
++	mockClient.On("DescribeImages", mock.Anything, mock.Anything, mock.Anything).Return(&ec2.DescribeImagesOutput{
++		Images: []types.Image{
++			{
++				ImageId:        aws.String("ami-12345678"),
++				RootDeviceName: aws.String("/dev/sda1"),
++			},
++		},
++	}, nil)
++}
++
++// A spot-eligible RunnerSpec renders RunInstances with InstanceMarketOptions
++// (MarketType=spot + SpotOptions), still as a one-job (MaxCount==MinCount==1)
++// launch.
++func TestCreateRunningInstanceSpotMarketOptions(t *testing.T) {
++	ctx := context.Background()
++	mockClient := new(MockComputeClient)
++	awsCli := spotTestCli(mockClient)
++	describeImagesOK(mockClient)
++
++	var captured *ec2.RunInstancesInput
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Run(func(args mock.Arguments) {
++			captured = args.Get(1).(*ec2.RunInstancesInput)
++		}).
++		Return(&ec2.RunInstancesOutput{
++			Instances: []types.Instance{{InstanceId: aws.String("i-spot0001")}},
++		}, nil)
++
++	rs := spotRunnerSpec()
++	maxPrice := "0.05"
++	rs.MarketType = "spot"
++	rs.SpotMaxPrice = maxPrice
++	rs.SpotInstanceType = "one-time"
++	rs.SpotInstanceInterruptionBehavior = "terminate"
++
++	id, err := awsCli.CreateRunningInstance(ctx, rs)
++	require.NoError(t, err)
++	require.Equal(t, "i-spot0001", id)
++
++	require.NotNil(t, captured, "RunInstances was not called")
++	require.NotNil(t, captured.InstanceMarketOptions, "spot spec must set InstanceMarketOptions")
++	require.Equal(t, types.MarketTypeSpot, captured.InstanceMarketOptions.MarketType)
++	require.NotNil(t, captured.InstanceMarketOptions.SpotOptions)
++	require.Equal(t, types.SpotInstanceTypeOneTime, captured.InstanceMarketOptions.SpotOptions.SpotInstanceType)
++	require.Equal(t, types.InstanceInterruptionBehaviorTerminate, captured.InstanceMarketOptions.SpotOptions.InstanceInterruptionBehavior)
++	require.NotNil(t, captured.InstanceMarketOptions.SpotOptions.MaxPrice)
++	require.Equal(t, maxPrice, *captured.InstanceMarketOptions.SpotOptions.MaxPrice)
++	// Ephemeral one-job auto-terminate: exactly one instance per Create.
++	require.Equal(t, int32(1), *captured.MaxCount)
++	// An OS power-off (the in-guest TTL backstop) must TERMINATE, never stop.
++	require.Equal(t, types.ShutdownBehaviorTerminate, captured.InstanceInitiatedShutdownBehavior)
++	requireVolumeOwnershipTags(t, captured)
++	require.Equal(t, int32(1), *captured.MinCount)
++}
++
++// An on-demand (unset MarketType) RunnerSpec must NOT set InstanceMarketOptions
++// — the negative control proving the patch is inert by default.
++func TestCreateRunningInstanceOnDemandNoMarketOptions(t *testing.T) {
++	ctx := context.Background()
++	mockClient := new(MockComputeClient)
++	awsCli := spotTestCli(mockClient)
++	describeImagesOK(mockClient)
++
++	var captured *ec2.RunInstancesInput
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Run(func(args mock.Arguments) {
++			captured = args.Get(1).(*ec2.RunInstancesInput)
++		}).
++		Return(&ec2.RunInstancesOutput{
++			Instances: []types.Instance{{InstanceId: aws.String("i-ond00001")}},
++		}, nil)
++
++	rs := spotRunnerSpec() // MarketType left empty
++	id, err := awsCli.CreateRunningInstance(ctx, rs)
++	require.NoError(t, err)
++	require.Equal(t, "i-ond00001", id)
++	require.NotNil(t, captured)
++	require.Nil(t, captured.InstanceMarketOptions, "on-demand launch must not carry InstanceMarketOptions")
++	// Ephemeral one-job auto-terminate: exactly one instance per Create, so a
++	// burst never over-provisions per queued job.
++	require.Equal(t, int32(1), *captured.MaxCount)
++	// An OS power-off (the in-guest TTL backstop) must TERMINATE, never stop.
++	require.Equal(t, types.ShutdownBehaviorTerminate, captured.InstanceInitiatedShutdownBehavior)
++	requireVolumeOwnershipTags(t, captured)
++	require.Equal(t, int32(1), *captured.MinCount)
++}
++
++// With on_demand_fallback=true, a spot capacity failure retries the SAME launch
++// on-demand: the second RunInstances call carries no InstanceMarketOptions and
++// the Create succeeds.
++func TestCreateRunningInstanceSpotOnDemandFallback(t *testing.T) {
++	ctx := context.Background()
++	mockClient := new(MockComputeClient)
++	awsCli := spotTestCli(mockClient)
++	describeImagesOK(mockClient)
++
++	// The provider reuses (mutates) the same RunInstancesInput pointer for the
++	// on-demand retry, so snapshot whether InstanceMarketOptions was set AT
++	// CALL TIME rather than retaining the pointer.
++	var marketOptsPresent []bool
++	// First (spot) call fails with a capacity error.
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Run(func(args mock.Arguments) {
++			marketOptsPresent = append(marketOptsPresent, args.Get(1).(*ec2.RunInstancesInput).InstanceMarketOptions != nil)
++		}).
++		Return((*ec2.RunInstancesOutput)(nil), errors.New("InsufficientInstanceCapacity: not enough spot capacity")).
++		Once()
++	// Second (on-demand) call succeeds.
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Run(func(args mock.Arguments) {
++			marketOptsPresent = append(marketOptsPresent, args.Get(1).(*ec2.RunInstancesInput).InstanceMarketOptions != nil)
++		}).
++		Return(&ec2.RunInstancesOutput{
++			Instances: []types.Instance{{InstanceId: aws.String("i-fallback01")}},
++		}, nil).
++		Once()
++
++	rs := spotRunnerSpec()
++	rs.MarketType = "spot"
++	rs.OnDemandFallback = true
++
++	id, err := awsCli.CreateRunningInstance(ctx, rs)
++	require.NoError(t, err)
++	require.Equal(t, "i-fallback01", id)
++	require.Len(t, marketOptsPresent, 2, "expected a spot attempt then an on-demand retry")
++	require.True(t, marketOptsPresent[0], "first attempt must be spot (InstanceMarketOptions set)")
++	require.False(t, marketOptsPresent[1], "fallback attempt must be on-demand (InstanceMarketOptions cleared)")
++}
++
++// Without on_demand_fallback, a spot capacity failure propagates (no retry).
++func TestCreateRunningInstanceSpotNoFallbackPropagates(t *testing.T) {
++	ctx := context.Background()
++	mockClient := new(MockComputeClient)
++	awsCli := spotTestCli(mockClient)
++	describeImagesOK(mockClient)
++
++	calls := 0
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Run(func(args mock.Arguments) { calls++ }).
++		Return((*ec2.RunInstancesOutput)(nil), errors.New("InsufficientInstanceCapacity: not enough spot capacity"))
++
++	rs := spotRunnerSpec()
++	rs.MarketType = "spot"
++	rs.OnDemandFallback = false
++
++	_, err := awsCli.CreateRunningInstance(ctx, rs)
++	require.Error(t, err)
++	require.Equal(t, 1, calls, "no fallback expected without on_demand_fallback")
++}
++
++// Graceful interruption handling at the provider layer: an interrupted spot
++// runner shows up as a terminated/shutting-down EC2 instance, which
++// FindInstances excludes from the live set — so GARM's DB-as-truth reconcile
++// sees the runner gone and re-queues the job. This asserts the state filter the
++// reconcile relies on.
++func TestFindInstancesExcludesInterruptedSpot(t *testing.T) {
++	ctx := context.Background()
++	mockClient := new(MockComputeClient)
++	awsCli := spotTestCli(mockClient)
++
++	var captured *ec2.DescribeInstancesInput
++	mockClient.On("DescribeInstances", mock.Anything, mock.Anything, mock.Anything).
++		Run(func(args mock.Arguments) {
++			captured = args.Get(1).(*ec2.DescribeInstancesInput)
++		}).
++		Return(&ec2.DescribeInstancesOutput{}, nil)
++
++	_, err := awsCli.FindInstances(ctx, "controllerID", "instance-name")
++	require.NoError(t, err)
++	require.NotNil(t, captured)
++
++	// The instance-state-name filter must exclude terminated + shutting-down
++	// (the two states an interrupted spot instance passes through) so the
++	// reconcile treats an interrupted runner as gone.
++	var stateValues []string
++	for _, f := range captured.Filters {
++		if f.Name != nil && *f.Name == "instance-state-name" {
++			stateValues = f.Values
++		}
++	}
++	require.NotEmpty(t, stateValues, "expected an instance-state-name filter")
++	require.NotContains(t, stateValues, "terminated")
++	require.NotContains(t, stateValues, "shutting-down")
++}
++
++// requireVolumeOwnershipTags asserts the launch tags the root volume with the
++// same GARM ownership keys as the instance, so a cloud-side reconcile can
++// attribute every billable resource a launch creates.
++func requireVolumeOwnershipTags(t *testing.T, in *ec2.RunInstancesInput) {
++	t.Helper()
++	for _, ts := range in.TagSpecifications {
++		if ts.ResourceType != types.ResourceTypeVolume {
++			continue
++		}
++		got := map[string]string{}
++		for _, tag := range ts.Tags {
++			got[*tag.Key] = *tag.Value
++		}
++		require.Equal(t, "poolID", got["GARM_POOL_ID"])
++		require.Equal(t, "controllerID", got["GARM_CONTROLLER_ID"])
++		require.Equal(t, "instance-name", got["Name"])
++		return
++	}
++	t.Fatal("RunInstances carries no volume TagSpecification")
++}
+diff --git a/internal/spec/spec.go b/internal/spec/spec.go
+index f309113..531f0a7 100644
+--- a/internal/spec/spec.go
++++ b/internal/spec/spec.go
+@@ -22,6 +22,7 @@ import (
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"fmt"
++	"strings"
+ 
+ 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
+ 	"github.com/cloudbase/garm-provider-aws/config"
+@@ -88,6 +89,15 @@ type extraSpecs struct {
+ 	DisableUpdates     *bool            `json:"disable_updates,omitempty" jsonschema:"description=Disable automatic updates on the VM."`
+ 	EnableBootDebug    *bool            `json:"enable_boot_debug,omitempty" jsonschema:"description=Enable boot debug on the VM."`
+ 	ExtraPackages      []string         `json:"extra_packages,omitempty" jsonschema:"description=Extra packages to install on the VM."`
++	// Spot / InstanceMarketOptions support (Metacraft Labs downstream patch).
++	// When MarketType is "spot", the instance is launched via EC2
++	// InstanceMarketOptions with MarketType=spot, cutting burst cost. See the
++	// provenance note in the patch header.
++	MarketType                       *string `json:"market_type,omitempty" jsonschema:"enum=spot,description=Instance market type. Set to 'spot' to launch the runner as a Spot instance via EC2 InstanceMarketOptions. Omit (or empty) for a standard on-demand instance."`
++	SpotMaxPrice                     *string `json:"spot_max_price,omitempty" jsonschema:"description=The maximum hourly price (in USD) you are willing to pay for the Spot instance. Empty means the On-Demand price is used as the cap (recommended). Only consulted when market_type is 'spot'."`
++	SpotInstanceType                 *string `json:"spot_instance_type,omitempty" jsonschema:"enum=one-time,enum=persistent,description=Spot request type. 'one-time' (default) suits ephemeral one-job runners; 'persistent' re-requests after an interruption. Only consulted when market_type is 'spot'."`
++	SpotInstanceInterruptionBehavior *string `json:"spot_instance_interruption_behavior,omitempty" jsonschema:"enum=terminate,enum=stop,enum=hibernate,description=What EC2 does to the Spot instance on interruption. 'terminate' (default) is correct for ephemeral runners. Only consulted when market_type is 'spot'."`
++	OnDemandFallback                 *bool   `json:"on_demand_fallback,omitempty" jsonschema:"description=When true and a Spot request fails with a capacity/price error, retry the SAME launch as an on-demand instance instead of failing. Only consulted when market_type is 'spot'."`
+ 	cloudconfig.CloudConfigSpec
+ }
+ 
+@@ -136,6 +146,19 @@ type RunnerSpec struct {
+ 	VolumeSize         *int32
+ 	VolumeType         types.VolumeType
+ 	ControllerID       string
++	// Spot / InstanceMarketOptions (Metacraft Labs downstream patch).
++	MarketType                       string
++	SpotMaxPrice                     string
++	SpotInstanceType                 string
++	SpotInstanceInterruptionBehavior string
++	OnDemandFallback                 bool
++}
++
++// UsesSpot reports whether this runner should be launched as an EC2 Spot
++// instance (MarketType == "spot", case-insensitive). Added by the Metacraft
++// Labs downstream spot patch.
++func (r *RunnerSpec) UsesSpot() bool {
++	return strings.EqualFold(r.MarketType, "spot")
+ }
+ 
+ func (r *RunnerSpec) Validate() error {
+@@ -246,6 +269,23 @@ func (r *RunnerSpec) MergeExtraSpecs(extraSpecs *extraSpecs) {
+ 			Arn: extraSpecs.IAMInstanceProfile,
+ 		}
+ 	}
++
++	// Spot / InstanceMarketOptions (Metacraft Labs downstream patch).
++	if extraSpecs.MarketType != nil {
++		r.MarketType = *extraSpecs.MarketType
++	}
++	if extraSpecs.SpotMaxPrice != nil {
++		r.SpotMaxPrice = *extraSpecs.SpotMaxPrice
++	}
++	if extraSpecs.SpotInstanceType != nil {
++		r.SpotInstanceType = *extraSpecs.SpotInstanceType
++	}
++	if extraSpecs.SpotInstanceInterruptionBehavior != nil {
++		r.SpotInstanceInterruptionBehavior = *extraSpecs.SpotInstanceInterruptionBehavior
++	}
++	if extraSpecs.OnDemandFallback != nil {
++		r.OnDemandFallback = *extraSpecs.OnDemandFallback
++	}
+ }
+ 
+ func (r *RunnerSpec) ComposeUserData() (string, error) {
+diff --git a/internal/spec/spot_schema_test.go b/internal/spec/spot_schema_test.go
+new file mode 100644
+index 0000000..9335bf2
+--- /dev/null
++++ b/internal/spec/spot_schema_test.go
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: Apache-2.0
++// Copyright 2024 Cloudbase Solutions SRL
++//
++//    Licensed under the Apache License, Version 2.0 (the "License"); you may
++//    not use this file except in compliance with the License. You may obtain
++//    a copy of the License at
++//
++//         http://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++//    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++//    License for the specific language governing permissions and limitations
++//    under the License.
++
++// Metacraft Labs downstream spot patch — proves the generated extra-specs JSON
++// schema (the contract GARM validates a pool's extra_specs against) advertises
++// the new spot / InstanceMarketOptions fields, so a pool requesting spot passes
++// validation and reaches the RunInstances path. No mock; this reflects the real
++// schema the shipped binary emits.
++package spec
++
++import (
++	"encoding/json"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestExtraSpecsSchemaAdvertisesSpot(t *testing.T) {
++	schema := generateJSONSchema()
++	b, err := json.Marshal(schema)
++	require.NoError(t, err)
++	s := string(b)
++	for _, field := range []string{
++		"market_type",
++		"spot_max_price",
++		"spot_instance_type",
++		"spot_instance_interruption_behavior",
++		"on_demand_fallback",
++	} {
++		require.Contains(t, s, field, "extra-specs schema must advertise %q", field)
++	}
++	// The spot enum value must be present on market_type.
++	require.Contains(t, s, "spot")
++}

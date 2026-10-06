@@ -1,0 +1,54 @@
+# RD2 — guard: fail a PUBLIC-repo workflow that names a larger/GPU GitHub-hosted
+# runner (the one way a public repo still incurs Actions charges, and a job that
+# the $0 budget would block). Standard hosted runners (ubuntu-latest etc.) and
+# self-hosted classes pass; on a private repo the guard only warns.
+#
+# Campaign: Runner-Fleet-Capability-Pools-And-Remote-Driving, milestone RD2
+# (gate `t_public_repo_free_ci`). The checker is
+# nixos-modules/scripts/ci/check_public_repo_runners.py.
+#
+# Wire it into a consumer repo's CI as a cheap lint job:
+#
+#   jobs:
+#     runner-policy:
+#       uses: metacraft-labs/devops-modules/.github/workflows/reusable-public-runner-guard.yml@dev
+
+name: public-runner-guard
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'nixos-modules ref to fetch the checker from.'
+        type: string
+        default: 'main'
+      billed_labels:
+        description: 'Extra runner labels to treat as billed, space-separated.'
+        type: string
+        default: ''
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v6.0.2
+      - name: Checkout nixos-modules (checker source)
+        uses: actions/checkout@v6.0.2
+        with:
+          repository: metacraft-labs/devops-modules
+          ref: ${{ inputs.ref }}
+          path: _ci-guard
+      - name: Run the public-repo billed-runner guard
+        env:
+          GH_REPO_VISIBILITY: ${{ github.event.repository.private && 'private' || 'public' }}
+          BILLED_LABELS: ${{ inputs.billed_labels }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check pyyaml
+          args=(--visibility "$GH_REPO_VISIBILITY")
+          for label in $BILLED_LABELS; do
+            args+=(--billed-label "$label")
+          done
+          python3 _ci-guard/scripts/ci/check_public_repo_runners.py \
+            "${args[@]}" .github/workflows

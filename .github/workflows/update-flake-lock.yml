@@ -17,5 +17,5 @@ jobs:
       CREATE_PR_APP_PRIVATE_KEY: ${{ secrets.CREATE_PR_APP_PRIVATE_KEY }}
       GIT_GPG_SIGNING_SECRET_KEY: ${{ secrets.GIT_GPG_SIGNING_SECRET_KEY }}
     with:
-      runner: '["self-hosted", "Linux", "x86-64-v2"]'
+      runner: '["self-hosted", "linux", "x64"]'
       sign-commits: true

@@ -1,0 +1,12 @@
+diff --git a/runner/types.go b/runner/types.go
+index ee41188..73644ef 100644
+--- a/runner/types.go
++++ b/runner/types.go
+@@ -29,6 +29,7 @@ var (
+ 	supportedOSType map[params.OSType]struct{} = map[params.OSType]struct{}{
+ 		params.Linux:   {},
+ 		params.Windows: {},
++		params.MacOS:   {},
+ 	}
+ 
+ 	// These are the architectures that Github supports.

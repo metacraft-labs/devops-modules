@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+require_env() {
+  local name="$1"
+  if [ -z "${!name:-}" ]; then
+    echo "::error::${name} is required." >&2
+    exit 1
+  fi
+}
+
+base64url() {
+  openssl base64 -A | tr '+/' '-_' | tr -d '='
+}
+
+require_env GITHUB_OUTPUT
+require_env GITHUB_REPOSITORY_OWNER
+require_env RUNNER_TEMP
+
+token_path="${RUNNER_TEMP}/github-governance-token"
+
+if [ -n "${GOVERNANCE_STATIC_TOKEN:-}" ]; then
+  printf '%s' "$GOVERNANCE_STATIC_TOKEN" > "$token_path"
+  echo "::add-mask::$GOVERNANCE_STATIC_TOKEN"
+  echo "token_source=GH_GOVERNANCE_TOKEN" >> "$GITHUB_OUTPUT"
+  echo "Selected GitHub governance token source: GH_GOVERNANCE_TOKEN"
+else
+  app_id=""
+  app_private_key=""
+  app_source=""
+
+  if [ -n "${GH_GOVERNANCE_APP_ID:-}" ] && [ -n "${GH_GOVERNANCE_APP_PRIVATE_KEY:-}" ]; then
+    app_id="$GH_GOVERNANCE_APP_ID"
+    app_private_key="$GH_GOVERNANCE_APP_PRIVATE_KEY"
+    app_source="GH_GOVERNANCE_APP"
+  elif [ -n "${CI_TOKEN_PROVIDER_APP_ID:-}" ] && [ -n "${CI_TOKEN_PROVIDER_PRIVATE_KEY:-}" ]; then
+    app_id="$CI_TOKEN_PROVIDER_APP_ID"
+    app_private_key="$CI_TOKEN_PROVIDER_PRIVATE_KEY"
+    app_source="CI_TOKEN_PROVIDER_APP"
+  fi
+
+  if [ -z "$app_id" ] || [ -z "$app_private_key" ]; then
+    echo "::error::No GitHub governance credential is configured. Set GH_GOVERNANCE_TOKEN, GH_GOVERNANCE_APP_ID/GH_GOVERNANCE_APP_PRIVATE_KEY, or CI_TOKEN_PROVIDER_APP_ID/CI_TOKEN_PROVIDER_PRIVATE_KEY." >&2
+    exit 1
+  fi
+
+  key_path="${RUNNER_TEMP}/github-governance-app-key.pem"
+  printf '%s\n' "$app_private_key" > "$key_path"
+  chmod 600 "$key_path"
+
+  api_url="${GITHUB_API_URL:-https://api.github.com}"
+  now="$(date +%s)"
+  iat="$((now - 60))"
+  exp="$((now + 540))"
+
+  header="$(printf '{"alg":"RS256","typ":"JWT"}' | base64url)"
+  payload="$(
+    jq -nc \
+      --argjson iat "$iat" \
+      --argjson exp "$exp" \
+      --arg iss "$app_id" \
+      '{iat: $iat, exp: $exp, iss: $iss}'
+  )"
+  payload64="$(printf '%s' "$payload" | base64url)"
+  signing_input="${header}.${payload64}"
+  signature="$(
+    printf '%s' "$signing_input" \
+      | openssl dgst -sha256 -sign "$key_path" -binary \
+      | base64url
+  )"
+  jwt="${signing_input}.${signature}"
+
+  installation_id="$(
+    curl -fsSL \
+      -H "Authorization: Bearer ${jwt}" \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      "${api_url}/app/installations" \
+      | jq -r --arg owner "$GITHUB_REPOSITORY_OWNER" \
+          '.[] | select(.account.login == $owner) | .id' \
+      | head -n 1
+  )"
+
+  if [ -z "$installation_id" ] || [ "$installation_id" = "null" ]; then
+    echo "::error::Could not find a GitHub App installation for ${GITHUB_REPOSITORY_OWNER}." >&2
+    exit 1
+  fi
+
+  app_token="$(
+    curl -fsSL \
+      -X POST \
+      -H "Authorization: Bearer ${jwt}" \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      "${api_url}/app/installations/${installation_id}/access_tokens" \
+      | jq -r '.token // empty'
+  )"
+
+  if [ -z "$app_token" ]; then
+    echo "::error::GitHub governance app did not return an installation token." >&2
+    exit 1
+  fi
+
+  printf '%s' "$app_token" > "$token_path"
+  echo "::add-mask::$app_token"
+  echo "token_source=$app_source" >> "$GITHUB_OUTPUT"
+  echo "Selected GitHub governance token source: $app_source"
+fi
+
+chmod 600 "$token_path"
+echo "token_path=$token_path" >> "$GITHUB_OUTPUT"

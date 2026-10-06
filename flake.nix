@@ -3,11 +3,11 @@
 
   nixConfig = {
     extra-substituters = [
-      "https://cache.metacraft-labs.com/metacraft-public"
+      "https://cache.metacraft-labs.com/metacraft-private-infrastructure"
       "https://dlang-community.cachix.org"
     ];
     extra-trusted-public-keys = [
-      "metacraft-public:UtS6PK+p0uZaJK3i/jD2DQOjTpddhQUQmNQDQih5N4Q="
+      "metacraft-private-infrastructure:TWjFAlGXK9Mky5VG3PBln2MqYz4XPw3MTHHVPYZiAhE="
       "dlang-community.cachix.org-1:eAX1RqX4PjTDPCAp/TvcZP+DYBco2nJBackkAJ2BsDQ="
     ];
   };
@@ -15,6 +15,58 @@
   inputs = {
     nixos-2511.url = "github:NixOS/nixpkgs/nixos-25.11";
     nixos-2605.url = "github:NixOS/nixpkgs/nixos-26.05";
+
+    # Windows-Runner-Binary-Cache-Deploy M1 — the reprobuild flake provides the
+    # `repro-binary-cache` package (the binary-cache HTTP daemon) that the
+    # `services.mcl-repro-binary-cache` NixOS module packages into a systemd
+    # unit, mirroring how `mcl.attic-cache-host` packages atticd. reprobuild
+    # already pins `nixpkgs.follows = "nixos-modules/nixpkgs-unstable"`, so it is
+    # built against the same unstable package set as this repo. (There is no
+    # lock cycle: reprobuild's `nixos-modules` input keeps its own pinned
+    # revision; Nix resolves each flake's inputs independently.)
+    #
+    # PINNED to a specific rev (not a bare branch): we deploy reprobuild to
+    # servers through this input, so an explicit pin keeps the installed
+    # `repro` reproducible. Bump this SHA to roll forward.
+    #
+    # THE SHA MAY BE ON `agents`, and need not wait for `dev`. The earlier
+    # wording here required `dev` or a published release tag; that was wrong and
+    # cost real time. `agents` is the agent landing branch for product repos, so
+    # requiring `dev` coupled every pin bump to the separate agents-to-dev
+    # promotion campaign — a fix could be landed, tested and unusable for days.
+    # What the pin actually needs is a revision that EXISTS on a pushed ref and
+    # satisfies the three checks below; which branch carries it is not one of
+    # them. (A release tag's commit remains fine, and a release branch reaches
+    # `dev` later.)
+    #
+    # This SHA is the single source of truth
+    # for the reprobuild revision: nearly every consumer reaches `repro` through
+    # this input with `follows` rather than declaring a pin of its own, so a
+    # machine cannot end up running a `repro` other than the one its closure was
+    # built against.
+    #
+    # `codetracer` is a documented exception — it consumes the prebuilt package
+    # and overrides six of reprobuild's inputs to get a `repro` built with
+    # `ct_interpose`, which a bare `follows` cannot express, so it mirrors this
+    # SHA by hand. Bumping is therefore a two-file edit: here first, then
+    # codetracer's `flake.nix`. Do not "tidy" that input into a `follows`.
+    # See metacraft-specs/how-to-distribute-new-reprobuild-versions-internally.md.
+    # Before bumping, check the candidate against a real workspace — it must
+    # still parse the current manifests (`repro workspace status`) and still
+    # satisfy the installed managed-hook contract
+    # (`repro hooks protocol --require=2 --hook-contract=...`).
+    #
+    # THIS INPUT NOW ALSO SUPPLIES THE MODULES, not just the packages.
+    # Distribution-And-Packaging M4 moved `mcl-reprobuild` and
+    # `mcl-repro-binary-cache` into reprobuild's own flake
+    # (`nixosModules.reprobuild`, `darwinModules.reprobuild`,
+    # `homeManagerModules.reprobuild`, `nixosModules.repro-binary-cache`);
+    # `modules/mcl-reprobuild` and `modules/mcl-repro-binary-cache` here are
+    # thin re-exports of them and hold no schema of their own. So this pin must
+    # name a revision that carries reprobuild's `nix/modules/` directory — a pin
+    # older than that makes `modules/` fail to evaluate, not merely ship a stale
+    # `repro`.
+    reprobuild.url = "github:metacraft-labs/reprobuild/3fbceecee94378c3234270e4d5baeb6e754b94f8";
 
     nixpkgs.follows = "nixos-2605";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";

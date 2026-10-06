@@ -1,0 +1,55 @@
+From 3e9a7c1489f3ddfbaf51a9df5f9b2342109fce2b Mon Sep 17 00:00:00 2001
+From: Zahary Karadjov <zahary@metacraft-labs.com>
+Date: Wed, 22 Jul 2026 15:27:27 +0300
+Subject: [PATCH] Fix inverted error check in external provider ListInstances
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The v0.1.1 external provider's ListInstances guarded the result of
+execWithTimeout with an inverted condition:
+
+    out, err := e.execWithTimeout(ctx, nil, asEnv)
+    if err == nil {
+        ...
+        return []commonParams.ProviderInstance{}, garmErrors.NewProviderError(
+            "provider binary %s returned error: %s", e.execPath, err)
+    }
+
+Every other command in this file (CreateInstance, DeleteInstance,
+GetInstance, RemoveAllInstances, Start, Stop) uses `if err != nil`;
+ListInstances was the sole outlier.
+
+The effect: on a SUCCESSFUL provider ListInstances run (err == nil), GARM
+took the failure branch, formatted the nil error with %s and logged
+
+    provider binary <path> returned error: %!s(<nil>)
+
+then returned an empty instance slice — the provider's real output was
+never parsed. Downstream, scale-set runner-state consolidation never saw
+the instances the provider actually reported, producing genuine state
+drift, plus recurring ERROR log spam on every list cycle.
+
+Flip the check to `if err != nil` so the error branch fires only on a
+genuine provider failure and the successful output is parsed as intended.
+
+Signed-off-by: Zahary Karadjov <zahary@metacraft-labs.com>
+---
+ runner/providers/v0.1.1/external.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/runner/providers/v0.1.1/external.go b/runner/providers/v0.1.1/external.go
+index 3ff8aff..41822f8 100644
+--- a/runner/providers/v0.1.1/external.go
++++ b/runner/providers/v0.1.1/external.go
+@@ -265,7 +265,7 @@ func (e *external) ListInstances(ctx context.Context, poolID string, listInstanc
+ 	).Inc()
+ 
+ 	out, err := e.execWithTimeout(ctx, nil, asEnv)
+-	if err == nil {
++	if err != nil {
+ 		metrics.InstanceOperationFailedCount.WithLabelValues(
+ 			"ListInstances", // label: operation
+ 			e.cfg.Name,      // label: provider
+-- 
+2.54.0
