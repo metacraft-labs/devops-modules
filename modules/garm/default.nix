@@ -389,8 +389,9 @@
         a: a.runnerTemplate == "sandbox" || (a.runnerTemplate == "" && a.substrate == "local-sandbox");
       # The payload runs the runner the way nixpkgs' services.github-runners
       # unit does: the same package, and the unit's `path` (bash, coreutils,
-      # git, gnutar, gzip, nix) plus extraPackages, plus what the payload
-      # itself calls (curl, sed). The job's shell is the store bash, so the
+      # git, gnutar, gzip, nix) plus NixOS's default service path (findutils,
+      # gnugrep, gnused, systemd) plus extraPackages, plus what the payload
+      # itself calls (curl). The job's shell is the store bash, so the
       # payload never depends on an FHS /bin/bash.
       mkAgentharborRunnerKeys =
         r:
@@ -404,6 +405,14 @@
             config.nix.package
             pkgs.curl
             pkgs.gnused
+            # NixOS appends these to EVERY systemd service's PATH
+            # (systemd.services.<n>.path defaults: coreutils, findutils,
+            # gnugrep, gnused, systemd), so the systemd runners have them
+            # whether or not their module lists them. Without them a job
+            # script that calls grep/find fails only on the sandbox runner.
+            pkgs.findutils
+            pkgs.gnugrep
+            config.systemd.package
           ]
           ++ r.extraPackages;
           binDirs = map (p: "${lib.getBin p}/bin") pathPkgs;
