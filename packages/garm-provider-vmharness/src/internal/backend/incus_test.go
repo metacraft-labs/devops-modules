@@ -233,8 +233,30 @@ func writeMockIncus(t *testing.T) (cmd []string, stateDir string) {
 	return []string{script}, stateDir
 }
 
+// The IPv4 allocation lock lives under os.TempDir() for the tests, NOT at the
+// production constant's fixed /tmp path.
+//
+// `incusIPAllocationLock` is deliberately a fixed absolute path: GARM runs each
+// external-provider request in its own process, so the only thing that can
+// serialise the non-atomic Incus lease window is a lock every allocator agrees
+// on. That is right in production and wrong in a test, because /tmp is shared
+// between users on a CI builder: a lock file left by another user's build is
+// mode 0600 and owned by them, so every Create fails with
+//
+//	open incus IPv4 allocation lock /tmp/…: permission denied
+//
+// which is what the aarch64-darwin leg of batch 5/6 was failing on. Reproduced
+// on Linux by creating that path root-owned before running the suite, and fixed
+// by this line.
+//
+// os.TempDir() honours TMPDIR, which Nix sets per build, so the path is private
+// to one build and SHARED BY EVERY BACKEND IN IT. The sharing is required, not
+// incidental: tests that construct two backends and expect their allocations to
+// be serialised against each other would pass vacuously on two different locks.
 func newTestIncusBackend(cmd []string) *IncusBackend {
 	return &IncusBackend{
+		IPAllocationLockPath: filepath.Join(os.TempDir(),
+			"garm-provider-vmharness-incus-ip-allocation.test.lock"),
 		IncusCmd:    cmd,
 		Bridge:      "incusbr0",
 		IPv4CIDR:    "10.0.100.0/24",
