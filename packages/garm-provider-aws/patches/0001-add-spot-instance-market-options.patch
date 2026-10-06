@@ -1,5 +1,5 @@
 diff --git a/internal/client/aws.go b/internal/client/aws.go
-index 6d2fce8..d2f2073 100644
+index 6d2fce8..e585e15 100644
 --- a/internal/client/aws.go
 +++ b/internal/client/aws.go
 @@ -263,7 +263,7 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
@@ -11,9 +11,43 @@ index 6d2fce8..d2f2073 100644
  		ImageId:            aws.String(spec.BootstrapParams.Image),
  		InstanceType:       types.InstanceType(spec.BootstrapParams.Flavor),
  		MaxCount:           aws.Int32(1),
-@@ -312,10 +312,78 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
+@@ -273,6 +273,12 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
+ 		UserData:           aws.String(udata),
+ 		KeyName:            spec.SSHKeyName,
+ 		IamInstanceProfile: spec.IAMInstanceProfile,
++		// Metacraft Labs downstream patch: an OS-initiated power-off (the
++		// in-guest TTL backstop, or a runner that shuts its VM down after its
++		// job) TERMINATES the instance. The EC2 default is "stop", which leaves a
++		// stopped, EBS-billed instance that ListInstances still reports and that
++		// GARM's reconcile then tries to Start again.
++		InstanceInitiatedShutdownBehavior: types.ShutdownBehaviorTerminate,
+ 		BlockDeviceMappings: []types.BlockDeviceMapping{
+ 			{
+ 				DeviceName: aws.String(root_volume),
+@@ -311,11 +317,99 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
+ 					},
  				},
  			},
++			// Metacraft Labs downstream patch: tag the root volume with the same
++			// ownership keys, so a cloud-side reconcile can attribute (and
++			// account for) every billable resource a runner launch creates.
++			{
++				ResourceType: types.ResourceTypeVolume,
++				Tags: []types.Tag{
++					{
++						Key:   aws.String("Name"),
++						Value: aws.String(spec.BootstrapParams.Name),
++					},
++					{
++						Key:   aws.String("GARM_POOL_ID"),
++						Value: aws.String(spec.BootstrapParams.PoolID),
++					},
++					{
++						Key:   aws.String("GARM_CONTROLLER_ID"),
++						Value: aws.String(spec.ControllerID),
++					},
++				},
++			},
  		},
 -	})
 +	}
@@ -93,10 +127,10 @@ index 6d2fce8..d2f2073 100644
 +}
 diff --git a/internal/client/spot_test.go b/internal/client/spot_test.go
 new file mode 100644
-index 0000000..6d97654
+index 0000000..52f4ef5
 --- /dev/null
 +++ b/internal/client/spot_test.go
-@@ -0,0 +1,266 @@
+@@ -0,0 +1,293 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright 2024 Cloudbase Solutions SRL
 +//
@@ -234,6 +268,9 @@ index 0000000..6d97654
 +	require.Equal(t, maxPrice, *captured.InstanceMarketOptions.SpotOptions.MaxPrice)
 +	// Ephemeral one-job auto-terminate: exactly one instance per Create.
 +	require.Equal(t, int32(1), *captured.MaxCount)
++	// An OS power-off (the in-guest TTL backstop) must TERMINATE, never stop.
++	require.Equal(t, types.ShutdownBehaviorTerminate, captured.InstanceInitiatedShutdownBehavior)
++	requireVolumeOwnershipTags(t, captured)
 +	require.Equal(t, int32(1), *captured.MinCount)
 +}
 +
@@ -263,6 +300,9 @@ index 0000000..6d97654
 +	// Ephemeral one-job auto-terminate: exactly one instance per Create, so a
 +	// burst never over-provisions per queued job.
 +	require.Equal(t, int32(1), *captured.MaxCount)
++	// An OS power-off (the in-guest TTL backstop) must TERMINATE, never stop.
++	require.Equal(t, types.ShutdownBehaviorTerminate, captured.InstanceInitiatedShutdownBehavior)
++	requireVolumeOwnershipTags(t, captured)
 +	require.Equal(t, int32(1), *captured.MinCount)
 +}
 +
@@ -362,6 +402,27 @@ index 0000000..6d97654
 +	require.NotEmpty(t, stateValues, "expected an instance-state-name filter")
 +	require.NotContains(t, stateValues, "terminated")
 +	require.NotContains(t, stateValues, "shutting-down")
++}
++
++// requireVolumeOwnershipTags asserts the launch tags the root volume with the
++// same GARM ownership keys as the instance, so a cloud-side reconcile can
++// attribute every billable resource a launch creates.
++func requireVolumeOwnershipTags(t *testing.T, in *ec2.RunInstancesInput) {
++	t.Helper()
++	for _, ts := range in.TagSpecifications {
++		if ts.ResourceType != types.ResourceTypeVolume {
++			continue
++		}
++		got := map[string]string{}
++		for _, tag := range ts.Tags {
++			got[*tag.Key] = *tag.Value
++		}
++		require.Equal(t, "poolID", got["GARM_POOL_ID"])
++		require.Equal(t, "controllerID", got["GARM_CONTROLLER_ID"])
++		require.Equal(t, "instance-name", got["Name"])
++		return
++	}
++	t.Fatal("RunInstances carries no volume TagSpecification")
 +}
 diff --git a/internal/spec/spec.go b/internal/spec/spec.go
 index f309113..531f0a7 100644

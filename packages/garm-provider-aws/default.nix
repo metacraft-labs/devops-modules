@@ -33,6 +33,12 @@
 #     the SAME launch on-demand (InstanceMarketOptions cleared) when
 #     `on_demand_fallback` is set, so a burst still lands — at on-demand cost —
 #     rather than starving the queue;
+#   * launches EVERY instance with InstanceInitiatedShutdownBehavior=terminate
+#     (EC2's default is `stop`), so an in-guest power-off, notably the
+#     `burstPools.<n>.ttlMinutes` backstop, ends billing instead of leaving a
+#     stopped instance that GARM would try to Start again; and tags the root
+#     VOLUME with the same Name/GARM_POOL_ID/GARM_CONTROLLER_ID keys as the
+#     instance, for cloud-side reconcile;
 #   * ships white-box tests (internal/client/spot_test.go) that drive the
 #     provider's own EC2-client mock to assert the rendered RunInstances, the
 #     fallback path, and that FindInstances excludes interrupted (terminated /
