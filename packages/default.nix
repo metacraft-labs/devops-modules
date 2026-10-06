@@ -67,9 +67,7 @@
             exec python3 ${../scripts/attic-migrate-flake} "$@"
           '';
         };
-        cachix-deploy-metrics = pkgs.callPackage ./cachix-deploy-metrics {
-          dCompiler = inputs'.dlang-nix.packages.ldc;
-        };
+        cachix-deploy-metrics = pkgs.callPackage ./cachix-deploy-metrics { };
         # Cross-repo sealer for the fleet-alerting receiver secrets (ntfy topic +
         # token, Healthchecks ping URL). Shared by every Metacraft infra repo per
         # policies/alerting-methodology.md. Operates on the consumer repo's flake.
@@ -100,9 +98,7 @@
         };
         lido-withdrawals-automation = pkgs.callPackage ./lido-withdrawals-automation { };
         pyroscope = pkgs.callPackage ./pyroscope { };
-        random-alerts = pkgs.callPackage ./random-alerts {
-          dCompiler = inputs'.dlang-nix.packages."ldc-binary-1_38_0";
-        };
+        random-alerts = pkgs.callPackage ./random-alerts { };
         mcl-devops = pkgs.callPackage ./mcl-devops {
           dCompiler = inputs'.dlang-nix.packages."ldc-binary-1_38_0";
           inherit (legacyPackages.inputs.nixpkgs) cachix nix nix-eval-jobs;
