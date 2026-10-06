@@ -268,6 +268,11 @@ status "using the Nix github-runner $RUNNER_VERSION{{ if .OfferedVersion }} (Git
 mkdir -p "$STATE_DIRECTORY" "$WORK_DIRECTORY" "$LOGS_DIRECTORY"
 export HOME="$WORK_DIRECTORY"
 export RUNNER_ROOT="$STATE_DIRECTORY"
+# A systemd service has no user session, so the systemd runners see no
+# XDG_RUNTIME_DIR or session bus. The sandbox job may inherit the ah host
+# user's (hidden and read-only inside the sandbox), and tools that honour
+# it (just, for one) then fail; mirror the service environment.
+unset XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
 {{- range .Env }}
 export {{ index . 0 }}={{ shell (index . 1) }}
 {{- end }}
