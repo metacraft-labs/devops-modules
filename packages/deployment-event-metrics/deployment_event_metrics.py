@@ -52,11 +52,32 @@ def prom_escape_label(value: object) -> str:
     return text.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
+def prom_value(value: float | int) -> str:
+    """Exposition text for a sample value, at FULL precision.
+
+    This used to be `f"{value:g}"`, which keeps 6 significant digits. A Unix
+    timestamp has 10, so every `*_timestamp_seconds` gauge was rounded to the
+    nearest 10^4 s (~2.8 h): every host's "last successful deploy" read
+    1.7912e+09 and the same age. Byte counters past 10^6 lost precision the
+    same way. Integral values print as integers; everything else uses
+    `repr`, Python's shortest round-tripping form.
+    """
+    number = float(value)
+    if number != number:
+        return "NaN"
+    if number in (float("inf"), float("-inf")):
+        return "+Inf" if number > 0 else "-Inf"
+    if number.is_integer() and abs(number) < 2**63:
+        return str(int(number))
+    return repr(number)
+
+
 def prom_sample(name: str, labels: dict[str, object], value: float | int) -> str:
     label_text = ",".join(
         f'{key}="{prom_escape_label(labels[key])}"' for key in sorted(labels)
     )
-    return f"{name}{{{label_text}}} {value:g}" if label_text else f"{name} {value:g}"
+    rendered = prom_value(value)
+    return f"{name}{{{label_text}}} {rendered}" if label_text else f"{name} {rendered}"
 
 
 def metric_key(name: str, labels: dict[str, object]) -> tuple[str, tuple[tuple[str, str], ...]]:
@@ -455,7 +476,14 @@ def render_metrics(
 ) -> str:
     now = dt.datetime.now(dt.timezone.utc).timestamp() if now is None else now
     merged = deployment_metrics(event_logs, event_dirs, expected_targets, now)
-    merged.update(nginx_metrics(nginx_logs))
+    # Only render the Attic families when an access log was asked for.
+    # `nginx_metrics` zero-seeds `mcl_attic_nginx_forbidden_total`, so an
+    # events-only invocation used to emit that family too. Consumers that
+    # render events and the access log in separate passes and concatenate the
+    # outputs (infra's two-cadence snapshot) then got a duplicate HELP/TYPE
+    # for it, which is an invalid exposition.
+    if nginx_logs:
+        merged.update(nginx_metrics(nginx_logs))
 
     lines: list[str] = []
     emitted_help: set[str] = set()
@@ -826,6 +854,35 @@ def self_test() -> None:
             raise AssertionError("missing metrics:\n" + "\n".join(missing) + "\n\n" + output)
         if 'mcl_deployment_in_progress_age_seconds{cache="cache",controller="direct-ssh",phase="switch",status="running",target="app-server-03",transport="direct-ssh"}' in output:
             raise AssertionError("stale in-progress metric was not cleared:\n" + output)
+
+        # FULL PRECISION. With `:g` this line read 1.77867e+09 — a timestamp
+        # rounded to 10^4 s. Pin the exact integer.
+        expected_ts = int(parse_timestamp("2026-05-13T09:00:05Z"))
+        precise = [
+            line
+            for line in output.splitlines()
+            if line.startswith("mcl_deployment_last_phase_success_timestamp_seconds{")
+        ]
+        if not precise or any("e+" in line for line in precise):
+            raise AssertionError("timestamps lost precision:\n" + "\n".join(precise))
+        if not any(line.endswith(f" {expected_ts}") for line in precise):
+            raise AssertionError(f"no phase-success timestamp equals {expected_ts}:\n" + "\n".join(precise))
+        for value, text in [(1791240000.0, "1791240000"), (0.25, "0.25"), (1791240000.5, "1791240000.5"), (18693830640, "18693830640")]:
+            if prom_value(value) != text:
+                raise AssertionError(f"prom_value({value!r}) = {prom_value(value)!r}, want {text!r}")
+
+        # AN EVENTS-ONLY RENDER EMITS NO ATTIC FAMILY. Separate event and
+        # access-log renders are concatenated downstream; a zero-seeded
+        # `mcl_attic_nginx_forbidden_total` in both would duplicate its HELP.
+        events_only = render_metrics([], [str(event_dir)], [], ["app-server-01"], now=parse_timestamp("2026-05-13T09:01:00Z"))
+        if "mcl_attic_nginx_" in events_only:
+            raise AssertionError("events-only render emitted Attic families:\n" + events_only)
+        attic_only = render_metrics([], [str(root / "no-events")], [str(nginx_log)], [], now=parse_timestamp("2026-05-13T09:01:00Z"))
+        combined = events_only + attic_only
+        helps = [line for line in combined.splitlines() if line.startswith("# HELP ")]
+        duplicates = sorted({h for h in helps if helps.count(h) > 1})
+        if duplicates:
+            raise AssertionError("concatenated renders duplicate HELP lines:\n" + "\n".join(duplicates))
 
 
 def build_parser() -> argparse.ArgumentParser:
