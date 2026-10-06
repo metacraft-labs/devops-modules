@@ -31,6 +31,7 @@
     ./runner-mode-switch.nix
     ./runner-mode-manager.nix
     ./ci-runs-on-capability.nix
+    ./ci-nixos-runner-hazards.nix
     ./garm-reconcile.nix
     ./garm-stale-scaleset-job-reaped.nix
     ./garm-job-cache-self-heal.nix
