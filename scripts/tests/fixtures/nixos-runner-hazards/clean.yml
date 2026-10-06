@@ -1,0 +1,35 @@
+name: clean
+on: push
+# nixos-runner-ok: actions/setup-python (documented exception for this fixture)
+jobs:
+  link-check:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+      - run: nix shell nixpkgs#lychee -c lychee --offline '**/*.md'
+      # A comment mentioning apt-get install is not a command.
+      - run: echo "apt is not used here"
+      - uses: actions/setup-python@v5
+  mixed:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [[self-hosted, linux, x64], [self-hosted, macos, arm64]]
+    steps:
+      - if: runner.os == 'macOS'
+        shell: /bin/bash -e {0}
+        run: brew install coreutils
+  hosted:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/setup-node@v4
+      - run: sudo apt-get install -y musl-tools
+  dynamic:
+    runs-on: ${{ fromJSON(needs.choose.outputs.runs_on) }}
+    steps:
+      - uses: actions/setup-node@v4
+  passwordless-sudo:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - run: sudo -n true

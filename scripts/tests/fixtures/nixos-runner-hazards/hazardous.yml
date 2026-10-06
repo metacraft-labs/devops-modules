@@ -1,0 +1,26 @@
+name: hazardous
+on: push
+jobs:
+  link-check:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lycheeverse/lychee-action@v2
+  nim:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [[self-hosted, linux, x64], [self-hosted, macos, arm64]]
+    steps:
+      - uses: jiro4989/setup-nim-action@v2
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: FHS shell
+        shell: /bin/bash -e {0}
+        run: echo hi
+  in-docker:
+    runs-on: [self-hosted, nixos]
+    container: archlinux:latest
+    steps:
+      - run: pacman -Syu --noconfirm
