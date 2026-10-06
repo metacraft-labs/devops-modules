@@ -13,7 +13,7 @@
   };
 
   inputs = {
-    nixos-2511.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixos-2505.url = "github:NixOS/nixpkgs/nixos-25.05";
     nixos-2605.url = "github:NixOS/nixpkgs/nixos-26.05";
 
     # Windows-Runner-Binary-Cache-Deploy M1 — the reprobuild flake provides the
@@ -132,7 +132,7 @@
     ethereum-nix = {
       url = "github:metacraft-labs/ethereum.nix/dev";
       inputs = {
-        nixpkgs.follows = "nixos-2511";
+        nixpkgs.follows = "nixos-2505";
         nixpkgs-unstable.follows = "nixpkgs-unstable";
         flake-parts.follows = "flake-parts";
         flake-utils.follows = "flake-utils";
