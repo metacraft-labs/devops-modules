@@ -26,7 +26,7 @@ top@{ ... }:
   #       credentials (a JWT signed with the JIT key), exits with its own
   #       TerminatedError, and is reported to GARM as a crash (error + reason)
   #       rather than a clean stop.
-  #   (3) NEGATIVE CONTROLS: the end-to-end gate is re-run against seven
+  #   (3) NEGATIVE CONTROLS: the end-to-end gate is re-run against eight
   #       single-line mutations of the provider source and MUST fail each time
   #       with a test failure (not a build failure), plus once against the
   #       unmutated source copy, which MUST pass — so a control cannot fail
@@ -249,6 +249,10 @@ top@{ ... }:
               mutate crash "$P" \
                 'inst.Status = commonParams.InstanceError' \
                 'inst.Status = commonParams.InstanceStopped'
+              # The payload leaks the ah host user's XDG_RUNTIME_DIR into the runner.
+              mutate runtimedir "$N" \
+                'unset XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS' \
+                'unset DBUS_SESSION_BUS_ADDRESS'
               # The payload does not point the runner at its JIT state.
               mutate runnerroot "$N" \
                 'export RUNNER_ROOT="$STATE_DIRECTORY"' \
@@ -258,7 +262,7 @@ top@{ ... }:
                 'if lag >= maxMinorLag {' \
                 'if false && lag >= maxMinorLag {'
 
-              echo "[t_garm_provider_agentharbor][PASS] behaviour matrix + end-to-end runner lifecycle + real Nix runner crash path + 7/7 negative controls"
+              echo "[t_garm_provider_agentharbor][PASS] behaviour matrix + end-to-end runner lifecycle + real Nix runner crash path + 8/8 negative controls"
               touch "$out"
             '';
 
