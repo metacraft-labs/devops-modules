@@ -91,6 +91,13 @@ top@{ ... }:
           floorPolicy = "floor";
           priority = 50;
           jobAgeBackoff = 45;
+          # The in-guest TTL backstop + infra-supplied provider extra-specs.
+          ttlMinutes = 360;
+          extraSpecs = {
+            security_group_ids = [ "sg-0123456789abcdef0" ];
+            iam_instance_profile = "arn:aws:iam::123456789012:instance-profile/runners";
+            volume_size = 50;
+          };
         };
         # Same pool tuning but pure-lazy: the effective floor must collapse to 0.
         burstPools.linux-aws-lazy = {
@@ -122,6 +129,7 @@ top@{ ... }:
               ];
               inherit garmUnit reconcileUnit;
               awsSrc = self'.packages.garm-provider-aws.src;
+              awsBin = lib.getExe self'.packages.garm-provider-aws;
             }
             ''
               set -euo pipefail
@@ -144,6 +152,14 @@ top@{ ... }:
               grep -qx 'credential_type = "role"' "$awscfg" || fail "aws credential_type not rendered"
               # No secret ever in the store config.
               ! grep -qi 'access_key\|secret' "$awscfg" || fail "aws provider config leaked a credential into the store"
+
+              # -- the provider ABI: garm-provider-aws implements ONLY v0.1.0 ----
+              # Rendering v0.1.1 for it (the module's hard-coded value until
+              # 2026-10-05) made every create AND delete fail at the provider's
+              # dispatch on the live central GARM. Assert the rendered value.
+              awsblock=$(awk '/^\[\[provider\]\]/{inb=0} /^name = "aws-burst"/{inb=1} inb' "$tmpl")
+              ifver=$(echo "$awsblock" | sed -n 's/^ *interface_version = "\(.*\)"$/\1/p' | head -1)
+              [ "$ifver" = "v0.1.0" ] || fail "aws provider must render interface_version v0.1.0 (got '$ifver')"
 
               # -- the reconcile manifest: floor / max / priority / backoff ------
               rpre=$(grep -ohE '/nix/store/[^ ]*garm-reconcile[^ ]*' "$reconcileUnit/garm-reconcile.service" | head -1)
@@ -170,6 +186,23 @@ top@{ ... }:
               # The org referenced by the burst pools is created against its cred.
               jq -e '.orgs[] | select(.name=="org-cloud" and .credentials=="app-cloud")' "$manifest" >/dev/null || fail "burst-pool org not derived into desiredOrgs"
 
+              # TTL backstop + extra-specs passthrough: the extraSpecs JSON string
+              # carries the infra keys AND a base64 pre-install script that
+              # decodes byte-for-byte to the TTL arm.
+              specs=$(jq -r '.burstPools[] | select(.name=="linux-aws") | .extraSpecs' "$manifest")
+              echo "$specs" | jq -e '.security_group_ids == ["sg-0123456789abcdef0"]' >/dev/null || fail "extraSpecs security_group_ids not passed through"
+              echo "$specs" | jq -e '.iam_instance_profile == "arn:aws:iam::123456789012:instance-profile/runners"' >/dev/null || fail "extraSpecs iam_instance_profile not passed through"
+              echo "$specs" | jq -e '.volume_size == 50' >/dev/null || fail "extraSpecs volume_size not passed through"
+              echo "$specs" | jq -r '.pre_install_scripts["00-garm-burst-ttl"]' | base64 -d > ttl.sh || fail "TTL pre-install script is not valid base64"
+              printf '%s\n' '#!/bin/sh' \
+                '# garm burst-pool TTL backstop (devops-modules services.garm.burstPools.<n>.ttlMinutes)' \
+                'shutdown -P +360 "garm burst TTL reached" || systemd-run --on-active=360m /bin/systemctl poweroff' \
+                'exit 0' > ttl.expected
+              cmp ttl.sh ttl.expected || fail "decoded TTL script differs from the expected script"
+              # TTL off by default: the lazy pool carries no pre-install script.
+              jq -r '.burstPools[] | select(.name=="linux-aws-lazy") | .extraSpecs' "$manifest" \
+                | jq -e 'has("pre_install_scripts") | not' >/dev/null || fail "ttlMinutes=0 must render no TTL script"
+
               echo "[t_aws_burst_runners] module render OK (floor honoured, lazy collapses to 0, spill priority + backoff + ephemeral + role creds)"
 
               # ===== (B) PROVIDER BEHAVIOUR (go test, offline) ==================
@@ -190,6 +223,30 @@ top@{ ... }:
               grep -q 'PASS: TestCreateRunningInstanceOnDemandNoMarketOptions' "$OLDPWD/gotest.log" || fail "one-job on-demand create not proven"
               grep -q 'PASS: TestFindInstancesExcludesInterruptedSpot' "$OLDPWD/gotest.log" || fail "scale-back state filter not proven"
               cd "$OLDPWD"
+
+              # ===== (C) PROVIDER ABI, end to end against the BUILT binary ========
+              # Run the packaged binary exactly as GARM does (GARM_* env, the
+              # rendered config file, the rendered interface version) with the
+              # EC2 endpoint pointed at a closed local port. Under the rendered
+              # version the call must get past the ABI dispatch and fail only
+              # at the network; the v0.1.1 negative control must fail at the
+              # dispatch, which is what proves this probe can see the bug.
+              probe() {
+                env -i PATH="$PATH" HOME="$HOME" \
+                  GARM_INTERFACE_VERSION="$1" GARM_COMMAND=ListInstances \
+                  GARM_CONTROLLER_ID=ctl-0 GARM_POOL_ID=pool-0 \
+                  GARM_PROVIDER_CONFIG_FILE="$awscfg" \
+                  AWS_ENDPOINT_URL=http://127.0.0.1:9 AWS_MAX_ATTEMPTS=1 \
+                  AWS_ACCESS_KEY_ID=AKIDEXAMPLE AWS_SECRET_ACCESS_KEY=example \
+                  AWS_EC2_METADATA_DISABLED=true \
+                  timeout 60 "$awsBin" > "abi-$1.out" 2> "abi-$1.err" && return 0 || return 1
+              }
+              ! probe "$ifver" || fail "ListInstances unexpectedly succeeded against a closed endpoint"
+              ! grep -q 'does not implement' "abi-$ifver.err" || fail "provider rejects the rendered interface version: $(cat abi-$ifver.err)"
+              grep -q '127.0.0.1:9' "abi-$ifver.err" || fail "rendered-version call did not reach the EC2 API: $(cat abi-$ifver.err)"
+              ! probe v0.1.1 || fail "v0.1.1 control unexpectedly succeeded"
+              grep -q 'does not implement v0.1.1 ExternalProvider' abi-v0.1.1.err || fail "v0.1.1 negative control did not reproduce the ABI mismatch: $(cat abi-v0.1.1.err)"
+              echo "[t_aws_burst_runners] provider ABI OK (rendered $ifver reaches EC2; v0.1.1 control rejected)"
 
               echo "[t_aws_burst_runners][PASS] AWS burst spill+floor+ephemeral+scale-back render and provider behaviour verified"
               touch "$out"

@@ -26,7 +26,7 @@ top@{ ... }:
   #       credentials (a JWT signed with the JIT key), exits with its own
   #       TerminatedError, and is reported to GARM as a crash (error + reason)
   #       rather than a clean stop.
-  #   (3) NEGATIVE CONTROLS: the end-to-end gate is re-run against seven
+  #   (3) NEGATIVE CONTROLS: the end-to-end gate is re-run against eight
   #       single-line mutations of the provider source and MUST fail each time
   #       with a test failure (not a build failure), plus once against the
   #       unmutated source copy, which MUST pass — so a control cannot fail
@@ -249,6 +249,10 @@ top@{ ... }:
               mutate crash "$P" \
                 'inst.Status = commonParams.InstanceError' \
                 'inst.Status = commonParams.InstanceStopped'
+              # The payload leaks the ah host user's XDG_RUNTIME_DIR into the runner.
+              mutate runtimedir "$N" \
+                'unset XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS' \
+                'unset DBUS_SESSION_BUS_ADDRESS'
               # The payload does not point the runner at its JIT state.
               mutate runnerroot "$N" \
                 'export RUNNER_ROOT="$STATE_DIRECTORY"' \
@@ -258,7 +262,7 @@ top@{ ... }:
                 'if lag >= maxMinorLag {' \
                 'if false && lag >= maxMinorLag {'
 
-              echo "[t_garm_provider_agentharbor][PASS] behaviour matrix + end-to-end runner lifecycle + real Nix runner crash path + 7/7 negative controls"
+              echo "[t_garm_provider_agentharbor][PASS] behaviour matrix + end-to-end runner lifecycle + real Nix runner crash path + 8/8 negative controls"
               touch "$out"
             '';
 
@@ -318,6 +322,15 @@ top@{ ... }:
               done
               grep -q "^path = \[\"$bash/bin\", .*\"$jq/bin\"\]\$" "$cfg" \
                 || fail "the runner PATH is not the module's path + extraPackages"
+              # NixOS's default service path (what the systemd runners get for
+              # free): a job script calling grep/find must work in the sandbox.
+              for tool in grep find xargs systemctl sed; do
+                found=0
+                for d in $(sed -n 's/^path = \[\(.*\)\]$/\1/p' "$cfg" | tr -d '"' | tr ',' ' '); do
+                  [ -x "$d/$tool" ] && found=1
+                done
+                [ "$found" = 1 ] || fail "the runner PATH lacks $tool (NixOS's default systemd service path)"
+              done
               # `command` must be a top-level key, i.e. before the first table.
               first_table=$(grep -n '^\[' "$cfg" | head -1 | cut -d: -f1)
               cmd_line=$(grep -n '^command = ' "$cfg" | cut -d: -f1)

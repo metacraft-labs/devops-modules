@@ -656,27 +656,20 @@ for workflow_and_count in \
   ' "$workflow"
   check "$workflow_name documents the fallback as lower-precedence and optional" $?
 
-  # The literal GitHub expression must reach the workflow unchanged. What this
-  # protects is the ORDER AND PRECEDENCE OF THE STATIC SECRETS, and the trailing
-  # term is a LAST resort reached only when neither secret is set. Two such terms
-  # exist and both are permitted:
+  # The literal GitHub expression must reach the workflow unchanged. The one
+  # permitted extension is a single LAST-resort token after the static
+  # secrets: reusable-lint's App-minted `app-token` step (runs only when
+  # neither secret is set), or the workflow's own `github.token`
+  # (a5bc0d79: it authenticates PUBLIC Nix inputs against the anonymous
+  # rate limit when no secret is configured). Either way the static secrets
+  # keep their order and precedence.
   #
-  #   steps.app-token.outputs.token   reusable-lint's App-minted token
-  #   github.token                    the workflow's own token, enough to
-  #                                   authenticate PUBLIC Nix inputs against
-  #                                   api.github.com rate limits
-  #
-  # `github.token` was added by a5bc0d7 and this assertion refused it, because
-  # the pattern allowlisted one extension BY NAME while its own stated purpose is
-  # about precedence. Appending a last-resort term changes no precedence, so the
-  # pattern was narrower than the rule it exists to enforce. Widening it is not a
-  # weakening: a term placed anywhere but last, or the two static secrets
-  # reordered, still fails — verified by hand against this workflow, since the
-  # mutation harness below rewrites the target SCRIPT and cannot mutate a
-  # workflow.
-  #
-  # Add a third term only with the same test: that it is unreachable while either
-  # secret is set.
+  # WIDENING THIS IS NOT WEAKENING IT, and that was checked rather than
+  # asserted: with the pattern as it stands, `github.token` placed anywhere but
+  # last, or the two static secrets reordered, still fails the assertion. Both
+  # were run by hand against the real workflow, because the mutation harness
+  # below rewrites the target SCRIPT and cannot mutate a workflow. Add a third
+  # term only with the same check.
   # shellcheck disable=SC2016
   precedence_count="$(grep -Ec 'nix-github-token: \$\{\{ secrets\.NIX_GITHUB_TOKEN \|\| secrets\.GH_READ_METACRAFT_PRIVATE_REPOS( \|\| (steps\.app-token\.outputs\.token|github\.token))? \}\}$' "$workflow")"
   token_input_count="$(grep -Ec '^[[:space:]]+nix-github-token:' "$workflow")"
