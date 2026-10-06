@@ -124,6 +124,7 @@ for f in .runner .credentials .credentials_rsaparams; do
   test -L "$PWD/$f" || { echo "$f is not linked into the work directory" >&2; exit 66; }
 done
 [ "$HOME" = "$PWD" ] || { echo "HOME ($HOME) is not the work directory ($PWD)" >&2; exit 67; }
+[ -z "${XDG_RUNTIME_DIR:-}" ] || { echo "XDG_RUNTIME_DIR leaked into the runner: $XDG_RUNTIME_DIR" >&2; exit 69; }
 [ "$(readlink "$PWD/_diag")" != "" ] || { echo "_diag is not linked" >&2; exit 68; }
 server=$(sed -n 's/.*"serverUrl": *"\([^"]*\)".*/\1/p' "$RUNNER_ROOT/.runner")
 name=$(sed -n 's/.*"agentName": *"\([^"]*\)".*/\1/p' "$RUNNER_ROOT/.runner")
@@ -482,6 +483,10 @@ env = { DOTNET_CLI_TELEMETRY_OPTOUT = "1" }
 		"HOME=" + h.home,
 		"TMPDIR=" + h.home,
 	}
+	// The ah mock forwards its allow-listed base environment (which includes
+	// XDG_RUNTIME_DIR) into every job, as the real server does; give it one
+	// so the payload's unset is exercised.
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(tmp, "xdg-runtime"))
 	return h
 }
 
