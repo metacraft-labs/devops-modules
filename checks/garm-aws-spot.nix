@@ -160,18 +160,21 @@ top@{ ... }:
 
               # (C) RunInstances InstanceMarketOptions + fallback + interruption.
               go test ./internal/client/ \
-                -run 'TestCreateRunningInstanceSpotMarketOptions|TestCreateRunningInstanceSpotOnDemandFallback|TestCreateRunningInstanceSpotNoFallbackPropagates|TestFindInstancesExcludesInterruptedSpot' \
+                -run 'TestCreateRunningInstanceSpotMarketOptions|TestCreateRunningInstanceSpotOnDemandFallback|TestCreateRunningInstanceSpotNoFallbackPropagates|TestFindInstancesExcludesInterruptedSpot|TestCreateRunningInstancePlacementFallback' \
                 -v 2>&1 | tee "$OLDPWD/client.log" || fail "spot provider go test failed"
               for tc in \
                 TestCreateRunningInstanceSpotMarketOptions \
                 TestCreateRunningInstanceSpotOnDemandFallback \
                 TestCreateRunningInstanceSpotNoFallbackPropagates \
-                TestFindInstancesExcludesInterruptedSpot; do
+                TestFindInstancesExcludesInterruptedSpot \
+                TestCreateRunningInstancePlacementFallback \
+                TestCreateRunningInstancePlacementFallbackStopsOnOtherErrors \
+                TestCreateRunningInstancePlacementFallbackExhausted; do
                 grep -q "PASS: $tc" "$OLDPWD/client.log" || fail "spot behaviour not proven: $tc"
               done
               cd "$OLDPWD"
 
-              echo "[t_aws_spot_runners][PASS] spot InstanceMarketOptions render, schema, on-demand fallback, and interruption reconcile all verified"
+              echo "[t_aws_spot_runners][PASS] spot InstanceMarketOptions render, schema, on-demand fallback, placement (subnet/flavor) capacity fallback, and interruption reconcile all verified"
               touch "$out"
             '';
       };
