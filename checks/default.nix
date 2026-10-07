@@ -20,6 +20,7 @@
     ./garm-aws-burst.nix
     ./garm-aws-spot.nix
     ./garm-webhook-delivery.nix
+    ./garm-webhook-public-paths.nix
     ./garm-pools-labels.nix
     ./garm-pools-cutover-complete.nix
     ./garm-capability-placement.nix

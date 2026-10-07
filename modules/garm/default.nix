@@ -324,13 +324,25 @@
       # / AWS_SESSION_TOKEN) or a mounted shared-credentials file. NOTE: unlike
       # the vm-harness backends, this config carries NO golden-image map — the
       # AMI is a per-pool value (`burstPools.<name>.image`), not a provider one.
-      mkAwsKeys = p: ''
-        region = "${p.aws.region}"
-        subnet_id = "${p.aws.subnetId}"
+      mkAwsKeys =
+        p:
+        ''
+          region = "${p.aws.region}"
+          subnet_id = "${p.aws.subnetId}"
+        ''
+        # The guest URL overrides (garm-provider-aws downstream patch): a cloud
+        # instance cannot reach a controller URL that lives on a private network.
+        + optionalString (p.guestMetadataURL != null) ''
+          guest_metadata_url = "${p.guestMetadataURL}"
+        ''
+        + optionalString (p.guestCallbackURL != null) ''
+          guest_callback_url = "${p.guestCallbackURL}"
+        ''
+        + ''
 
-        [credentials]
-        credential_type = "${p.aws.credentialType}"
-      '';
+          [credentials]
+          credential_type = "${p.aws.credentialType}"
+        '';
       # AH3: the `garm-provider-agentharbor` config.toml
       # (garm-provider-vmharness/src/internal/agentharbor/config.go). NO secret:
       # the API credential is read from the staged file or a forwarded env var.
@@ -2207,8 +2219,11 @@
               example = "http://10.0.2.2:9997/api/v1/metadata";
               description = ''
                 Optional provider-local override for the GARM metadata URL
-                rendered into guest bootstrap scripts for vm-harness-run
-                backends. Leave null to use `services.garm.metadataURL`.
+                rendered into guest bootstrap scripts for vm-harness-run,
+                `agentharbor` and `aws` backends. Leave null to use
+                `services.garm.metadataURL`. For `aws` it is how a controller whose
+                own URL is on a private network (a VPN address) gives cloud
+                instances a reachable route to the same endpoint.
               '';
             };
 
@@ -2218,8 +2233,11 @@
               example = "http://10.0.2.2:9997/api/v1/callbacks";
               description = ''
                 Optional provider-local override for the GARM callback URL
-                rendered into guest bootstrap scripts for vm-harness-run
-                backends. Leave null to use `services.garm.callbackURL`.
+                rendered into guest bootstrap scripts for vm-harness-run,
+                `agentharbor` and `aws` backends. Leave null to use
+                `services.garm.callbackURL`. For `aws` it is how a controller whose
+                own URL is on a private network (a VPN address) gives cloud
+                instances a reachable route to the same endpoint.
               '';
             };
 
