@@ -1,8 +1,17 @@
 diff --git a/config/config.go b/config/config.go
-index c262e8c..67aea65 100644
+index c262e8c..3033e82 100644
 --- a/config/config.go
 +++ b/config/config.go
-@@ -23,6 +23,7 @@ import (
+@@ -16,13 +16,16 @@
+ package config
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"fmt"
+ 
+ 	"github.com/BurntSushi/toml"
  	"github.com/aws/aws-sdk-go-v2/aws"
  	"github.com/aws/aws-sdk-go-v2/config"
  	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -10,7 +19,7 @@ index c262e8c..67aea65 100644
  )
  
  type AWSCredentialType string
-@@ -49,6 +50,26 @@ type Config struct {
+@@ -49,6 +52,87 @@ type Config struct {
  	Credentials Credentials `toml:"credentials"`
  	SubnetID    string      `toml:"subnet_id"`
  	Region      string      `toml:"region"`
@@ -25,15 +34,76 @@ index c262e8c..67aea65 100644
 +}
 +
 +// ApplyGuestURLOverrides returns bootstrapParams with the metadata/callback
-+// URLs replaced by the configured guest overrides, when set.
++// URLs replaced by the configured guest overrides, when set. GARM also
++// pre-renders its runner-install wrapper with those URLs baked in and passes it
++// as the `runner_install_template` extra-spec, so the old URLs are rewritten
++// inside the cloud-config extra-specs too (`runner_install_template`,
++// `pre_install_scripts`, `extra_context`). Same rewrite as the vm-harness
++// provider's guest URL override.
 +func (c *Config) ApplyGuestURLOverrides(bootstrapParams params.BootstrapInstance) params.BootstrapInstance {
++	oldMetadataURL, oldCallbackURL := bootstrapParams.MetadataURL, bootstrapParams.CallbackURL
 +	if c.GuestMetadataURL != "" {
 +		bootstrapParams.MetadataURL = c.GuestMetadataURL
 +	}
 +	if c.GuestCallbackURL != "" {
 +		bootstrapParams.CallbackURL = c.GuestCallbackURL
 +	}
++	bootstrapParams.ExtraSpecs = rewriteSpecURLs(bootstrapParams.ExtraSpecs,
++		oldMetadataURL, bootstrapParams.MetadataURL, oldCallbackURL, bootstrapParams.CallbackURL)
 +	return bootstrapParams
++}
++
++func replaceURL(b []byte, oldURL, newURL string) []byte {
++	if oldURL == "" || oldURL == newURL {
++		return b
++	}
++	return bytes.ReplaceAll(b, []byte(oldURL), []byte(newURL))
++}
++
++func rewriteSpecURLs(raw json.RawMessage, oldMeta, newMeta, oldCb, newCb string) json.RawMessage {
++	if len(raw) == 0 || (oldMeta == newMeta && oldCb == newCb) {
++		return raw
++	}
++	var spec map[string]json.RawMessage
++	if err := json.Unmarshal(raw, &spec); err != nil {
++		return raw
++	}
++	if v, ok := spec["runner_install_template"]; ok {
++		var script []byte
++		if err := json.Unmarshal(v, &script); err == nil {
++			script = replaceURL(replaceURL(script, oldMeta, newMeta), oldCb, newCb)
++			if enc, err := json.Marshal(script); err == nil {
++				spec["runner_install_template"] = enc
++			}
++		}
++	}
++	if v, ok := spec["pre_install_scripts"]; ok {
++		var scripts map[string][]byte
++		if err := json.Unmarshal(v, &scripts); err == nil {
++			for name, script := range scripts {
++				scripts[name] = replaceURL(replaceURL(script, oldMeta, newMeta), oldCb, newCb)
++			}
++			if enc, err := json.Marshal(scripts); err == nil {
++				spec["pre_install_scripts"] = enc
++			}
++		}
++	}
++	if v, ok := spec["extra_context"]; ok {
++		var extra map[string]string
++		if err := json.Unmarshal(v, &extra); err == nil {
++			for k, val := range extra {
++				extra[k] = string(replaceURL(replaceURL([]byte(val), oldMeta, newMeta), oldCb, newCb))
++			}
++			if enc, err := json.Marshal(extra); err == nil {
++				spec["extra_context"] = enc
++			}
++		}
++	}
++	out, err := json.Marshal(spec)
++	if err != nil {
++		return raw
++	}
++	return out
  }
  
  func (c *Config) Validate() error {
@@ -80,7 +150,7 @@ index 0000000..799827c
 +	require.Equal(t, "http://10.0.0.1:9997/api/v1/metadata", in.MetadataURL)
 +}
 diff --git a/internal/client/aws.go b/internal/client/aws.go
-index 6d2fce8..e585e15 100644
+index 6d2fce8..9dda8d6 100644
 --- a/internal/client/aws.go
 +++ b/internal/client/aws.go
 @@ -263,7 +263,7 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
@@ -105,7 +175,7 @@ index 6d2fce8..e585e15 100644
  		BlockDeviceMappings: []types.BlockDeviceMapping{
  			{
  				DeviceName: aws.String(root_volume),
-@@ -311,11 +317,99 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
+@@ -311,11 +317,124 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
  					},
  				},
  			},
@@ -131,29 +201,54 @@ index 6d2fce8..e585e15 100644
 +			},
  		},
 -	})
-+	}
-+
+-	if err != nil {
+-		return "", fmt.Errorf("failed to create instance: %w", err)
+ 	}
+ 
+-	return *resp.Instances[0].InstanceId, nil
 +	// Spot support (Metacraft Labs downstream patch). When the pool's
 +	// extra-specs request market_type=spot, attach InstanceMarketOptions so
 +	// EC2 launches a Spot instance. On a Spot capacity/price failure, and only
 +	// when on_demand_fallback is set, retry the SAME launch on-demand (with
 +	// InstanceMarketOptions cleared) so a burst still succeeds — at on-demand
 +	// cost — rather than starving the queue.
-+	if spec.UsesSpot() {
-+		applySpotMarketOptions(runInput, spec)
++	// Capacity fallback (Metacraft Labs downstream patch): try each placement
++	// (flavor x subnet, see RunnerSpec.Placements) in order. In each one, spot
++	// first when requested, then on-demand when on_demand_fallback is set.
++	// Only a capacity/price rejection moves on to the next attempt; any other
++	// error (permissions, bad AMI, ...) is returned at once.
++	var lastErr error
++	for _, p := range spec.Placements() {
++		runInput.InstanceType = types.InstanceType(p.Flavor)
++		runInput.SubnetId = aws.String(p.SubnetID)
++		attempts := []bool{false} // useSpot
++		if spec.UsesSpot() {
++			attempts = []bool{true}
++			if spec.OnDemandFallback {
++				attempts = append(attempts, false)
++			}
++		}
++		for _, useSpot := range attempts {
++			if useSpot {
++				applySpotMarketOptions(runInput, spec)
++			} else {
++				runInput.InstanceMarketOptions = nil
++			}
++			resp, err := a.client.RunInstances(ctx, runInput)
++			if err == nil {
++				return *resp.Instances[0].InstanceId, nil
++			}
++			lastErr = err
++			if !isSpotCapacityError(err) {
++				return "", fmt.Errorf("failed to create instance: %w", err)
++			}
++		}
 +	}
-+
-+	resp, err := a.client.RunInstances(ctx, runInput)
-+	if err != nil && spec.UsesSpot() && spec.OnDemandFallback && isSpotCapacityError(err) {
-+		runInput.InstanceMarketOptions = nil
-+		resp, err = a.client.RunInstances(ctx, runInput)
++	if lastErr == nil {
++		lastErr = fmt.Errorf("no launch placement (flavor/subnet) configured")
 +	}
- 	if err != nil {
- 		return "", fmt.Errorf("failed to create instance: %w", err)
- 	}
- 
- 	return *resp.Instances[0].InstanceId, nil
- }
++	return "", fmt.Errorf("failed to create instance: %w", lastErr)
++}
 +
 +// applySpotMarketOptions sets EC2 InstanceMarketOptions (MarketType=spot plus
 +// SpotOptions) on the RunInstances input from the runner spec. Added by the
@@ -199,19 +294,22 @@ index 6d2fce8..e585e15 100644
 +		"spotmaxpricetoolow",
 +		"maxspotinstancecountexceeded",
 +		"unfulfillablecapacity",
++		// The flavor is not offered in that subnet's availability zone:
++		// another placement can still succeed.
++		"is not supported in your requested availability zone",
 +	} {
 +		if strings.Contains(msg, s) {
 +			return true
 +		}
 +	}
 +	return false
-+}
+ }
 diff --git a/internal/client/spot_test.go b/internal/client/spot_test.go
 new file mode 100644
-index 0000000..52f4ef5
+index 0000000..41fba5d
 --- /dev/null
 +++ b/internal/client/spot_test.go
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,379 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright 2024 Cloudbase Solutions SRL
 +//
@@ -505,12 +603,98 @@ index 0000000..52f4ef5
 +	}
 +	t.Fatal("RunInstances carries no volume TagSpecification")
 +}
++
++// Capacity fallback across placements: the pool's flavor in its own subnet,
++// then the fallback subnets, then the fallback flavors. Every capacity
++// rejection moves on; the first success is returned. Drives the provider's own
++// EC2-client mock (the seam the upstream tests use) to observe each
++// RunInstances request in order.
++func TestCreateRunningInstancePlacementFallback(t *testing.T) {
++	ctx := context.Background()
++	mockClient := new(MockComputeClient)
++	awsCli := spotTestCli(mockClient)
++	describeImagesOK(mockClient)
++
++	type call struct {
++		flavor, subnet string
++		spot           bool
++	}
++	var calls []call
++	capacity := errors.New("api error InsufficientInstanceCapacity: no capacity")
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Run(func(args mock.Arguments) {
++			in := args.Get(1).(*ec2.RunInstancesInput)
++			calls = append(calls, call{string(in.InstanceType), *in.SubnetId, in.InstanceMarketOptions != nil})
++		}).
++		Return((*ec2.RunInstancesOutput)(nil), capacity).Times(5)
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Run(func(args mock.Arguments) {
++			in := args.Get(1).(*ec2.RunInstancesInput)
++			calls = append(calls, call{string(in.InstanceType), *in.SubnetId, in.InstanceMarketOptions != nil})
++		}).
++		Return(&ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String("i-fallback")}}}, nil).Once()
++
++	rs := spotRunnerSpec()
++	rs.MarketType = "spot"
++	rs.OnDemandFallback = true
++	rs.SubnetID = "subnet-a"
++	rs.FallbackSubnetIDs = []string{"subnet-b", "subnet-c"}
++	rs.FallbackFlavors = []string{"m6a.large"}
++
++	id, err := awsCli.CreateRunningInstance(ctx, rs)
++	require.NoError(t, err)
++	require.Equal(t, "i-fallback", id)
++	require.Equal(t, []call{
++		{"t3.medium", "subnet-a", true}, {"t3.medium", "subnet-a", false},
++		{"t3.medium", "subnet-b", true}, {"t3.medium", "subnet-b", false},
++		{"t3.medium", "subnet-c", true}, {"t3.medium", "subnet-c", false},
++	}, calls)
++}
++
++// A non-capacity error stops the walk at once (no blind retries on, e.g., an
++// authorization failure).
++func TestCreateRunningInstancePlacementFallbackStopsOnOtherErrors(t *testing.T) {
++	ctx := context.Background()
++	mockClient := new(MockComputeClient)
++	awsCli := spotTestCli(mockClient)
++	describeImagesOK(mockClient)
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Return((*ec2.RunInstancesOutput)(nil), errors.New("api error UnauthorizedOperation: denied")).Once()
++
++	rs := spotRunnerSpec()
++	rs.MarketType = "spot"
++	rs.OnDemandFallback = true
++	rs.FallbackSubnetIDs = []string{"subnet-b"}
++	rs.FallbackFlavors = []string{"m6a.large"}
++	_, err := awsCli.CreateRunningInstance(ctx, rs)
++	require.ErrorContains(t, err, "UnauthorizedOperation")
++	mockClient.AssertNumberOfCalls(t, "RunInstances", 1)
++}
++
++// Every placement exhausted: the last capacity error is returned.
++func TestCreateRunningInstancePlacementFallbackExhausted(t *testing.T) {
++	ctx := context.Background()
++	mockClient := new(MockComputeClient)
++	awsCli := spotTestCli(mockClient)
++	describeImagesOK(mockClient)
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Return((*ec2.RunInstancesOutput)(nil), errors.New("api error InsufficientInstanceCapacity: none")).Times(4)
++
++	rs := spotRunnerSpec()
++	rs.SubnetID = "subnet-a"
++	rs.FallbackSubnetIDs = []string{"subnet-b"}
++	rs.FallbackFlavors = []string{"m6a.large"}
++	_, err := awsCli.CreateRunningInstance(ctx, rs)
++	require.ErrorContains(t, err, "InsufficientInstanceCapacity")
++	// on-demand only (no spot): 2 flavors x 2 subnets.
++	mockClient.AssertNumberOfCalls(t, "RunInstances", 4)
++}
 diff --git a/internal/spec/guest_url_userdata_test.go b/internal/spec/guest_url_userdata_test.go
 new file mode 100644
-index 0000000..ff3459b
+index 0000000..b337bcd
 --- /dev/null
 +++ b/internal/spec/guest_url_userdata_test.go
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,85 @@
 +// SPDX-License-Identifier: Apache-2.0
 +
 +// Metacraft Labs downstream patch: the guest metadata/callback URL override
@@ -533,6 +717,14 @@ index 0000000..ff3459b
 +	"github.com/stretchr/testify/require"
 +)
 +
++// garmWrapperSpecs mimics what GARM sends: it pre-renders its runner-install
++// wrapper with the controller's URLs baked in and passes it, base64-encoded,
++// as the `runner_install_template` extra-spec (garm util.MaybeAddWrapperToExtraSpecs).
++func garmWrapperSpecs() []byte {
++	wrapper := "#!/bin/bash\nMETADATA_URL=\"http://100.64.0.1:9997/api/v1/metadata\"\nCALLBACK_URL=\"http://100.64.0.1:9997/api/v1/callbacks\"\ncurl -fsSL \"$METADATA_URL/install-script\" | bash\n"
++	return []byte(`{"runner_install_template":"` + base64.StdEncoding.EncodeToString([]byte(wrapper)) + `"}`)
++}
++
 +func userdataFor(t *testing.T, cfg *config.Config) string {
 +	t.Helper()
 +	DefaultToolFetch = func(params.OSType, params.OSArch, []params.RunnerApplicationDownload) (params.RunnerApplicationDownload, error) {
@@ -545,7 +737,7 @@ index 0000000..ff3459b
 +		Name: "garm-guesturl", OSType: params.Linux, OSArch: params.Amd64,
 +		MetadataURL:   "http://100.64.0.1:9997/api/v1/metadata",
 +		CallbackURL:   "http://100.64.0.1:9997/api/v1/callbacks",
-+		InstanceToken: "token", ExtraSpecs: []byte(`{}`), Image: "ami-0123456789abcdef0", Flavor: "m6i.large",
++		InstanceToken: "token", ExtraSpecs: garmWrapperSpecs(), Image: "ami-0123456789abcdef0", Flavor: "m6i.large",
 +	}
 +	bp = cfg.ApplyGuestURLOverrides(bp)
 +	rs, err := GetRunnerSpecFromBootstrapParams(cfg, bp, "ctl")
@@ -589,7 +781,7 @@ index 0000000..ff3459b
 +	require.False(t, strings.Contains(ud, "100.64.0.1"), "no controller-private URL may remain in the userdata")
 +}
 diff --git a/internal/spec/spec.go b/internal/spec/spec.go
-index f309113..531f0a7 100644
+index f309113..53c1029 100644
 --- a/internal/spec/spec.go
 +++ b/internal/spec/spec.go
 @@ -22,6 +22,7 @@ import (
@@ -600,7 +792,7 @@ index f309113..531f0a7 100644
  
  	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
  	"github.com/cloudbase/garm-provider-aws/config"
-@@ -88,6 +89,15 @@ type extraSpecs struct {
+@@ -88,6 +89,18 @@ type extraSpecs struct {
  	DisableUpdates     *bool            `json:"disable_updates,omitempty" jsonschema:"description=Disable automatic updates on the VM."`
  	EnableBootDebug    *bool            `json:"enable_boot_debug,omitempty" jsonschema:"description=Enable boot debug on the VM."`
  	ExtraPackages      []string         `json:"extra_packages,omitempty" jsonschema:"description=Extra packages to install on the VM."`
@@ -613,10 +805,13 @@ index f309113..531f0a7 100644
 +	SpotInstanceType                 *string `json:"spot_instance_type,omitempty" jsonschema:"enum=one-time,enum=persistent,description=Spot request type. 'one-time' (default) suits ephemeral one-job runners; 'persistent' re-requests after an interruption. Only consulted when market_type is 'spot'."`
 +	SpotInstanceInterruptionBehavior *string `json:"spot_instance_interruption_behavior,omitempty" jsonschema:"enum=terminate,enum=stop,enum=hibernate,description=What EC2 does to the Spot instance on interruption. 'terminate' (default) is correct for ephemeral runners. Only consulted when market_type is 'spot'."`
 +	OnDemandFallback                 *bool   `json:"on_demand_fallback,omitempty" jsonschema:"description=When true and a Spot request fails with a capacity/price error, retry the SAME launch as an on-demand instance instead of failing. Only consulted when market_type is 'spot'."`
++	// Metacraft Labs downstream patch: capacity fallback placements.
++	FallbackSubnetIDs []string `json:"fallback_subnet_ids,omitempty" jsonschema:"description=Further subnets (typically in other availability zones) tried in order when EC2 has no capacity for a launch in the pool's subnet."`
++	FallbackFlavors   []string `json:"fallback_flavors,omitempty" jsonschema:"description=Further instance types of equivalent size tried in order, after every subnet has been tried with the pool's flavor, when EC2 has no capacity."`
  	cloudconfig.CloudConfigSpec
  }
  
-@@ -136,6 +146,19 @@ type RunnerSpec struct {
+@@ -136,6 +149,21 @@ type RunnerSpec struct {
  	VolumeSize         *int32
  	VolumeType         types.VolumeType
  	ControllerID       string
@@ -626,6 +821,8 @@ index f309113..531f0a7 100644
 +	SpotInstanceType                 string
 +	SpotInstanceInterruptionBehavior string
 +	OnDemandFallback                 bool
++	FallbackSubnetIDs                []string
++	FallbackFlavors                  []string
 +}
 +
 +// UsesSpot reports whether this runner should be launched as an EC2 Spot
@@ -636,7 +833,7 @@ index f309113..531f0a7 100644
  }
  
  func (r *RunnerSpec) Validate() error {
-@@ -246,6 +269,23 @@ func (r *RunnerSpec) MergeExtraSpecs(extraSpecs *extraSpecs) {
+@@ -246,6 +274,31 @@ func (r *RunnerSpec) MergeExtraSpecs(extraSpecs *extraSpecs) {
  			Arn: extraSpecs.IAMInstanceProfile,
  		}
  	}
@@ -657,9 +854,49 @@ index f309113..531f0a7 100644
 +	if extraSpecs.OnDemandFallback != nil {
 +		r.OnDemandFallback = *extraSpecs.OnDemandFallback
 +	}
++
++	if len(extraSpecs.FallbackSubnetIDs) > 0 {
++		r.FallbackSubnetIDs = extraSpecs.FallbackSubnetIDs
++	}
++
++	if len(extraSpecs.FallbackFlavors) > 0 {
++		r.FallbackFlavors = extraSpecs.FallbackFlavors
++	}
  }
  
  func (r *RunnerSpec) ComposeUserData() (string, error) {
+@@ -313,3 +366,31 @@ func maybeCompressUserdata(udata []byte, targetOS params.OSType) ([]byte, error)
+ 	}
+ 	return b.Bytes(), nil
+ }
++
++// Placement is one (instance type, subnet) launch candidate.
++type Placement struct {
++	Flavor   string
++	SubnetID string
++}
++
++// Placements returns the launch candidates in the order they are tried:
++// the pool's flavor in its subnet, then in each fallback subnet, then each
++// fallback flavor across the same subnets. Duplicates are dropped. Added by
++// the Metacraft Labs downstream capacity-fallback patch.
++func (r *RunnerSpec) Placements() []Placement {
++	subnets := append([]string{r.SubnetID}, r.FallbackSubnetIDs...)
++	flavors := append([]string{r.BootstrapParams.Flavor}, r.FallbackFlavors...)
++	seen := map[Placement]bool{}
++	var out []Placement
++	for _, f := range flavors {
++		for _, sn := range subnets {
++			p := Placement{Flavor: f, SubnetID: sn}
++			if f == "" || sn == "" || seen[p] {
++				continue
++			}
++			seen[p] = true
++			out = append(out, p)
++		}
++	}
++	return out
++}
 diff --git a/internal/spec/spot_schema_test.go b/internal/spec/spot_schema_test.go
 new file mode 100644
 index 0000000..9335bf2
