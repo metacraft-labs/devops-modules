@@ -229,9 +229,10 @@ top@{ ... }:
               grep -q 'PASS: TestFindInstancesExcludesInterruptedSpot' "$OLDPWD/gotest.log" || fail "scale-back state filter not proven"
               # The guest URL override reaches the userdata the instance boots
               # with (no controller-private URL left in it).
-              go test ./config/ ./internal/spec/ -run 'TestApplyGuestURLOverrides|TestGuestURLOverrideReachesUserdata' \
+              go test ./config/ ./internal/spec/ -run 'TestApplyGuestURLOverrides|TestGuestURLOverrideReachesUserdata|TestGuestOverrideRewritesTheFetchedInstallScript|TestGuestOverrideNoWrapperNoInjection' \
                 -v 2>&1 | tee "$OLDPWD/gotest-guest.log" || fail "guest URL override go test failed"
               grep -q 'PASS: TestGuestURLOverrideReachesUserdata' "$OLDPWD/gotest-guest.log" || fail "guest URL override not proven in userdata"
+              grep -q 'PASS: TestGuestOverrideRewritesTheFetchedInstallScript' "$OLDPWD/gotest-guest.log" || fail "guest URL override not proven for the install script GARM serves at boot"
               cd "$OLDPWD"
 
               # ===== (C) PROVIDER ABI, end to end against the BUILT binary ========
