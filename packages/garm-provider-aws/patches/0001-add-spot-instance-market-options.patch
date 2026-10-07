@@ -1,8 +1,8 @@
 diff --git a/config/config.go b/config/config.go
-index c262e8c..3033e82 100644
+index c262e8c..9960451 100644
 --- a/config/config.go
 +++ b/config/config.go
-@@ -16,13 +16,16 @@
+@@ -16,13 +16,17 @@
  package config
  
  import (
@@ -10,6 +10,7 @@ index c262e8c..3033e82 100644
  	"context"
 +	"encoding/json"
  	"fmt"
++	"strings"
  
  	"github.com/BurntSushi/toml"
  	"github.com/aws/aws-sdk-go-v2/aws"
@@ -19,7 +20,7 @@ index c262e8c..3033e82 100644
  )
  
  type AWSCredentialType string
-@@ -49,6 +52,87 @@ type Config struct {
+@@ -49,6 +53,88 @@ type Config struct {
  	Credentials Credentials `toml:"credentials"`
  	SubnetID    string      `toml:"subnet_id"`
  	Region      string      `toml:"region"`
@@ -72,6 +73,7 @@ index c262e8c..3033e82 100644
 +		var script []byte
 +		if err := json.Unmarshal(v, &script); err == nil {
 +			script = replaceURL(replaceURL(script, oldMeta, newMeta), oldCb, newCb)
++			script = rewriteFetchedInstallScript(script, oldMeta, newMeta, oldCb, newCb)
 +			if enc, err := json.Marshal(script); err == nil {
 +				spec["runner_install_template"] = enc
 +			}
@@ -107,6 +109,145 @@ index c262e8c..3033e82 100644
  }
  
  func (c *Config) Validate() error {
+@@ -133,3 +219,45 @@ func (c Config) GetAWSConfig(ctx context.Context) (aws.Config, error) {
+ 	}
+ 	return cfg, nil
+ }
++
++// garmWrapperRunLine is where GARM's Linux install wrapper
++// (internal/templates/userdata/linux_wrapper.tmpl) runs the install script it
++// downloaded from "$METADATA_URL/install-script/". GARM renders that script
++// SERVER-side from the instance's own metadata/callback URLs (the controller's),
++// so a guest that can only reach the controller through the override URLs must
++// have them rewritten in the downloaded script before it runs.
++const garmWrapperRunLine = "chmod +x /tmp/real-install.sh\n"
++
++// sedLiteral escapes s for use as a literal in a sed `s#…#…#g` expression.
++func sedLiteral(s string, replacement bool) string {
++	var b strings.Builder
++	for _, r := range s {
++		switch {
++		case replacement && (r == '&' || r == '#' || r == '\\'):
++			b.WriteRune('\\')
++		case !replacement && strings.ContainsRune(`.[]*^$\#`, r):
++			b.WriteRune('\\')
++		}
++		b.WriteRune(r)
++	}
++	return b.String()
++}
++
++func rewriteFetchedInstallScript(wrapper []byte, oldMeta, newMeta, oldCb, newCb string) []byte {
++	if !bytes.Contains(wrapper, []byte(garmWrapperRunLine)) {
++		return wrapper
++	}
++	var exprs []string
++	for _, p := range [][2]string{{oldMeta, newMeta}, {oldCb, newCb}} {
++		if p[0] != "" && p[0] != p[1] {
++			exprs = append(exprs, fmt.Sprintf("-e 's#%s#%s#g'", sedLiteral(p[0], false), sedLiteral(p[1], true)))
++		}
++	}
++	if len(exprs) == 0 {
++		return wrapper
++	}
++	inject := "# garm-provider-aws guest URL override: the downloaded script carries the\n" +
++		"# controller's own URLs; point them at the guest-reachable ones.\n" +
++		"sed -i " + strings.Join(exprs, " ") + " /tmp/real-install.sh\n"
++	return bytes.Replace(wrapper, []byte(garmWrapperRunLine), []byte(inject+garmWrapperRunLine), 1)
++}
+diff --git a/config/garm_wrapper_test.go b/config/garm_wrapper_test.go
+new file mode 100644
+index 0000000..4b3ff50
+--- /dev/null
++++ b/config/garm_wrapper_test.go
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: Apache-2.0
++
++// Metacraft Labs downstream patch: the guest URL override must also reach the
++// install script GARM's wrapper downloads at boot (GARM renders it server-side
++// with the controller's URLs). No mocks: the test runs the rewritten wrapper's
++// injected sed command for real against a script shaped like GARM's.
++package config
++
++import (
++	"bytes"
++	"encoding/base64"
++	"encoding/json"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/cloudbase/garm-provider-common/params"
++	"github.com/stretchr/testify/require"
++)
++
++const (
++	ctlMeta = "http://100.64.0.1:9997/api/v1/metadata"
++	ctlCb   = "http://100.64.0.1:9997/api/v1/callbacks"
++	pubMeta = "https://garm.example.com/api/v1/metadata"
++	pubCb   = "https://garm.example.com/api/v1/callbacks"
++)
++
++// The tail of GARM's internal/templates/userdata/linux_wrapper.tmpl.
++const garmWrapper = `#!/bin/bash
++METADATA_URL="` + ctlMeta + `"
++CALLBACK_URL="` + ctlCb + `"
++HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/real-install.sh "$METADATA_URL/install-script/" || echo "000")
++chmod +x /tmp/real-install.sh
++/tmp/real-install.sh
++rm -f /tmp/real-install.sh
++`
++
++func TestGuestOverrideRewritesTheFetchedInstallScript(t *testing.T) {
++	specs, _ := json.Marshal(map[string][]byte{"runner_install_template": []byte(garmWrapper)})
++	c := &Config{GuestMetadataURL: pubMeta, GuestCallbackURL: pubCb}
++	out := c.ApplyGuestURLOverrides(params.BootstrapInstance{MetadataURL: ctlMeta, CallbackURL: ctlCb, ExtraSpecs: specs})
++
++	var got map[string][]byte
++	require.NoError(t, json.Unmarshal(out.ExtraSpecs, &got))
++	wrapper := string(got["runner_install_template"])
++	require.NotContains(t, strings.SplitN(wrapper, "sed -i", 2)[0], "100.64.0.1", "wrapper variables must already be rewritten")
++
++	// Extract the injected sed line and run it against a GARM-like install script.
++	var sedLine string
++	for _, l := range strings.Split(wrapper, "\n") {
++		if strings.HasPrefix(l, "sed -i ") {
++			sedLine = l
++		}
++	}
++	require.NotEmpty(t, sedLine, "no rewrite of /tmp/real-install.sh was injected")
++	require.Less(t, strings.Index(wrapper, sedLine), strings.Index(wrapper, "chmod +x /tmp/real-install.sh"))
++
++	if _, err := exec.LookPath("sed"); err != nil {
++		t.Skip("sed not available")
++	}
++	dir := t.TempDir()
++	script := filepath.Join(dir, "real-install.sh")
++	body := "CALLBACK_URL=\"" + ctlCb + "\"\nMETADATA_URL=\"" + ctlMeta + "\"\ncurl \"" + ctlCb + "/status\"\n"
++	require.NoError(t, os.WriteFile(script, []byte(body), 0o600))
++	cmd := exec.Command("sh", "-c", strings.ReplaceAll(sedLine, "/tmp/real-install.sh", script))
++	outb, err := cmd.CombinedOutput()
++	require.NoError(t, err, string(outb))
++	res, err := os.ReadFile(script)
++	require.NoError(t, err)
++	require.False(t, bytes.Contains(res, []byte("100.64.0.1")), "controller URL left in the fetched script: %s", res)
++	require.Contains(t, string(res), pubCb+"/status")
++	require.Contains(t, string(res), "METADATA_URL=\""+pubMeta+"\"")
++}
++
++// Without the wrapper (a user-supplied template), nothing is injected.
++func TestGuestOverrideNoWrapperNoInjection(t *testing.T) {
++	tpl := base64.StdEncoding.EncodeToString([]byte("#!/bin/sh\necho " + ctlMeta + "\n"))
++	specs := []byte(`{"runner_install_template":"` + tpl + `"}`)
++	c := &Config{GuestMetadataURL: pubMeta, GuestCallbackURL: pubCb}
++	out := c.ApplyGuestURLOverrides(params.BootstrapInstance{MetadataURL: ctlMeta, CallbackURL: ctlCb, ExtraSpecs: specs})
++	var got map[string][]byte
++	require.NoError(t, json.Unmarshal(out.ExtraSpecs, &got))
++	require.NotContains(t, string(got["runner_install_template"]), "sed -i")
++	require.Contains(t, string(got["runner_install_template"]), pubMeta)
++}
 diff --git a/config/guest_url_test.go b/config/guest_url_test.go
 new file mode 100644
 index 0000000..799827c
