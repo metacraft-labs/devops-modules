@@ -1,3 +1,84 @@
+diff --git a/config/config.go b/config/config.go
+index c262e8c..67aea65 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -23,6 +23,7 @@ import (
+ 	"github.com/aws/aws-sdk-go-v2/aws"
+ 	"github.com/aws/aws-sdk-go-v2/config"
+ 	"github.com/aws/aws-sdk-go-v2/credentials"
++	"github.com/cloudbase/garm-provider-common/params"
+ )
+ 
+ type AWSCredentialType string
+@@ -49,6 +50,26 @@ type Config struct {
+ 	Credentials Credentials `toml:"credentials"`
+ 	SubnetID    string      `toml:"subnet_id"`
+ 	Region      string      `toml:"region"`
++	// GuestMetadataURL / GuestCallbackURL (Metacraft Labs downstream patch)
++	// optionally replace the controller's metadata/callback URLs in the
++	// bootstrap parameters this provider renders into instance userdata. A
++	// controller whose own URLs are only reachable on a private network (a VPN
++	// address) can then point cloud instances at a public route to the same
++	// endpoints. Empty keeps the controller's values.
++	GuestMetadataURL string `toml:"guest_metadata_url"`
++	GuestCallbackURL string `toml:"guest_callback_url"`
++}
++
++// ApplyGuestURLOverrides returns bootstrapParams with the metadata/callback
++// URLs replaced by the configured guest overrides, when set.
++func (c *Config) ApplyGuestURLOverrides(bootstrapParams params.BootstrapInstance) params.BootstrapInstance {
++	if c.GuestMetadataURL != "" {
++		bootstrapParams.MetadataURL = c.GuestMetadataURL
++	}
++	if c.GuestCallbackURL != "" {
++		bootstrapParams.CallbackURL = c.GuestCallbackURL
++	}
++	return bootstrapParams
+ }
+ 
+ func (c *Config) Validate() error {
+diff --git a/config/guest_url_test.go b/config/guest_url_test.go
+new file mode 100644
+index 0000000..799827c
+--- /dev/null
++++ b/config/guest_url_test.go
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: Apache-2.0
++
++// Metacraft Labs downstream patch: guest metadata/callback URL overrides. No
++// mocks: ApplyGuestURLOverrides is a pure function of the config and the
++// bootstrap parameters.
++package config
++
++import (
++	"testing"
++
++	"github.com/cloudbase/garm-provider-common/params"
++	"github.com/stretchr/testify/require"
++)
++
++func TestApplyGuestURLOverrides(t *testing.T) {
++	in := params.BootstrapInstance{
++		MetadataURL: "http://10.0.0.1:9997/api/v1/metadata",
++		CallbackURL: "http://10.0.0.1:9997/api/v1/callbacks",
++	}
++
++	// Unset overrides keep the controller's URLs.
++	out := (&Config{}).ApplyGuestURLOverrides(in)
++	require.Equal(t, in.MetadataURL, out.MetadataURL)
++	require.Equal(t, in.CallbackURL, out.CallbackURL)
++
++	// Set overrides replace both.
++	c := &Config{
++		GuestMetadataURL: "https://garm.example.com/api/v1/metadata",
++		GuestCallbackURL: "https://garm.example.com/api/v1/callbacks",
++	}
++	out = c.ApplyGuestURLOverrides(in)
++	require.Equal(t, "https://garm.example.com/api/v1/metadata", out.MetadataURL)
++	require.Equal(t, "https://garm.example.com/api/v1/callbacks", out.CallbackURL)
++	// The input is not mutated.
++	require.Equal(t, "http://10.0.0.1:9997/api/v1/metadata", in.MetadataURL)
++}
 diff --git a/internal/client/aws.go b/internal/client/aws.go
 index 6d2fce8..e585e15 100644
 --- a/internal/client/aws.go
@@ -424,6 +505,89 @@ index 0000000..52f4ef5
 +	}
 +	t.Fatal("RunInstances carries no volume TagSpecification")
 +}
+diff --git a/internal/spec/guest_url_userdata_test.go b/internal/spec/guest_url_userdata_test.go
+new file mode 100644
+index 0000000..ff3459b
+--- /dev/null
++++ b/internal/spec/guest_url_userdata_test.go
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: Apache-2.0
++
++// Metacraft Labs downstream patch: the guest metadata/callback URL override
++// must reach the userdata the instance boots with. Only the runner-tool lookup
++// is stubbed (DefaultToolFetch, the same seam the upstream spec tests use):
++// it would otherwise need GitHub's runner download list.
++package spec
++
++import (
++	"bytes"
++	"compress/gzip"
++	"encoding/base64"
++	"io"
++	"strings"
++	"testing"
++
++	"github.com/aws/aws-sdk-go-v2/aws"
++	"github.com/cloudbase/garm-provider-aws/config"
++	"github.com/cloudbase/garm-provider-common/params"
++	"github.com/stretchr/testify/require"
++)
++
++func userdataFor(t *testing.T, cfg *config.Config) string {
++	t.Helper()
++	DefaultToolFetch = func(params.OSType, params.OSArch, []params.RunnerApplicationDownload) (params.RunnerApplicationDownload, error) {
++		return params.RunnerApplicationDownload{
++			OS: aws.String("linux"), Architecture: aws.String("x64"),
++			DownloadURL: aws.String("https://example.invalid/runner.tgz"), Filename: aws.String("runner.tgz"),
++		}, nil
++	}
++	bp := params.BootstrapInstance{
++		Name: "garm-guesturl", OSType: params.Linux, OSArch: params.Amd64,
++		MetadataURL:   "http://100.64.0.1:9997/api/v1/metadata",
++		CallbackURL:   "http://100.64.0.1:9997/api/v1/callbacks",
++		InstanceToken: "token", ExtraSpecs: []byte(`{}`), Image: "ami-0123456789abcdef0", Flavor: "m6i.large",
++	}
++	bp = cfg.ApplyGuestURLOverrides(bp)
++	rs, err := GetRunnerSpecFromBootstrapParams(cfg, bp, "ctl")
++	require.NoError(t, err)
++	ud, err := rs.ComposeUserData()
++	require.NoError(t, err)
++	raw, err := base64.StdEncoding.DecodeString(ud)
++	require.NoError(t, err)
++	if len(raw) > 2 && raw[0] == 0x1f && raw[1] == 0x8b {
++		zr, err := gzip.NewReader(bytes.NewReader(raw))
++		require.NoError(t, err)
++		raw, err = io.ReadAll(zr)
++		require.NoError(t, err)
++	}
++	// cloud-config embeds the install script base64-encoded; expand every
++	// `content:` payload so the assertions see the script text.
++	out := string(raw)
++	for _, line := range strings.Split(string(raw), "\n") {
++		f := strings.TrimSpace(line)
++		if v, ok := strings.CutPrefix(f, "content: "); ok {
++			if dec, err := base64.StdEncoding.DecodeString(strings.Trim(v, "\"'")); err == nil {
++				out += "\n" + string(dec)
++			}
++		}
++	}
++	return out
++}
++
++func TestGuestURLOverrideReachesUserdata(t *testing.T) {
++	base := config.Config{SubnetID: "subnet-0123456789abcdef0", Region: "us-east-1"}
++
++	ud := userdataFor(t, &base)
++	require.True(t, strings.Contains(ud, "http://100.64.0.1:9997/api/v1/metadata"), "without an override the controller URL is used")
++
++	over := base
++	over.GuestMetadataURL = "https://garm.example.com/api/v1/metadata"
++	over.GuestCallbackURL = "https://garm.example.com/api/v1/callbacks"
++	ud = userdataFor(t, &over)
++	require.True(t, strings.Contains(ud, "https://garm.example.com/api/v1/metadata"))
++	require.True(t, strings.Contains(ud, "https://garm.example.com/api/v1/callbacks"))
++	require.False(t, strings.Contains(ud, "100.64.0.1"), "no controller-private URL may remain in the userdata")
++}
 diff --git a/internal/spec/spec.go b/internal/spec/spec.go
 index f309113..531f0a7 100644
 --- a/internal/spec/spec.go
@@ -548,3 +712,15 @@ index 0000000..9335bf2
 +	// The spot enum value must be present on market_type.
 +	require.Contains(t, s, "spot")
 +}
+diff --git a/provider/provider.go b/provider/provider.go
+index 90b49e5..cb42005 100644
+--- a/provider/provider.go
++++ b/provider/provider.go
+@@ -57,6 +57,7 @@ type AwsProvider struct {
+ }
+ 
+ func (a *AwsProvider) CreateInstance(ctx context.Context, bootstrapParams params.BootstrapInstance) (params.ProviderInstance, error) {
++	bootstrapParams = a.awsCli.Config().ApplyGuestURLOverrides(bootstrapParams)
+ 	spec, err := spec.GetRunnerSpecFromBootstrapParams(a.awsCli.Config(), bootstrapParams, a.controllerID)
+ 	if err != nil {
+ 		return params.ProviderInstance{}, fmt.Errorf("failed to get runner spec: %w", err)
