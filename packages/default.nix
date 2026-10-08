@@ -96,6 +96,28 @@
             exec python3 ${../scripts/consumer-flake-no-cachix-residual} "$@"
           '';
         };
+        # environment-domains-and-dev-certificates.md §4 — the org's DEVELOPMENT
+        # certificate minting tooling, "parametric over root, domains and
+        # validity". It lives here rather than in a consumer `infra` repo because
+        # that section has metacraft-labs, agent-harbor and blocksense each
+        # running their own root CA under one shared scheme; the tool therefore
+        # names no org and takes everything from a JSON spec (the consumer repo's
+        # `lib/dev-certificates.nix`, evaluated).
+        #
+        # It does NOT seal anything: sealing needs the consumer repo's agenix
+        # recipient set, which is an evaluation of THAT flake, and reaching for
+        # it here would make this package depend on a tree it cannot see.
+        mint-dev-certificates = pkgs.writeShellApplication {
+          name = "mint-dev-certificates";
+          runtimeInputs = [
+            pkgs.openssl
+            pkgs.jq
+            pkgs.coreutils
+          ];
+          text = ''
+            exec bash ${../scripts/mint-dev-certificates.sh} "$@"
+          '';
+        };
         lido-withdrawals-automation = pkgs.callPackage ./lido-withdrawals-automation { };
         pyroscope = pkgs.callPackage ./pyroscope { };
         random-alerts = pkgs.callPackage ./random-alerts { };
