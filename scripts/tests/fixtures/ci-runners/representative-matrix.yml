@@ -33,3 +33,9 @@ jobs:
     runs-on: [self-hosted, windows, x64]
     steps:
       - run: just test
+
+  kvm:
+    # `bare-metal`: nixosTest VMs need /dev/kvm; ephemeral runners have no nested KVM.
+    runs-on: [self-hosted, linux, x64, bare-metal]
+    steps:
+      - run: nix build .#checks.x86_64-linux.vm-test
