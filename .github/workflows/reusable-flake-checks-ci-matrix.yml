@@ -57,6 +57,23 @@ on:
         default: '{}'
         required: false
         type: string
+      build-timeout-minutes:
+        # A hung build used to hold its runner for GitHub's 360-minute default.
+        # On 2026-10-08 one `gprbuild | aarch64-darwin` job hung in `make` at 0%
+        # CPU on m3, the only macOS runner then taking work, and held it toward
+        # that 6 h limit, stalling every repository's macOS CI behind it,
+        # including infra's fleet deployment.
+        #
+        # 270 = the longest legitimate build observed across the callers
+        # (nix-codetracer-toolchains / devops-modules / nix-nim-development /
+        # nix-blockchain-development, last 60 runs each, 2026-10-08): a cold
+        # `gnat | aarch64-darwin` at 217 min, then `gcc13` at 175 min, plus
+        # ~25% margin. p99 was 35-48 min. A caller whose build or
+        # `build-max-jobs` batch legitimately needs longer raises this.
+        description: "Per-job timeout in minutes for each build matrix job (well under GitHub's 360-minute default)"
+        default: 270
+        required: false
+        type: number
       push-deployment-caches:
         description: 'Push deployment target closures to configured deployment cache backends'
         default: false
@@ -653,6 +670,8 @@ jobs:
         matrix.ghRunner
       }}
     continue-on-error: ${{ matrix.allowedToFail }}
+    # See the `build-timeout-minutes` input.
+    timeout-minutes: ${{ inputs.build-timeout-minutes }}
     steps:
       - name: No builds required
         if: ${{ matrix.noop }}
