@@ -70,6 +70,26 @@ jobs:
           echo "Found machines: $machines"
           echo "::endgroup::"
 
+          # A machine ADDED by this PR has no base closure, and nix-diff-action
+          # fails the whole job when `nix path-info` cannot resolve the base
+          # attribute. Diff only the machines the base branch also defines and
+          # name the new ones. If the base cannot be listed at all, keep every
+          # machine, which is the previous behaviour.
+          echo "::group::Excluding machines the base branch does not define"
+          base_rev=$(git rev-parse "origin/${GITHUB_BASE_REF}")
+          if base_machines=$(nix eval --json --accept-flake-config \
+                --option warn-dirty false \
+                --apply builtins.attrNames \
+                "git+file://$PWD?rev=${base_rev}#${{ inputs.machines-attr }}"); then
+            new_machines=$(jq -c --argjson base "$base_machines" '. - $base' <<<"$machines")
+            machines=$(jq -c --argjson base "$base_machines" 'map(select(. as $m | $base | index($m)))' <<<"$machines")
+            echo "New in this PR (not diffed): $new_machines"
+            echo "Diffed: $machines"
+          else
+            echo "::warning::Could not list the base branch's machines; diffing every machine."
+          fi
+          echo "::endgroup::"
+
           # Generate nix-diff-action attributes YAML
           attrs=$(echo "$machines" | jq -r \
             '.[] | "- displayName: " + . + "\n  attribute: nixosConfigurations." + . + ".config.system.build.toplevel"')
