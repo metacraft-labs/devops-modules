@@ -123,6 +123,14 @@ let
           "iam:GetRole"
           "iam:ListRolePolicies"
           "iam:ListAttachedRolePolicies"
+          # Authorized against the ROLE arn, not the instance-profile arn, which
+          # is why it belongs in this statement and not the instance-profile one
+          # below. The AWS provider calls ListInstanceProfilesForRole as a
+          # pre-step of every aws_iam_role delete (to detach the role from any
+          # profile first), so without it a destroy fails mid-apply with
+          # `AccessDenied ... on resource: role <name>` -- after earlier
+          # resources in the same apply have already been destroyed.
+          "iam:ListInstanceProfilesForRole"
           "iam:PutRolePolicy"
           "iam:GetRolePolicy"
           "iam:DeleteRolePolicy"
