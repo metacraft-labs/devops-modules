@@ -15,6 +15,13 @@ Time: about ten minutes. One command creates everything on the Google Cloud
 side (§3); the delegation approval is the one console step (§4), because Google
 publishes no API for it.
 
+> [!NOTE]
+> The commands below assume `google-workspace-dwd` and `gcloud` are on `PATH`: they are in
+> this repository's dev shell, and a consumer repo gets them by adding
+> `inputs'.nixos-modules.packages.workspace-admin-tools` to its own dev shell.
+> Outside one, prefix a command with
+> `nix run github:metacraft-labs/devops-modules#google-workspace-dwd --`.
+
 ## 1. What this gives you, and what it does not
 
 **Covered by the APIs** (with the matching scope approved; a short scope name
@@ -68,7 +75,7 @@ in the organisation and administer service accounts, then run it:
 
 ```sh
 gcloud auth login
-nix run github:metacraft-labs/devops-modules#google-workspace-dwd -- setup \
+google-workspace-dwd setup \
   --project <project-id> --organization <org-id> \
   --scopes admin.directory.user,admin.directory.group,admin.directory.domain.readonly
 ```
@@ -129,7 +136,7 @@ The approval takes effect within minutes, occasionally up to 24 hours.
 Only when the caller needs a key (§2):
 
 ```sh
-nix run github:metacraft-labs/devops-modules#google-workspace-dwd -- seal-key \
+google-workspace-dwd seal-key \
   --project <project-id> --recipients <recipients-file> --out <secrets-dir>/service-account.json.age
 ```
 
@@ -152,7 +159,7 @@ and remove it afterwards — never in a working tree, even a gitignored one.
 With the key decrypted for the session:
 
 ```sh
-nix run github:metacraft-labs/devops-modules#google-workspace-dwd -- verify \
+google-workspace-dwd verify \
   --key <decrypted service-account.json> --subject automation-admin@<domain>
 ```
 
