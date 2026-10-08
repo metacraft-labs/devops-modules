@@ -1,0 +1,15 @@
+Verbatim copies of GARM's runner-install templates, from
+github.com/cloudbase/garm at 0a9a939c10f1e253947b63b0708acaa0c9d5e0bc (the rev
+packages/garm pins), internal/templates/userdata/:
+
+  linux_wrapper.tmpl, windows_wrapper.tmpl
+      the install-script wrappers GARM >= 0.2 puts in a pool's
+      runner_install_template extra spec (util.MaybeAddWrapperToExtraSpecs);
+  github_linux_userdata.tmpl, github_windows_userdata.tmpl
+      the system templates `github_linux` / `github_windows` that GARM seeds
+      into its database and renders at "$METADATA_URL/install-script/".
+
+The check t_garm_install_script_template_fixtures fails when any of them stops
+being byte-identical to the packaged GARM source (up to a final newline,
+which the end-of-file-fixer hook adds to github_windows_userdata.tmpl), so a GARM bump has to refresh
+them (and re-run the guard tests against the new text).
