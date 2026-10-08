@@ -663,6 +663,13 @@ for workflow_and_count in \
   # (a5bc0d79: it authenticates PUBLIC Nix inputs against the anonymous
   # rate limit when no secret is configured). Either way the static secrets
   # keep their order and precedence.
+  #
+  # WIDENING THIS IS NOT WEAKENING IT, and that was checked rather than
+  # asserted: with the pattern as it stands, `github.token` placed anywhere but
+  # last, or the two static secrets reordered, still fails the assertion. Both
+  # were run by hand against the real workflow, because the mutation harness
+  # below rewrites the target SCRIPT and cannot mutate a workflow. Add a third
+  # term only with the same check.
   # shellcheck disable=SC2016
   precedence_count="$(grep -Ec 'nix-github-token: \$\{\{ secrets\.NIX_GITHUB_TOKEN \|\| secrets\.GH_READ_METACRAFT_PRIVATE_REPOS( \|\| (steps\.app-token\.outputs\.token|github\.token))? \}\}$' "$workflow")"
   token_input_count="$(grep -Ec '^[[:space:]]+nix-github-token:' "$workflow")"

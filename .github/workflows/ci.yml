@@ -61,6 +61,23 @@ jobs:
   # an obscure "command not found"), while a working devShell must still be
   # exported to $GITHUB_ENV. Uses the fixture flake under
   # `.github/setup-nix/tests/devshell-fixture/`.
+  #
+  # Both setup-nix steps need `nix-github-token`, and this job needs it more
+  # than any other in this file: staging the fixture does `rm -f flake.lock`,
+  # so Nix must RESOLVE `github:NixOS/nixpkgs/nixos-unstable` through
+  # api.github.com rather than fetch a locked rev. With the input empty the
+  # action writes no `access-tokens` line at all, that resolve goes out
+  # anonymously, and it is billed to the runner fleet's shared egress IP —
+  # which exhausts the 60/hour anonymous budget and returns HTTP 403.
+  #
+  # Note what that costs on the NEGATIVE leg specifically: a 403 makes the
+  # `devshell: failing` step fail for a reason that has nothing to do with the
+  # devShell, so `steps.setup-failing.outcome == 'failure'` is satisfied
+  # vacuously and the assertion stops proving anything. Authenticating both
+  # steps is what keeps that leg honest, not just what keeps the job green.
+  #
+  # The precedence matches the reusable workflows (a5bc0d79): the two static
+  # secrets first, `github.token` only as a last resort.
   test-setup-nix-devshell:
     name: Validate setup-nix devShell build-failure detection
     # Successful runs: at most 5 minutes (last 100 CI runs).
@@ -83,6 +100,7 @@ jobs:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
           devshell: failing
 
       - name: Assert the failing devShell was detected
@@ -100,6 +118,7 @@ jobs:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
           devshell: default
 
       - name: Assert the working devShell was exported to PATH
