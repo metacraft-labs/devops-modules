@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "domains": {
+    "example.com": {
+      "zone_id": "0123456789abcdef0123456789abcdef",
+      "dkim": {
+        "google": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAexample+/=",
+        "google2026": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArotated"
+      }
+    },
+    "example.net": {
+      "zone_id": "fedcba9876543210fedcba9876543210",
+      "dkim": {
+        "google": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnet"
+      }
+    },
+    "example.org": {
+      "zone_id": "00000000000000000000000000000000",
+      "dkim": {}
+    }
+  }
+}

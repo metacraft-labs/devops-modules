@@ -14,12 +14,14 @@
     ./deployment-pull-agent-darwin.nix
     ./deployment-reconciler.nix
     ./garm-credentials-no-race.nix
+    ./google-workspace-dkim.nix
     ./garm-service-boot.nix
     ./garm-api-watchdog.nix
     ./garm-multi-provider.nix
     ./garm-aws-burst.nix
     ./garm-aws-spot.nix
     ./garm-webhook-delivery.nix
+    ./garm-webhook-public-paths.nix
     ./garm-pools-labels.nix
     ./garm-pools-cutover-complete.nix
     ./garm-capability-placement.nix
@@ -42,6 +44,7 @@
     ./garm-incus-runner-host.nix
     ./garm-incus-storage-pool-source.nix
     ./garm-macos-runner-install-wrapper.nix
+    ./garm-install-script-template-fixtures.nix
     ./garm-provider-vmharness-backend.nix
     ./garm-provider-remote.nix
     ./garm-provider-remote-old-daemon.nix

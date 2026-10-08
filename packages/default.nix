@@ -3,6 +3,7 @@
   perSystem =
     {
       inputs',
+      self',
       pkgs,
       ...
     }:
@@ -81,6 +82,61 @@
           text = ''
             exec bash ${../scripts/seal-alerting-secrets.sh} "$@"
           '';
+        };
+        # Google Workspace Admin API access through a service account with
+        # domain-wide delegation: project, APIs, service account, sealed key and
+        # verification in one tool (docs/Google-Workspace-Admin-API-Access.md).
+        google-workspace-dwd = pkgs.writeShellApplication {
+          name = "google-workspace-dwd";
+          runtimeInputs = [
+            pkgs.age
+            pkgs.coreutils
+            pkgs.gawk
+            pkgs.gnugrep
+            pkgs.google-cloud-sdk
+            pkgs.jq
+            (pkgs.python3.withPackages (p: [
+              p.google-auth
+              p.requests
+            ]))
+          ];
+          text = ''
+            exec bash ${../scripts/google-workspace-dwd.sh} "$@"
+          '';
+        };
+        # Google Workspace DKIM: validate the key the Admin console generates,
+        # publish it through the consumer's Terraform data + PR, wait for DNS
+        # (docs/Google-Workspace-DKIM.md). The data side is
+        # terraform/cloudflare/mail-auth.nix.
+        google-workspace-dkim = pkgs.writeShellApplication {
+          name = "google-workspace-dkim";
+          runtimeInputs = [
+            pkgs.coreutils
+            pkgs.dnsutils
+            pkgs.gawk
+            pkgs.gh
+            pkgs.git
+            pkgs.gnugrep
+            pkgs.gnused
+            pkgs.jq
+            pkgs.openssl
+          ]
+          ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.xdg-utils;
+          text = ''
+            exec ${pkgs.runtimeShell} ${../scripts/google-workspace-dkim.sh} "$@"
+          '';
+        };
+        # The Workspace administration tools as one bundle, for consumer dev
+        # shells: `packages = [ inputs'.nixos-modules.packages.workspace-admin-tools ]`
+        # puts gcloud and both helpers on PATH, so a consumer's recipes call them
+        # directly instead of `nix run`.
+        workspace-admin-tools = pkgs.symlinkJoin {
+          name = "workspace-admin-tools";
+          paths = [
+            self'.packages.google-workspace-dwd
+            self'.packages.google-workspace-dkim
+            pkgs.google-cloud-sdk
+          ];
         };
         consumer-flake-cachix-inventory-tool = pkgs.writeShellApplication {
           name = "consumer-flake-cachix-inventory";

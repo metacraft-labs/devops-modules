@@ -33,6 +33,9 @@
             [
               inputs'.agenix.packages.agenix
               inputs'.nixos-anywhere.packages.nixos-anywhere
+              # gcloud + the Workspace admin helpers (packages/default.nix); consumer
+              # infra repos add the same bundle to their own dev shells.
+              config.packages.workspace-admin-tools
               figlet
               just
               jq
