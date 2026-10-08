@@ -1390,9 +1390,10 @@ unittest
     auto keyPath = base ~ ".ed25519";
     auto stateDir = base ~ ".state";
     auto manifestPath = base ~ ".manifest.json";
+    auto eventLog = base ~ ".events.jsonl";
     scope(exit)
     {
-        foreach (path; [base, keyPath, keyPath ~ ".pub", manifestPath])
+        foreach (path; [base, keyPath, keyPath ~ ".pub", manifestPath, eventLog])
             if (path.exists) path.remove;
         if (stateDir.exists) stateDir.rmdirRecurse;
     }
@@ -1438,6 +1439,7 @@ unittest
     args.restoreCommand = "restore";
     args.generationCommand = "current-generation";
     args.preSwitchHook = "/hooks/readiness";
+    args.eventLog = eventLog;
 
     foreach (_; 0 .. 3)
         assert(deployAgentImpl(args, DeployAgentDependencies(
@@ -1452,6 +1454,24 @@ unittest
     assert(status["retryable"].boolean is true);
     assert(status["errorCode"].str == "deployment_deferred");
     assert(readinessRuns == 3);
+
+    // Every deferral's terminal event names the failing readiness condition
+    // (the hook's stderr), not only the generic outcome.
+    import std.algorithm : filter;
+    import std.array : array;
+    import std.string : splitLines;
+    auto completes = eventLog.readText.splitLines
+        .filter!(line => line.length)
+        .map!(line => line.parseJSON)
+        .filter!(event => event["phase"].str == "complete")
+        .array;
+    assert(completes.length == 3, eventLog.readText);
+    foreach (event; completes)
+    {
+        assert(event["error"]["code"].str == "deployment_deferred");
+        assert(event["error"]["details"]["stderrSummary"].str == "host is busy",
+            event.toString);
+    }
     assert(!manifestStatePath(stateDir, "converged", "deploy-deferred").exists);
 }
 

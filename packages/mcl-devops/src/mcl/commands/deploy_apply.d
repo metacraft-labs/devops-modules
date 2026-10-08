@@ -702,16 +702,22 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
     if (!preHook.succeeded)
     {
         auto deferred = preHook.exitCode == deployApplyDeferredExitCode;
+        // The terminal event and the durable state name WHICH readiness
+        // condition failed: the hook reports it on stderr. Without this the
+        // outcome an operator reads said only "conditions are not met"
+        // (m3, 2026-10-08), and the reason sat in an earlier event.
+        auto hookReason = preHook.stderr.stderrSummary;
         markDeploymentState(args.stateDir, manifest, deferred ? "deferred" : "failed",
-            deferred
+            (deferred
                 ? "Readiness hook deferred deployment; retry budget was not consumed."
-                : "Readiness hook failed.");
+                : "Readiness hook failed.")
+            ~ (hookReason.length ? " " ~ hookReason : ""));
         emit("complete", "mcl-devops deploy-apply", ["mcl-devops", "deploy-apply"],
             deferred ? "skipped" : "failed",
             deferred ? deployApplyDeferredExitCode : 1,
             deferred ? "Deployment readiness conditions are not met."
                 : "Deployment readiness hook failed.",
-            deferred ? "deployment_deferred" : "pre_switch_hook_failed", "", [
+            deferred ? "deployment_deferred" : "pre_switch_hook_failed", hookReason, [
                 "lifecycleStage": JSONValue("pre-switch"),
                 "outcome": JSONValue(deferred ? "deferred" : "failed"),
             ], deferred);
