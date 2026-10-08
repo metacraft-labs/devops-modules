@@ -47,14 +47,21 @@ stderr_has() { grep -qF -- "$1" "$work/stderr"; }
 # (The interpreter is spelled out: a build sandbox has no /usr/bin/env.)
 printf '#!%s\n' "$(command -v bash)" | tee "$work/bin/dig" >"$work/bin/gh"
 cat >>"$work/bin/dig" <<'EOF'
-name="" resolver=""
+# NS queries answer from $work/dns/<name>.NS. Every query is logged.
+name="" resolver="" type=TXT
 for a in "$@"; do
   case "$a" in
     @*) resolver="${a#@}" ;;
-    +* | TXT) ;;
+    +*) ;;
+    TXT | NS) type="$a" ;;
     *) name="$a" ;;
   esac
 done
+echo "dig $*" >>"$STUB_DIG_LOG"
+if [ "$type" = NS ]; then
+  [ -f "$STUB_DNS/$name.NS" ] && cat "$STUB_DNS/$name.NS"
+  exit 0
+fi
 f="$STUB_DNS/$name@$resolver"
 [ -f "$f" ] || f="$STUB_DNS/$name"
 [ -f "$f" ] && cat "$f"
@@ -71,13 +78,22 @@ case "$1 $2" in
     echo 0 ;;
   "pr view") git -C "$STUB_ORIGIN" rev-parse "refs/heads/$STUB_BRANCH" ;;
   "pr merge") exit 0 ;;
+  "run list") # one state per call from $STUB_GH_RUNS_FILE, then "ok"
+    if [ -s "${STUB_GH_RUNS_FILE:-/nonexistent}" ]; then
+      head -n1 "$STUB_GH_RUNS_FILE"
+      sed -i 1d "$STUB_GH_RUNS_FILE"
+    else
+      echo ok
+    fi ;;
   "repo view") echo main ;;
   *) echo "gh stub: unexpected $*" >&2; exit 9 ;;
 esac
 EOF
 chmod +x "$work/bin/dig" "$work/bin/gh"
-export PATH="$work/bin:$PATH" STUB_DNS="$work/dns" STUB_GH_LOG="$work/gh.log"
+export PATH="$work/bin:$PATH" STUB_DNS="$work/dns" STUB_GH_LOG="$work/gh.log" STUB_DIG_LOG="$work/dig.log"
+export STUB_GH_RUNS_FILE="$work/gh-runs"
 export GOOGLE_WORKSPACE_DKIM_DNS_INTERVAL=1 GOOGLE_WORKSPACE_DKIM_RESOLVERS="192.0.2.1 192.0.2.2"
+export GOOGLE_WORKSPACE_DKIM_CHECK_INTERVAL=0
 
 # ── keys ─────────────────────────────────────────────────────────────────────
 pubkey() { openssl genrsa "$1" 2>/dev/null | openssl rsa -pubout -outform DER 2>/dev/null | base64 -w0; }
@@ -225,9 +241,30 @@ unset STUB_GH_OPEN_PR
 : >"$STUB_GH_LOG"
 export STUB_GH_CHECKS_RC=1 STUB_GH_OPEN_PR=7
 expect_not "a failed check stops publish before any merge" \
-  run publish --no-open --merge --base main --domain example.com --data "$data" --value "$v2048"
+  run publish --no-open --merge --dns-timeout 0 --base main --domain example.com --data "$data" --value "$v2048"
 expect "... no merge was attempted" bash -c '! grep -q "pr merge" "$1"' _ "$STUB_GH_LOG"
 unset STUB_GH_CHECKS_RC STUB_GH_OPEN_PR
+
+# The reported checks pass while a workflow run is still going (a job that
+# `needs:` another has not registered its check yet), then one fails.
+: >"$STUB_GH_LOG"
+printf 'pending\nbad\n' >"$STUB_GH_RUNS_FILE"
+export STUB_GH_OPEN_PR=7
+expect_not "a workflow run that fails after the reported checks passed stops the merge" \
+  run publish --no-open --merge --dns-timeout 0 --base main --domain example.com --data "$data" --value "$v2048"
+expect "... after watching the checks again while the run was pending" \
+  test "$(grep -c -- "pr checks 7 --watch" "$STUB_GH_LOG")" = 2
+expect "... and no merge was attempted" bash -c '! grep -q "pr merge" "$1"' _ "$STUB_GH_LOG"
+: >"$STUB_GH_RUNS_FILE"
+
+# An open PR whose branch carries another value (the key was regenerated in
+# the console since) must not be resumed.
+: >"$STUB_GH_LOG"
+expect_not "an open PR carrying a different value is not resumed" \
+  run publish --no-open --merge --dns-timeout 0 --base main --domain example.com --data "$data" --value "$v2048b"
+expect "... saying the key may have been regenerated" stderr_has "was the key regenerated?"
+expect "... and nothing was watched or merged" bash -c '! grep -qE "pr (checks|merge)" "$1"' _ "$STUB_GH_LOG"
+unset STUB_GH_OPEN_PR
 
 # The PR merged: origin/main now carries the value.
 git -C "$origin" update-ref refs/heads/main "$pushed"
@@ -235,7 +272,24 @@ git -C "$origin" update-ref refs/heads/main "$pushed"
 expect "once the value is on the base, a re-run skips straight to the DNS wait" \
   run publish --no-open --dns-timeout 5 --base main --domain example.com --data "$data" --value "$v2048"
 expect "... without any PR call" bash -c '! grep -q "gh pr" "$1"' _ "$STUB_GH_LOG"
-expect "... and reports the record live" stderr_has "resolves to the published value on every resolver"
+expect "... and reports the record live" stderr_has "resolves to the published value on every one of the public resolvers"
+# With the zone's nameservers known, they are asked first (non-recursively),
+# and the public resolvers only once the nameservers serve the value.
+printf 'ns1.example.invalid.\n' >"$work/dns/example.com.NS"
+printf '"%s"\n' "$v2048b" >"$work/dns/$name@ns1.example.invalid"
+: >"$STUB_DIG_LOG"
+expect_not "the DNS wait does not finish while the zone's nameservers serve another value" \
+  run publish --no-open --dns-timeout 0 --base main --domain example.com --data "$data" --value "$v2048"
+expect "... naming the nameservers" stderr_has "on the zone's nameservers"
+expect "... asking them without recursion" grep -q -- "+norecurse TXT $name @ns1.example.invalid" "$STUB_DIG_LOG"
+expect "... and never asking a public resolver for the record" bash -c '! grep -q "TXT $2 @192.0.2" "$1"' _ "$STUB_DIG_LOG" "$name"
+rm -f "$work/dns/$name@ns1.example.invalid"
+: >"$STUB_DIG_LOG"
+expect "once the nameservers serve the value, the public resolvers are asked and the wait ends" \
+  run publish --no-open --dns-timeout 5 --base main --domain example.com --data "$data" --value "$v2048"
+expect "... in that order" bash -c 'grep -n "TXT $2 @" "$1" | head -n1 | grep -q "@ns1.example.invalid"' _ "$STUB_DIG_LOG" "$name"
+rm -f "$work/dns/example.com.NS"
+
 printf '"%s"\n' "$v2048b" >"$work/dns/$name"
 expect_not "the DNS wait gives up at --dns-timeout when the answer differs" \
   run publish --no-open --dns-timeout 0 --base main --domain example.com --data "$data" --value "$v2048"

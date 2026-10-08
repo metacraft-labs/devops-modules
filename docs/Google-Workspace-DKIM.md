@@ -74,7 +74,7 @@ it can, Admin console → **Apps → Google Workspace → Gmail → Authenticate
 - select the domain (each domain has its own key and status);
 - **Generate new record** with **DKIM key bit length 2048** and the **prefix
   selector** it names — `google` by default, or the `--selector` you passed (use
-  a dated one, `google2026`, when rotating, §5);
+  a dated one, `google2026`, when rotating, §6);
 - copy the **TXT record value** (`v=DKIM1; k=rsa; p=…`). It is a **public** key,
   not a secret: pasting it into a terminal or a PR is fine.
 
@@ -94,7 +94,7 @@ trouble with. `google-workspace-dkim validate` runs this step alone.
 **3.3 Set it in the data file.** With `jq`, `.domains[<domain>].dkim[<selector>]
 = <value>`, nothing else. The tool never adds a domain (§4). A selector that
 already holds the **same** value is reported and skipped; one that holds a
-**different** value is refused — a new key goes under a new selector (§5) —
+**different** value is refused — a new key goes under a new selector (§6) —
 unless `--replace` says to overwrite it deliberately.
 
 **3.4 Run the consumer's hook.** `--post-edit CMD` runs in the repository root
@@ -109,18 +109,42 @@ repository's default branch), so your checkout and its uncommitted work are
 never touched. It stages the data file and exactly the files the hook changed
 (compared by `git status` before and after — never `git add -A`), commits
 (re-staging once if a formatting hook rewrote them), pushes, opens the PR with
-`gh pr create`, and watches `gh pr checks --watch`. With `--merge` it merges
-only when every check passed, and only at the head commit it watched
+`gh pr create`, and watches `gh pr checks --watch` at the PR's head commit.
+That watch alone can finish early: a job that `needs:` another, or a matrix one
+job computes, registers its check only when that job is done, so for a moment
+every check that exists has passed. The tool therefore also waits until every
+GitHub Actions workflow run for the head (`gh run list --commit`) has
+completed, and watches again while any is running. With `--merge` it merges
+only when all checks and runs passed, and only at the head commit it watched
 (`gh pr merge --match-head-commit`); without it, merge by hand and re-run. If
 the repository requires review approval the merge is refused, and the tool says
-so.
+so. Do not rely on branch protection to catch a red PR: the tool is written to
+be the gate even where the base branch requires no status checks.
+
+An open PR for the branch is resumed only if it carries the value just pasted.
+Generating a record again in the console replaces the pending key, so a PR with
+an older value is refused: close it, delete its branch, and re-run.
 
 **3.6 Wait for DNS.** Once the value is on the base branch, CI applies the root
-(plan on PR, apply on merge). The tool polls `dig +short TXT <name>` on 1.1.1.1
-and 8.8.8.8 (`GOOGLE_WORKSPACE_DKIM_RESOLVERS` overrides) every 30 s, for up to
-`--dns-timeout` seconds (default 1800), printing what each resolver answers.
-It is done when every resolver returns exactly one TXT record whose strings,
-concatenated, equal the console value byte for byte.
+(plan on PR, apply on merge). The wait has two phases, each polling every 30 s
+for up to `--dns-timeout` seconds (default 1800) and printing what each server
+answers:
+
+1. the zone's own nameservers (its `NS` set), asked with `dig +norecurse`.
+   They answer from the zone itself, so this is the signal that the apply has
+   run. If it times out, look at the apply run on the base branch;
+2. then the public resolvers 1.1.1.1 and 8.8.8.8
+   (`GOOGLE_WORKSPACE_DKIM_RESOLVERS` overrides).
+
+The order matters. A public resolver asked for a name that does not exist yet
+caches that negative answer for the zone's SOA minimum, 1800 s on Cloudflare,
+and keeps returning it after the record appears. Asking only the nameservers
+until the apply lands keeps the tool from causing that delay. Running `check`
+before the apply can still cause it; the second phase then lasts until the
+negative answer expires.
+
+Each phase is done when every server returns exactly one TXT record whose
+strings, concatenated, equal the console value byte for byte.
 
 Long values: a 2048-bit key is about 410 characters, more than one DNS
 character-string (255). Cloudflare accepts the whole value and splits it on the

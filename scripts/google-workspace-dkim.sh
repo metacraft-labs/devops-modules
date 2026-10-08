@@ -32,15 +32,19 @@
 #   5. unless --no-pr: in a temporary git worktree on branch dkim/<D>-<S> from
 #      origin/<base> (default: the repository's default branch), commits FILE and
 #      exactly the files the hook changed, pushes, opens a PR and watches its
-#      checks; with --merge, merges only when every check passed on the head it
-#      watched (--match-head-commit). Your own checkout is never touched;
+#      checks and every workflow run of its head; with --merge, merges only
+#      when all of them passed on the head it watched (--match-head-commit).
+#      Your own checkout is never touched;
 #   6. once the change is on <base> (merged now, or on an earlier run), waits —
-#      bounded by --dns-timeout, default 1800 s — until every resolver
-#      (1.1.1.1 and 8.8.8.8, or $GOOGLE_WORKSPACE_DKIM_RESOLVERS) answers exactly
-#      the value;
+#      bounded by --dns-timeout, default 1800 s, per phase — first until the
+#      zone's own nameservers serve exactly the value (the apply has run), then
+#      until every public resolver (1.1.1.1 and 8.8.8.8, or
+#      $GOOGLE_WORKSPACE_DKIM_RESOLVERS) does. Asking public resolvers earlier
+#      would make them cache "no such name" for the zone's SOA minimum;
 #   7. tells you to click Start authentication, and how to verify.
 #   Re-running is safe: a value already on <base> skips to step 6, an open PR
-#   for the branch is resumed rather than duplicated.
+#   for the branch is resumed rather than duplicated (and refused if it carries
+#   a different value, e.g. after the key was regenerated).
 #
 # check: looks the record up on every resolver, reassembles it, validates the
 # key, compares it with FILE's value when --expect-file is given, and prints the
@@ -202,7 +206,7 @@ read_value() {
 # Every TXT record at $1 on resolver $2, one reassembled value per line.
 lookup_txt() {
   local name="$1" resolver="$2" out line
-  out="$(dig +short +time=5 +tries=2 TXT "$name" "@$resolver" 2>/dev/null)" || return 2
+  out="$(dig +short +time=5 +tries=2 ${dig_extra:+"$dig_extra"} TXT "$name" "@$resolver" 2>/dev/null)" || return 2
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     [[ $line == '"'* ]] || continue # a CNAME target or a comment line
@@ -210,33 +214,69 @@ lookup_txt() {
   done <<<"$out"
 }
 
-# 0 when every resolver answers exactly one TXT record equal to $2.
+dig_extra=""
+
+# 0 when every server in the remaining arguments answers exactly one TXT
+# record at $1 equal to $2.
 dns_matches() {
   local name="$1" want="$2" r got
-  for r in "${resolvers[@]}"; do
+  shift 2
+  for r in "$@"; do
     got="$(lookup_txt "$name" "$r")" || return 1
     [ "$got" = "$want" ] || return 1
   done
 }
 
+# The nameservers of the zone holding $1: the NS set of the closest enclosing
+# name that has one, looked up through the first resolver. Empty if none.
+authoritative_servers() {
+  local n="$1" ns
+  while [[ $n == *.* ]]; do
+    ns="$(dig +short +time=5 +tries=2 NS "$n" "@${resolvers[0]}" 2>/dev/null | sed -n 's/\.$//; /^[A-Za-z0-9.-]*$/p' | sort -u)" || ns=""
+    if [ -n "$ns" ]; then
+      printf '%s\n' "$ns"
+      return 0
+    fi
+    n="${n#*.}"
+  done
+}
+
+# Two phases. Public resolvers cache a negative answer for the zone's SOA
+# minimum (1800 s on Cloudflare), so asking them before the record exists would
+# make them keep answering "no such name" for that long after the apply lands.
+# Phase 1 therefore asks the zone's own nameservers, non-recursively, until they
+# serve the value — that is the CI apply having run. Only then are the public
+# resolvers asked. Each phase is bounded by --dns-timeout.
 wait_for_dns() {
-  local name="$1" want="$2" start now r got
+  local name="$1" want="$2" ns=()
+  mapfile -t ns < <(authoritative_servers "$domain")
+  if [ "${#ns[@]}" -gt 0 ]; then
+    dig_extra="+norecurse" poll_dns "$name" "$want" "the zone's nameservers (the apply has run)" "${ns[@]}"
+  else
+    say "could not find the nameservers of $domain; asking the public resolvers directly"
+  fi
+  poll_dns "$name" "$want" "the public resolvers" "${resolvers[@]}"
+}
+
+poll_dns() {
+  local name="$1" want="$2" what="$3" start now r got
+  shift 3
   start="$(date +%s)"
-  say "waiting up to ${dns_timeout}s for $name to resolve to the value on: ${resolvers[*]}"
+  say "waiting up to ${dns_timeout}s for $name to resolve to the value on $what: $*"
   while :; do
-    if dns_matches "$name" "$want"; then
-      say "$name resolves to the published value on every resolver"
+    if dns_matches "$name" "$want" "$@"; then
+      say "$name resolves to the published value on every one of $what"
       return 0
     fi
     now="$(date +%s)"
     if [ $((now - start)) -ge "$dns_timeout" ]; then
-      for r in "${resolvers[@]}"; do
+      for r in "$@"; do
         got="$(lookup_txt "$name" "$r" || true)"
         say "  @$r answers: ${got:-<nothing>}"
       done
-      die "$name did not resolve to the value within ${dns_timeout}s; re-run to keep waiting, or '$prog check --domain $domain --selector $selector' to see what is published"
+      die "$name did not resolve to the value on $what within ${dns_timeout}s (if the nameservers lag, check the Terraform apply run on the base branch; if only public resolvers lag, a cached negative answer expires within the zone's SOA minimum). Re-run to keep waiting, or '$prog check --domain $domain --selector $selector' to see what is published"
     fi
-    for r in "${resolvers[@]}"; do
+    for r in "$@"; do
       got="$(lookup_txt "$name" "$r" || true)"
       if [ -z "$got" ]; then
         say "  [$((now - start))s] @$r: no TXT record yet"
@@ -470,7 +510,14 @@ publish_pr() {
 
   pr="$(cd "$root" && gh pr list --head "$branch" --base "$base" --state open --json number -q '.[0].number // empty')"
   if [ -n "$pr" ]; then
-    say "PR #$pr for $branch is already open; resuming it"
+    # Regenerating in the console replaces the pending key, so an open PR may
+    # carry an older value than the one just pasted. Merging that would publish
+    # a key Google no longer signs with.
+    git -C "$root" fetch --quiet origin "$branch" ||
+      die "PR #$pr is open but origin/$branch could not be fetched"
+    [ "$(git -C "$root" show "FETCH_HEAD:$rel" | compare_data /dev/stdin "$v")" = same ] ||
+      die "PR #$pr ($branch) carries a different value for $record_name than the one you pasted (was the key regenerated?). Close it and delete the branch, then re-run"
+    say "PR #$pr for $branch is already open with this value; resuming it"
   else
     wt="$(mktemp -d "${TMPDIR:-/tmp}/$prog.XXXXXX")"
     trap 'git -C "'"$root"'" worktree remove --force "'"$wt"'" >/dev/null 2>&1 || true; rm -rf "'"$wt"'"' EXIT
@@ -510,12 +557,15 @@ Generated in the Admin console and validated by \`google-workspace-dkim publish\
     pr="${pr##*/}"
   fi
 
-  watch_checks "$root" "$pr"
+  # The head is fixed before watching, so the merge below can only land the
+  # commit whose checks were watched.
+  head="$(cd "$root" && gh pr view "$pr" --json headRefOid -q .headRefOid)"
+  [ -n "$head" ] || die "could not read the head commit of PR #$pr"
+  watch_checks "$root" "$pr" "$head"
   if [ "$merge" != 1 ]; then
     say "checks passed on PR #$pr. Merge it, then re-run this command: it will skip to the DNS wait."
     exit 0
   fi
-  head="$(cd "$root" && gh pr view "$pr" --json headRefOid -q .headRefOid)"
   state="$(cd "$root" && gh pr checks "$pr" --json bucket -q '[.[].bucket] | map(select(. != "pass" and . != "skipping")) | length')"
   [ "$state" = 0 ] || die "PR #$pr has checks that did not pass; not merging"
   say "merging PR #$pr at ${head:0:12}"
@@ -523,15 +573,45 @@ Generated in the Admin console and validated by \`google-workspace-dkim publish\
     die "gh pr merge refused (review required, or the head moved); merge PR #$pr by hand and re-run"
 }
 
+# Summarises the GitHub Actions workflow runs for commit $2: "ok" when every
+# run completed as success/skipped/neutral (or there are none), "bad" when one
+# concluded otherwise, "pending" while any is still running.
+runs_state() {
+  (cd "$1" && gh run list --commit "$2" --limit 200 --json status,conclusion -q '
+    [.[] | if .status != "completed" then "pending"
+           elif (.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") then "ok"
+           else "bad" end]
+    | if any(. == "bad") then "bad" elif any(. == "pending") then "pending" else "ok" end')
+}
+
+# Returns once every check of PR $2 passed and every workflow run for its head
+# $3 completed successfully; exits otherwise. `gh pr checks --watch` alone is
+# not enough: a job that `needs:` another, or a matrix computed by one, only
+# registers its check once that job finishes, so the watch can see "all passed"
+# while part of the pipeline does not exist yet. A workflow run stays
+# in_progress until all of its jobs have finished, so it closes that window.
 watch_checks() {
-  local root="$1" pr="$2" tries=0 out rc
-  say "watching the checks of PR #$pr"
+  local root="$1" pr="$2" head="$3" tries=0 rounds=0 out rc runs
+  say "watching the checks of PR #$pr at ${head:0:12}"
   while :; do
     rc=0
     out="$(cd "$root" && gh pr checks "$pr" --watch --interval 20 2>&1)" || rc=$?
     if [ "$rc" = 0 ]; then
-      say "all checks passed on PR #$pr"
-      return 0
+      runs="$(runs_state "$root" "$head")" || die "could not list the workflow runs of ${head:0:12}"
+      case "$runs" in
+        ok)
+          say "all checks passed on PR #$pr, and every workflow run for ${head:0:12} completed"
+          return 0
+          ;;
+        bad) die "PR #$pr: a workflow run for ${head:0:12} did not succeed; fix it and re-run (the open PR is resumed)" ;;
+        *)
+          rounds=$((rounds + 1))
+          [ "$rounds" -le 180 ] || die "PR #$pr: workflow runs for ${head:0:12} still running after the checks passed; re-run to keep waiting"
+          say "the reported checks passed but workflow runs for ${head:0:12} are still running; watching again"
+          sleep "${GOOGLE_WORKSPACE_DKIM_CHECK_INTERVAL:-20}"
+          continue
+          ;;
+      esac
     fi
     if [[ $out == *"no checks reported"* ]] && [ "$tries" -lt 30 ]; then
       tries=$((tries + 1))
