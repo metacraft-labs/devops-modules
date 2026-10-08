@@ -3,6 +3,7 @@
   perSystem =
     {
       inputs',
+      self',
       pkgs,
       ...
     }:
@@ -124,6 +125,18 @@
           text = ''
             exec ${pkgs.runtimeShell} ${../scripts/google-workspace-dkim.sh} "$@"
           '';
+        };
+        # The Workspace administration tools as one bundle, for consumer dev
+        # shells: `packages = [ inputs'.nixos-modules.packages.workspace-admin-tools ]`
+        # puts gcloud and both helpers on PATH, so a consumer's recipes call them
+        # directly instead of `nix run`.
+        workspace-admin-tools = pkgs.symlinkJoin {
+          name = "workspace-admin-tools";
+          paths = [
+            self'.packages.google-workspace-dwd
+            self'.packages.google-workspace-dkim
+            pkgs.google-cloud-sdk
+          ];
         };
         consumer-flake-cachix-inventory-tool = pkgs.writeShellApplication {
           name = "consumer-flake-cachix-inventory";

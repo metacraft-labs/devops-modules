@@ -8,10 +8,17 @@ policy.
 
 Time: a minute of console work and one command, plus CI and DNS propagation.
 
+> [!NOTE]
+> The commands below assume `google-workspace-dkim` and `gcloud` are on `PATH`: they are in
+> this repository's dev shell, and a consumer repo gets them by adding
+> `inputs'.nixos-modules.packages.workspace-admin-tools` to its own dev shell.
+> Outside one, prefix a command with
+> `nix run github:metacraft-labs/devops-modules#google-workspace-dkim --`.
+
 ## 1. Run the tool
 
 ```sh
-nix run github:metacraft-labs/devops-modules#google-workspace-dkim -- \
+google-workspace-dkim \
   publish --domain example.com --data terraform/cloudflare/<root>/mail-auth.json \
   --post-edit <the root's census hook> --merge
 ```
