@@ -5,6 +5,7 @@
 # Admin console (Google publishes no API for it).
 #
 #   google-workspace-dwd setup     --project ID [--organization ORG | --folder F] [--sa NAME] [--scopes S,...]
+#                                  [--keyless] [--grant-policy-admin]
 #   google-workspace-dwd seal-key  --project ID [--sa NAME] --recipients FILE --out PATH.age
 #   google-workspace-dwd verify    --key FILE --subject USER [--scope S]
 #   google-workspace-dwd keys      --project ID [--sa NAME]
@@ -14,10 +15,19 @@
 # organisation (or use an existing project) and administer its service accounts.
 #
 # setup is idempotent: it creates the project only if it does not exist, enables
-# the Admin SDK and Gmail APIs, creates the service account only if missing,
-# reports whether the organisation policy that blocks key creation applies, and
-# prints the numeric client id, the full scope list and the console page where a
-# super admin approves them.
+# the Admin SDK, Gmail and Organization Policy APIs, creates the service account
+# only if missing, and prints the numeric client id, the full scope list and the
+# console page where a super admin approves them.
+#
+# Key creation: organisations created since 2024 enforce the constraints
+# iam.disableServiceAccountKeyCreation and iam.managed.disableServiceAccountKeyCreation
+# by default. Unless --keyless is given, setup exempts THIS PROJECT ONLY from
+# both (a project-level policy with enforce: false), leaving the organisation's
+# default in place everywhere else. That needs roles/orgpolicy.policyAdmin on the
+# organisation, which even an organisation admin does not hold by default; with
+# --grant-policy-admin, setup grants it to the signed-in account (an
+# organisation admin may) and retries, otherwise it prints the grant command and
+# stops. Policy and IAM changes take minutes to propagate, so both are retried.
 #
 # seal-key keeps the plaintext key only on tmpfs, in a 0700 directory, for the
 # moment between gcloud writing it and age sealing it to the recipients file (one
@@ -27,6 +37,8 @@
 # Scopes are short names (admin.directory.user) or full URLs. The default list
 # is the least a Workspace user/group automation needs; pass --scopes to change it.
 set -euo pipefail
+# Never wait on an interactive gcloud prompt (e.g. "enable this API? (y/N)").
+export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 
 die() {
   echo "google-workspace-dwd: $*" >&2
@@ -59,6 +71,7 @@ cmd="${1:-}"
 shift
 
 project="" organization="" folder="" scopes="$default_scopes" recipients="" out="" key="" subject="" scope=""
+keyless=0 grant_policy_admin=0
 positional=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -72,12 +85,67 @@ while [ $# -gt 0 ]; do
     --key) key="${2:?}"; shift 2 ;;
     --subject) subject="${2:?}"; shift 2 ;;
     --scope) scope="${2:?}"; shift 2 ;;
+    --keyless) keyless=1; shift ;;
+    --grant-policy-admin) grant_policy_admin=1; shift ;;
     --*) die "unknown option $1" ;;
     *) positional+=("$1"); shift ;;
   esac
 done
 
 need_project() { [ -n "$project" ] || die "--project is required"; }
+
+key_constraints=(iam.disableServiceAccountKeyCreation iam.managed.disableServiceAccountKeyCreation)
+
+# "false" only when the effective policy is known not to enforce the constraint;
+# anything else (enforced, or not readable yet) is handled as enforced, since
+# setting the project-level exemption is idempotent.
+constraint_enforced() {
+  local out
+  out="$(gcloud org-policies describe "$1" --project "$project" --effective --format=json 2>/dev/null |
+    jq -r '[.spec.rules[]? | .enforce // false] | any | tostring' 2>/dev/null || true)"
+  printf '%s' "${out:-unknown}"
+}
+
+# The organisation the project belongs to (numeric id), from its ancestry.
+project_org() {
+  gcloud projects get-ancestors "$project" --format='value(id,type)' 2>/dev/null |
+    awk '$2 == "organization" {print $1}'
+}
+
+exempt_project_from_key_policy() {
+  local c policy attempt granted=0 org account
+  for c in "${key_constraints[@]}"; do
+    [ "$(constraint_enforced "$c")" != false ] || { echo "$c: not enforced for $project"; continue; }
+    policy="$(mktemp)"
+    printf 'name: projects/%s/policies/%s\nspec:\n  rules:\n  - enforce: false\n' "$project" "$c" >"$policy"
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+      if gcloud org-policies set-policy "$policy" >/dev/null 2>"$policy.err"; then
+        echo "$c: exempted $project (project-level enforce: false)"
+        break
+      fi
+      if grep -q PERMISSION_DENIED "$policy.err" && [ "$granted" = 0 ]; then
+        org="${organization:-$(project_org)}"
+        account="$(gcloud config get-value account 2>/dev/null)"
+        if [ "$grant_policy_admin" != 1 ]; then
+          rm -f -- "$policy" "$policy.err"
+          die "exempting $project from $c needs roles/orgpolicy.policyAdmin on the organisation. Re-run with --grant-policy-admin, or have an organisation admin run:
+  gcloud organizations add-iam-policy-binding ${org:-<org-id>} --member user:${account:-<you>} --role roles/orgpolicy.policyAdmin --condition None"
+        fi
+        [ -n "$org" ] || die "cannot determine the project's organisation; pass --organization"
+        gcloud organizations add-iam-policy-binding "$org" --member "user:$account" \
+          --role roles/orgpolicy.policyAdmin --condition None >/dev/null
+        echo "granted roles/orgpolicy.policyAdmin on organisation $org to $account (remove it later if it should not stay)"
+        granted=1
+      elif [ "$attempt" = 10 ]; then
+        cat "$policy.err" >&2
+        rm -f -- "$policy" "$policy.err"
+        die "could not exempt $project from $c"
+      fi
+      sleep 20
+    done
+    rm -f -- "$policy" "$policy.err"
+  done
+}
 
 case "$cmd" in
   setup)
@@ -96,8 +164,9 @@ case "$cmd" in
       gcloud projects create "$project" "${parent[@]}" --name "Workspace Admin API" >/dev/null
       echo "created project $project"
     fi
-    gcloud services enable admin.googleapis.com gmail.googleapis.com --project "$project" >/dev/null
-    echo "enabled admin.googleapis.com, gmail.googleapis.com"
+    gcloud services enable admin.googleapis.com gmail.googleapis.com orgpolicy.googleapis.com \
+      --project "$project" >/dev/null
+    echo "enabled admin.googleapis.com, gmail.googleapis.com, orgpolicy.googleapis.com"
     if gcloud iam service-accounts describe "$(sa_email)" --project "$project" >/dev/null 2>&1; then
       echo "service account $(sa_email) exists"
     else
@@ -106,11 +175,10 @@ case "$cmd" in
       echo "created service account $(sa_email)"
     fi
     client_id="$(gcloud iam service-accounts describe "$(sa_email)" --project "$project" --format='value(uniqueId)')"
-    enforced="$(gcloud resource-manager org-policies describe iam.disableServiceAccountKeyCreation \
-      --project "$project" --effective --format='value(booleanPolicy.enforced)' 2>/dev/null || true)"
-    if [ "$enforced" = True ]; then
-      echo "NOTE: iam.disableServiceAccountKeyCreation is enforced for $project; seal-key will be refused"
-      echo "      until an organisation policy admin exempts this project, or use the keyless route."
+    if [ "$keyless" = 1 ]; then
+      echo "--keyless: leaving the key-creation policy as it is (seal-key will not be used)"
+    else
+      exempt_project_from_key_policy
     fi
     cat <<EOF
 
@@ -136,9 +204,21 @@ EOF
     trap 'shred -u "$work/key.json" 2>/dev/null; rm -rf -- "$work" "$out.tmp"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    gcloud iam service-accounts keys create "$work/key.json" --iam-account "$(sa_email)" \
-      --project "$project" --quiet >/dev/null 2>&1 ||
-      die "creating the key failed (is iam.disableServiceAccountKeyCreation enforced? see 'setup')"
+    # A fresh policy exemption takes minutes to reach the IAM API: retry while
+    # the refusal is the key-creation constraint, for up to ten minutes.
+    for attempt in $(seq 1 20); do
+      if gcloud iam service-accounts keys create "$work/key.json" --iam-account "$(sa_email)" \
+        --project "$project" --quiet >/dev/null 2>"$work/err"; then
+        break
+      fi
+      if grep -q -i 'disableServiceAccountKeyCreation' "$work/err" && [ "$attempt" -lt 20 ]; then
+        echo "key creation still refused by the org policy (propagating?); retrying in 30 s" >&2
+        sleep 30
+        continue
+      fi
+      cat "$work/err" >&2
+      die "creating the key failed (run 'setup' without --keyless to exempt the project from the key-creation policy)"
+    done
     age -R "$recipients" -o "$out.tmp" "$work/key.json" || die "sealing the key failed"
     shred -u "$work/key.json"
     [ -s "$out.tmp" ] || die "gcloud produced no key"

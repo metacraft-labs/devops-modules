@@ -20,14 +20,15 @@ publishes no API for it.
 **Covered by the APIs** (with the matching scope approved; a short scope name
 `x` stands for `https://www.googleapis.com/auth/x`):
 
-| Task                                                        | API                      | Scope                                                        |
-| ----------------------------------------------------------- | ------------------------ | ------------------------------------------------------------ |
-| Create, suspend and update users; aliases; reset passwords  | Admin SDK Directory      | `admin.directory.user`                                       |
-| Groups and memberships                                      | Admin SDK Directory      | `admin.directory.group`                                      |
-| Read domains, org units                                     | Admin SDK Directory      | `admin.directory.domain.readonly`, `admin.directory.orgunit` |
-| Per-user Gmail settings: send-as, filters, forwarding, IMAP | Gmail API (as that user) | `gmail.settings.basic`, `gmail.settings.sharing`             |
-| Insert a message into a user's mailbox                      | Gmail API (as that user) | `gmail.insert`                                               |
-| The `googleworkspace` Terraform provider                    | the above                | whatever its resources need                                  |
+| Task                                                                                | API                      | Scope                                                        |
+| ----------------------------------------------------------------------------------- | ------------------------ | ------------------------------------------------------------ |
+| Create, suspend and update users; aliases; reset passwords                          | Admin SDK Directory      | `admin.directory.user`                                       |
+| Custom admin roles and their assignment (e.g. creating the automation admin itself) | Admin SDK Directory      | `admin.directory.rolemanagement`                             |
+| Groups and memberships                                                              | Admin SDK Directory      | `admin.directory.group`                                      |
+| Read domains, org units                                                             | Admin SDK Directory      | `admin.directory.domain.readonly`, `admin.directory.orgunit` |
+| Per-user Gmail settings: send-as, filters, forwarding, IMAP                         | Gmail API (as that user) | `gmail.settings.basic`, `gmail.settings.sharing`             |
+| Insert a message into a user's mailbox                                              | Gmail API (as that user) | `gmail.insert`                                               |
+| The `googleworkspace` Terraform provider                                            | the above                | whatever its resources need                                  |
 
 **Not covered — console-only at the time of writing.** Google publishes no API
 for these; they need a person, or browser automation signed in as an admin:
@@ -76,30 +77,45 @@ nix run github:metacraft-labs/devops-modules#google-workspace-dwd -- setup \
 instead of `--organization` puts the project in a folder. The organisation id is
 `gcloud organizations list`.)
 
-It prints the client id and the exact scope line for §4. Behind the scenes, and
-safe to re-run — each step is skipped when already done:
+Add `--grant-policy-admin` the first time in an organisation that still has
+Google's default key-creation policy (step 5). Behind the scenes, and safe to
+re-run — each step is skipped when already done:
 
 1. **Project.** `gcloud projects create <id> --organization <org>`, if
    `gcloud projects describe` does not find it. The project belongs to the
    organisation, not to the person running it. No billing account is needed: the
    Admin SDK and Gmail APIs are free.
-2. **APIs.** `gcloud services enable admin.googleapis.com gmail.googleapis.com`.
+2. **APIs.** `gcloud services enable admin.googleapis.com gmail.googleapis.com orgpolicy.googleapis.com`.
 3. **Service account.** `gcloud iam service-accounts create workspace-admin`
    (`--sa` changes the name). It needs **no** IAM role on the project: domain-wide
    delegation is granted in the Workspace Admin console, not in IAM.
 4. **Client id.** The service account's numeric `uniqueId` — the "Client ID" the
    Admin console asks for. It is not the service account's email address.
-5. **Key-creation policy.** It reads the effective
-   `iam.disableServiceAccountKeyCreation` policy for the project and warns if it
-   is enforced (Google enforces it by default in organisations created since
-   2024). Then either have an organisation policy admin exempt this one project
-   and record that in the overlay, or use the keyless route (§2).
+5. **Key-creation policy.** Organisations created since 2024 enforce
+   `iam.disableServiceAccountKeyCreation` and its newer twin
+   `iam.managed.disableServiceAccountKeyCreation` by default, and either one
+   refuses `seal-key`. Unless `--keyless` is given, `setup` enables the
+   Organization Policy API and writes a **project-level** policy with
+   `enforce: false` for each enforced constraint, so the organisation's default
+   stays in force everywhere else. Writing it needs `roles/orgpolicy.policyAdmin`
+   on the organisation, which an organisation admin does **not** hold by default:
+   with `--grant-policy-admin`, `setup` grants it to the signed-in account (an
+   organisation admin may) and retries; without it, `setup` stops and prints the
+   one `gcloud organizations add-iam-policy-binding` command to run. The grant
+   stays on the account — remove it afterwards if your policy says so.
+   Policy and IAM changes take a minute or more to reach the IAM API; `setup` and
+   `seal-key` retry while they propagate.
+6. **Client id and scopes.** It prints the numeric client id and the scope line
+   for §4.
+
+All gcloud calls run with prompts disabled, so a missing API fails with an
+error instead of waiting for a "y/N" nobody sees.
 
 ## 4. Approve the delegation (Admin console, super admin)
 
 1. Admin console → **Security → Access and data control → API controls →
    Manage Domain Wide Delegation** (<https://admin.google.com/ac/owl/domainwidedelegation>).
-2. **Add new**: Client ID = the numeric unique ID from §3.4; OAuth scopes = the
+2. **Add new**: Client ID = the numeric id `setup` printed; OAuth scopes = the
    comma-separated full scope URLs from §2. **Authorise.**
 3. If the impersonated user is a dedicated automation admin, create it now:
    **Account → Admin roles → Create new role** with only the needed privileges,

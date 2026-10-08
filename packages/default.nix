@@ -90,7 +90,10 @@
           runtimeInputs = [
             pkgs.age
             pkgs.coreutils
+            pkgs.gawk
+            pkgs.gnugrep
             pkgs.google-cloud-sdk
+            pkgs.jq
             (pkgs.python3.withPackages (p: [
               p.google-auth
               p.requests
