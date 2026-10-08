@@ -14,6 +14,7 @@
     ./deployment-pull-agent-darwin.nix
     ./deployment-reconciler.nix
     ./garm-credentials-no-race.nix
+    ./google-workspace-dkim.nix
     ./garm-service-boot.nix
     ./garm-api-watchdog.nix
     ./garm-multi-provider.nix

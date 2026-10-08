@@ -44,6 +44,64 @@ blocks; `--resource-types a,b` overrides. `plan` = read on every managed group,
 `apply` = edit on writable groups + `zone:read`, `import` = broad read for
 inventory. Managing zone-level settings? add `--zone-writable`.
 
+## `mail-auth.nix` — DKIM TXT records from a JSON data file
+
+A Terranix helper that renders DKIM records for Cloudflare zones from a data
+file the consumer keeps in its root. It is the Terraform half of the
+[Google Workspace DKIM runbook](../../docs/Google-Workspace-DKIM.md), whose
+`google-workspace-dkim publish` tool edits the same file.
+
+```json
+{
+  "version": 1,
+  "domains": {
+    "example.com": {
+      "zone_id": "<32 hex>",
+      "dkim": { "google": "v=DKIM1; k=rsa; p=MIIB…" }
+    }
+  }
+}
+```
+
+```nix
+let
+  devops-modules = builtins.fetchGit {
+    url = "https://github.com/metacraft-labs/devops-modules";
+    rev = "<a revision carrying mail-auth.nix>";
+  };
+  mailAuth = import "${devops-modules}/terraform/cloudflare/mail-auth.nix" {
+    data = builtins.fromJSON (builtins.readFile ./mail-auth.json);
+    resourceName = "mail_auth_dkim"; # default
+    comment = "DKIM (docs/runbooks/…)"; # optional
+  };
+in
+{
+  imports = [ mailAuth ];
+  # … the rest of the root
+}
+```
+
+It renders one `resource.cloudflare_dns_record.<resourceName>` (provider v5)
+with a `for_each` keyed `"<selector>._domainkey.<domain>|TXT"`: TXT, unproxied,
+`ttl = 1` (automatic), `comment`. Addresses are therefore
+`cloudflare_dns_record.mail_auth_dkim["google._domainkey.example.com|TXT"]`, and
+they are stable — adding a domain or a selector adds one address and re-keys
+none. With no DKIM value anywhere it renders nothing at all, so declaring
+domains before their keys exist leaves the plan unchanged. Values are one
+unquoted string each; Cloudflare splits values over 255 characters on the wire.
+
+Evaluation fails, naming the entry, on an unknown `version`, a zone id that is
+not 32 lowercase hex, a domain or selector that is not a lowercase DNS name or
+label, and a value that does not start with `v=DKIM1;` or uses a character
+outside the DKIM tag alphabet (which also keeps Terraform template sequences
+out of the rendered JSON).
+
+Tested by `nix build .#checks.<system>.cloudflare-mail-auth`
+([`tests/mail-auth.nix`](./tests/mail-auth.nix): key stability, empty
+rendering, attribute values, each refusal; plus a comparison of
+[`tests/mail-auth/data.json`](./tests/mail-auth/data.json)'s rendering with the
+reviewed [`expected.json`](./tests/mail-auth/expected.json)).
+
 ## `cloudflare-import-blocks` — shared import-block generator
 
 Emits credential-free `import {}` blocks for a Cloudflare root from the root's
