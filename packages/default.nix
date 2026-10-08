@@ -103,6 +103,28 @@
             exec bash ${../scripts/google-workspace-dwd.sh} "$@"
           '';
         };
+        # Google Workspace DKIM: validate the key the Admin console generates,
+        # publish it through the consumer's Terraform data + PR, wait for DNS
+        # (docs/Google-Workspace-DKIM.md). The data side is
+        # terraform/cloudflare/mail-auth.nix.
+        google-workspace-dkim = pkgs.writeShellApplication {
+          name = "google-workspace-dkim";
+          runtimeInputs = [
+            pkgs.coreutils
+            pkgs.dnsutils
+            pkgs.gawk
+            pkgs.gh
+            pkgs.git
+            pkgs.gnugrep
+            pkgs.gnused
+            pkgs.jq
+            pkgs.openssl
+          ]
+          ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.xdg-utils;
+          text = ''
+            exec ${pkgs.runtimeShell} ${../scripts/google-workspace-dkim.sh} "$@"
+          '';
+        };
         consumer-flake-cachix-inventory-tool = pkgs.writeShellApplication {
           name = "consumer-flake-cachix-inventory";
           runtimeInputs = [ pkgs.python3 ];
