@@ -82,6 +82,24 @@
             exec bash ${../scripts/seal-alerting-secrets.sh} "$@"
           '';
         };
+        # Google Workspace Admin API access through a service account with
+        # domain-wide delegation: project, APIs, service account, sealed key and
+        # verification in one tool (docs/Google-Workspace-Admin-API-Access.md).
+        google-workspace-dwd = pkgs.writeShellApplication {
+          name = "google-workspace-dwd";
+          runtimeInputs = [
+            pkgs.age
+            pkgs.coreutils
+            pkgs.google-cloud-sdk
+            (pkgs.python3.withPackages (p: [
+              p.google-auth
+              p.requests
+            ]))
+          ];
+          text = ''
+            exec bash ${../scripts/google-workspace-dwd.sh} "$@"
+          '';
+        };
         consumer-flake-cachix-inventory-tool = pkgs.writeShellApplication {
           name = "consumer-flake-cachix-inventory";
           runtimeInputs = [ pkgs.python3 ];

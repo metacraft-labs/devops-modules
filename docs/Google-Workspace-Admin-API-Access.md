@@ -11,7 +11,9 @@ The mechanism is a **Google Cloud service account with domain-wide delegation
 user, for a fixed list of OAuth scopes that a super admin approves once in the
 Admin console.
 
-Time: about fifteen minutes, all of it in two consoles.
+Time: about ten minutes. One command creates everything on the Google Cloud
+side (§3); the delegation approval is the one console step (§4), because Google
+publishes no API for it.
 
 ## 1. What this gives you, and what it does not
 
@@ -57,38 +59,41 @@ over time, and a console step that has gained an API should move into code.
   A developer workstation or an agent session usually cannot, so it needs a key —
   sealed, and decrypted only for a session.
 
-## 3. Create the service account (Google Cloud console)
+## 3. Create the project and the service account: `google-workspace-dwd setup`
 
-1. Pick or create a project owned by the organisation (not a personal project):
-   <https://console.cloud.google.com/projectcreate>.
-2. Enable the APIs the scopes belong to — at least **Admin SDK API**
-   (`admin.googleapis.com`), plus **Gmail API** (`gmail.googleapis.com`) for
-   Gmail scopes:
-   ```sh
-   gcloud services enable admin.googleapis.com gmail.googleapis.com --project <project>
-   ```
-3. Create the service account. It needs **no** IAM role on the project for DWD:
-   ```sh
-   gcloud iam service-accounts create workspace-admin \
-     --project <project> --display-name "Workspace Admin API (DWD)"
-   ```
-4. Read its **numeric unique ID** — the "OAuth 2 client ID" the Admin console
-   asks for. It is not the email address:
-   ```sh
-   gcloud iam service-accounts describe \
-     workspace-admin@<project>.iam.gserviceaccount.com --format 'value(uniqueId)'
-   ```
-5. Only if you need a key (§2): create it, seal it straight away (§5) and delete
-   the plaintext.
-   ```sh
-   gcloud iam service-accounts keys create key.json \
-     --iam-account workspace-admin@<project>.iam.gserviceaccount.com
-   ```
-   **If this is refused** with a constraint violation, the organisation enforces
-   `iam.disableServiceAccountKeyCreation` (Google turns it on by default for
-   organisations created since 2024). Either go keyless (§2) or have an
-   organisation policy admin exempt this one project, and record the exemption
-   in the overlay.
+Every Google Cloud step is one command from this repository's
+`google-workspace-dwd` package. Sign in once as someone who may create projects
+in the organisation and administer service accounts, then run it:
+
+```sh
+gcloud auth login
+nix run github:metacraft-labs/devops-modules#google-workspace-dwd -- setup \
+  --project <project-id> --organization <org-id> \
+  --scopes admin.directory.user,admin.directory.group,admin.directory.domain.readonly
+```
+
+(An infra repo wraps this in a `just` recipe with its own values; `--folder`
+instead of `--organization` puts the project in a folder. The organisation id is
+`gcloud organizations list`.)
+
+It prints the client id and the exact scope line for §4. Behind the scenes, and
+safe to re-run — each step is skipped when already done:
+
+1. **Project.** `gcloud projects create <id> --organization <org>`, if
+   `gcloud projects describe` does not find it. The project belongs to the
+   organisation, not to the person running it. No billing account is needed: the
+   Admin SDK and Gmail APIs are free.
+2. **APIs.** `gcloud services enable admin.googleapis.com gmail.googleapis.com`.
+3. **Service account.** `gcloud iam service-accounts create workspace-admin`
+   (`--sa` changes the name). It needs **no** IAM role on the project: domain-wide
+   delegation is granted in the Workspace Admin console, not in IAM.
+4. **Client id.** The service account's numeric `uniqueId` — the "Client ID" the
+   Admin console asks for. It is not the service account's email address.
+5. **Key-creation policy.** It reads the effective
+   `iam.disableServiceAccountKeyCreation` policy for the project and warns if it
+   is enforced (Google enforces it by default in organisations created since
+   2024). Then either have an organisation policy admin exempt this one project
+   and record that in the overlay, or use the keyless route (§2).
 
 ## 4. Approve the delegation (Admin console, super admin)
 
@@ -103,46 +108,43 @@ over time, and a console step that has gained an API should move into code.
 
 The approval takes effect within minutes, occasionally up to 24 hours.
 
-## 5. Keep the key sealed
+## 5. Create and seal a key: `google-workspace-dwd seal-key`
 
-- Seal the key to the people (user keys) and, where needed, CI identities that
-  must use it — never to a host that does not run the automation. With
-  agenix/age:
-  ```sh
-  age -R recipients.txt -o <secrets-dir>/service-account.json.age < key.json
-  shred -u key.json
-  ```
-- Decrypt it only for a session or a job, onto tmpfs, with mode 0600, and remove
-  it afterwards. Do not leave it in a working tree, even a gitignored one.
-- Record the key ID (`gcloud iam service-accounts keys list`) in the overlay, so
-  a rotation knows which key to delete.
-
-## 6. Verify
-
-Mint a token as the impersonated user and make one read call. Request a scope
-that is **exactly** in the approved list: `admin.directory.user` does not imply
-`admin.directory.user.readonly`, and asking for an unapproved scope fails the
-whole token request.
+Only when the caller needs a key (§2):
 
 ```sh
-SA_KEY=/path/to/unlocked/service-account.json ADMIN_USER=automation-admin@example.com \
-nix shell --impure --expr '(builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}.python3.withPackages (p: [ p.google-auth p.requests ])' \
-  --command python3 - <<'PY'
-import os
-from google.oauth2 import service_account
-from google.auth.transport.requests import AuthorizedSession
-creds = service_account.Credentials.from_service_account_file(
-    os.environ["SA_KEY"],
-    scopes=["https://www.googleapis.com/auth/admin.directory.user"],
-).with_subject(os.environ["ADMIN_USER"])
-r = AuthorizedSession(creds).get(
-    "https://admin.googleapis.com/admin/directory/v1/users",
-    params={"customer": "my_customer", "maxResults": 1})
-print(r.status_code, "users" in r.json())
-PY
+nix run github:metacraft-labs/devops-modules#google-workspace-dwd -- seal-key \
+  --project <project-id> --recipients <recipients-file> --out <secrets-dir>/service-account.json.age
 ```
 
-Expected: `200 True`. The usual failures:
+`<recipients-file>` holds one age or SSH public key per line — the people (user
+keys) and, where needed, CI identities that must use the key; never a host that
+does not run the automation. Behind the scenes:
+
+1. It refuses to overwrite an existing `--out` unless `FORCE=1` (a rotation).
+2. `gcloud iam service-accounts keys create` writes the new key into a 0700
+   directory on tmpfs (`$XDG_RUNTIME_DIR`); `age -R <recipients-file>` seals it to
+   `--out`; the plaintext is shredded immediately and on every exit path.
+3. It prints the new **key id** (the difference between the key list before and
+   after), never the key. Record the id in the overlay: rotation needs it.
+
+Use the sealed key only decrypted for a session or a job, on tmpfs, mode 0600,
+and remove it afterwards — never in a working tree, even a gitignored one.
+
+## 6. Verify: `google-workspace-dwd verify`
+
+With the key decrypted for the session:
+
+```sh
+nix run github:metacraft-labs/devops-modules#google-workspace-dwd -- verify \
+  --key <decrypted service-account.json> --subject automation-admin@<domain>
+```
+
+Behind the scenes it mints a token **as** `--subject` for one scope
+(`admin.directory.user` unless `--scope` says otherwise — it must be **exactly**
+one of the approved scopes; `admin.directory.user` does not imply
+`admin.directory.user.readonly`) and lists one user of the tenant. It prints
+`ok: …` on success. The usual failures:
 
 | Error                                            | Cause                                                                                                                             |
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
@@ -153,9 +155,11 @@ Expected: `200 True`. The usual failures:
 
 ## 7. Rotate and revoke
 
-- **Rotate the key:** create a new key, seal it, switch every consumer, then
-  `gcloud iam service-accounts keys delete <old-key-id>`. Deleting the key is
-  what revokes it; removing the sealed file does not.
+- **Rotate the key:** `FORCE=1 google-workspace-dwd seal-key …` creates and
+  seals a new key over the old sealed file; switch every consumer to it; then
+  `google-workspace-dwd keys --project <id>` lists the keys and
+  `google-workspace-dwd delete-key --project <id> <old-key-id>` deletes the old
+  one. Deleting the key is what revokes it; removing a sealed file does not.
 - **Revoke everything:** delete the delegation entry in the Admin console (all
   tokens for every user stop working within minutes), then delete or disable the
   service account.
