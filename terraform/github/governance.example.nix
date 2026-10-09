@@ -118,6 +118,17 @@ import ./governance.nix {
         canAdminsBypass = true;
         waitTimer = 0;
       }
+      {
+        repository = "docs";
+        environment = "publish";
+        canAdminsBypass = true;
+        waitTimer = 0;
+        deploymentBranchPolicy = {
+          protectedBranches = false;
+          customBranchPolicies = true;
+          branchPatterns = [ "publish" ];
+        };
+      }
     ];
     actionsRepositoryPermissions = [
       {

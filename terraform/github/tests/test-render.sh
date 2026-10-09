@@ -26,6 +26,38 @@ for t in "${need[@]}"; do
   [[ "$n" -ge 1 ]] || { echo "FAIL: expected resource $t"; fail=1; }
 done
 
+# An Environment that names its allowed branches renders one deployment
+# policy per pattern, bound to that Environment's resource so Terraform
+# creates the Environment first; one that names none renders no policy.
+dp='.resource.github_repository_environment_deployment_policy'
+[[ "$(jq -r "$dp | keys | join(\",\")" <<<"$json")" == "environment_docs_publish_branch_publish" ]] \
+  || { echo "FAIL: expected exactly one deployment policy, for docs:publish"; fail=1; }
+[[ "$(jq -r "$dp.environment_docs_publish_branch_publish.branch_pattern" <<<"$json")" == "publish" ]] \
+  || { echo "FAIL: deployment policy branch_pattern not carried through"; fail=1; }
+[[ "$(jq -r "$dp.environment_docs_publish_branch_publish.environment" <<<"$json")" == '${github_repository_environment.environment_docs_publish.environment}' ]] \
+  || { echo "FAIL: deployment policy must reference its Environment resource"; fail=1; }
+[[ "$(jq '.output.github_governance_environment_deployment_policy_count.value' <<<"$json")" == "1" ]] \
+  || { echo "FAIL: github_governance_environment_deployment_policy_count"; fail=1; }
+
+# Negative control: branch patterns under the protected-branches mode (or with
+# custom policies off) are a contradiction GitHub refuses; the engine must
+# throw at eval time rather than render an unappliable plan.
+# The example imports the engine by a relative path, so the mutated copy has
+# that path made absolute before it is evaluated from the store.
+if nix eval --json --impure --expr "
+  let
+    ex = builtins.readFile ${here}/../governance.example.nix;
+  in
+  import (builtins.toFile \"bad-env.nix\" (builtins.replaceStrings
+    [ \"customBranchPolicies = true;\n          branchPatterns\" \"import ./governance.nix\" ]
+    [ \"customBranchPolicies = false;\n          branchPatterns\" \"import ${here}/../governance.nix\" ]
+    ex))" >/dev/null 2>"$here/.bad-env.err"; then
+  echo "FAIL: branchPatterns with customBranchPolicies = false must be refused"; fail=1
+elif ! grep -q "deployment-branch patterns are inconsistent" "$here/.bad-env.err"; then
+  echo "FAIL: branchPatterns contradiction refused for the wrong reason:"; cat "$here/.bad-env.err"; fail=1
+fi
+rm -f "$here/.bad-env.err"
+
 # The team data source is emitted for the granted team.
 [[ "$(jq '.data.github_team | length' <<<"$json")" -ge 1 ]] || { echo "FAIL: expected github_team data source"; fail=1; }
 
