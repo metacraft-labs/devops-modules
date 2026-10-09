@@ -203,6 +203,18 @@ git init --quiet --bare "$origin"
 git -C "$origin" symbolic-ref HEAD refs/heads/main
 git -C "$repo" checkout --quiet -- "$data" 2>/dev/null || true
 git -C "$repo" reset --quiet --hard
+# Like a dev shell: an ignored, generated .pre-commit-config.yaml and a commit
+# hook that refuses without it. The PR flow commits in a fresh worktree.
+echo '.pre-commit-config.yaml' >>"$repo/.gitignore"
+git -C "$repo" add .gitignore
+git -C "$repo" commit --quiet -m "ignore the generated hook config"
+echo 'repos: []' >"$work/generated-pre-commit-config.yaml"
+ln -s "$work/generated-pre-commit-config.yaml" "$repo/.pre-commit-config.yaml"
+cat >"$repo/.git/hooks/pre-commit" <<'HOOK'
+#!/bin/sh
+[ -e .pre-commit-config.yaml ] || { echo "error: config file not found: .pre-commit-config.yaml" >&2; exit 1; }
+HOOK
+chmod +x "$repo/.git/hooks/pre-commit"
 git -C "$repo" remote add origin "$origin"
 git -C "$repo" push --quiet origin HEAD:main
 # Unrelated local work in the operator's checkout must not reach the commit.
@@ -222,6 +234,9 @@ expect "... with the value in the committed data" \
   test "$(git -C "$origin" show "$pushed:dns/mail-auth.json" | jq -r '.domains["example.com"].dkim.google')" = "$v2048"
 expect "... without the operator's unrelated edit to the census" \
   bash -c '! git -C "$1" show "$2:census.expected" | grep -qx edited' _ "$origin" "$pushed"
+expect "... committing although the hook needs the ignored, generated config" test -n "$pushed"
+expect "... which is not part of the commit" \
+  bash -c '! git -C "$1" show "$2:.pre-commit-config.yaml" >/dev/null 2>&1' _ "$origin" "$pushed"
 expect "... and leaves the operator's checkout as it was" \
   test "$(git -C "$repo" status --porcelain | tr '\n' ' ')" = " M census.expected ?? unrelated.txt "
 expect "... created the PR against the base" grep -q "^gh pr create --base main --head $STUB_BRANCH" "$STUB_GH_LOG"

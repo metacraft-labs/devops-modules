@@ -522,6 +522,16 @@ publish_pr() {
     wt="$(mktemp -d "${TMPDIR:-/tmp}/$prog.XXXXXX")"
     trap 'git -C "'"$root"'" worktree remove --force "'"$wt"'" >/dev/null 2>&1 || true; rm -rf "'"$wt"'"' EXIT
     git -C "$root" worktree add --quiet -B "$branch" "$wt" "origin/$base"
+    # Dev shells often generate the commit-hook configuration as an untracked,
+    # ignored file (a .pre-commit-config.yaml symlink into the Nix store). A
+    # fresh worktree does not have it, and the hook then refuses the commit, so
+    # link the operator's copy in. Only an ignored file is linked, so it can
+    # never be staged.
+    for f in .pre-commit-config.yaml; do
+      if [ -e "$root/$f" ] && [ ! -e "$wt/$f" ] && git -C "$root" check-ignore -q -- "$f"; then
+        ln -s "$(readlink -f "$root/$f")" "$wt/$f"
+      fi
+    done
     before="$(git -C "$wt" status --porcelain=v1 --untracked-files=all)"
     local rc=0
     apply_edit "$wt/$rel" "$wt" "$v" || rc=$?
