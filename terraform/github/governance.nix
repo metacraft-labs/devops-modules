@@ -56,6 +56,7 @@ let
     length
     listToAttrs
     map
+    mapAttrs
     replaceStrings
     sort
     throw
@@ -345,6 +346,132 @@ let
       security_and_analysis = [ (securityAndAnalysisBlock repo) ];
     }
   );
+
+  # Terraform-only repository creation (opt-in `seed`; README "Creating a
+  # repository with Terraform alone"). A Terraform-created repository is empty,
+  # and GitHub makes the first branch pushed to an empty repository its default.
+  # The seed pushes exactly one commit to the mainline, so `main` never exists.
+  # Every resource naming the repository is ordered after it, which includes
+  # github_branch_default and the rulesets. With no `seed` row, nothing here
+  # renders and no resource gains a depends_on.
+  seededRepositories = filter (repo: repo ? seed) governance.repositories;
+  seedViolations = concatMap (
+    repo:
+    (
+      if repo.archived or false then [ "${repo.name}: an archived repository cannot be seeded" ] else [ ]
+    )
+    ++ (
+      if !(repo.seed ? authorName && repo.seed ? authorEmail) then
+        [ "${repo.name}: seed needs authorName and authorEmail (the first commit is permanent)" ]
+      else
+        [ ]
+    )
+  ) seededRepositories;
+  seedResourceName = name: governanceResourceKey "seed:${name}";
+  repositoryNodeIdRef = name: terraformRef "github_repository.${repositoryResourceName name}.node_id";
+  # Values passed through to Terraform verbatim: escape its template syntax.
+  terraformLiteral = replaceStrings [ "\${" "%{" ] [ "$\${" "%%{" ];
+  # Written without `${` / `%{`, so Terraform passes it to bash unchanged.
+  repositorySeedScript = ''
+    set -euo pipefail
+    remote="$(printenv GOVERNANCE_SEED_REMOTE || true)"
+    if [ -z "$remote" ]; then
+      token="$(printenv GITHUB_TOKEN || true)"
+      if [ -z "$token" ]; then
+        echo "governance seed: GITHUB_TOKEN is not set" >&2
+        exit 1
+      fi
+      remote="https://github.com/$SEED_OWNER/$SEED_REPOSITORY.git"
+      export GIT_CONFIG_COUNT=1
+      export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+      GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
+      export GIT_CONFIG_VALUE_0
+    fi
+    export GIT_TERMINAL_PROMPT=0
+    heads="$(git ls-remote --heads "$remote")"
+    if printf '%s\n' "$heads" | grep -q "[[:space:]]refs/heads/$SEED_BRANCH\$"; then
+      echo "governance seed: $SEED_OWNER/$SEED_REPOSITORY already has $SEED_BRANCH; nothing to do"
+      exit 0
+    fi
+    if [ -n "$heads" ]; then
+      echo "governance seed: $SEED_OWNER/$SEED_REPOSITORY has branches but not $SEED_BRANCH; refusing to seed (it would not become the default)" >&2
+      exit 1
+    fi
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT
+    git -C "$work" init -q -b "$SEED_BRANCH"
+    printf '%s' "$SEED_README" > "$work/README.md"
+    git -C "$work" add README.md
+    git -C "$work" -c user.name="$SEED_AUTHOR_NAME" -c user.email="$SEED_AUTHOR_EMAIL" \
+      -c commit.gpgsign=false commit -q -m "$SEED_MESSAGE"
+    git -C "$work" push -q "$remote" "HEAD:refs/heads/$SEED_BRANCH"
+    echo "governance seed: pushed $SEED_BRANCH to $SEED_OWNER/$SEED_REPOSITORY"
+  '';
+  repositorySeedResources =
+    listToResourceAttrs seededRepositories (repo: "seed:${repo.name}")
+      (repo: {
+        triggers_replace = [
+          (repositoryNodeIdRef repo.name)
+          repo.defaultBranch
+        ];
+        provisioner = [
+          {
+            local-exec = {
+              interpreter = [
+                "bash"
+                "-c"
+              ];
+              command = repositorySeedScript;
+              environment = {
+                SEED_OWNER = githubOwner;
+                SEED_REPOSITORY = repo.name;
+                SEED_BRANCH = repo.defaultBranch;
+                SEED_AUTHOR_NAME = terraformLiteral repo.seed.authorName;
+                SEED_AUTHOR_EMAIL = terraformLiteral repo.seed.authorEmail;
+                SEED_MESSAGE = terraformLiteral (repo.seed.message or "Initial commit");
+                SEED_README = terraformLiteral (
+                  repo.seed.readme
+                    or ("# ${repo.name}\n" + (if repo ? description then "\n${repo.description}\n" else ""))
+                );
+              };
+            };
+          }
+        ];
+      });
+  # The seed a resource instance must wait for, or null. A resource names its
+  # repository by `repository` (bare name) or by `repository_id` (the node_id
+  # reference used by classic branch protection).
+  seedDependencyOf =
+    instance:
+    let
+      byName = filter (
+        repo:
+        (instance.repository or null) == repo.name
+        || (instance.repository_id or null) == repositoryNodeIdRef repo.name
+      ) seededRepositories;
+    in
+    if byName == [ ] then null else "terraform_data.${seedResourceName (head byName).name}";
+  orderAfterSeeds =
+    resourcesByType:
+    if seededRepositories == [ ] then
+      resourcesByType
+    else
+      mapAttrs (
+        type: instances:
+        if type == "terraform_data" || type == "github_repository" then
+          instances
+        else
+          mapAttrs (
+            _: instance:
+            let
+              dependency = seedDependencyOf instance;
+            in
+            if dependency == null then
+              instance
+            else
+              instance // { depends_on = (instance.depends_on or [ ]) ++ [ dependency ]; }
+          ) instances
+      ) resourcesByType;
 
   # Dependabot alerts and Dependabot security updates are free on every GitHub
   # plan and both visibilities, and each is its own importable resource keyed by
@@ -896,6 +1023,7 @@ let
     // optionalAttrs (membershipResources != { }) { github_membership = membershipResources; }
     // optionalAttrs (repositoryResources != { }) { github_repository = repositoryResources; }
     // optionalAttrs (branchDefaultResources != { }) { github_branch_default = branchDefaultResources; }
+    // optionalAttrs (repositorySeedResources != { }) { terraform_data = repositorySeedResources; }
     // optionalAttrs (repositoryCollaboratorResources != { }) {
       github_repository_collaborator = repositoryCollaboratorResources;
     }
@@ -1161,8 +1289,10 @@ let
       throw "governance: environment deployment-branch patterns are inconsistent:\n  - ${concatStringsSep "\n  - " environmentBranchPatternViolations}"
     else if mergeMethodViolations != [ ] then
       throw "governance: merge-method settings leave pull requests unmergeable:\n  - ${concatStringsSep "\n  - " mergeMethodViolations}"
+    else if seedViolations != [ ] then
+      throw "governance: repository seed settings are invalid:\n  - ${concatStringsSep "\n  - " seedViolations}"
     else
-      resources;
+      orderAfterSeeds resources;
 
   countTopics = foldl' (sum: repo: sum + length (repo.topics or [ ])) 0 governance.repositories;
 
