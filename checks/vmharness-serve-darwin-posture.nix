@@ -45,7 +45,7 @@ top@{ ... }:
               {
                 networking.hostName = "vmh-serve-posture-fixture";
                 system.stateVersion = 6;
-                services.vm-harness-serve = {
+                services.gosti-serve = {
                   enable = true;
                   # Loopback + a fixed port so the check can stand a REAL
                   # HTTP responder at the probe URL. The script bakes the

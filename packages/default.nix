@@ -270,7 +270,9 @@
         # RA1 remoting daemon), which `services.vm-harness-serve` packages into a
         # hardened systemd unit. Vendored (like garm-provider-vmharness) to keep
         # this repo's flake.lock free of vm-harness's own input tree.
-        vm-harness = pkgs.callPackage ./vm-harness { };
+        gosti = pkgs.callPackage ./gosti { };
+        # GOSTI1b: the pre-rename attribute name, kept as an alias.
+        vm-harness = self'.packages.gosti;
       }
       // optionalAttrs isLinux {
         deployment-event-metrics = pkgs.callPackage ./deployment-event-metrics { };

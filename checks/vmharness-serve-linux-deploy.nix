@@ -139,7 +139,7 @@ top@{ ... }:
                 image.enable = false;
               };
 
-              services.vm-harness-serve = {
+              services.gosti-serve = {
                 enable = true;
                 listenAddress = overlayHostIp; # bind the OVERLAY address only
                 port = servePort;

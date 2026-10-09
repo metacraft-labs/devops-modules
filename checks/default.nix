@@ -59,6 +59,7 @@
     ./vmharness-serve-linux-deploy.nix
     ./vmharness-serve-inventory-textfile.nix
     ./vmharness-serve-darwin-posture.nix
+    ./gosti-serve-rename.nix
     ./vmharness-serve-win-libvirt.nix
     ./runner-label-taxonomy.nix
     ./s3-artifact-store.nix
