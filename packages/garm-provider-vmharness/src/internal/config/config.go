@@ -206,6 +206,14 @@ type Config struct {
 	// milestones can wire it without changing the protocol surface.
 	VMHarnessPath string `toml:"vm_harness_path"`
 
+	// DetachBootstrap makes the vm-harness-run backends (tart-*, linux/macOS
+	// guests) start the runner bootstrap with `run --detach-script` instead of
+	// in the foreground of one SSH session. In the foreground form a single
+	// stalled connection SIGHUPs the runner mid-job ("lost communication with
+	// the server"). Opt-in because it needs a vm-harness that knows the flag:
+	// set it only where `vm_harness_path` points at one.
+	DetachBootstrap bool `toml:"detach_bootstrap"`
+
 	// QemuImgPath is the path to the `qemu-img` binary used to create the
 	// per-job CoW overlay over the golden (M4 clone path). Defaults to
 	// "qemu-img" (resolved via PATH).
