@@ -412,8 +412,15 @@ jobs:
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
           ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
           ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
-          PRECALC_MATRIX: ${{ steps.merge.outputs.full_matrix }}
-        run: ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} print-table
+        # The full matrix is passed as a FILE (PRECALC_MATRIX=@path). Inline it
+        # outgrew Linux's 128 KiB per-string argv/env limit and the runner
+        # failed to start the step's shell ("Argument list too long").
+        run: |
+          matrix_file="$RUNNER_TEMP/precalc-matrix.json"
+          cat > "$matrix_file" <<'MCL_PRECALC_MATRIX_EOF'
+          ${{ steps.merge.outputs.full_matrix }}
+          MCL_PRECALC_MATRIX_EOF
+          PRECALC_MATRIX="@$matrix_file" ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} print-table
 
       - name: Post CI matrix comment
         uses: metacraft-labs/devops-modules/.github/sticky-comment@dev
@@ -1100,12 +1107,17 @@ jobs:
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
           ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
           ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
-          PRECALC_MATRIX: ${{
+        # Passed as a file, see "Generate CI matrix comment".
+        run: |
+          matrix_file="$RUNNER_TEMP/precalc-matrix.json"
+          cat > "$matrix_file" <<'MCL_PRECALC_MATRIX_EOF'
+          ${{
             needs.merge-matrices.result == 'success' &&
             needs.merge-matrices.outputs.full_matrix ||
             needs.shard-matrix.outputs.full_matrix
-            }}
-        run: ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} print-table
+          }}
+          MCL_PRECALC_MATRIX_EOF
+          PRECALC_MATRIX="@$matrix_file" ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} print-table
 
       - name: Update GitHub Comment
         uses: metacraft-labs/devops-modules/.github/sticky-comment@dev
