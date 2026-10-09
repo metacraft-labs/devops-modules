@@ -496,7 +496,9 @@ let
   otherResources = resources recordsResourceName recordsComment {
     type = "\${each.value.type}";
     content = "\${each.value.content}";
-    priority = "\${each.value.priority}";
+    # try(): a renderer that drops null attributes (terranix does) leaves the
+    # TXT entries without `priority` at all.
+    priority = "\${try(each.value.priority, null)}";
   } otherRecords;
 
   all' = dkimResources // otherResources;

@@ -199,6 +199,13 @@ let
           ]
         );
 
+    # terranix drops null attributes, so a TXT entry reaches Terraform with no
+    # `priority` at all; a bare each.value.priority then fails the plan
+    # ("Unsupported attribute"), as the first consumer plan showed.
+    "priority is read through try(), so null-dropping renderers still plan" =
+      (render (two google)).resource.cloudflare_dns_record.mail_auth.priority
+      == "\${try(each.value.priority, null)}";
+
     "SPF is one quoted TXT, ~all by default" =
       (mail (two google))."example.com|TXT|spf".content == "\"v=spf1 include:_spf.google.com ~all\"";
     "DMARC tags render in RFC order, quoted" =

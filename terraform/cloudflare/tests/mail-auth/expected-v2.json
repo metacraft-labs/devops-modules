@@ -84,7 +84,7 @@
           }
         },
         "name": "${each.value.name}",
-        "priority": "${each.value.priority}",
+        "priority": "${try(each.value.priority, null)}",
         "proxied": false,
         "ttl": 1,
         "type": "${each.value.type}",
@@ -139,7 +139,7 @@
           }
         },
         "name": "${each.value.name}",
-        "priority": "${each.value.priority}",
+        "priority": "${try(each.value.priority, null)}",
         "proxied": false,
         "ttl": 1,
         "type": "${each.value.type}",
