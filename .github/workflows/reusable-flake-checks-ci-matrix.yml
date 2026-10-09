@@ -217,6 +217,18 @@ jobs:
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
           nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
+          # Nix reads a private cache through netrc, and setup-nix writes netrc
+          # in its own `Configure Nix` step — BEFORE `Probe binary caches`.
+          # Passing the pull token here is what lets that probe authenticate.
+          # Without it the probe gets HTTP 401 and probe-substituters.sh REMOVES
+          # the private cache from nix.conf for the remainder of the job, so
+          # every path only that cache holds is rebuilt from source. The
+          # standalone netrc step that follows runs after the probe, and it only
+          # writes netrc — it cannot restore an already-dropped substituter.
+          #
+          # Uploads stay off: `Start Attic watch-store` also requires
+          # `attic-cache`, which no job here passes, and push-to-cache is false.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
 
       - name: Authenticate nix to the private Attic cache
         shell: bash
@@ -272,6 +284,18 @@ jobs:
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
           nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
+          # Nix reads a private cache through netrc, and setup-nix writes netrc
+          # in its own `Configure Nix` step — BEFORE `Probe binary caches`.
+          # Passing the pull token here is what lets that probe authenticate.
+          # Without it the probe gets HTTP 401 and probe-substituters.sh REMOVES
+          # the private cache from nix.conf for the remainder of the job, so
+          # every path only that cache holds is rebuilt from source. The
+          # standalone netrc step that follows runs after the probe, and it only
+          # writes netrc — it cannot restore an already-dropped substituter.
+          #
+          # Uploads stay off: `Start Attic watch-store` also requires
+          # `attic-cache`, which no job here passes, and push-to-cache is false.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
 
       - name: Authenticate nix to the private Attic cache
         shell: bash
@@ -339,6 +363,18 @@ jobs:
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
           nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
+          # Nix reads a private cache through netrc, and setup-nix writes netrc
+          # in its own `Configure Nix` step — BEFORE `Probe binary caches`.
+          # Passing the pull token here is what lets that probe authenticate.
+          # Without it the probe gets HTTP 401 and probe-substituters.sh REMOVES
+          # the private cache from nix.conf for the remainder of the job, so
+          # every path only that cache holds is rebuilt from source. The
+          # standalone netrc step that follows runs after the probe, and it only
+          # writes netrc — it cannot restore an already-dropped substituter.
+          #
+          # Uploads stay off: `Start Attic watch-store` also requires
+          # `attic-cache`, which no job here passes, and push-to-cache is false.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
 
       - name: Authenticate nix to the private Attic cache
         shell: bash
@@ -738,6 +774,18 @@ jobs:
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
           nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
+          # Nix reads a private cache through netrc, and setup-nix writes netrc
+          # in its own `Configure Nix` step — BEFORE `Probe binary caches`.
+          # Passing the pull token here is what lets that probe authenticate.
+          # Without it the probe gets HTTP 401 and probe-substituters.sh REMOVES
+          # the private cache from nix.conf for the remainder of the job, so
+          # every path only that cache holds is rebuilt from source. The
+          # standalone netrc step that follows runs after the probe, and it only
+          # writes netrc — it cannot restore an already-dropped substituter.
+          #
+          # Uploads stay off: `Start Attic watch-store` also requires
+          # `attic-cache`, which no job here passes, and push-to-cache is false.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
 
       - name: Authenticate nix to the private Attic cache
         shell: bash
@@ -1140,6 +1188,18 @@ jobs:
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
           nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
+          # Nix reads a private cache through netrc, and setup-nix writes netrc
+          # in its own `Configure Nix` step — BEFORE `Probe binary caches`.
+          # Passing the pull token here is what lets that probe authenticate.
+          # Without it the probe gets HTTP 401 and probe-substituters.sh REMOVES
+          # the private cache from nix.conf for the remainder of the job, so
+          # every path only that cache holds is rebuilt from source. The
+          # standalone netrc step that follows runs after the probe, and it only
+          # writes netrc — it cannot restore an already-dropped substituter.
+          #
+          # Uploads stay off: `Start Attic watch-store` also requires
+          # `attic-cache`, which no job here passes, and push-to-cache is false.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
 
       - name: Print CI Matrix
         env:
