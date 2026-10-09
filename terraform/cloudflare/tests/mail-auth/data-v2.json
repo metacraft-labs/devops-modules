@@ -1,0 +1,37 @@
+{
+  "version": 2,
+  "domains": {
+    "example.com": {
+      "zone_id": "0123456789abcdef0123456789abcdef",
+      "dkim": {
+        "google": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAexample+/="
+      },
+      "google_verification": ["google-site-verification=AbCdEfGh_12345-xyz"],
+      "mx": [
+        { "priority": 1, "host": "aspmx.l.google.com" },
+        { "priority": 5, "host": "alt1.aspmx.l.google.com" }
+      ],
+      "spf": { "include": ["mailgun.org", "_spf.google.com"], "all": "~all" },
+      "dmarc": { "p": "reject", "pct": 100, "adkim": "s", "aspf": "s" }
+    },
+    "example.net": {
+      "zone_id": "fedcba9876543210fedcba9876543210",
+      "dkim": {},
+      "google_verification": ["google-site-verification=NetToken_000000"],
+      "mx": [{ "priority": 1, "host": "smtp.google.com" }],
+      "spf": { "include": ["_spf.google.com"] },
+      "dmarc": { "p": "none", "rua": ["mailto:dmarc@example.com"] }
+    },
+    "example.org": {
+      "zone_lookup": "example_org",
+      "dkim": {
+        "google": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAorg"
+      },
+      "mx": [{ "priority": 1, "host": "smtp.google.com" }],
+      "dmarc": { "p": "none", "rua": ["mailto:dmarc@example.com"] }
+    },
+    "example.io": {
+      "zone_id": "11111111111111111111111111111111"
+    }
+  }
+}
