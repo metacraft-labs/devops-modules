@@ -702,6 +702,43 @@ let
         }
       );
 
+  # Custom deployment-branch policies: `deploymentBranchPolicy.branchPatterns`
+  # names the branches allowed to deploy to an Environment. GitHub models the
+  # policy MODE on the Environment (custom_branch_policies) and each allowed
+  # NAME as its own object, so the mode alone, which is all the booleans
+  # express, leaves an Environment that accepts no branch, or, with no policy
+  # at all, any branch. Each pattern references its Environment resource so
+  # Terraform creates the Environment first.
+  environmentKey = environment: "environment:${environment.repository}:${environment.environment}";
+  environmentBranchPatterns = concatMap (
+    environment:
+    map (pattern: { inherit environment pattern; }) (
+      (environment.deploymentBranchPolicy or { }).branchPatterns or [ ]
+    )
+  ) governance.repositoryEnvironments;
+  environmentBranchPatternViolations = concatMap (
+    environment:
+    let
+      policy = environment.deploymentBranchPolicy or { };
+    in
+    if (policy.branchPatterns or [ ]) == [ ] then
+      [ ]
+    else if !(policy.customBranchPolicies or false) || (policy.protectedBranches or false) then
+      [
+        "${environment.repository}:${environment.environment}: branchPatterns need customBranchPolicies = true and protectedBranches = false (GitHub allows only one mode)"
+      ]
+    else
+      [ ]
+  ) governance.repositoryEnvironments;
+  repositoryEnvironmentDeploymentPolicyResources =
+    listToResourceAttrs environmentBranchPatterns
+      (p: "${environmentKey p.environment}:branch:${p.pattern}")
+      (p: {
+        repository = p.environment.repository;
+        environment = "\${github_repository_environment.${governanceResourceKey (environmentKey p.environment)}.environment}";
+        branch_pattern = p.pattern;
+      });
+
   actionsRepositoryPermissionResources =
     listToResourceAttrs governance.actionsRepositoryPermissions
       (permissions: "actions-repository-permissions:${permissions.repository}")
@@ -886,6 +923,9 @@ let
     }
     // optionalAttrs (repositoryEnvironmentResources != { }) {
       github_repository_environment = repositoryEnvironmentResources;
+    }
+    // optionalAttrs (repositoryEnvironmentDeploymentPolicyResources != { }) {
+      github_repository_environment_deployment_policy = repositoryEnvironmentDeploymentPolicyResources;
     }
     // optionalAttrs (actionsRepositoryPermissionResources != { }) {
       github_actions_repository_permissions = actionsRepositoryPermissionResources;
@@ -1117,6 +1157,8 @@ let
   checkedResources =
     if noBypassViolations != [ ] then
       throw "governance: the no-bypass branch-protection policy is violated:\n  - ${concatStringsSep "\n  - " noBypassViolations}"
+    else if environmentBranchPatternViolations != [ ] then
+      throw "governance: environment deployment-branch patterns are inconsistent:\n  - ${concatStringsSep "\n  - " environmentBranchPatternViolations}"
     else if mergeMethodViolations != [ ] then
       throw "governance: merge-method settings leave pull requests unmergeable:\n  - ${concatStringsSep "\n  - " mergeMethodViolations}"
     else
@@ -1283,6 +1325,11 @@ in
     github_governance_environment_count = {
       value = countAttrs repositoryEnvironmentResources;
       description = "Repository Environment resources emitted by the governance model.";
+    };
+
+    github_governance_environment_deployment_policy_count = {
+      value = countAttrs repositoryEnvironmentDeploymentPolicyResources;
+      description = "Environment deployment-branch policy (allowed branch pattern) resources emitted by the governance model.";
     };
 
     github_governance_actions_repository_permissions_count = {

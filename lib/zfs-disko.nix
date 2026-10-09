@@ -148,7 +148,18 @@ rec {
               "com.sun:auto-snapshot" = "true";
               canmount = "on";
               mountpoint = "legacy";
-              refreservation = "200GiB";
+              # A plain `reservation`, not `refreservation`: both guarantee /home
+              # 200 GiB, but a refreservation must ALSO be re-guaranteed in full
+              # the moment a snapshot exists (every block the dataset references
+              # becomes shared with it), so with less than 200 GiB free in the
+              # pool every `zfs snapshot` of /home fails with "out of space".
+              # That broke Agent Harbor's copy-on-write workspaces and the
+              # snapshot-first /home procedures in infra's runbooks. A reservation
+              # counts snapshots against the same 200 GiB instead.
+              # Existing pools keep the old property until it is changed in place:
+              #   zfs set reservation=200GiB <pool>/root/home
+              #   zfs set refreservation=none <pool>/root/home
+              reservation = "200GiB";
             };
           };
 

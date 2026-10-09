@@ -320,6 +320,16 @@ plus a **secret manifest** and the GitHub-encrypted **payloads** rendered by
 exposes the rich `output` block the bootstrap helper reads. It is the engine
 behind each org's `terraform/github/<name>-governance-prod` root.
 
+**Environment deployment-branch patterns.** An Environment's
+`deploymentBranchPolicy` may name the branches allowed to deploy to it:
+`branchPatterns = [ "cloud" ]` together with `customBranchPolicies = true` and
+`protectedBranches = false`. Each pattern renders a
+`github_repository_environment_deployment_policy` bound to the Environment's
+resource. Without patterns, custom mode accepts no branch, and an Environment
+with no policy at all accepts any branch. Patterns under the protected-branches
+mode, or with custom policies off, are refused at eval time, since GitHub
+allows only one mode.
+
 **That root is Layer 1+, not Layer 0.** Org governance is policy, not pipeline
 plumbing: nothing the CI/CD pipeline needs in order to run lives in it, so it
 carries a `metadata.json` (`credential_mode: "github-app"`), is discovered by
