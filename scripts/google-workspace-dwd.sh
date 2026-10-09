@@ -15,7 +15,7 @@
 # organisation (or use an existing project) and administer its service accounts.
 #
 # setup is idempotent: it creates the project only if it does not exist, enables
-# the Admin SDK, Gmail and Organization Policy APIs, creates the service account
+# the Admin SDK, Gmail, Site Verification and Organization Policy APIs, creates the service account
 # only if missing, and prints the numeric client id, the full scope list and the
 # console page where a super admin approves them.
 #
@@ -164,9 +164,9 @@ case "$cmd" in
       gcloud projects create "$project" "${parent[@]}" --name "Workspace Admin API" >/dev/null
       echo "created project $project"
     fi
-    gcloud services enable admin.googleapis.com gmail.googleapis.com orgpolicy.googleapis.com \
-      --project "$project" >/dev/null
-    echo "enabled admin.googleapis.com, gmail.googleapis.com, orgpolicy.googleapis.com"
+    gcloud services enable admin.googleapis.com gmail.googleapis.com siteverification.googleapis.com \
+      orgpolicy.googleapis.com --project "$project" >/dev/null
+    echo "enabled admin.googleapis.com, gmail.googleapis.com, siteverification.googleapis.com, orgpolicy.googleapis.com"
     if gcloud iam service-accounts describe "$(sa_email)" --project "$project" >/dev/null 2>&1; then
       echo "service account $(sa_email) exists"
     else

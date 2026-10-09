@@ -51,16 +51,17 @@
 # domain's SPF and DMARC records for context. Non-zero on any mismatch.
 #
 # validate: step 2 alone, for a value in hand.
+# shellcheck source-path=SCRIPTDIR
 set -euo pipefail
 
 prog=google-workspace-dkim
 console_url="https://admin.google.com/ac/apps/gmail/authenticateemail"
 
-die() {
-  echo "$prog: $*" >&2
-  exit 1
-}
-say() { echo "$prog: $*" >&2; }
+# The PR flow and the DNS wait are shared with google-workspace-domains
+# (lib/pr-publish.sh). The package points GOOGLE_WORKSPACE_TOOLS_LIB at the
+# library directory; from a checkout it is beside this script.
+# shellcheck source=lib/pr-publish.sh
+. "${GOOGLE_WORKSPACE_TOOLS_LIB:-$(dirname -- "${BASH_SOURCE[0]}")/lib}/pr-publish.sh"
 
 usage="usage: $prog publish|check|validate ... (see the header of this script)"
 cmd="${1:-}"
@@ -101,33 +102,6 @@ fi
 record_name="${selector}._domainkey.${domain}"
 
 # ── value parsing ────────────────────────────────────────────────────────────
-
-# Concatenate the "…" character-strings of one line, the way a resolver hands
-# a TXT record back (dig +short) and the way consoles sometimes show a long
-# value. Backslash escapes (\" \\ \DDD) are decoded. Fails if anything but
-# whitespace sits outside the quotes, or a quote is left open.
-concat_strings() {
-  awk '{
-    out = ""; n = length($0); inq = 0; bad = 0; i = 1
-    while (i <= n) {
-      c = substr($0, i, 1)
-      if (inq) {
-        if (c == "\\") {
-          d = substr($0, i + 1, 3)
-          if (d ~ /^[0-9][0-9][0-9]$/) { out = out sprintf("%c", d + 0); i += 4; continue }
-          out = out substr($0, i + 1, 1); i += 2; continue
-        }
-        if (c == "\"") { inq = 0; i++; continue }
-        out = out c; i++; continue
-      }
-      if (c == "\"") { inq = 1; i++; continue }
-      if (c != " " && c != "\t") bad = 1
-      i++
-    }
-    if (inq || bad) exit 3
-    print out
-  }'
-}
 
 # One value from what an operator pasted: CRs dropped, lines joined, outer
 # whitespace trimmed; a quoted form is reassembled with concat_strings.
@@ -203,89 +177,20 @@ read_value() {
 
 # ── DNS ──────────────────────────────────────────────────────────────────────
 
-# Every TXT record at $1 on resolver $2, one reassembled value per line.
-lookup_txt() {
-  local name="$1" resolver="$2" out line
-  out="$(dig +short +time=5 +tries=2 ${dig_extra:+"$dig_extra"} TXT "$name" "@$resolver" 2>/dev/null)" || return 2
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    [[ $line == '"'* ]] || continue # a CNAME target or a comment line
-    printf '%s\n' "$line" | concat_strings || return 2
-  done <<<"$out"
+# 0 when server $1 answers exactly one TXT record at $record_name equal to
+# $want_value; the matcher wait_until_served polls.
+dkim_served() {
+  local got
+  got="$(lookup_txt "$record_name" "$1")" || return 1
+  [ "$got" = "$want_value" ]
 }
+dkim_answer() { lookup_txt "$record_name" "$1"; }
 
-dig_extra=""
-
-# 0 when every server in the remaining arguments answers exactly one TXT
-# record at $1 equal to $2.
-dns_matches() {
-  local name="$1" want="$2" r got
-  shift 2
-  for r in "$@"; do
-    got="$(lookup_txt "$name" "$r")" || return 1
-    [ "$got" = "$want" ] || return 1
-  done
-}
-
-# The nameservers of the zone holding $1: the NS set of the closest enclosing
-# name that has one, looked up through the first resolver. Empty if none.
-authoritative_servers() {
-  local n="$1" ns
-  while [[ $n == *.* ]]; do
-    ns="$(dig +short +time=5 +tries=2 NS "$n" "@${resolvers[0]}" 2>/dev/null | sed -n 's/\.$//; /^[A-Za-z0-9.-]*$/p' | sort -u)" || ns=""
-    if [ -n "$ns" ]; then
-      printf '%s\n' "$ns"
-      return 0
-    fi
-    n="${n#*.}"
-  done
-}
-
-# Two phases. Public resolvers cache a negative answer for the zone's SOA
-# minimum (1800 s on Cloudflare), so asking them before the record exists would
-# make them keep answering "no such name" for that long after the apply lands.
-# Phase 1 therefore asks the zone's own nameservers, non-recursively, until they
-# serve the value — that is the CI apply having run. Only then are the public
-# resolvers asked. Each phase is bounded by --dns-timeout.
+want_value=""
 wait_for_dns() {
-  local name="$1" want="$2" ns=()
-  mapfile -t ns < <(authoritative_servers "$domain")
-  if [ "${#ns[@]}" -gt 0 ]; then
-    dig_extra="+norecurse" poll_dns "$name" "$want" "the zone's nameservers (the apply has run)" "${ns[@]}"
-  else
-    say "could not find the nameservers of $domain; asking the public resolvers directly"
-  fi
-  poll_dns "$name" "$want" "the public resolvers" "${resolvers[@]}"
-}
-
-poll_dns() {
-  local name="$1" want="$2" what="$3" start now r got
-  shift 3
-  start="$(date +%s)"
-  say "waiting up to ${dns_timeout}s for $name to resolve to the value on $what: $*"
-  while :; do
-    if dns_matches "$name" "$want" "$@"; then
-      say "$name resolves to the published value on every one of $what"
-      return 0
-    fi
-    now="$(date +%s)"
-    if [ $((now - start)) -ge "$dns_timeout" ]; then
-      for r in "$@"; do
-        got="$(lookup_txt "$name" "$r" || true)"
-        say "  @$r answers: ${got:-<nothing>}"
-      done
-      die "$name did not resolve to the value on $what within ${dns_timeout}s (if the nameservers lag, check the Terraform apply run on the base branch; if only public resolvers lag, a cached negative answer expires within the zone's SOA minimum). Re-run to keep waiting, or '$prog check --domain $domain --selector $selector' to see what is published"
-    fi
-    for r in "$@"; do
-      got="$(lookup_txt "$name" "$r" || true)"
-      if [ -z "$got" ]; then
-        say "  [$((now - start))s] @$r: no TXT record yet"
-      else
-        say "  [$((now - start))s] @$r: a different value (${got:0:40}…)"
-      fi
-    done
-    sleep "$dns_interval"
-  done
+  want_value="$2"
+  wait_until_served "$domain" "$1" dkim_served dkim_answer \
+    "'$prog check --domain $domain --selector $selector' to see what is published"
 }
 
 # ── data file ────────────────────────────────────────────────────────────────
@@ -293,8 +198,8 @@ poll_dns() {
 # Exits with instructions unless FILE ($1) declares $domain.
 require_declared() {
   local f="$1"
-  jq -e '.version == 1' "$f" >/dev/null 2>&1 || die "$f is not a version-1 mail-auth data file (expected \"version\": 1)"
-  if ! jq -e --arg d "$domain" '.domains[$d].zone_id | type == "string"' "$f" >/dev/null; then
+  jq -e '.version == 1 or .version == 2' "$f" >/dev/null 2>&1 || die "$f is not a mail-auth data file (expected \"version\": 1 or 2)"
+  if ! jq -e --arg d "$domain" '.domains[$d] | (.zone_id // .zone_lookup) | type == "string"' "$f" >/dev/null; then
     cat >&2 <<EOF
 $prog: $domain is not declared in $f.
   Declare the domain and the Cloudflare zone that holds it first, in its own
@@ -484,153 +389,34 @@ EOF
     return 0
   fi
 
-  publish_pr "$root" "$rel" "$v"
+  publish_dkim_pr "$root" "$rel" "$v"
   wait_for_dns "$record_name" "$v"
   finish_message
 }
 
-# Branch, commit, push, PR, checks, merge. Returns once the value is on <base>,
-# or exits when it is not going to be (no --merge, or a check failed).
-publish_pr() {
-  local root="$1" rel="$2" v="$3" branch pr wt before after paths=() p head state
-  command -v gh >/dev/null || die "gh is required for the PR flow (or pass --no-pr)"
-  branch="dkim/$domain-$selector"
-  if [ -z "$base" ]; then
-    base="$(cd "$root" && gh repo view --json defaultBranchRef -q .defaultBranchRef.name)" ||
-      die "could not determine the default branch; pass --base"
-  fi
-  say "fetching origin/$base"
-  git -C "$root" fetch --quiet origin "$base"
+# The data file as a revision has it, compared with the pasted value.
+dkim_state() { compare_data "$1" "$pasted_value"; }
+dkim_edit() { apply_edit "$1" "$2" "$pasted_value"; }
 
-  if git -C "$root" show "origin/$base:$rel" >/dev/null 2>&1 &&
-    [ "$(git -C "$root" show "origin/$base:$rel" | compare_data /dev/stdin "$v")" = same ]; then
-    say "origin/$base already publishes this value for $record_name; skipping to the DNS wait"
-    return 0
-  fi
+pasted_value=""
+publish_dkim_pr() {
+  local root="$1" rel="$2"
+  pasted_value="$3"
+  # Regenerating in the console replaces the pending key, so an open PR may
+  # carry an older value than the one just pasted. Merging that would publish
+  # a key Google no longer signs with.
+  pr_subject="this value for $record_name"
+  pr_mismatch_msg="the open PR (dkim/$domain-$selector) carries a different value for $record_name than the one you pasted (was the key regenerated?). Close it and delete the branch, then re-run"
+  publish_pr "$root" "$rel" "dkim/$domain-$selector" \
+    "dkim: publish $record_name" \
+    "Publishes the Google Workspace DKIM public key for \`$domain\` (selector \`$selector\`, $key_bits-bit RSA) at \`$record_name\`.
 
-  pr="$(cd "$root" && gh pr list --head "$branch" --base "$base" --state open --json number -q '.[0].number // empty')"
-  if [ -n "$pr" ]; then
-    # Regenerating in the console replaces the pending key, so an open PR may
-    # carry an older value than the one just pasted. Merging that would publish
-    # a key Google no longer signs with.
-    git -C "$root" fetch --quiet origin "$branch" ||
-      die "PR #$pr is open but origin/$branch could not be fetched"
-    [ "$(git -C "$root" show "FETCH_HEAD:$rel" | compare_data /dev/stdin "$v")" = same ] ||
-      die "PR #$pr ($branch) carries a different value for $record_name than the one you pasted (was the key regenerated?). Close it and delete the branch, then re-run"
-    say "PR #$pr for $branch is already open with this value; resuming it"
-  else
-    wt="$(mktemp -d "${TMPDIR:-/tmp}/$prog.XXXXXX")"
-    trap 'git -C "'"$root"'" worktree remove --force "'"$wt"'" >/dev/null 2>&1 || true; rm -rf "'"$wt"'"' EXIT
-    git -C "$root" worktree add --quiet -B "$branch" "$wt" "origin/$base"
-    # Dev shells often generate the commit-hook configuration as an untracked,
-    # ignored file (a .pre-commit-config.yaml symlink into the Nix store). A
-    # fresh worktree does not have it, and the hook then refuses the commit, so
-    # link the operator's copy in. Only an ignored file is linked, so it can
-    # never be staged.
-    for f in .pre-commit-config.yaml; do
-      if [ -e "$root/$f" ] && [ ! -e "$wt/$f" ] && git -C "$root" check-ignore -q -- "$f"; then
-        ln -s "$(readlink -f "$root/$f")" "$wt/$f"
-      fi
-    done
-    before="$(git -C "$wt" status --porcelain=v1 --untracked-files=all)"
-    local rc=0
-    apply_edit "$wt/$rel" "$wt" "$v" || rc=$?
-    [ "$rc" = 0 ] || die "nothing to commit on $branch (the value is already there)"
-    after="$(git -C "$wt" status --porcelain=v1 --untracked-files=all)"
-    # Stage the data file and exactly the paths the hook changed.
-    paths=("$rel")
-    while IFS= read -r p; do
-      [ -n "$p" ] || continue
-      p="${p:3}"
-      p="${p##* -> }"
-      [ "$p" = "$rel" ] || paths+=("$p")
-    done < <(comm -13 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort))
-    say "staging: ${paths[*]}"
-    git -C "$wt" add -- "${paths[@]}"
-    local msg="dkim: publish $record_name
+Generated in the Admin console and validated by \`google-workspace-dkim publish\`. After this is applied and the record resolves, an admin clicks **Start authentication** for $domain." \
+    "dkim: publish $record_name
 
 Google Workspace DKIM key for $domain ($key_bits-bit RSA, selector $selector),
-generated in the Admin console and published by google-workspace-dkim."
-    if ! git -C "$wt" commit --quiet -m "$msg"; then
-      # A formatting hook may have rewritten the staged files; take its result once.
-      say "the commit hooks changed files; re-staging and committing again"
-      git -C "$wt" add -- "${paths[@]}"
-      git -C "$wt" commit --quiet -m "$msg" || die "commit failed in $wt"
-    fi
-    git -C "$wt" push --quiet --force-with-lease -u origin "$branch"
-    pr="$(cd "$wt" && gh pr create --base "$base" --head "$branch" \
-      --title "dkim: publish $record_name" \
-      --body "Publishes the Google Workspace DKIM public key for \`$domain\` (selector \`$selector\`, $key_bits-bit RSA) at \`$record_name\`.
-
-Generated in the Admin console and validated by \`google-workspace-dkim publish\`. After this is applied and the record resolves, an admin clicks **Start authentication** for $domain.")"
-    say "opened $pr"
-    pr="${pr##*/}"
-  fi
-
-  # The head is fixed before watching, so the merge below can only land the
-  # commit whose checks were watched.
-  head="$(cd "$root" && gh pr view "$pr" --json headRefOid -q .headRefOid)"
-  [ -n "$head" ] || die "could not read the head commit of PR #$pr"
-  watch_checks "$root" "$pr" "$head"
-  if [ "$merge" != 1 ]; then
-    say "checks passed on PR #$pr. Merge it, then re-run this command: it will skip to the DNS wait."
-    exit 0
-  fi
-  state="$(cd "$root" && gh pr checks "$pr" --json bucket -q '[.[].bucket] | map(select(. != "pass" and . != "skipping")) | length')"
-  [ "$state" = 0 ] || die "PR #$pr has checks that did not pass; not merging"
-  say "merging PR #$pr at ${head:0:12}"
-  (cd "$root" && gh pr merge "$pr" --merge --match-head-commit "$head") ||
-    die "gh pr merge refused (review required, or the head moved); merge PR #$pr by hand and re-run"
-}
-
-# Summarises the GitHub Actions workflow runs for commit $2: "ok" when every
-# run completed as success/skipped/neutral (or there are none), "bad" when one
-# concluded otherwise, "pending" while any is still running.
-runs_state() {
-  (cd "$1" && gh run list --commit "$2" --limit 200 --json status,conclusion -q '
-    [.[] | if .status != "completed" then "pending"
-           elif (.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") then "ok"
-           else "bad" end]
-    | if any(. == "bad") then "bad" elif any(. == "pending") then "pending" else "ok" end')
-}
-
-# Returns once every check of PR $2 passed and every workflow run for its head
-# $3 completed successfully; exits otherwise. `gh pr checks --watch` alone is
-# not enough: a job that `needs:` another, or a matrix computed by one, only
-# registers its check once that job finishes, so the watch can see "all passed"
-# while part of the pipeline does not exist yet. A workflow run stays
-# in_progress until all of its jobs have finished, so it closes that window.
-watch_checks() {
-  local root="$1" pr="$2" head="$3" tries=0 rounds=0 out rc runs
-  say "watching the checks of PR #$pr at ${head:0:12}"
-  while :; do
-    rc=0
-    out="$(cd "$root" && gh pr checks "$pr" --watch --interval 20 2>&1)" || rc=$?
-    if [ "$rc" = 0 ]; then
-      runs="$(runs_state "$root" "$head")" || die "could not list the workflow runs of ${head:0:12}"
-      case "$runs" in
-        ok)
-          say "all checks passed on PR #$pr, and every workflow run for ${head:0:12} completed"
-          return 0
-          ;;
-        bad) die "PR #$pr: a workflow run for ${head:0:12} did not succeed; fix it and re-run (the open PR is resumed)" ;;
-        *)
-          rounds=$((rounds + 1))
-          [ "$rounds" -le 180 ] || die "PR #$pr: workflow runs for ${head:0:12} still running after the checks passed; re-run to keep waiting"
-          say "the reported checks passed but workflow runs for ${head:0:12} are still running; watching again"
-          sleep "${GOOGLE_WORKSPACE_DKIM_CHECK_INTERVAL:-20}"
-          continue
-          ;;
-      esac
-    fi
-    if [[ $out == *"no checks reported"* ]] && [ "$tries" -lt 30 ]; then
-      tries=$((tries + 1))
-      sleep 10
-      continue
-    fi
-    printf '%s\n' "$out" >&2
-    die "PR #$pr: checks did not pass; fix it and re-run (the open PR is resumed)"
-  done
+generated in the Admin console and published by google-workspace-dkim." \
+    dkim_state dkim_edit
 }
 
 case "$cmd" in
