@@ -164,7 +164,7 @@
                 pkg.update(extra)
                 return pkg
 
-            def plan(packages, max_jobs, foundry="", push="false"):
+            def plan(packages, max_jobs, foundry="", push="false", systems=""):
                 with tempfile.TemporaryDirectory() as temp:
                     out = Path(temp) / "gh-output.env"
                     out.write_text("")
@@ -172,6 +172,8 @@
                     env.update({
                         "SOURCE_BUILD_MATRIX": json.dumps({"include": packages}),
                         "BUILD_MAX_JOBS": json.dumps(max_jobs),
+                        "BUILD_SYSTEMS": systems,
+                        "NOOP_RUNNER": json.dumps(["eph-linux-x64"]),
                         "FOUNDRY_DARWIN_BOOTSTRAP_RUNNER": foundry,
                         "PUSH_DEPLOYMENT_CACHES": push,
                         "GITHUB_OUTPUT": str(out),
@@ -233,6 +235,33 @@
                     [r.split("\t")[1] for r in rows] == [m["attrPath"] for m in entry["batch"]],
                     "batchTsv must carry the same attributes as the batch list",
                 )
+
+            # -- S. build-systems keeps only the named systems' outputs. ------
+            mixed = [package("dar-%d" % n) for n in range(5)] + [
+                package("lin-%d" % n, system="x86_64-linux") for n in range(4)
+            ]
+            linux_only = plan(mixed, {}, systems='["x86_64-linux"]')
+            check(
+                outputs_of(linux_only) == population([p for p in mixed if p["system"] == "x86_64-linux"]),
+                "build-systems [x86_64-linux] must build exactly the Linux outputs",
+            )
+            darwin_only = plan(mixed, {"aarch64-darwin": 2}, systems='["aarch64-darwin"]')
+            check(
+                len(darwin_only["include"]) == 2
+                and outputs_of(darwin_only) == population([p for p in mixed if p["system"] == "aarch64-darwin"]),
+                "build-systems must compose with build-max-jobs (5 Darwin outputs in 2 jobs)",
+            )
+            nothing = plan([p for p in mixed if p["system"] == "x86_64-linux"], {}, systems='["aarch64-darwin"]')
+            check(
+                len(nothing["include"]) == 1 and nothing["include"][0].get("noop") is True
+                and nothing["include"][0]["system"] == "x86_64-linux",
+                "a filter that leaves nothing must plan one Linux no-op, never an empty "
+                "plan (the build job would fall back to the UNFILTERED matrix)",
+            )
+            check(
+                "inputs.build-systems != '''" in workflow,
+                "plan-build-matrix must run whenever build-systems is set",
+            )
 
             # -- B. No cap for the system: one job per output, unchanged. -----
             unplanned = plan(fifty_one, {})
