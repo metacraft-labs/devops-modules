@@ -285,6 +285,10 @@ git -C "$repo" commit --quiet -am "declare example.biz" && git -C "$repo" push -
 echo dirty >"$repo/unrelated.txt"
 : >"$api_log"
 : >"$STUB_GH_LOG"
+# Google's verification reaches the Directory API only on the second read after
+# webResource.insert, so a tool that went on after insert alone would open the
+# records PR while the alias is still unverified.
+set_state '.verify_lag = 2'
 expect "onboard --merge opens, watches and merges two PRs" \
   run onboard --merge --dns-timeout 5 --domain example.biz --parent example.com --data "$data" --post-edit "$hook" --dmarc-rua dmarc@example.com
 expect "... first mail/<domain>-verification, then mail/<domain>-records" \
@@ -298,14 +302,19 @@ expect "... and the census line the hook added, nothing else" \
 expect "... a zone_lookup domain's addresses name its own resource" \
   bash -c 'git -C "$1" show "$2:census.expected" | grep -qF "cloudflare_dns_record.mail_auth_example_biz[\"example.biz|TXT|google-site-verification=example-biz-Tok_123\"]"' _ "$origin" "$v1"
 line_of() { grep -n -m1 -- "$1" "$api_log" | cut -d: -f1; }
-expect "... in the order alias -> token -> verification PR -> merge -> verify -> records PR" \
+expect "... in the order alias -> token -> verification PR -> merge -> verify -> Directory reports verified -> records PR" \
   bash -c 'a="$1"; for n in "$@"; do [ -n "$n" ] || exit 1; done; shift; for n in "$@"; do [ "$n" -gt "$a" ] || exit 1; a="$n"; done' _ \
   "$(line_of '^POST /admin/directory/v1/customer/my_customer/domainaliases')" \
   "$(line_of '^POST /siteVerification/v1/token')" \
   "$(line_of '^gh pr create.*example.biz-verification')" \
   "$(line_of '^gh pr merge 1 ')" \
   "$(line_of '^POST /siteVerification/v1/webResource')" \
+  "$(line_of '^READ example.biz verified=true$')" \
   "$(line_of '^gh pr create.*example.biz-records')"
+expect "... having seen the alias unverified after webResource.insert (the lag was exercised)" \
+  bash -c 'sed -n "/^POST \/siteVerification\/v1\/webResource/,\$p" "$1" | grep -qx "READ example.biz verified=false"' _ "$api_log"
+set_state '.verify_lag = 0'
+
 expect "... the records commit sets MX/SPF/DMARC" \
   bash -c 'git -C "$1" show "$2:dns/mail-auth.json" | jq -e ".domains[\"example.biz\"].mx == [{priority: 1, host: \"smtp.google.com\"}]" >/dev/null' _ "$origin" "$v2"
 expect "... each merge at the head it watched" \

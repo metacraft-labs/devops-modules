@@ -229,6 +229,16 @@ let
         builtins.match ".*_report.*example[.]net.*" k != null
         && builtins.match "example[.]net[.]_report.*" k == null
       ) (builtins.attrNames (mail fixture2)));
+    # Its zone is not this file's to write: the record is the consumer's job.
+    "an external DMARC report domain that is NOT declared renders no authorisation record" =
+      builtins.attrNames (
+        mail (two {
+          dmarc = {
+            p = "none";
+            rua = [ "mailto:dmarc@reports.example.net" ];
+          };
+        })
+      ) == [ "_dmarc.example.com|TXT" ];
 
     "a lookup zone gets its own resources, with the data-source reference" =
       let

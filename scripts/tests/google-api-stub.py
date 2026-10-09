@@ -11,13 +11,20 @@ it between runs:
     {"domains": {"example.com": {"isPrimary": true, "verified": true}},
      "aliases": {"example.org": {"parent": "example.com", "verified": false}},
      "deny_scopes": ["admin.directory.domain"],   # token refused: unauthorized_client
-     "site_api_disabled": false}                  # 403 accessNotConfigured
+     "site_api_disabled": false,                  # 403 accessNotConfigured
+     "verify_lag": 2}                             # see below
+
+getToken and webResource.insert answer 400 unless the site is INET_DOMAIN and
+the method DNS_TXT, the only form the tool may use for a domain.
 
 webResource.insert succeeds only when DNS_DIR/<domain> (the stub resolver's
 TXT answer for the apex) holds the token getToken issued; it then marks the
-domain or alias verified. Every request is appended to LOG as
-"<METHOD> <path> <scope the bearer token was minted for>". No network beyond
-127.0.0.1.
+domain or alias verified — at once, or, with "verify_lag": N, only on the Nth
+Directory read after it (Google's verification reaches the Directory API with a
+delay, and the tool must wait for it). Every request is appended to LOG as
+"<METHOD> <path> <scope the bearer token was minted for>", and every Directory
+read of a known domain or alias also as "READ <name> verified=<true|false>". No
+network beyond 127.0.0.1.
 """
 
 import base64
@@ -134,7 +141,11 @@ class H(BaseHTTPRequestHandler):
                 return
             b = json.loads(raw)
             domain = b["site"]["identifier"]
+            if b["site"].get("type") != "INET_DOMAIN":
+                return self.reply(400, {"error": {"code": 400, "message": "bad site type"}})
             if u.path == "/siteVerification/v1/token":
+                if b.get("verificationMethod") != "DNS_TXT":
+                    return self.reply(400, {"error": {"code": 400, "message": "bad verificationMethod"}})
                 return self.reply(200, {"method": "DNS_TXT", "token": token_for(domain)})
             if u.path == "/siteVerification/v1/webResource":
                 if urllib.parse.parse_qs(u.query).get("verificationMethod") != ["DNS_TXT"]:
@@ -149,9 +160,13 @@ class H(BaseHTTPRequestHandler):
                         400,
                         {"error": {"code": 400, "message": "The necessary verification token could not be found on your site."}},
                     )
+                lag = s.get("verify_lag", 0)
                 for coll in ("domains", "aliases"):
                     if domain in s[coll]:
-                        s[coll][domain]["verified"] = True
+                        if lag > 0:
+                            s[coll][domain]["reads_until_verified"] = lag
+                        else:
+                            s[coll][domain]["verified"] = True
                 save(s)
                 return self.reply(200, {"id": "dns://" + domain, "site": b["site"], "owners": ["admin@example.com"]})
         return self.reply(404, {"error": {"code": 404, "message": "no such stub route"}})
@@ -168,6 +183,14 @@ class H(BaseHTTPRequestHandler):
                 if name not in s[coll]:
                     return self.reply(404, {"error": {"code": 404, "message": "Resource Not Found: domain"}})
                 d = s[coll][name]
+                if d.get("reads_until_verified", 0) > 0:
+                    d["reads_until_verified"] -= 1
+                    if d["reads_until_verified"] == 0:
+                        del d["reads_until_verified"]
+                        d["verified"] = True
+                    save(s)
+                with open(LOG, "a") as f:
+                    f.write(f"READ {name} verified={str(d['verified']).lower()}\n")
                 if coll == "domains":
                     return self.reply(200, {"domainName": name, "isPrimary": d.get("isPrimary", False), "verified": d["verified"]})
                 return self.reply(200, {"domainAliasName": name, "parentDomainName": d["parent"], "verified": d["verified"]})
