@@ -366,6 +366,85 @@ org's inventory and secret facts. Only the mapper is shared. See
 [`governance.example.nix`](./governance.example.nix) for a minimal renderable
 model and [`tests/test-render.sh`](./tests/test-render.sh) for the offline check.
 
+### Creating a repository with Terraform alone (`seed`)
+
+Without help, a Terraform create of a modelled repository fails partway
+through the apply. `github_repository` creates an **empty** repository. Every
+repository also gets a `github_branch_default`, and that resource needs the
+mainline to exist. GitHub gives an empty repository no branches.
+
+A repository row may carry an opt-in `seed`:
+
+```nix
+{
+  name = "new-tool";
+  defaultBranch = "dev";
+  description = "One sentence.";
+  # …the usual fields…
+  seed = {
+    authorName = "Jane Operator";          # identity of the first commit
+    authorEmail = "jane@example.com";
+    message = "Initial commit";            # optional
+    readme = "# new-tool\n";               # optional; default "# <name>\n\n<description>\n"
+  };
+}
+```
+
+The engine then renders a `terraform_data.seed_<key>` whose `local-exec`
+provisioner pushes one commit (a `README.md`) to `refs/heads/<defaultBranch>`
+over HTTPS. It authenticates with the `GITHUB_TOKEN` the provider already uses.
+An empty repository takes the **first branch pushed** as its default branch, so
+the mainline becomes the default and `main` is never created. Every resource
+that names the repository, through `repository` or the `repository_id` node
+reference, gets a `depends_on` on the seed. Those resources include the
+`github_branch_default` and the rulesets, so a PR-only ruleset cannot exist yet
+when the seed push runs.
+
+Rejected alternatives, checked against `integrations/github` v6.12.1:
+
+- `github_repository.auto_init` commits to GitHub's default branch name, which
+  is usually `main`. That is the branch the `no-main-branch` ruleset forbids.
+  Creating it and deleting it afterwards still creates it. The org's default
+  branch name cannot be set through the API either.
+- `github_repository_file` with `branch = <mainline>` first checks that the
+  branch exists. `autocreate_branch` branches from a source ref, and an empty
+  repository has none. Without `branch`, the file is committed to the
+  repository's reported default branch, which is `main` again.
+- The Git database API (blobs, trees, commits, refs) returns 409 on an empty
+  repository.
+- `template` needs a template repository for each mainline name, and it copies
+  that repository's content.
+
+Properties:
+
+- **Opt-in and inert for everything else.** With no `seed` row, the render is
+  byte-identical to the render without this feature: no `terraform_data`, and
+  no `depends_on`. Existing repositories plan no diff.
+- **Idempotent.** The script lists the remote heads first. If the mainline
+  already exists, it exits 0 without pushing, so a re-run after a partial
+  apply, or a `seed` left on an adopted repository, does nothing. A repository
+  that has other branches but not the mainline is refused rather than pushed
+  to, because it would no longer take the mainline as its default.
+- **Runs once.** Provisioners run at create time only. The seed is replaced
+  only if the repository's `node_id` or the mainline name changes. Removing
+  `seed` once the repository exists destroys only the `terraform_data`, which
+  is a no-op on GitHub.
+- **Refused at eval:** a `seed` on an archived repository, and a `seed` without
+  `authorName`/`authorEmail`, because a public repository keeps its first
+  commit forever.
+- Requirements on the apply host: `bash`, `git` and `base64` on `PATH`. The
+  token must be able to push contents. A GitHub App installation token needs
+  `contents: write`. The token is passed to git through `GIT_CONFIG_*`
+  environment variables, so it never appears in a command line.
+  `GOVERNANCE_SEED_REMOTE`, when set, replaces the GitHub URL. It is the seam
+  the offline test uses to push to a local bare repository.
+
+[`tests/test-repository-seed.sh`](./tests/test-repository-seed.sh) checks the
+golden no-diff for unseeded repositories and the ordering in the render and the
+plan graph. It also runs a mock-provider `tofu test` apply whose real
+provisioner pushes to a local bare repository, then checks that only the
+mainline exists and that a second run is a no-op.
+
 ### Org-wide team grants
 
 `governance.teamRepositories` enumerates one grant per (team, repo). For an
