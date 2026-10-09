@@ -1,0 +1,95 @@
+name: 'vm-evidence-kvm'
+
+# TEMPORARY, MANUAL-ONLY evidence job.
+#
+# The two Incus VM gates below need the `kvm` Nix system feature. The shared
+# `[self-hosted, linux, x64]` class spans BOTH bare-metal hosts (which have
+# /dev/kvm, so Nix advertises `kvm`) AND ephemeral Incus-backed runners (which
+# default to `incusNestedKvm = false`, so they advertise `nixos-test` WITHOUT
+# `kvm`). A NixOS VM test that lands on the latter never runs; it dies at
+# scheduling with:
+#
+#   Reason: missing system features
+#   Required features: {kvm, nixos-test}
+#   Available features: {benchmark, big-parallel, nixos-test, uid-range}
+#
+# Which runner a job draws is luck, so the regular matrix cannot be used to
+# prove anything about these two gates. This workflow pins the class to
+# `bare-metal` so the result is deterministic, and reports each gate SEPARATELY
+# by name rather than as an aggregate.
+#
+# Delete this file once the matrix can route kvm-requiring outputs itself.
+on:
+  workflow_dispatch:
+
+jobs:
+  vm-evidence:
+    name: Incus VM gates on a kvm-capable runner
+    runs-on: [self-hosted, linux, x64, bare-metal]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Setup Nix
+        uses: ./.github/setup-nix
+        with:
+          push-to-cache: false
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || github.token }}
+          nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
+          nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+
+      # Fail loudly and EARLY if this runner cannot run a NixOS VM test at all,
+      # so a scheduling failure is never mistaken for a test verdict.
+      - name: Assert this runner advertises kvm
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner: ${RUNNER_NAME:-unknown}"
+          ls -l /dev/kvm
+          feats="$(nix config show system-features 2>/dev/null || nix show-config system-features)"
+          echo "system-features: $feats"
+          case "$feats" in
+            *kvm*) echo "OK: kvm present" ;;
+            *) echo "::error title=No kvm on this runner::This runner cannot execute NixOS VM tests; the results below would be scheduling failures, not verdicts."; exit 1 ;;
+          esac
+
+      - name: t_garm_incus_runner_host
+        id: runner_host
+        shell: bash
+        run: |
+          set -uo pipefail
+          nix build -L --no-link --show-trace \
+            '.#checks.x86_64-linux.t_garm_incus_runner_host'
+          echo "verdict=$?" >> "$GITHUB_OUTPUT"
+
+      - name: t_garm_incus_storage_pool_source
+        id: storage_pool
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          nix build -L --no-link --show-trace \
+            '.#checks.x86_64-linux.t_garm_incus_storage_pool_source'
+          echo "verdict=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Report each gate by name
+        if: always()
+        shell: bash
+        env:
+          RH: ${{ steps.runner_host.outcome }}
+          SP: ${{ steps.storage_pool.outcome }}
+        run: |
+          {
+            echo "### Incus VM gates (nixpkgs 26.05), runner ${RUNNER_NAME:-unknown}"
+            echo
+            echo "| gate | result |"
+            echo "| --- | --- |"
+            echo "| \`t_garm_incus_runner_host\` | $RH |"
+            echo "| \`t_garm_incus_storage_pool_source\` | $SP |"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+          echo "t_garm_incus_runner_host=$RH"
+          echo "t_garm_incus_storage_pool_source=$SP"
+          [[ "$RH" == success && "$SP" == success ]]
