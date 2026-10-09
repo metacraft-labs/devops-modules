@@ -33,6 +33,8 @@ publishes no API for it.
 | Custom admin roles and their assignment (e.g. creating the automation admin itself) | Admin SDK Directory      | `admin.directory.rolemanagement`                             |
 | Groups and memberships                                                              | Admin SDK Directory      | `admin.directory.group`                                      |
 | Read domains, org units                                                             | Admin SDK Directory      | `admin.directory.domain.readonly`, `admin.directory.orgunit` |
+| Add domains and domain aliases                                                      | Admin SDK Directory      | `admin.directory.domain`                                     |
+| Prove domain ownership through DNS (TXT token, verify)                              | Site Verification        | `siteverification`                                           |
 | Per-user Gmail settings: send-as, filters, forwarding, IMAP                         | Gmail API (as that user) | `gmail.settings.basic`, `gmail.settings.sharing`             |
 | Insert a message into a user's mailbox                                              | Gmail API (as that user) | `gmail.insert`                                               |
 | The `googleworkspace` Terraform provider                                            | the above                | whatever its resources need                                  |
@@ -43,6 +45,8 @@ for these; they need a person, or browser automation signed in as an admin:
 - approving the delegation itself (§4 below);
 - generating a domain's Gmail DKIM key and starting authentication
   ([Google-Workspace-DKIM.md](./Google-Workspace-DKIM.md));
+- "Activate Gmail" for a newly verified domain alias
+  ([Google-Workspace-Domains.md](./Google-Workspace-Domains.md));
 - a user's 2-Step Verification enrolment and app passwords.
 
 Re-check this list before automating around it: Google adds Admin SDK surface
@@ -92,7 +96,11 @@ re-run — each step is skipped when already done:
    `gcloud projects describe` does not find it. The project belongs to the
    organisation, not to the person running it. No billing account is needed: the
    Admin SDK and Gmail APIs are free.
-2. **APIs.** `gcloud services enable admin.googleapis.com gmail.googleapis.com orgpolicy.googleapis.com`.
+2. **APIs.** `gcloud services enable admin.googleapis.com gmail.googleapis.com siteverification.googleapis.com orgpolicy.googleapis.com`.
+   The Site Verification API is what
+   [`google-workspace-domains`](./Google-Workspace-Domains.md) uses to verify a
+   new domain; enabling it in a project made before it was added is the same
+   command (`setup` again is fine).
 3. **Service account.** `gcloud iam service-accounts create workspace-admin`
    (`--sa` changes the name). It needs **no** IAM role on the project: domain-wide
    delegation is granted in the Workspace Admin console, not in IAM.

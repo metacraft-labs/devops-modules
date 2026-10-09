@@ -123,18 +123,46 @@
           ]
           ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.xdg-utils;
           text = ''
+            export GOOGLE_WORKSPACE_TOOLS_LIB=${../scripts/lib}
             exec ${pkgs.runtimeShell} ${../scripts/google-workspace-dkim.sh} "$@"
+          '';
+        };
+        # Google Workspace domains: add a domain as a domain alias, verify it
+        # through DNS and switch its MX/SPF/DMARC, each DNS change through the
+        # consumer's Terraform data + PR (docs/Google-Workspace-Domains.md).
+        google-workspace-domains = pkgs.writeShellApplication {
+          name = "google-workspace-domains";
+          runtimeInputs = [
+            pkgs.coreutils
+            pkgs.dnsutils
+            pkgs.gawk
+            pkgs.gh
+            pkgs.git
+            pkgs.gnugrep
+            pkgs.gnused
+            pkgs.jq
+          ];
+          text = ''
+            export GOOGLE_WORKSPACE_TOOLS_LIB=${../scripts/lib}
+            export GOOGLE_WORKSPACE_DOMAINS_API="${
+              pkgs.python3.withPackages (p: [
+                p.google-auth
+                p.requests
+              ])
+            }/bin/python3 ${../scripts/google-workspace-domains-api.py}"
+            exec ${pkgs.runtimeShell} ${../scripts/google-workspace-domains.sh} "$@"
           '';
         };
         # The Workspace administration tools as one bundle, for consumer dev
         # shells: `packages = [ inputs'.nixos-modules.packages.workspace-admin-tools ]`
-        # puts gcloud and both helpers on PATH, so a consumer's recipes call them
+        # puts gcloud and the helpers on PATH, so a consumer's recipes call them
         # directly instead of `nix run`.
         workspace-admin-tools = pkgs.symlinkJoin {
           name = "workspace-admin-tools";
           paths = [
             self'.packages.google-workspace-dwd
             self'.packages.google-workspace-dkim
+            self'.packages.google-workspace-domains
             pkgs.google-cloud-sdk
           ];
         };
