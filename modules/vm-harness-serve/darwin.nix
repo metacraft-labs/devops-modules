@@ -866,6 +866,17 @@
             RunAtLoad = true;
             ThrottleInterval = 10;
 
+            # KEPT GUESTS MUST OUTLIVE A DAEMON RESTART. `run --ephemeral
+            # --keep` returns and leaves the guest's `tart run` process alive,
+            # still in THIS job's process group (sudo/asuser do not start a new
+            # one). When a job dies launchd kills every remaining process in its
+            # process group (launchd.plist(5)), so each daemon restart — every
+            # deploy that changes this plist, i.e. any package bump — kills
+            # every kept central-GARM guest on the host mid-job. The guests
+            # are owned and reaped through their handles (ephemeral-destroy /
+            # ephemeral-list), not through this daemon's lifetime.
+            AbandonProcessGroup = true;
+
             # THE macOS DEFAULT IS 256 AND IT IS NOT ENOUGH — measured, not
             # precautionary. `launchctl limit maxfiles` on m3 reports a SOFT
             # limit of 256, and a launchd daemon inherits it unless the plist
