@@ -37,6 +37,7 @@ publishes no API for it.
 | Prove domain ownership through DNS (TXT token, verify)                              | Site Verification        | `siteverification`                                           |
 | Per-user Gmail settings: send-as, filters, forwarding, IMAP                         | Gmail API (as that user) | `gmail.settings.basic`, `gmail.settings.sharing`             |
 | Insert a message into a user's mailbox                                              | Gmail API (as that user) | `gmail.insert`                                               |
+| Send a message as a user (e.g. a mail-rendering test loop)                          | Gmail API (as that user) | `gmail.send`                                                 |
 | The `googleworkspace` Terraform provider                                            | the above                | whatever its resources need                                  |
 
 **Not covered — console-only at the time of writing.** Google publishes no API

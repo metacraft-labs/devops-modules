@@ -62,6 +62,10 @@ declares it.
 - `--subject` is a **super admin**: adding a domain and verifying it are
   super-admin privileges, and the verification token is issued to that user.
 - `gh auth login`, with permission to open PRs on the consumer repo.
+- The `--dmarc-rua` mailbox **exists and accepts mail from outside the tenant**
+  (a Google group is the usual choice) before the second PR is applied. The
+  DMARC record starts sending aggregate reports to it at once, and reports to a
+  mailbox that does not exist bounce back to every receiver that sends one.
 
 ## 2. What `onboard` does, step by step
 
