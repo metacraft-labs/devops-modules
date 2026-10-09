@@ -56,6 +56,10 @@
 # --no-pr edits FILE in place for the next step and stops: commit it yourself,
 # and re-run once it is applied.
 #
+# $GOOGLE_WORKSPACE_DOMAINS_DNS_TIMEOUT and $GOOGLE_WORKSPACE_DOMAINS_VERIFY_TIMEOUT
+# set the defaults of --dns-timeout (1800 s per DNS phase) and --verify-timeout
+# (900 s).
+#
 # status: per domain, what the tenant knows (with --key/--subject) and what
 # public DNS serves for MX, SPF, DMARC, each verification token and each DKIM
 # selector, against FILE. Non-zero when anything FILE declares is not served.
@@ -80,7 +84,7 @@ case "$cmd" in -h | --help) set -- --help ;; esac
 domain="" parent="" data="" post_edit="" base="" merge=0 no_pr=0 all=0
 key="${GOOGLE_WORKSPACE_KEY:-}" subject="${GOOGLE_WORKSPACE_SUBJECT:-}"
 mx_spec="1:smtp.google.com" mx_explicit=0 spf_drop=() spf_replace=0 dmarc_rua=""
-dns_timeout=1800 verify_timeout=900
+dns_timeout="${GOOGLE_WORKSPACE_DOMAINS_DNS_TIMEOUT:-1800}" verify_timeout="${GOOGLE_WORKSPACE_DOMAINS_VERIFY_TIMEOUT:-900}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --domain) domain="${2:?--domain needs a value}"; shift 2 ;;
