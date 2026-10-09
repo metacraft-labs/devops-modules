@@ -44,10 +44,19 @@
             nix-fast-build
             nixos-rebuild-ng
             ;
-          inherit (self'.legacyPackages.inputs.ethereum-nix) foundry;
-        }
-        // optionalAttrs (system == "x86_64-linux" || system == "aarch64-darwin") {
-          inherit (self'.legacyPackages.inputs.ethereum-nix) geth;
+          # The Ethereum clients (foundry, geth, nimbus, erigon, nethermind,
+          # web3signer, mev-boost) are NOT in this matrix, by decision. They
+          # came from the `ethereum-nix` input, which pins its own nixpkgs to
+          # the end-of-life 25.05 release because the clients do not evaluate
+          # against newer ones. Building them here kept that package set alive
+          # in the tree and made every unrelated nixpkgs bump a cold rebuild of
+          # seven packages that then fail.
+          #
+          # Nothing deploys them any more: the one host that served a node was
+          # given a different role, so the matrix was the only thing still
+          # asking for them. The input itself is now unused except for a
+          # passthrough re-export in packages/default.nix, and can be dropped
+          # along with its pinned release in a change of its own.
         }
         // optionalAttrs isLinux {
           disko = self'.legacyPackages.inputs.disko.default;
@@ -62,13 +71,6 @@
             serve-d
             dmd
             ldc
-            ;
-          inherit (self'.legacyPackages.inputs.ethereum-nix)
-            mev-boost
-            nethermind
-            web3signer
-            nimbus
-            erigon
             ;
         };
     };
