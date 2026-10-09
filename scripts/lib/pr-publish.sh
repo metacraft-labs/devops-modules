@@ -70,11 +70,13 @@ lookup_txt() {
 }
 
 # Every MX record at $1 on resolver $2 as "<priority> <host>" lines, host
-# lowercased without the trailing dot, sorted.
+# lowercased without the trailing dot, sorted bytewise (LC_ALL=C: a locale's
+# collation ignores the space, and "10 a" vs "1 b" would then compare
+# differently from the jq-sorted expectation).
 lookup_mx() {
   local name="$1" resolver="$2" out
   out="$(dig +short +time=5 +tries=2 ${dig_extra:+"$dig_extra"} MX "$name" "@$resolver" 2>/dev/null)" || return 2
-  printf '%s\n' "$out" | awk 'NF == 2 && $1 ~ /^[0-9]+$/ { h = tolower($2); sub(/\.$/, "", h); print $1, h }' | sort
+  printf '%s\n' "$out" | awk 'NF == 2 && $1 ~ /^[0-9]+$/ { h = tolower($2); sub(/\.$/, "", h); print $1, h }' | LC_ALL=C sort
 }
 
 # The nameservers of the zone holding $1: the NS set of the closest enclosing

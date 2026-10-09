@@ -55,5 +55,6 @@ def mail_auth_dmarc($d):
          | join("; ")
     end;
 
-# "<priority> <host>" lines, sorted — the form lookup_mx prints.
+# "<priority> <host>" lines, sorted by codepoint — the form lookup_mx prints
+# (it sorts with LC_ALL=C; callers comparing the two should sort both alike).
 def mail_auth_mx($d): [(.domains[$d].mx // [])[] | "\(.priority) \(.host)"] | sort | .[];

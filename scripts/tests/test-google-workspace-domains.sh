@@ -188,7 +188,7 @@ EOF
 # example.com: the tenant's primary domain, on the legacy Google MX set with a
 # second sender in SPF and a strict DMARC policy.
 jq '.version = 2 | .domains["example.com"] += {
-  mx: [{priority: 1, host: "aspmx.l.google.com"}, {priority: 5, host: "alt1.aspmx.l.google.com"}],
+  mx: [{priority: 1, host: "aspmx.l.google.com"}, {priority: 5, host: "alt1.aspmx.l.google.com"}, {priority: 10, host: "alt3.aspmx.l.google.com"}],
   spf: {include: ["mailgun.org", "_spf.google.com"], all: "~all"},
   dmarc: {p: "reject", pct: 100, adkim: "s", aspf: "s"} }
   | .domains["example.net"] += {
@@ -345,7 +345,7 @@ expect "onboarding the primary domain adds no alias and no verification" \
 expect "... no domainAliases.insert and no getToken" \
   bash -c '! grep -qE "^POST /admin/directory/v1/customer/my_customer/domainaliases|^POST /siteVerification" "$1"' _ "$api_log"
 expect "... the legacy Google MX set is kept" \
-  test "$(jq -c '[.domains["example.com"].mx[].host]' "$data")" = '["aspmx.l.google.com","alt1.aspmx.l.google.com"]'
+  test "$(jq -c '[.domains["example.com"].mx[].host]' "$data")" = '["aspmx.l.google.com","alt1.aspmx.l.google.com","alt3.aspmx.l.google.com"]'
 expect "... the other sender stays in SPF next to Google" \
   test "$(jq -c '.domains["example.com"].spf' "$data")" = '{"include":["mailgun.org","_spf.google.com"],"all":"~all"}'
 expect "... and the existing DMARC policy is kept" \
@@ -381,6 +381,12 @@ expect "... saying what is served" output_has "MX       DIFFERS: declared 1 smtp
 "$STUB_APPLY"
 expect "status --all covers every declared domain" \
   bash -c 'bash "$1" status --all --data "$2" 2>/dev/null | grep -c "^== " | grep -qx 5' _ "$tool" "$data"
+# Priorities 1, 5 and 10: a collating sort puts "10 …" before "1 …", jq does
+# not. Both sides must be sorted alike whatever the operator's locale.
+for loc in C $(locale -a 2>/dev/null | grep -iE '^(en_US|C)\.utf-?8$' || true); do
+  expect "status of a multi-MX domain passes under LC_ALL=$loc" \
+    env LC_ALL="$loc" bash "$tool" status --domain example.com --data "$data"
+done
 expect "status runs without credentials (DNS only)" \
   env GOOGLE_WORKSPACE_KEY= bash "$tool" status --domain example.org --data "$data" >/dev/null 2>&1
 

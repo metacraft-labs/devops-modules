@@ -380,7 +380,7 @@ Opened by \`google-workspace-domains onboard\`."
     git -C "$root" fetch --quiet origin "$base"
     served="$(git -C "$root" show "origin/$base:$rel")"
   fi
-  want_mx="$(jqm -r --arg d "$domain" 'include "mail-auth"; mail_auth_mx($d)' <<<"$served")"
+  want_mx="$(jqm -r --arg d "$domain" 'include "mail-auth"; mail_auth_mx($d)' <<<"$served" | LC_ALL=C sort)"
   want_spf="$(jqm -r --arg d "$domain" 'include "mail-auth"; mail_auth_spf($d) // empty' <<<"$served")"
   want_dmarc="$(jqm -r --arg d "$domain" 'include "mail-auth"; mail_auth_dmarc($d) // empty' <<<"$served")"
   wait_until_served "$domain" "the MX, SPF and DMARC records of $domain" records_served records_answer \
@@ -433,7 +433,7 @@ status_domain() {
       status=1
     fi
   }
-  want="$(jqm -r --arg d "$d" 'include "mail-auth"; mail_auth_mx($d)' "$data_abs" | paste -sd, -)"
+  want="$(jqm -r --arg d "$d" 'include "mail-auth"; mail_auth_mx($d)' "$data_abs" | LC_ALL=C sort | paste -sd, -)"
   got="$(lookup_mx "$d" "$r" | paste -sd, -)"
   line MX "$want" "$got"
   want="$(jqm -r --arg d "$d" 'include "mail-auth"; mail_auth_spf($d) // empty' "$data_abs")"
