@@ -44,10 +44,38 @@
             nix-fast-build
             nixos-rebuild-ng
             ;
-          inherit (self'.legacyPackages.inputs.ethereum-nix) foundry;
-        }
-        // optionalAttrs (system == "x86_64-linux" || system == "aarch64-darwin") {
-          inherit (self'.legacyPackages.inputs.ethereum-nix) geth;
+          # The Ethereum clients (foundry, geth, nimbus, erigon, nethermind,
+          # web3signer, mev-boost) are NOT in this matrix, by decision. They
+          # came from the `ethereum-nix` input, which pins its own nixpkgs to
+          # the end-of-life 25.05 release because the clients do not evaluate
+          # against newer ones. Building them here kept that package set alive
+          # in the tree and made every unrelated nixpkgs bump a cold rebuild of
+          # seven packages that then fail.
+          #
+          # Nothing deploys them any more: the one host that served a node was
+          # given a different role, so no machine or module asks for them.
+          #
+          # ONE CONSUMER REMAINS, and it is not a deployment.
+          # nix-blockchain-development's DEFAULT devShell takes `geth` (and
+          # `nimbus` on x86_64-linux) from this same input, which it reaches by
+          # following ours. Those are the identical derivations this matrix used
+          # to build — measured, not assumed:
+          #
+          #   checks.x86_64-linux.geth   -> 4jh2r6adnja3fzdq2n2van02k30ik856
+          #   checks.x86_64-linux.nimbus -> 82nqj86qxqg6dgqx8n87yrzpg70winaw
+          #
+          # so this matrix was what populated the cache for that shell, and
+          # cache.nixos.org does not carry them. Entering that shell will build
+          # from source once the existing cache entries age out. That repo's own
+          # CI does not cover them: its `checks` re-export of geth/nimbus is
+          # commented out. If that shell is meant to stay warm, it should build
+          # them itself rather than rely on this matrix as a side effect.
+          #
+          # The input is otherwise reachable only through a passthrough
+          # re-export in packages/default.nix. Removing it (and its pinned
+          # end-of-life release) additionally requires dropping the
+          # `ethereum-nix` follows in nix-blockchain-development and
+          # nimbus-test, which would otherwise fail to lock.
         }
         // optionalAttrs isLinux {
           disko = self'.legacyPackages.inputs.disko.default;
@@ -62,13 +90,6 @@
             serve-d
             dmd
             ldc
-            ;
-          inherit (self'.legacyPackages.inputs.ethereum-nix)
-            mev-boost
-            nethermind
-            web3signer
-            nimbus
-            erigon
             ;
         };
     };
