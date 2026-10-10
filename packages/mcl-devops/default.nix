@@ -21,7 +21,7 @@ let
       util-linux
       bash
       coreutils
-      xorg.xrandr
+      xrandr
       alejandra
       openssh
       cachix

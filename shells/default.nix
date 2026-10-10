@@ -60,7 +60,15 @@
               tflint
             ]
             ++ pkgs.lib.optionals (pkgs.stdenv.system == "x86_64-linux") [
-              dmd
+              # nixpkgs' dmd 2.110.0 does not build against the gcc 15 that is
+              # now the default stdenv compiler: phobos compiles zlib through
+              # ImportC, and gcc 15's stddef.h uses `nullptr`, which DMD 2.110's
+              # C importer does not know ("undefined identifier `nullptr`").
+              # cache.nixos.org has no dmd 2.110.0, so this is broken upstream
+              # rather than local. ldc and dub above come from nixpkgs on
+              # purpose -- dlang.nix's are far older (ldc 1.30 vs 1.41) and
+              # cannot parse argparse 2.x, which breaks `dub test`.
+              inputs'.dlang-nix.packages.dmd
             ]
             ++ config.pre-commit.settings.enabledPackages
             ++ [ config.pre-commit.settings.package ];

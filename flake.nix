@@ -14,7 +14,7 @@
 
   inputs = {
     nixos-2505.url = "github:NixOS/nixpkgs/nixos-25.05";
-    nixos-2511.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixos-2605.url = "github:NixOS/nixpkgs/nixos-26.05";
 
     # Windows-Runner-Binary-Cache-Deploy M1 — the reprobuild flake provides the
     # `repro-binary-cache` package (the binary-cache HTTP daemon) that the
@@ -68,11 +68,11 @@
     # `repro`.
     reprobuild.url = "github:metacraft-labs/reprobuild/9ceb532d068c75659b76d05f5f2f1027f145b413";
 
-    nixpkgs.follows = "nixos-2511";
+    nixpkgs.follows = "nixos-2605";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     home-manager = {
-      url = "github:nix-community/home-manager/release-25.11";
+      url = "github:nix-community/home-manager/release-26.05";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 
@@ -82,7 +82,7 @@
     };
 
     nix-darwin = {
-      url = "github:nix-darwin/nix-darwin/nix-darwin-25.11";
+      url = "github:nix-darwin/nix-darwin/nix-darwin-26.05";
       inputs.nixpkgs.follows = "nixpkgs";
     };
 

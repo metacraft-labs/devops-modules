@@ -1,6 +1,6 @@
 let
   currentFlake = builtins.fromJSON (builtins.readFile ../flake.lock);
-  inherit (currentFlake.nodes.nixos-2511.locked)
+  inherit (currentFlake.nodes.nixos-2605.locked)
     owner
     repo
     rev

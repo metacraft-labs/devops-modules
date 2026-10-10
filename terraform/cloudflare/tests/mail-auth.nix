@@ -220,7 +220,8 @@ let
     "a verification token is keyed by its value" =
       (mail (two {
         google_verification = [ "google-site-verification=abcdefgh123" ];
-      })) ? "example.com|TXT|google-site-verification=abcdefgh123";
+      }))
+        ? "example.com|TXT|google-site-verification=abcdefgh123";
     "an external DMARC report domain that is declared gets its authorisation record" =
       (mail fixture2)."example.net._report._dmarc.example.com|TXT".content == "\"v=DMARC1\"";
     "a report domain that is the domain itself needs no authorisation record" =
