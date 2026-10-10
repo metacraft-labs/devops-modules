@@ -19,8 +19,15 @@ name: 'vm-evidence-kvm'
 # by name rather than as an aggregate.
 #
 # Delete this file once the matrix can route kvm-requiring outputs itself.
+#
+# Triggered by pushes to its own scratch branch: `workflow_dispatch` is only
+# dispatchable once the file is on the DEFAULT branch, and this job is not
+# worth putting on a mainline.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - ci/vm-evidence-nixpkgs-2605
 
 jobs:
   vm-evidence:
