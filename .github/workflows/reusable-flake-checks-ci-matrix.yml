@@ -57,6 +57,36 @@ on:
         default: '{}'
         required: false
         type: string
+      build-systems:
+        # Restrict the BUILD jobs to these Nix systems; empty = every system.
+        # Eval still covers every system. A caller can split one flake's CI
+        # into independent calls, e.g. a Linux call that gates a deployment and
+        # a Darwin call that only reports, so a starved macOS pool cannot hold
+        # a Linux deployment (infra, 2026-10-08: 27 queued aarch64-darwin legs
+        # behind other repositories' jobs blocked fleet publication). A filter
+        # that leaves nothing builds a single no-op instead of falling back to
+        # the unfiltered matrix.
+        description: 'JSON array of Nix systems whose outputs this call builds (empty = all)'
+        default: ''
+        required: false
+        type: string
+      build-timeout-minutes:
+        # A hung build used to hold its runner for GitHub's 360-minute default.
+        # On 2026-10-08 one `gprbuild | aarch64-darwin` job hung in `make` at 0%
+        # CPU on m3, the only macOS runner then taking work, and held it toward
+        # that 6 h limit, stalling every repository's macOS CI behind it,
+        # including infra's fleet deployment.
+        #
+        # 270 = the longest legitimate build observed across the callers
+        # (nix-codetracer-toolchains / devops-modules / nix-nim-development /
+        # nix-blockchain-development, last 60 runs each, 2026-10-08): a cold
+        # `gnat | aarch64-darwin` at 217 min, then `gcc13` at 175 min, plus
+        # ~25% margin. p99 was 35-48 min. A caller whose build or
+        # `build-max-jobs` batch legitimately needs longer raises this.
+        description: "Per-job timeout in minutes for each build matrix job (well under GitHub's 360-minute default)"
+        default: 270
+        required: false
+        type: number
       push-deployment-caches:
         description: 'Push deployment target closures to configured deployment cache backends'
         default: false
@@ -395,8 +425,15 @@ jobs:
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
           ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
           ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
-          PRECALC_MATRIX: ${{ steps.merge.outputs.full_matrix }}
-        run: ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} print-table
+        # The full matrix is passed as a FILE (PRECALC_MATRIX=@path). Inline it
+        # outgrew Linux's 128 KiB per-string argv/env limit and the runner
+        # failed to start the step's shell ("Argument list too long").
+        run: |
+          matrix_file="$RUNNER_TEMP/precalc-matrix.json"
+          cat > "$matrix_file" <<'MCL_PRECALC_MATRIX_EOF'
+          ${{ steps.merge.outputs.full_matrix }}
+          MCL_PRECALC_MATRIX_EOF
+          PRECALC_MATRIX="@$matrix_file" ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} print-table
 
       - name: Post CI matrix comment
         uses: metacraft-labs/devops-modules/.github/sticky-comment@dev
@@ -413,7 +450,11 @@ jobs:
   plan-build-matrix:
     name: Plan build matrix
     needs: [shard-matrix, merge-matrices]
-    if: always() && inputs.build-max-jobs != '' && inputs.build-max-jobs != '{}'
+    if: >-
+      always() && (
+        (inputs.build-max-jobs != '' && inputs.build-max-jobs != '{}') ||
+        inputs.build-systems != ''
+      )
     runs-on: ${{ fromJSON(inputs.runners).x86_64-linux }}
     outputs:
       build_matrix: ${{ steps.plan.outputs.build_matrix }}
@@ -435,6 +476,8 @@ jobs:
               ''
             }}
           BUILD_MAX_JOBS: ${{ inputs.build-max-jobs }}
+          BUILD_SYSTEMS: ${{ inputs.build-systems }}
+          NOOP_RUNNER: ${{ toJSON(fromJSON(inputs.runners).x86_64-linux) }}
           FOUNDRY_DARWIN_BOOTSTRAP_RUNNER: ${{ inputs.foundry-darwin-bootstrap-runner }}
           PUSH_DEPLOYMENT_CACHES: ${{ inputs.push-deployment-caches }}
         run: |
@@ -488,6 +531,27 @@ jobs:
               sys.exit(0)
 
           packages = json.loads(raw).get("include", [])
+          raw_systems = os.environ.get("BUILD_SYSTEMS", "").strip()
+          if raw_systems:
+              systems = json.loads(raw_systems)
+              if not (isinstance(systems, list) and systems
+                      and all(isinstance(item, str) and item for item in systems)):
+                  raise SystemExit("build-systems must be a non-empty JSON array of Nix systems")
+              kept = [pkg for pkg in packages if pkg.get("system") in systems]
+              note("build-systems {}: building {} of {} flake output(s).".format(
+                  systems, len(kept), len(packages)))
+              if not kept:
+                  # Never return an empty plan here: `build` would fall back to
+                  # the UNFILTERED matrix. One no-op keeps the call's shape.
+                  emit({"include": [{
+                      "name": "no-builds-required",
+                      "system": "x86_64-linux",
+                      "ghRunner": json.loads(os.environ["NOOP_RUNNER"]),
+                      "allowedToFail": False,
+                      "noop": True,
+                  }]})
+                  sys.exit(0)
+              packages = kept
           max_jobs = json.loads(raw_max_jobs) if raw_max_jobs else {}
           if not isinstance(max_jobs, dict):
               raise SystemExit("build-max-jobs must be a JSON object mapping system -> integer")
@@ -653,6 +717,8 @@ jobs:
         matrix.ghRunner
       }}
     continue-on-error: ${{ matrix.allowedToFail }}
+    # See the `build-timeout-minutes` input.
+    timeout-minutes: ${{ inputs.build-timeout-minutes }}
     steps:
       - name: No builds required
         if: ${{ matrix.noop }}
@@ -1081,12 +1147,17 @@ jobs:
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
           ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
           ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
-          PRECALC_MATRIX: ${{
+        # Passed as a file, see "Generate CI matrix comment".
+        run: |
+          matrix_file="$RUNNER_TEMP/precalc-matrix.json"
+          cat > "$matrix_file" <<'MCL_PRECALC_MATRIX_EOF'
+          ${{
             needs.merge-matrices.result == 'success' &&
             needs.merge-matrices.outputs.full_matrix ||
             needs.shard-matrix.outputs.full_matrix
-            }}
-        run: ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} print-table
+          }}
+          MCL_PRECALC_MATRIX_EOF
+          PRECALC_MATRIX="@$matrix_file" ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} print-table
 
       - name: Update GitHub Comment
         uses: metacraft-labs/devops-modules/.github/sticky-comment@dev

@@ -1479,11 +1479,48 @@ unittest
     ));
 }
 
+/// `@<path>` reads the matrix from a file. A whole CI matrix outgrew the
+/// 128 KiB Linux limit on one argv/env string (MAX_ARG_STRLEN), so passing it
+/// inline as PRECALC_MATRIX failed the runner's exec of the step's shell with
+/// "Argument list too long" (devops-modules, 2026-10-09).
+string resolvePrecalcMatrix(string value)
+{
+    import std.file : readText;
+
+    if (value == "")
+        return `{"include": []}`;
+    if (value.length > 1 && value[0] == '@')
+        return readText(value[1 .. $]);
+    return value;
+}
+
 Package[] getPrecalcMatrix(T)(auto ref T args)
     if (is(T == PrintTableArgs) || is(T == DeploySpecArgs))
 {
-    auto precalcMatrixStr = args.precalcMatrix == "" ? `{"include": []}` : args.precalcMatrix;
-    return parseJSON(precalcMatrixStr)["include"].array.map!(fromJSON!Package).array;
+    return parseJSON(resolvePrecalcMatrix(args.precalcMatrix))["include"].array
+        .map!(fromJSON!Package).array;
+}
+
+@("resolvePrecalcMatrix reads @file, passes inline JSON through, defaults empty")
+unittest
+{
+    import std.file : remove, tempDir, write;
+    import std.path : buildPath;
+    import std.process : thisProcessID;
+    import std.conv : to;
+
+    auto path = buildPath(tempDir, "mcl-precalc-matrix-" ~ thisProcessID.to!string ~ ".json");
+    scope (exit) remove(path);
+    // Larger than MAX_ARG_STRLEN (128 KiB): exactly what failed inline.
+    string big = `{"include": [`;
+    foreach (i; 0 .. 4000)
+        big ~= (i ? "," : "") ~ `{"name": "pkg-` ~ i.to!string ~ `-padding-padding"}`;
+    big ~= `]}`;
+    assert(big.length > 128 * 1024);
+    path.write(big);
+    assert(resolvePrecalcMatrix("@" ~ path) == big);
+    assert(resolvePrecalcMatrix(`{"include":[]}`) == `{"include":[]}`);
+    assert(resolvePrecalcMatrix("") == `{"include": []}`);
 }
 
 @(Command("merge-ci-matrices", "merge_ci_matrices")

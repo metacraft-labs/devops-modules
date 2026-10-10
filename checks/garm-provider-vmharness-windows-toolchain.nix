@@ -34,6 +34,10 @@
             nativeCheckInputs = (old.nativeCheckInputs or [ ]) ++ [
               pkgs.curl
               pkgs.powershell
+              # The guard's install-script splice runs awk in the guest, whose
+              # Debian image ships mawk; the tests run it under every awk found
+              # (gawk comes with stdenv).
+              pkgs.mawk
             ];
             checkPhase = ''
               runHook preCheck

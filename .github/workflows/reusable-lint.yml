@@ -105,6 +105,11 @@ on:
         default: 'auto'
         required: false
         type: string
+      nixos-runner-hazards:
+        description: 'Scan .github/workflows for steps that cannot run on the self-hosted NixOS runners (scripts/ci/check_nixos_runner_hazards.py): warn (annotations only) | error (fail the job) | off'
+        default: 'warn'
+        required: false
+        type: string
       fetch-depth:
         description: 'actions/checkout fetch-depth (0 = full history, for flakes that cannot evaluate from a shallow clone)'
         default: 1
@@ -347,6 +352,22 @@ jobs:
             fi
           done
           echo "reusable-lint: materialized $count develop-set sibling(s) from repro.lock"
+
+      # Advisory by default. #!/bin/bash action entrypoints, glibc tool
+      # downloads, distro package managers and docker container jobs all fail
+      # on the NixOS runners -- often before doing anything, and sometimes
+      # silently behind `|| true`. `error` turns the findings into a failure
+      # once a repository has cleaned them up.
+      - name: Check workflows for NixOS-runner hazards
+        if: inputs.nixos-runner-hazards != 'off' && hashFiles('.github/workflows/*.yml', '.github/workflows/*.yaml') != ''
+        env:
+          HAZARD_MODE: ${{ inputs.nixos-runner-hazards }}
+        run: |
+          set -euo pipefail
+          args=()
+          [ "$HAZARD_MODE" = error ] || args+=(--warn)
+          nix run --no-write-lock-file 'github:metacraft-labs/devops-modules/dev#check-nixos-runner-hazards' -- \
+            "${args[@]}" .github/workflows
 
       - name: Check formatting
         env:

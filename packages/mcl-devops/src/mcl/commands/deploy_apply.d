@@ -119,7 +119,7 @@ struct DeployApplyArgs
 
     @(NamedArgument(["system-profile"])
         .Placeholder("PATH")
-        .Description("nix-darwin system profile updated atomically before activation"))
+        .Description("system profile the activated generation is registered in (NixOS and nix-darwin)"))
     string systemProfile = "/nix/var/nix/profiles/system";
 
     @(NamedArgument(["pre-switch-hook"])
@@ -337,6 +337,35 @@ ProcessResult runLifecycleHook(
     if (outcome != "")
         command ~= outcome;
     return runner(command);
+}
+
+// The production NixOS activation: register the generation in the system
+// profile, then switch to it -- what `nixos-rebuild switch` does around
+// switch-to-configuration. switch-to-configuration builds the boot entries from
+// the system-profile generations, so a bare `<path>/bin/switch-to-configuration
+// switch` activates at runtime only and the host boots the previous generation
+// after its next reboot. A test that overrides --switch-command or
+// --rollback-command bypasses the profile write together with the switch.
+string nixosSwitchCommand(string profile, string generation)
+{
+    import std.process : escapeShellFileName;
+
+    return "nix-env --profile " ~ escapeShellFileName(profile)
+        ~ " --set " ~ escapeShellFileName(generation)
+        ~ " && " ~ escapeShellFileName(generation ~ "/bin/switch-to-configuration")
+        ~ " switch";
+}
+
+@("deployApply.nixosSwitchCommand registers the generation before switching")
+unittest
+{
+    import std.algorithm : canFind;
+
+    auto command = nixosSwitchCommand("/nix/var/nix/profiles/system", "/nix/store/abc-nixos-system-host");
+    assert(command == "nix-env --profile /nix/var/nix/profiles/system --set /nix/store/abc-nixos-system-host"
+        ~ " && /nix/store/abc-nixos-system-host/bin/switch-to-configuration switch", command);
+    // A path that needs quoting is quoted rather than split by the shell.
+    assert(nixosSwitchCommand("/tmp/a b", "/nix/store/x").canFind("'/tmp/a b'"));
 }
 
 ProcessResult setDarwinSystemProfile(
@@ -673,16 +702,22 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
     if (!preHook.succeeded)
     {
         auto deferred = preHook.exitCode == deployApplyDeferredExitCode;
+        // The terminal event and the durable state name WHICH readiness
+        // condition failed: the hook reports it on stderr. Without this the
+        // outcome an operator reads said only "conditions are not met"
+        // (m3, 2026-10-08), and the reason sat in an earlier event.
+        auto hookReason = preHook.stderr.stderrSummary;
         markDeploymentState(args.stateDir, manifest, deferred ? "deferred" : "failed",
-            deferred
+            (deferred
                 ? "Readiness hook deferred deployment; retry budget was not consumed."
-                : "Readiness hook failed.");
+                : "Readiness hook failed.")
+            ~ (hookReason.length ? " " ~ hookReason : ""));
         emit("complete", "mcl-devops deploy-apply", ["mcl-devops", "deploy-apply"],
             deferred ? "skipped" : "failed",
             deferred ? deployApplyDeferredExitCode : 1,
             deferred ? "Deployment readiness conditions are not met."
                 : "Deployment readiness hook failed.",
-            deferred ? "deployment_deferred" : "pre_switch_hook_failed", "", [
+            deferred ? "deployment_deferred" : "pre_switch_hook_failed", hookReason, [
                 "lifecycleStage": JSONValue("pre-switch"),
                 "outcome": JSONValue(deferred ? "deferred" : "failed"),
             ], deferred);
@@ -698,7 +733,7 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
     if (args.activationMode == DeploymentActivationMode.nixos)
     {
         auto switchCommand = args.switchCommand == ""
-            ? desired ~ "/bin/switch-to-configuration switch"
+            ? nixosSwitchCommand(args.systemProfile, desired)
             : args.switchCommand;
         auto switched = detachedSwitch(runner, switchCommand, !args.noDetachSwitch);
         auto currentResult = currentGeneration(args, queryRunner);
@@ -811,7 +846,7 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
             if (args.activationMode == DeploymentActivationMode.nixos)
             {
                 auto rollbackCommand = args.rollbackCommand == ""
-                    ? previous ~ "/bin/switch-to-configuration switch"
+                    ? nixosSwitchCommand(args.systemProfile, previous)
                     : args.rollbackCommand;
                 rollback = detachedSwitch(runner, rollbackCommand, !args.noDetachSwitch);
                 rollbackArgv = ["sh", "-c", rollbackCommand];
@@ -1645,6 +1680,86 @@ unittest
     assert(commands.canFind([desired ~ "/activate"]));
     assert(!commands.any!(command => command.canFind("systemd-run")));
     assert(manifestStatePath(stateDir, "converged", "deploy-darwin-success").exists);
+}
+
+@("test_deploy_apply_nixos_registers_the_generation_in_the_system_profile")
+unittest
+{
+    import std.algorithm : any, canFind;
+    import std.file : rmdirRecurse;
+    import std.json : JSONOptions;
+    import mcl.utils.deploy_manifest : ManifestSigningRequest, ManifestSubstituter,
+        signManifest;
+    import mcl.utils.deploy_state : manifestStatePath;
+
+    auto base = uniqueDeployStateTestPath("deploy-apply-nixos-profile");
+    auto keyPath = base ~ ".ed25519";
+    auto manifestPath = base ~ ".manifest.json";
+    auto stateDir = base ~ ".state";
+    scope(exit)
+    {
+        foreach (path; [base, keyPath, keyPath ~ ".pub", manifestPath])
+            if (path.exists) path.remove;
+        if (stateDir.exists) stateDir.rmdirRecurse;
+    }
+
+    auto keygen = runProcessCapture([
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", keyPath,
+    ]);
+    assert(keygen.succeeded, keygen.stderr);
+    auto desired = "/nix/store/22222222222222222222222222222222-nixos-system-host";
+    auto previous = "/nix/store/11111111111111111111111111111111-nixos-system-host";
+    auto manifest = signManifest(buildManifest(ManifestBuildRequest(
+        deploymentId: "deploy-nixos-profile",
+        target: "host",
+        system: "x86_64-linux",
+        gitRevision: "0123456789abcdef0123456789abcdef01234567",
+        sequence: 1,
+        desiredSystemPath: desired,
+        substituters: [ManifestSubstituter(
+            url: "https://cache.example/deployments",
+            trustedPublicKey: "deployments.example:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )],
+    )), ManifestSigningRequest(keyPath: keyPath, keyId: "mcl-deployment"));
+    manifestPath.write(manifest.toString(JSONOptions.doNotEscapeSlashes));
+
+    // The real default switch command, run in-process: the fake records it and
+    // "activates" the generation when it sees it.
+    auto expected = nixosSwitchCommand(base ~ ".profile", desired);
+    string current = previous;
+    string[][] commands;
+    ProcessResult fakeRun(string[] command)
+    {
+        commands ~= command.dup;
+        if (command == ["/bin/sh", "-c", expected])
+            current = desired;
+        return ProcessResult(0, "", "");
+    }
+    ProcessResult fakeQuery(string[] command)
+    {
+        if (command == ["/bin/sh", "-c", "current-generation"])
+            return ProcessResult(0, current ~ "\n", "");
+        return ProcessResult(0, "{}", "");
+    }
+
+    DeployApplyArgs args;
+    args.manifest = manifestPath;
+    args.target = "host";
+    args.trustedManifestPublicKey = (keyPath ~ ".pub").readText.strip;
+    args.stateDir = stateDir;
+    args.systemProfile = base ~ ".profile";
+    args.generationCommand = "current-generation";
+    args.noDetachSwitch = true;
+
+    assert(deployApplyImpl(args, DeployApplyDependencies(
+        runProcess: &fakeRun,
+        queryProcess: &fakeQuery,
+    )) == 0);
+    assert(current == desired);
+    assert(commands.canFind(["/bin/sh", "-c", expected]));
+    // Never a bare switch: that is the activation a reboot silently undoes.
+    assert(!commands.canFind(["/bin/sh", "-c", desired ~ "/bin/switch-to-configuration switch"]));
+    assert(manifestStatePath(stateDir, "converged", "deploy-nixos-profile").exists);
 }
 
 @("test_deploy_apply_nix_darwin_restores_previous_profile_on_activation_failure")

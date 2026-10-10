@@ -66,6 +66,19 @@
 
       webhookUrl = "https://${cfg.publicHostname}${cfg.webhookPath}";
 
+      # GARM's instance-facing API: what a runner guest calls while it boots
+      # (metadata: JIT config, tokens, install script) and reports back to
+      # (callbacks). Each request carries the instance's own short-lived JWT.
+      instancePaths = [
+        "/api/v1/metadata"
+        "/api/v1/callbacks"
+      ];
+      # The paths the public hostname forwards. Everything else, notably the
+      # admin API (/api/v1/auth/login, pools, credentials, ...), is refused at
+      # the edge (cloudflared `http_status:404`, nginx `return 404`).
+      publicPaths = [ cfg.webhookPath ] ++ optionals cfg.exposeInstanceAPI instancePaths;
+      tunnelPathRegex = "^(${concatStringsSep "|" (map lib.escapeRegex publicPaths)})(/.*)?$";
+
       # The org-webhook REGISTRATION SHAPE. This is exactly the JSON body an
       # operator (or `gh api -X POST /orgs/{org}/hooks`) posts to GitHub to point
       # an org at this endpoint. Non-secret: the HMAC secret is referenced by
@@ -132,6 +145,19 @@
           description = ''
             Path GARM serves the workflow_job handler on. Bare `/webhooks`, or
             the controller-scoped `/webhooks/<controller-webhook-uuid>` form.
+          '';
+        };
+
+        exposeInstanceAPI = mkOption {
+          type = types.bool;
+          default = false;
+          description = ''
+            Also forward GARM's instance-facing paths (`/api/v1/metadata`,
+            `/api/v1/callbacks`) on the public hostname, so runner guests that
+            cannot reach the controller's private URL (cloud burst instances)
+            can bootstrap through it. Those calls are authenticated by each
+            instance's own short-lived JWT. The rest of the GARM API is never
+            forwarded.
           '';
         };
 
@@ -275,22 +301,29 @@
               enableACME = cfg.tls.enableACME;
               sslCertificate = mkIf (!cfg.tls.enableACME) cfg.tls.certFile;
               sslCertificateKey = mkIf (!cfg.tls.enableACME) cfg.tls.keyFile;
-              locations.${cfg.webhookPath} = {
-                # Forward the RAW body unchanged — any rewrite would break the
-                # HMAC GitHub computed over the exact bytes.
-                proxyPass = "${cfg.upstream}${cfg.webhookPath}";
-                extraConfig = ''
-                  proxy_request_buffering off;
-                  proxy_http_version 1.1;
-                  ${optionalString cfg.pinToGithubRanges (
-                    (concatStringsSep "\n" (map (c: "allow ${c};") cfg.githubHookCidrs)) + "\ndeny all;"
-                  )}
-                '';
-              };
-              # Everything else is closed.
-              locations."/" = {
-                extraConfig = "return 404;";
-              };
+              locations = {
+                ${cfg.webhookPath} = {
+                  # Forward the RAW body unchanged — any rewrite would break the
+                  # HMAC GitHub computed over the exact bytes.
+                  proxyPass = "${cfg.upstream}${cfg.webhookPath}";
+                  extraConfig = ''
+                    proxy_request_buffering off;
+                    proxy_http_version 1.1;
+                    ${optionalString cfg.pinToGithubRanges (
+                      (concatStringsSep "\n" (map (c: "allow ${c};") cfg.githubHookCidrs)) + "\ndeny all;"
+                    )}
+                  '';
+                };
+                # Everything else is closed.
+                "/" = {
+                  extraConfig = "return 404;";
+                };
+              }
+              // lib.optionalAttrs cfg.exposeInstanceAPI (
+                lib.genAttrs instancePaths (path: {
+                  proxyPass = "${cfg.upstream}${path}";
+                })
+              );
             };
           };
 
@@ -313,6 +346,11 @@
               default = "http_status:404";
               ingress.${cfg.publicHostname} = {
                 service = cfg.upstream;
+                # ONLY the webhook (and, when exposeInstanceAPI, the instance
+                # paths). Before 2026-10-07 this rule had no `path`, so the
+                # whole GARM API, admin login included, was reachable on the
+                # public hostname; everything else now falls to `default`.
+                path = tunnelPathRegex;
                 # cloudflared only forwards this hostname's traffic to GARM;
                 # GitHub-IP pinning is a Cloudflare edge WAF rule (documented in
                 # README.md), NOT a NixOS-expressible allow/deny.

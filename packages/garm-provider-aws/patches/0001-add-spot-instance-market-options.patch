@@ -1,5 +1,297 @@
+diff --git a/config/config.go b/config/config.go
+index c262e8c..9960451 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -16,13 +16,17 @@
+ package config
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/json"
+ 	"fmt"
++	"strings"
+ 
+ 	"github.com/BurntSushi/toml"
+ 	"github.com/aws/aws-sdk-go-v2/aws"
+ 	"github.com/aws/aws-sdk-go-v2/config"
+ 	"github.com/aws/aws-sdk-go-v2/credentials"
++	"github.com/cloudbase/garm-provider-common/params"
+ )
+ 
+ type AWSCredentialType string
+@@ -49,6 +53,88 @@ type Config struct {
+ 	Credentials Credentials `toml:"credentials"`
+ 	SubnetID    string      `toml:"subnet_id"`
+ 	Region      string      `toml:"region"`
++	// GuestMetadataURL / GuestCallbackURL (Metacraft Labs downstream patch)
++	// optionally replace the controller's metadata/callback URLs in the
++	// bootstrap parameters this provider renders into instance userdata. A
++	// controller whose own URLs are only reachable on a private network (a VPN
++	// address) can then point cloud instances at a public route to the same
++	// endpoints. Empty keeps the controller's values.
++	GuestMetadataURL string `toml:"guest_metadata_url"`
++	GuestCallbackURL string `toml:"guest_callback_url"`
++}
++
++// ApplyGuestURLOverrides returns bootstrapParams with the metadata/callback
++// URLs replaced by the configured guest overrides, when set. GARM also
++// pre-renders its runner-install wrapper with those URLs baked in and passes it
++// as the `runner_install_template` extra-spec, so the old URLs are rewritten
++// inside the cloud-config extra-specs too (`runner_install_template`,
++// `pre_install_scripts`, `extra_context`). Same rewrite as the vm-harness
++// provider's guest URL override.
++func (c *Config) ApplyGuestURLOverrides(bootstrapParams params.BootstrapInstance) params.BootstrapInstance {
++	oldMetadataURL, oldCallbackURL := bootstrapParams.MetadataURL, bootstrapParams.CallbackURL
++	if c.GuestMetadataURL != "" {
++		bootstrapParams.MetadataURL = c.GuestMetadataURL
++	}
++	if c.GuestCallbackURL != "" {
++		bootstrapParams.CallbackURL = c.GuestCallbackURL
++	}
++	bootstrapParams.ExtraSpecs = rewriteSpecURLs(bootstrapParams.ExtraSpecs,
++		oldMetadataURL, bootstrapParams.MetadataURL, oldCallbackURL, bootstrapParams.CallbackURL)
++	return bootstrapParams
++}
++
++func replaceURL(b []byte, oldURL, newURL string) []byte {
++	if oldURL == "" || oldURL == newURL {
++		return b
++	}
++	return bytes.ReplaceAll(b, []byte(oldURL), []byte(newURL))
++}
++
++func rewriteSpecURLs(raw json.RawMessage, oldMeta, newMeta, oldCb, newCb string) json.RawMessage {
++	if len(raw) == 0 || (oldMeta == newMeta && oldCb == newCb) {
++		return raw
++	}
++	var spec map[string]json.RawMessage
++	if err := json.Unmarshal(raw, &spec); err != nil {
++		return raw
++	}
++	if v, ok := spec["runner_install_template"]; ok {
++		var script []byte
++		if err := json.Unmarshal(v, &script); err == nil {
++			script = replaceURL(replaceURL(script, oldMeta, newMeta), oldCb, newCb)
++			script = rewriteFetchedInstallScript(script, oldMeta, newMeta, oldCb, newCb)
++			if enc, err := json.Marshal(script); err == nil {
++				spec["runner_install_template"] = enc
++			}
++		}
++	}
++	if v, ok := spec["pre_install_scripts"]; ok {
++		var scripts map[string][]byte
++		if err := json.Unmarshal(v, &scripts); err == nil {
++			for name, script := range scripts {
++				scripts[name] = replaceURL(replaceURL(script, oldMeta, newMeta), oldCb, newCb)
++			}
++			if enc, err := json.Marshal(scripts); err == nil {
++				spec["pre_install_scripts"] = enc
++			}
++		}
++	}
++	if v, ok := spec["extra_context"]; ok {
++		var extra map[string]string
++		if err := json.Unmarshal(v, &extra); err == nil {
++			for k, val := range extra {
++				extra[k] = string(replaceURL(replaceURL([]byte(val), oldMeta, newMeta), oldCb, newCb))
++			}
++			if enc, err := json.Marshal(extra); err == nil {
++				spec["extra_context"] = enc
++			}
++		}
++	}
++	out, err := json.Marshal(spec)
++	if err != nil {
++		return raw
++	}
++	return out
+ }
+ 
+ func (c *Config) Validate() error {
+@@ -133,3 +219,45 @@ func (c Config) GetAWSConfig(ctx context.Context) (aws.Config, error) {
+ 	}
+ 	return cfg, nil
+ }
++
++// garmWrapperRunLine is where GARM's Linux install wrapper
++// (internal/templates/userdata/linux_wrapper.tmpl) runs the install script it
++// downloaded from "$METADATA_URL/install-script/". GARM renders that script
++// SERVER-side from the instance's own metadata/callback URLs (the controller's),
++// so a guest that can only reach the controller through the override URLs must
++// have them rewritten in the downloaded script before it runs.
++const garmWrapperRunLine = "chmod +x /tmp/real-install.sh\n"
++
++// sedLiteral escapes s for use as a literal in a sed `s#…#…#g` expression.
++func sedLiteral(s string, replacement bool) string {
++	var b strings.Builder
++	for _, r := range s {
++		switch {
++		case replacement && (r == '&' || r == '#' || r == '\\'):
++			b.WriteRune('\\')
++		case !replacement && strings.ContainsRune(`.[]*^$\#`, r):
++			b.WriteRune('\\')
++		}
++		b.WriteRune(r)
++	}
++	return b.String()
++}
++
++func rewriteFetchedInstallScript(wrapper []byte, oldMeta, newMeta, oldCb, newCb string) []byte {
++	if !bytes.Contains(wrapper, []byte(garmWrapperRunLine)) {
++		return wrapper
++	}
++	var exprs []string
++	for _, p := range [][2]string{{oldMeta, newMeta}, {oldCb, newCb}} {
++		if p[0] != "" && p[0] != p[1] {
++			exprs = append(exprs, fmt.Sprintf("-e 's#%s#%s#g'", sedLiteral(p[0], false), sedLiteral(p[1], true)))
++		}
++	}
++	if len(exprs) == 0 {
++		return wrapper
++	}
++	inject := "# garm-provider-aws guest URL override: the downloaded script carries the\n" +
++		"# controller's own URLs; point them at the guest-reachable ones.\n" +
++		"sed -i " + strings.Join(exprs, " ") + " /tmp/real-install.sh\n"
++	return bytes.Replace(wrapper, []byte(garmWrapperRunLine), []byte(inject+garmWrapperRunLine), 1)
++}
+diff --git a/config/garm_wrapper_test.go b/config/garm_wrapper_test.go
+new file mode 100644
+index 0000000..4b3ff50
+--- /dev/null
++++ b/config/garm_wrapper_test.go
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: Apache-2.0
++
++// Metacraft Labs downstream patch: the guest URL override must also reach the
++// install script GARM's wrapper downloads at boot (GARM renders it server-side
++// with the controller's URLs). No mocks: the test runs the rewritten wrapper's
++// injected sed command for real against a script shaped like GARM's.
++package config
++
++import (
++	"bytes"
++	"encoding/base64"
++	"encoding/json"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/cloudbase/garm-provider-common/params"
++	"github.com/stretchr/testify/require"
++)
++
++const (
++	ctlMeta = "http://100.64.0.1:9997/api/v1/metadata"
++	ctlCb   = "http://100.64.0.1:9997/api/v1/callbacks"
++	pubMeta = "https://garm.example.com/api/v1/metadata"
++	pubCb   = "https://garm.example.com/api/v1/callbacks"
++)
++
++// The tail of GARM's internal/templates/userdata/linux_wrapper.tmpl.
++const garmWrapper = `#!/bin/bash
++METADATA_URL="` + ctlMeta + `"
++CALLBACK_URL="` + ctlCb + `"
++HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/real-install.sh "$METADATA_URL/install-script/" || echo "000")
++chmod +x /tmp/real-install.sh
++/tmp/real-install.sh
++rm -f /tmp/real-install.sh
++`
++
++func TestGuestOverrideRewritesTheFetchedInstallScript(t *testing.T) {
++	specs, _ := json.Marshal(map[string][]byte{"runner_install_template": []byte(garmWrapper)})
++	c := &Config{GuestMetadataURL: pubMeta, GuestCallbackURL: pubCb}
++	out := c.ApplyGuestURLOverrides(params.BootstrapInstance{MetadataURL: ctlMeta, CallbackURL: ctlCb, ExtraSpecs: specs})
++
++	var got map[string][]byte
++	require.NoError(t, json.Unmarshal(out.ExtraSpecs, &got))
++	wrapper := string(got["runner_install_template"])
++	require.NotContains(t, strings.SplitN(wrapper, "sed -i", 2)[0], "100.64.0.1", "wrapper variables must already be rewritten")
++
++	// Extract the injected sed line and run it against a GARM-like install script.
++	var sedLine string
++	for _, l := range strings.Split(wrapper, "\n") {
++		if strings.HasPrefix(l, "sed -i ") {
++			sedLine = l
++		}
++	}
++	require.NotEmpty(t, sedLine, "no rewrite of /tmp/real-install.sh was injected")
++	require.Less(t, strings.Index(wrapper, sedLine), strings.Index(wrapper, "chmod +x /tmp/real-install.sh"))
++
++	if _, err := exec.LookPath("sed"); err != nil {
++		t.Skip("sed not available")
++	}
++	dir := t.TempDir()
++	script := filepath.Join(dir, "real-install.sh")
++	body := "CALLBACK_URL=\"" + ctlCb + "\"\nMETADATA_URL=\"" + ctlMeta + "\"\ncurl \"" + ctlCb + "/status\"\n"
++	require.NoError(t, os.WriteFile(script, []byte(body), 0o600))
++	cmd := exec.Command("sh", "-c", strings.ReplaceAll(sedLine, "/tmp/real-install.sh", script))
++	outb, err := cmd.CombinedOutput()
++	require.NoError(t, err, string(outb))
++	res, err := os.ReadFile(script)
++	require.NoError(t, err)
++	require.False(t, bytes.Contains(res, []byte("100.64.0.1")), "controller URL left in the fetched script: %s", res)
++	require.Contains(t, string(res), pubCb+"/status")
++	require.Contains(t, string(res), "METADATA_URL=\""+pubMeta+"\"")
++}
++
++// Without the wrapper (a user-supplied template), nothing is injected.
++func TestGuestOverrideNoWrapperNoInjection(t *testing.T) {
++	tpl := base64.StdEncoding.EncodeToString([]byte("#!/bin/sh\necho " + ctlMeta + "\n"))
++	specs := []byte(`{"runner_install_template":"` + tpl + `"}`)
++	c := &Config{GuestMetadataURL: pubMeta, GuestCallbackURL: pubCb}
++	out := c.ApplyGuestURLOverrides(params.BootstrapInstance{MetadataURL: ctlMeta, CallbackURL: ctlCb, ExtraSpecs: specs})
++	var got map[string][]byte
++	require.NoError(t, json.Unmarshal(out.ExtraSpecs, &got))
++	require.NotContains(t, string(got["runner_install_template"]), "sed -i")
++	require.Contains(t, string(got["runner_install_template"]), pubMeta)
++}
+diff --git a/config/guest_url_test.go b/config/guest_url_test.go
+new file mode 100644
+index 0000000..799827c
+--- /dev/null
++++ b/config/guest_url_test.go
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: Apache-2.0
++
++// Metacraft Labs downstream patch: guest metadata/callback URL overrides. No
++// mocks: ApplyGuestURLOverrides is a pure function of the config and the
++// bootstrap parameters.
++package config
++
++import (
++	"testing"
++
++	"github.com/cloudbase/garm-provider-common/params"
++	"github.com/stretchr/testify/require"
++)
++
++func TestApplyGuestURLOverrides(t *testing.T) {
++	in := params.BootstrapInstance{
++		MetadataURL: "http://10.0.0.1:9997/api/v1/metadata",
++		CallbackURL: "http://10.0.0.1:9997/api/v1/callbacks",
++	}
++
++	// Unset overrides keep the controller's URLs.
++	out := (&Config{}).ApplyGuestURLOverrides(in)
++	require.Equal(t, in.MetadataURL, out.MetadataURL)
++	require.Equal(t, in.CallbackURL, out.CallbackURL)
++
++	// Set overrides replace both.
++	c := &Config{
++		GuestMetadataURL: "https://garm.example.com/api/v1/metadata",
++		GuestCallbackURL: "https://garm.example.com/api/v1/callbacks",
++	}
++	out = c.ApplyGuestURLOverrides(in)
++	require.Equal(t, "https://garm.example.com/api/v1/metadata", out.MetadataURL)
++	require.Equal(t, "https://garm.example.com/api/v1/callbacks", out.CallbackURL)
++	// The input is not mutated.
++	require.Equal(t, "http://10.0.0.1:9997/api/v1/metadata", in.MetadataURL)
++}
 diff --git a/internal/client/aws.go b/internal/client/aws.go
-index 6d2fce8..e585e15 100644
+index 6d2fce8..9dda8d6 100644
 --- a/internal/client/aws.go
 +++ b/internal/client/aws.go
 @@ -263,7 +263,7 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
@@ -24,7 +316,7 @@ index 6d2fce8..e585e15 100644
  		BlockDeviceMappings: []types.BlockDeviceMapping{
  			{
  				DeviceName: aws.String(root_volume),
-@@ -311,11 +317,99 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
+@@ -311,11 +317,124 @@ func (a *AwsCli) CreateRunningInstance(ctx context.Context, spec *spec.RunnerSpe
  					},
  				},
  			},
@@ -50,29 +342,54 @@ index 6d2fce8..e585e15 100644
 +			},
  		},
 -	})
-+	}
-+
+-	if err != nil {
+-		return "", fmt.Errorf("failed to create instance: %w", err)
+ 	}
+ 
+-	return *resp.Instances[0].InstanceId, nil
 +	// Spot support (Metacraft Labs downstream patch). When the pool's
 +	// extra-specs request market_type=spot, attach InstanceMarketOptions so
 +	// EC2 launches a Spot instance. On a Spot capacity/price failure, and only
 +	// when on_demand_fallback is set, retry the SAME launch on-demand (with
 +	// InstanceMarketOptions cleared) so a burst still succeeds — at on-demand
 +	// cost — rather than starving the queue.
-+	if spec.UsesSpot() {
-+		applySpotMarketOptions(runInput, spec)
++	// Capacity fallback (Metacraft Labs downstream patch): try each placement
++	// (flavor x subnet, see RunnerSpec.Placements) in order. In each one, spot
++	// first when requested, then on-demand when on_demand_fallback is set.
++	// Only a capacity/price rejection moves on to the next attempt; any other
++	// error (permissions, bad AMI, ...) is returned at once.
++	var lastErr error
++	for _, p := range spec.Placements() {
++		runInput.InstanceType = types.InstanceType(p.Flavor)
++		runInput.SubnetId = aws.String(p.SubnetID)
++		attempts := []bool{false} // useSpot
++		if spec.UsesSpot() {
++			attempts = []bool{true}
++			if spec.OnDemandFallback {
++				attempts = append(attempts, false)
++			}
++		}
++		for _, useSpot := range attempts {
++			if useSpot {
++				applySpotMarketOptions(runInput, spec)
++			} else {
++				runInput.InstanceMarketOptions = nil
++			}
++			resp, err := a.client.RunInstances(ctx, runInput)
++			if err == nil {
++				return *resp.Instances[0].InstanceId, nil
++			}
++			lastErr = err
++			if !isSpotCapacityError(err) {
++				return "", fmt.Errorf("failed to create instance: %w", err)
++			}
++		}
 +	}
-+
-+	resp, err := a.client.RunInstances(ctx, runInput)
-+	if err != nil && spec.UsesSpot() && spec.OnDemandFallback && isSpotCapacityError(err) {
-+		runInput.InstanceMarketOptions = nil
-+		resp, err = a.client.RunInstances(ctx, runInput)
++	if lastErr == nil {
++		lastErr = fmt.Errorf("no launch placement (flavor/subnet) configured")
 +	}
- 	if err != nil {
- 		return "", fmt.Errorf("failed to create instance: %w", err)
- 	}
- 
- 	return *resp.Instances[0].InstanceId, nil
- }
++	return "", fmt.Errorf("failed to create instance: %w", lastErr)
++}
 +
 +// applySpotMarketOptions sets EC2 InstanceMarketOptions (MarketType=spot plus
 +// SpotOptions) on the RunInstances input from the runner spec. Added by the
@@ -118,19 +435,22 @@ index 6d2fce8..e585e15 100644
 +		"spotmaxpricetoolow",
 +		"maxspotinstancecountexceeded",
 +		"unfulfillablecapacity",
++		// The flavor is not offered in that subnet's availability zone:
++		// another placement can still succeed.
++		"is not supported in your requested availability zone",
 +	} {
 +		if strings.Contains(msg, s) {
 +			return true
 +		}
 +	}
 +	return false
-+}
+ }
 diff --git a/internal/client/spot_test.go b/internal/client/spot_test.go
 new file mode 100644
-index 0000000..52f4ef5
+index 0000000..41fba5d
 --- /dev/null
 +++ b/internal/client/spot_test.go
-@@ -0,0 +1,293 @@
+@@ -0,0 +1,379 @@
 +// SPDX-License-Identifier: Apache-2.0
 +// Copyright 2024 Cloudbase Solutions SRL
 +//
@@ -424,8 +744,185 @@ index 0000000..52f4ef5
 +	}
 +	t.Fatal("RunInstances carries no volume TagSpecification")
 +}
++
++// Capacity fallback across placements: the pool's flavor in its own subnet,
++// then the fallback subnets, then the fallback flavors. Every capacity
++// rejection moves on; the first success is returned. Drives the provider's own
++// EC2-client mock (the seam the upstream tests use) to observe each
++// RunInstances request in order.
++func TestCreateRunningInstancePlacementFallback(t *testing.T) {
++	ctx := context.Background()
++	mockClient := new(MockComputeClient)
++	awsCli := spotTestCli(mockClient)
++	describeImagesOK(mockClient)
++
++	type call struct {
++		flavor, subnet string
++		spot           bool
++	}
++	var calls []call
++	capacity := errors.New("api error InsufficientInstanceCapacity: no capacity")
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Run(func(args mock.Arguments) {
++			in := args.Get(1).(*ec2.RunInstancesInput)
++			calls = append(calls, call{string(in.InstanceType), *in.SubnetId, in.InstanceMarketOptions != nil})
++		}).
++		Return((*ec2.RunInstancesOutput)(nil), capacity).Times(5)
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Run(func(args mock.Arguments) {
++			in := args.Get(1).(*ec2.RunInstancesInput)
++			calls = append(calls, call{string(in.InstanceType), *in.SubnetId, in.InstanceMarketOptions != nil})
++		}).
++		Return(&ec2.RunInstancesOutput{Instances: []types.Instance{{InstanceId: aws.String("i-fallback")}}}, nil).Once()
++
++	rs := spotRunnerSpec()
++	rs.MarketType = "spot"
++	rs.OnDemandFallback = true
++	rs.SubnetID = "subnet-a"
++	rs.FallbackSubnetIDs = []string{"subnet-b", "subnet-c"}
++	rs.FallbackFlavors = []string{"m6a.large"}
++
++	id, err := awsCli.CreateRunningInstance(ctx, rs)
++	require.NoError(t, err)
++	require.Equal(t, "i-fallback", id)
++	require.Equal(t, []call{
++		{"t3.medium", "subnet-a", true}, {"t3.medium", "subnet-a", false},
++		{"t3.medium", "subnet-b", true}, {"t3.medium", "subnet-b", false},
++		{"t3.medium", "subnet-c", true}, {"t3.medium", "subnet-c", false},
++	}, calls)
++}
++
++// A non-capacity error stops the walk at once (no blind retries on, e.g., an
++// authorization failure).
++func TestCreateRunningInstancePlacementFallbackStopsOnOtherErrors(t *testing.T) {
++	ctx := context.Background()
++	mockClient := new(MockComputeClient)
++	awsCli := spotTestCli(mockClient)
++	describeImagesOK(mockClient)
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Return((*ec2.RunInstancesOutput)(nil), errors.New("api error UnauthorizedOperation: denied")).Once()
++
++	rs := spotRunnerSpec()
++	rs.MarketType = "spot"
++	rs.OnDemandFallback = true
++	rs.FallbackSubnetIDs = []string{"subnet-b"}
++	rs.FallbackFlavors = []string{"m6a.large"}
++	_, err := awsCli.CreateRunningInstance(ctx, rs)
++	require.ErrorContains(t, err, "UnauthorizedOperation")
++	mockClient.AssertNumberOfCalls(t, "RunInstances", 1)
++}
++
++// Every placement exhausted: the last capacity error is returned.
++func TestCreateRunningInstancePlacementFallbackExhausted(t *testing.T) {
++	ctx := context.Background()
++	mockClient := new(MockComputeClient)
++	awsCli := spotTestCli(mockClient)
++	describeImagesOK(mockClient)
++	mockClient.On("RunInstances", mock.Anything, mock.Anything, mock.Anything).
++		Return((*ec2.RunInstancesOutput)(nil), errors.New("api error InsufficientInstanceCapacity: none")).Times(4)
++
++	rs := spotRunnerSpec()
++	rs.SubnetID = "subnet-a"
++	rs.FallbackSubnetIDs = []string{"subnet-b"}
++	rs.FallbackFlavors = []string{"m6a.large"}
++	_, err := awsCli.CreateRunningInstance(ctx, rs)
++	require.ErrorContains(t, err, "InsufficientInstanceCapacity")
++	// on-demand only (no spot): 2 flavors x 2 subnets.
++	mockClient.AssertNumberOfCalls(t, "RunInstances", 4)
++}
+diff --git a/internal/spec/guest_url_userdata_test.go b/internal/spec/guest_url_userdata_test.go
+new file mode 100644
+index 0000000..b337bcd
+--- /dev/null
++++ b/internal/spec/guest_url_userdata_test.go
+@@ -0,0 +1,85 @@
++// SPDX-License-Identifier: Apache-2.0
++
++// Metacraft Labs downstream patch: the guest metadata/callback URL override
++// must reach the userdata the instance boots with. Only the runner-tool lookup
++// is stubbed (DefaultToolFetch, the same seam the upstream spec tests use):
++// it would otherwise need GitHub's runner download list.
++package spec
++
++import (
++	"bytes"
++	"compress/gzip"
++	"encoding/base64"
++	"io"
++	"strings"
++	"testing"
++
++	"github.com/aws/aws-sdk-go-v2/aws"
++	"github.com/cloudbase/garm-provider-aws/config"
++	"github.com/cloudbase/garm-provider-common/params"
++	"github.com/stretchr/testify/require"
++)
++
++// garmWrapperSpecs mimics what GARM sends: it pre-renders its runner-install
++// wrapper with the controller's URLs baked in and passes it, base64-encoded,
++// as the `runner_install_template` extra-spec (garm util.MaybeAddWrapperToExtraSpecs).
++func garmWrapperSpecs() []byte {
++	wrapper := "#!/bin/bash\nMETADATA_URL=\"http://100.64.0.1:9997/api/v1/metadata\"\nCALLBACK_URL=\"http://100.64.0.1:9997/api/v1/callbacks\"\ncurl -fsSL \"$METADATA_URL/install-script\" | bash\n"
++	return []byte(`{"runner_install_template":"` + base64.StdEncoding.EncodeToString([]byte(wrapper)) + `"}`)
++}
++
++func userdataFor(t *testing.T, cfg *config.Config) string {
++	t.Helper()
++	DefaultToolFetch = func(params.OSType, params.OSArch, []params.RunnerApplicationDownload) (params.RunnerApplicationDownload, error) {
++		return params.RunnerApplicationDownload{
++			OS: aws.String("linux"), Architecture: aws.String("x64"),
++			DownloadURL: aws.String("https://example.invalid/runner.tgz"), Filename: aws.String("runner.tgz"),
++		}, nil
++	}
++	bp := params.BootstrapInstance{
++		Name: "garm-guesturl", OSType: params.Linux, OSArch: params.Amd64,
++		MetadataURL:   "http://100.64.0.1:9997/api/v1/metadata",
++		CallbackURL:   "http://100.64.0.1:9997/api/v1/callbacks",
++		InstanceToken: "token", ExtraSpecs: garmWrapperSpecs(), Image: "ami-0123456789abcdef0", Flavor: "m6i.large",
++	}
++	bp = cfg.ApplyGuestURLOverrides(bp)
++	rs, err := GetRunnerSpecFromBootstrapParams(cfg, bp, "ctl")
++	require.NoError(t, err)
++	ud, err := rs.ComposeUserData()
++	require.NoError(t, err)
++	raw, err := base64.StdEncoding.DecodeString(ud)
++	require.NoError(t, err)
++	if len(raw) > 2 && raw[0] == 0x1f && raw[1] == 0x8b {
++		zr, err := gzip.NewReader(bytes.NewReader(raw))
++		require.NoError(t, err)
++		raw, err = io.ReadAll(zr)
++		require.NoError(t, err)
++	}
++	// cloud-config embeds the install script base64-encoded; expand every
++	// `content:` payload so the assertions see the script text.
++	out := string(raw)
++	for _, line := range strings.Split(string(raw), "\n") {
++		f := strings.TrimSpace(line)
++		if v, ok := strings.CutPrefix(f, "content: "); ok {
++			if dec, err := base64.StdEncoding.DecodeString(strings.Trim(v, "\"'")); err == nil {
++				out += "\n" + string(dec)
++			}
++		}
++	}
++	return out
++}
++
++func TestGuestURLOverrideReachesUserdata(t *testing.T) {
++	base := config.Config{SubnetID: "subnet-0123456789abcdef0", Region: "us-east-1"}
++
++	ud := userdataFor(t, &base)
++	require.True(t, strings.Contains(ud, "http://100.64.0.1:9997/api/v1/metadata"), "without an override the controller URL is used")
++
++	over := base
++	over.GuestMetadataURL = "https://garm.example.com/api/v1/metadata"
++	over.GuestCallbackURL = "https://garm.example.com/api/v1/callbacks"
++	ud = userdataFor(t, &over)
++	require.True(t, strings.Contains(ud, "https://garm.example.com/api/v1/metadata"))
++	require.True(t, strings.Contains(ud, "https://garm.example.com/api/v1/callbacks"))
++	require.False(t, strings.Contains(ud, "100.64.0.1"), "no controller-private URL may remain in the userdata")
++}
 diff --git a/internal/spec/spec.go b/internal/spec/spec.go
-index f309113..531f0a7 100644
+index f309113..53c1029 100644
 --- a/internal/spec/spec.go
 +++ b/internal/spec/spec.go
 @@ -22,6 +22,7 @@ import (
@@ -436,7 +933,7 @@ index f309113..531f0a7 100644
  
  	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
  	"github.com/cloudbase/garm-provider-aws/config"
-@@ -88,6 +89,15 @@ type extraSpecs struct {
+@@ -88,6 +89,18 @@ type extraSpecs struct {
  	DisableUpdates     *bool            `json:"disable_updates,omitempty" jsonschema:"description=Disable automatic updates on the VM."`
  	EnableBootDebug    *bool            `json:"enable_boot_debug,omitempty" jsonschema:"description=Enable boot debug on the VM."`
  	ExtraPackages      []string         `json:"extra_packages,omitempty" jsonschema:"description=Extra packages to install on the VM."`
@@ -449,10 +946,13 @@ index f309113..531f0a7 100644
 +	SpotInstanceType                 *string `json:"spot_instance_type,omitempty" jsonschema:"enum=one-time,enum=persistent,description=Spot request type. 'one-time' (default) suits ephemeral one-job runners; 'persistent' re-requests after an interruption. Only consulted when market_type is 'spot'."`
 +	SpotInstanceInterruptionBehavior *string `json:"spot_instance_interruption_behavior,omitempty" jsonschema:"enum=terminate,enum=stop,enum=hibernate,description=What EC2 does to the Spot instance on interruption. 'terminate' (default) is correct for ephemeral runners. Only consulted when market_type is 'spot'."`
 +	OnDemandFallback                 *bool   `json:"on_demand_fallback,omitempty" jsonschema:"description=When true and a Spot request fails with a capacity/price error, retry the SAME launch as an on-demand instance instead of failing. Only consulted when market_type is 'spot'."`
++	// Metacraft Labs downstream patch: capacity fallback placements.
++	FallbackSubnetIDs []string `json:"fallback_subnet_ids,omitempty" jsonschema:"description=Further subnets (typically in other availability zones) tried in order when EC2 has no capacity for a launch in the pool's subnet."`
++	FallbackFlavors   []string `json:"fallback_flavors,omitempty" jsonschema:"description=Further instance types of equivalent size tried in order, after every subnet has been tried with the pool's flavor, when EC2 has no capacity."`
  	cloudconfig.CloudConfigSpec
  }
  
-@@ -136,6 +146,19 @@ type RunnerSpec struct {
+@@ -136,6 +149,21 @@ type RunnerSpec struct {
  	VolumeSize         *int32
  	VolumeType         types.VolumeType
  	ControllerID       string
@@ -462,6 +962,8 @@ index f309113..531f0a7 100644
 +	SpotInstanceType                 string
 +	SpotInstanceInterruptionBehavior string
 +	OnDemandFallback                 bool
++	FallbackSubnetIDs                []string
++	FallbackFlavors                  []string
 +}
 +
 +// UsesSpot reports whether this runner should be launched as an EC2 Spot
@@ -472,7 +974,7 @@ index f309113..531f0a7 100644
  }
  
  func (r *RunnerSpec) Validate() error {
-@@ -246,6 +269,23 @@ func (r *RunnerSpec) MergeExtraSpecs(extraSpecs *extraSpecs) {
+@@ -246,6 +274,31 @@ func (r *RunnerSpec) MergeExtraSpecs(extraSpecs *extraSpecs) {
  			Arn: extraSpecs.IAMInstanceProfile,
  		}
  	}
@@ -493,9 +995,49 @@ index f309113..531f0a7 100644
 +	if extraSpecs.OnDemandFallback != nil {
 +		r.OnDemandFallback = *extraSpecs.OnDemandFallback
 +	}
++
++	if len(extraSpecs.FallbackSubnetIDs) > 0 {
++		r.FallbackSubnetIDs = extraSpecs.FallbackSubnetIDs
++	}
++
++	if len(extraSpecs.FallbackFlavors) > 0 {
++		r.FallbackFlavors = extraSpecs.FallbackFlavors
++	}
  }
  
  func (r *RunnerSpec) ComposeUserData() (string, error) {
+@@ -313,3 +366,31 @@ func maybeCompressUserdata(udata []byte, targetOS params.OSType) ([]byte, error)
+ 	}
+ 	return b.Bytes(), nil
+ }
++
++// Placement is one (instance type, subnet) launch candidate.
++type Placement struct {
++	Flavor   string
++	SubnetID string
++}
++
++// Placements returns the launch candidates in the order they are tried:
++// the pool's flavor in its subnet, then in each fallback subnet, then each
++// fallback flavor across the same subnets. Duplicates are dropped. Added by
++// the Metacraft Labs downstream capacity-fallback patch.
++func (r *RunnerSpec) Placements() []Placement {
++	subnets := append([]string{r.SubnetID}, r.FallbackSubnetIDs...)
++	flavors := append([]string{r.BootstrapParams.Flavor}, r.FallbackFlavors...)
++	seen := map[Placement]bool{}
++	var out []Placement
++	for _, f := range flavors {
++		for _, sn := range subnets {
++			p := Placement{Flavor: f, SubnetID: sn}
++			if f == "" || sn == "" || seen[p] {
++				continue
++			}
++			seen[p] = true
++			out = append(out, p)
++		}
++	}
++	return out
++}
 diff --git a/internal/spec/spot_schema_test.go b/internal/spec/spot_schema_test.go
 new file mode 100644
 index 0000000..9335bf2
@@ -548,3 +1090,15 @@ index 0000000..9335bf2
 +	// The spot enum value must be present on market_type.
 +	require.Contains(t, s, "spot")
 +}
+diff --git a/provider/provider.go b/provider/provider.go
+index 90b49e5..cb42005 100644
+--- a/provider/provider.go
++++ b/provider/provider.go
+@@ -57,6 +57,7 @@ type AwsProvider struct {
+ }
+ 
+ func (a *AwsProvider) CreateInstance(ctx context.Context, bootstrapParams params.BootstrapInstance) (params.ProviderInstance, error) {
++	bootstrapParams = a.awsCli.Config().ApplyGuestURLOverrides(bootstrapParams)
+ 	spec, err := spec.GetRunnerSpecFromBootstrapParams(a.awsCli.Config(), bootstrapParams, a.controllerID)
+ 	if err != nil {
+ 		return params.ProviderInstance{}, fmt.Errorf("failed to get runner spec: %w", err)

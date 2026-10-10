@@ -1,0 +1,32 @@
+{
+  "resource": {
+    "cloudflare_dns_record": {
+      "mail_auth_dkim": {
+        "comment": "DKIM (runbook)",
+        "content": "${each.value.content}",
+        "for_each": {
+          "google._domainkey.example.com|TXT": {
+            "content": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAexample+/=",
+            "name": "google._domainkey.example.com",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          },
+          "google._domainkey.example.net|TXT": {
+            "content": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnet",
+            "name": "google._domainkey.example.net",
+            "zone_id": "fedcba9876543210fedcba9876543210"
+          },
+          "google2026._domainkey.example.com|TXT": {
+            "content": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArotated",
+            "name": "google2026._domainkey.example.com",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          }
+        },
+        "name": "${each.value.name}",
+        "proxied": false,
+        "ttl": 1,
+        "type": "TXT",
+        "zone_id": "${each.value.zone_id}"
+      }
+    }
+  }
+}

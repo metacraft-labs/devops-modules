@@ -1,0 +1,134 @@
+#ps1_sysnative
+
+Set-ExecutionPolicy RemoteSigned -Force -ErrorAction SilentlyContinue
+$ErrorActionPreference="Stop"
+
+$MetadataUrl = "{{ .MetadataURL }}"
+$CallbackUrl = "{{ .CallbackURL }}"
+$CallbackToken = "{{ .CallbackToken }}"
+
+function Import-Certificate() {
+	[CmdletBinding()]
+	param (
+		[parameter(Mandatory=$true)]
+		$CertificateData,
+		[parameter(Mandatory=$false)]
+		[System.Security.Cryptography.X509Certificates.StoreLocation]$StoreLocation="LocalMachine",
+		[parameter(Mandatory=$false)]
+		[System.Security.Cryptography.X509Certificates.StoreName]$StoreName="Root"
+	)
+	PROCESS
+	{
+		$store = New-Object System.Security.Cryptography.X509Certificates.X509Store(
+			$StoreName, $StoreLocation)
+		$store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+		$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($CertificateData)
+		$store.Add($cert)
+	}
+}
+
+function Start-ExecuteWithRetry {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [ScriptBlock]$ScriptBlock,
+        [int]$MaxRetryCount=10,
+        [int]$RetryInterval=3,
+        [string]$RetryMessage,
+        [array]$ArgumentList=@()
+    )
+    PROCESS {
+        $currentErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        $retryCount = 0
+        while ($true) {
+            try {
+                $res = Invoke-Command -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
+                $ErrorActionPreference = $currentErrorActionPreference
+                return $res
+            } catch [System.Exception] {
+                $retryCount++
+
+                if ($_.Exception -is [System.Net.WebException]) {
+                    $webResponse = $_.Exception.Response
+					# Skip retry on Error: 4XX (e.g. 401 Unauthorized, 404 Not Found etc.)
+                    if ($webResponse -and $webResponse.StatusCode -ge 400 -and $webResponse.StatusCode -lt 500) {
+                        # Skip retry on 4xx errors
+                        Write-Output "Encountered non-retryable error (4xx): $($_.Exception.Message)"
+                        $ErrorActionPreference = $currentErrorActionPreference
+                        throw
+                    }
+                }
+
+                if ($retryCount -gt $MaxRetryCount) {
+                    $ErrorActionPreference = $currentErrorActionPreference
+                    throw
+                } else {
+                    if ($RetryMessage) {
+                        Write-Output $RetryMessage
+                    } elseif ($_) {
+                        Write-Output $_
+                    }
+                    Start-Sleep -Seconds $RetryInterval
+                }
+            }
+        }
+    }
+}
+
+function Send-Failure() {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Message
+    )
+    $statusUrl = $CallbackUrl
+    if ($statusUrl -notmatch '/status/?$') {
+        $statusUrl = "$statusUrl/status"
+    }
+    $payload = @{ status = "failed"; message = $Message } | ConvertTo-Json -Compress
+    try {
+        Invoke-WebRequest -UseBasicParsing -Method Post -Uri $statusUrl -Headers @{"Accept"="application/json"; "Authorization"="Bearer $CallbackToken"} -Body $payload | Out-Null
+    } catch {
+        Write-Output "failed to report failure status: $($_.Exception.Message)"
+    }
+}
+
+{{- if .CACertBundle }}
+$caBundleJson = '{{.CACertBundle}}'
+$converted = ConvertFrom-Json $caBundleJson
+foreach ($i in $converted.psobject.Properties){
+    $data = [System.Convert]::FromBase64String($i.Value)
+    Import-Certificate -CertificateData $data -StoreLocation LocalMachine
+}
+{{- end }}
+
+$installScript = (Join-Path $env:TMP "garm-install.ps1")
+try {
+    Start-ExecuteWithRetry -ScriptBlock {
+        wget -UseBasicParsing -Headers @{"Accept"="application/json"; "Authorization"="Bearer $CallbackToken"} -Uri "$MetadataUrl/install-script/" -OutFile $installScript
+    } -MaxRetryCount 5 -RetryInterval 5 -RetryMessage "Retrying download of runner install script..."
+} catch {
+    $detail = $_.Exception.Message
+    $resp = $_.Exception.Response
+    if ($resp -ne $null) {
+        try {
+            $reader = New-Object System.IO.StreamReader($resp.GetResponseStream())
+            $bodyText = $reader.ReadToEnd()
+            if (![string]::IsNullOrWhiteSpace($bodyText)) {
+                try {
+                    $parsed = $bodyText | ConvertFrom-Json
+                    if ($parsed.details) { $detail = $parsed.details }
+                    elseif ($parsed.error) { $detail = $parsed.error }
+                    else { $detail = $bodyText }
+                } catch {
+                    $detail = $bodyText
+                }
+            }
+        } catch { }
+    }
+    Send-Failure "failed to fetch install script: $detail"
+    exit 1
+}
+
+powershell.exe -Sta -NonInteractive -ExecutionPolicy RemoteSigned -File $installScript

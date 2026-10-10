@@ -39,6 +39,12 @@
 #     stopped instance that GARM would try to Start again; and tags the root
 #     VOLUME with the same Name/GARM_POOL_ID/GARM_CONTROLLER_ID keys as the
 #     instance, for cloud-side reconcile;
+#   * adds CAPACITY FALLBACK across placements: extra-specs
+#     `fallback_subnet_ids` (other AZs) and `fallback_flavors` (equivalent
+#     instance types). A launch walks flavor x subnet in order (spot, then
+#     on-demand when `on_demand_fallback`), moving on only on a capacity or
+#     unsupported-in-AZ rejection;
+#   * adds `guest_metadata_url` / `guest_callback_url` provider config keys;
 #   * ships white-box tests (internal/client/spot_test.go) that drive the
 #     provider's own EC2-client mock to assert the rendered RunInstances, the
 #     fallback path, and that FindInstances excludes interrupted (terminated /

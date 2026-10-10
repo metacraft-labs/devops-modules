@@ -16,6 +16,7 @@ package backend
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -233,15 +234,29 @@ func writeMockIncus(t *testing.T) (cmd []string, stateDir string) {
 	return []string{script}, stateDir
 }
 
+// newTestIncusBackend never uses the production host-wide IPv4 allocation
+// lock (/tmp/garm-provider-vmharness-incus-ip-allocation.lock). Darwin Nix
+// builds are not sandboxed, so /tmp is shared across builds and build users on
+// a persistent runner: a lock file left there by another nixbld user made every
+// later Create fail with "permission denied" (devops-modules batch 5/6 |
+// aarch64-darwin, 2026-10-07/08). The lock goes beside the test's own mock
+// (writeMockIncus puts it in t.TempDir()), or in this process's TMPDIR.
 func newTestIncusBackend(cmd []string) *IncusBackend {
+	lockDir := os.TempDir()
+	lockName := fmt.Sprintf("incus-ip-allocation-%d.lock", os.Getpid())
+	if len(cmd) > 0 && filepath.IsAbs(cmd[0]) {
+		lockDir = filepath.Dir(cmd[0])
+		lockName = "incus-ip-allocation.lock"
+	}
 	return &IncusBackend{
-		IncusCmd:    cmd,
-		Bridge:      "incusbr0",
-		IPv4CIDR:    "10.0.100.0/24",
-		IPv4Gateway: "10.0.100.1",
-		RangeStart:  "10.0.100.200",
-		RangeEnd:    "10.0.100.250",
-		Nameservers: []string{"1.1.1.1", "8.8.8.8"},
+		IncusCmd:             cmd,
+		Bridge:               "incusbr0",
+		IPv4CIDR:             "10.0.100.0/24",
+		IPv4Gateway:          "10.0.100.1",
+		RangeStart:           "10.0.100.200",
+		RangeEnd:             "10.0.100.250",
+		Nameservers:          []string{"1.1.1.1", "8.8.8.8"},
+		IPAllocationLockPath: filepath.Join(lockDir, lockName),
 	}
 }
 

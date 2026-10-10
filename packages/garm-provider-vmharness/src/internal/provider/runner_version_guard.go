@@ -292,10 +292,33 @@ func injectBeforeAnchor(script []byte, anchor, prevLine, snippet string) ([]byte
 	return buf.Bytes(), nil
 }
 
+// upstreamGuardSnippet renders the guard for GARM upstream's default template
+// of the given OS (the one rendered by garm-provider-common's cloudconfig and
+// the one GARM >= 0.2 stores as its system template and serves at boot: they
+// are the same text), or "" for an OS upstream has no default template for.
+func upstreamGuardSnippet(osType commonParams.OSType, offered string, tools commonParams.RunnerApplicationDownload) string {
+	switch osType {
+	case commonParams.Windows:
+		return powershellRunnerVersionGuard(offered, "runnerDir",
+			func(msg string) string { return `Update-GarmStatus -CallbackURL $CallbackURL -Message "` + msg + `"` },
+			func(msg string) string { return `Throw "` + msg + `"` },
+			true)
+	case commonParams.Linux:
+		return bashRunnerVersionGuard(offered, "RUN_HOME", "sendStatus", "fail", bashReplaceInPlace, bashRunnerDownload{
+			URL:               tools.GetDownloadURL(),
+			TempDownloadToken: tools.GetTempDownloadToken(),
+			SHA256Checksum:    tools.GetSHA256Checksum(),
+			Owner:             defaults.DefaultUser + ":" + defaults.DefaultUser,
+		})
+	}
+	return ""
+}
+
 // guardUpstreamRunnerInstallScript injects the version guard into a script
-// rendered by GARM upstream's DEFAULT template. A pool-supplied
-// runner_install_template is left untouched (its author owns its cache logic),
-// as is any script when no offered version is derivable.
+// rendered by GARM upstream's DEFAULT template, or -- when the script is GARM's
+// install-script wrapper -- into the script that wrapper fetches. Any other
+// pool-supplied runner_install_template is left untouched (its author owns its
+// cache logic), as is any script when no offered version is derivable.
 func guardUpstreamRunnerInstallScript(bootstrapParams commonParams.BootstrapInstance, tools commonParams.RunnerApplicationDownload, script []byte) ([]byte, error) {
 	offered := offeredRunnerVersion(tools)
 	if offered == "" {
@@ -306,23 +329,177 @@ func guardUpstreamRunnerInstallScript(bootstrapParams commonParams.BootstrapInst
 		return nil, fmt.Errorf("reading extra specs: %w", err)
 	}
 	if len(specs.RunnerInstallTemplate) > 0 {
-		return script, nil
+		return guardGarmInstallScriptWrapper(bootstrapParams.OSType, upstreamGuardSnippet(bootstrapParams.OSType, offered, tools), script)
 	}
 	switch bootstrapParams.OSType {
 	case commonParams.Windows:
-		snippet := powershellRunnerVersionGuard(offered, "runnerDir",
-			func(msg string) string { return `Update-GarmStatus -CallbackURL $CallbackURL -Message "` + msg + `"` },
-			func(msg string) string { return `Throw "` + msg + `"` },
-			true)
-		return injectBeforeAnchor(script, upstreamWindowsGuardAnchor, upstreamWindowsRunnerDirLine, snippet)
+		return injectBeforeAnchor(script, upstreamWindowsGuardAnchor, upstreamWindowsRunnerDirLine, upstreamGuardSnippet(bootstrapParams.OSType, offered, tools))
 	case commonParams.Linux:
-		snippet := bashRunnerVersionGuard(offered, "RUN_HOME", "sendStatus", "fail", bashReplaceInPlace, bashRunnerDownload{
-			URL:               tools.GetDownloadURL(),
-			TempDownloadToken: tools.GetTempDownloadToken(),
-			SHA256Checksum:    tools.GetSHA256Checksum(),
-			Owner:             defaults.DefaultUser + ":" + defaults.DefaultUser,
-		})
-		return injectBeforeAnchor(script, upstreamLinuxGuardAnchor, "", snippet)
+		return injectBeforeAnchor(script, upstreamLinuxGuardAnchor, "", upstreamGuardSnippet(bootstrapParams.OSType, offered, tools))
 	}
 	return script, nil
+}
+
+// GARM's install-script wrapper.
+//
+// GARM >= 0.2 does not let the provider render the runner install script. For
+// every pool or scale set without its own runner_install_template, GARM sets
+// runner_install_template to a small wrapper (garm internal/templates/userdata
+// linux_wrapper.tmpl / windows_wrapper.tmpl) that fetches
+// "$METADATA_URL/install-script/" -- the script GARM renders at boot from the
+// pool's stored template (the system github_linux / github_windows templates
+// by default) -- and runs it. The provider only ever sees the wrapper, so the
+// guard injection above, which keyed on "no runner_install_template", silently
+// skipped every such pool, and its anchors are not in the wrapper anyway.
+//
+// So when the rendered script is that wrapper, a splice step is inserted into
+// it between the fetch and the run. In the guest it inserts the guard into the
+// fetched script immediately before upstream's cached-runner decision, at the
+// very anchors used above, and only when the anchor occurs exactly once -- that
+// is, only when the pool's template is upstream's default, whose RUN_HOME /
+// $runnerDir and status functions the guard relies on. A custom stored
+// template without the anchor runs unmodified, with a status saying so.
+const (
+	garmLinuxWrapperFetch    = `"$METADATA_URL/install-script/"`
+	garmLinuxWrapperAnchor   = `chmod +x /tmp/real-install.sh`
+	garmWindowsWrapperFetch  = `"$MetadataUrl/install-script/"`
+	garmWindowsWrapperAnchor = `powershell.exe -Sta -NonInteractive -ExecutionPolicy RemoteSigned -File $installScript`
+
+	garmWrapperSpliceMarker = "# garm-provider-vmharness: splice the cached-runner version guard into the"
+	bashGuardHeredocEOF     = "GARM_RUNNER_VERSION_GUARD_EOF"
+)
+
+// isGarmInstallScriptWrapper reports whether script is GARM's install-script
+// wrapper for osType: it fetches the install-script endpoint, and the line that
+// runs the fetched script occurs exactly once, unindented (the splice carries
+// a heredoc / here-string whose terminator must start its line).
+func isGarmInstallScriptWrapper(osType commonParams.OSType, script []byte) bool {
+	var fetch, anchor string
+	switch osType {
+	case commonParams.Linux:
+		fetch, anchor = garmLinuxWrapperFetch, garmLinuxWrapperAnchor
+	case commonParams.Windows:
+		fetch, anchor = garmWindowsWrapperFetch, garmWindowsWrapperAnchor
+	default:
+		return false
+	}
+	text := string(script)
+	if !strings.Contains(text, fetch) {
+		return false
+	}
+	exact, trimmed := 0, 0
+	for _, l := range strings.Split(text, "\n") {
+		l = strings.TrimRight(l, "\r")
+		if strings.TrimSpace(l) == anchor {
+			trimmed++
+			if l == anchor {
+				exact++
+			}
+		}
+	}
+	return exact == 1 && trimmed == 1
+}
+
+// guardGarmInstallScriptWrapper inserts the in-guest splice step into GARM's
+// install-script wrapper. Any other script (a genuinely custom
+// runner_install_template) is returned unchanged.
+func guardGarmInstallScriptWrapper(osType commonParams.OSType, guard string, script []byte) ([]byte, error) {
+	if guard == "" || !isGarmInstallScriptWrapper(osType, script) {
+		return script, nil
+	}
+	switch osType {
+	case commonParams.Linux:
+		splice, err := bashWrapperGuardSplice(guard)
+		if err != nil {
+			return nil, err
+		}
+		return injectBeforeAnchor(script, garmLinuxWrapperAnchor, "", splice)
+	case commonParams.Windows:
+		splice, err := powershellWrapperGuardSplice(guard)
+		if err != nil {
+			return nil, err
+		}
+		return injectBeforeAnchor(script, garmWindowsWrapperAnchor, "", splice)
+	}
+	return script, nil
+}
+
+// bashWrapperGuardSplice renders the Linux wrapper's splice step. It runs under
+// the wrapper's `set -ex` + pipefail and never fails the bootstrap: on any
+// splice problem the fetched script runs as served, and the reason is posted
+// as an installing status (no double quotes: call() embeds it in JSON).
+func bashWrapperGuardSplice(guard string) (string, error) {
+	for _, l := range strings.Split(guard, "\n") {
+		if l == bashGuardHeredocEOF {
+			return "", fmt.Errorf("runner version guard: guard text contains the heredoc terminator %q", bashGuardHeredocEOF)
+		}
+	}
+	return garmWrapperSpliceMarker + `
+# install script GARM serves (see runner_version_guard.go), right before its
+# own cached-runner check, so a stale runner baked into the image is replaced.
+GARM_GUARD_SNIPPET=/tmp/garm-runner-version-guard.sh
+cat > "$GARM_GUARD_SNIPPET" <<'` + bashGuardHeredocEOF + `'
+` + guard + bashGuardHeredocEOF + `
+if awk -v snippet="$GARM_GUARD_SNIPPET" -v anchor=` + shellQuote(upstreamLinuxGuardAnchor) + ` '
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+{ line[NR] = $0; if (trim($0) == anchor) { hits++; at = NR } }
+END {
+	if (hits != 1) exit 3
+	indent = line[at]; sub(/[^ \t].*$/, "", indent)
+	for (i = 1; i <= NR; i++) {
+		if (i == at) { while ((getline l < snippet) > 0) print ((l ~ /[^ \t]/) ? indent l : l) }
+		print line[i]
+	}
+}' /tmp/real-install.sh > /tmp/real-install.sh.guarded; then
+	mv -f /tmp/real-install.sh.guarded /tmp/real-install.sh
+	echo "cached-runner version guard spliced into the served install script"
+else
+	rm -f /tmp/real-install.sh.guarded
+	call "{\"status\": \"installing\", \"message\": \"cached-runner version guard not applied: the served install script has no single cached-runner check to guard\"}"
+fi
+rm -f "$GARM_GUARD_SNIPPET"
+`, nil
+}
+
+// powershellWrapperGuardSplice is the Windows counterpart. It runs under the
+// wrapper's $ErrorActionPreference = "Stop"; every failure is caught, so the
+// fetched script then runs as served.
+func powershellWrapperGuardSplice(guard string) (string, error) {
+	for _, l := range strings.Split(guard, "\n") {
+		if strings.HasPrefix(l, "'@") {
+			return "", fmt.Errorf("runner version guard: guard text contains a here-string terminator line")
+		}
+	}
+	return garmWrapperSpliceMarker + `
+# install script GARM serves (see runner_version_guard.go), right before its
+# own cached-runner check, so a stale runner baked into the image is discarded.
+$garmRunnerVersionGuard = @'
+` + guard + `'@
+try {
+	$garmLines = [System.IO.File]::ReadAllLines($installScript)
+	$garmAt = -1
+	$garmHits = 0
+	for ($garmI = 0; $garmI -lt $garmLines.Length; $garmI++) {
+		if ($garmLines[$garmI].Trim() -eq ` + powershellQuote(upstreamWindowsGuardAnchor) + `) {
+			$garmHits++
+			$garmAt = $garmI
+		}
+	}
+	if ($garmHits -eq 1 -and $garmAt -gt 0 -and $garmLines[$garmAt - 1].Trim() -eq ` + powershellQuote(upstreamWindowsRunnerDirLine) + `) {
+		$garmIndent = [regex]::Match($garmLines[$garmAt], '^\s*').Value
+		$garmOut = New-Object System.Collections.Generic.List[string]
+		for ($garmI = 0; $garmI -lt $garmAt; $garmI++) { $garmOut.Add($garmLines[$garmI]) }
+		foreach ($garmLine in ($garmRunnerVersionGuard -split "\r?\n")) {
+			if ($garmLine.Trim()) { $garmOut.Add($garmIndent + $garmLine) } else { $garmOut.Add($garmLine) }
+		}
+		for ($garmI = $garmAt; $garmI -lt $garmLines.Length; $garmI++) { $garmOut.Add($garmLines[$garmI]) }
+		[System.IO.File]::WriteAllLines($installScript, $garmOut.ToArray())
+		Write-Output "cached-runner version guard spliced into the served install script"
+	} else {
+		Write-Output "cached-runner version guard not applied: the served install script has no single cached-runner check to guard"
+	}
+} catch {
+	Write-Output "cached-runner version guard not applied: $($_.Exception.Message)"
+}
+`, nil
 }

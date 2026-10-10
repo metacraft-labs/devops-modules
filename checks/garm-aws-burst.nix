@@ -71,6 +71,9 @@ top@{ ... }:
             subnetId = "subnet-0123456789abcdef0";
             credentialType = "role";
           };
+          # A cloud guest cannot reach a controller URL on a private network.
+          guestMetadataURL = "https://garm.example.com/api/v1/metadata";
+          guestCallbackURL = "https://garm.example.com/api/v1/callbacks";
         };
         burstPools.linux-aws = {
           provider = "aws-burst";
@@ -152,6 +155,8 @@ top@{ ... }:
               grep -qx 'credential_type = "role"' "$awscfg" || fail "aws credential_type not rendered"
               # No secret ever in the store config.
               ! grep -qi 'access_key\|secret' "$awscfg" || fail "aws provider config leaked a credential into the store"
+              grep -qx 'guest_metadata_url = "https://garm.example.com/api/v1/metadata"' "$awscfg" || fail "aws guest_metadata_url not rendered"
+              grep -qx 'guest_callback_url = "https://garm.example.com/api/v1/callbacks"' "$awscfg" || fail "aws guest_callback_url not rendered"
 
               # -- the provider ABI: garm-provider-aws implements ONLY v0.1.0 ----
               # Rendering v0.1.1 for it (the module's hard-coded value until
@@ -222,6 +227,12 @@ top@{ ... }:
               grep -q '^ok' "$OLDPWD/gotest.log" || fail "burst provider go test did not report ok"
               grep -q 'PASS: TestCreateRunningInstanceOnDemandNoMarketOptions' "$OLDPWD/gotest.log" || fail "one-job on-demand create not proven"
               grep -q 'PASS: TestFindInstancesExcludesInterruptedSpot' "$OLDPWD/gotest.log" || fail "scale-back state filter not proven"
+              # The guest URL override reaches the userdata the instance boots
+              # with (no controller-private URL left in it).
+              go test ./config/ ./internal/spec/ -run 'TestApplyGuestURLOverrides|TestGuestURLOverrideReachesUserdata|TestGuestOverrideRewritesTheFetchedInstallScript|TestGuestOverrideNoWrapperNoInjection' \
+                -v 2>&1 | tee "$OLDPWD/gotest-guest.log" || fail "guest URL override go test failed"
+              grep -q 'PASS: TestGuestURLOverrideReachesUserdata' "$OLDPWD/gotest-guest.log" || fail "guest URL override not proven in userdata"
+              grep -q 'PASS: TestGuestOverrideRewritesTheFetchedInstallScript' "$OLDPWD/gotest-guest.log" || fail "guest URL override not proven for the install script GARM serves at boot"
               cd "$OLDPWD"
 
               # ===== (C) PROVIDER ABI, end to end against the BUILT binary ========
