@@ -42,6 +42,23 @@
             touch "$out"
           '';
 
+      # A hung build must fail well before GitHub's 360-minute default, while
+      # still leaving room for the longest observed legitimate build (217 min).
+      checks.reusable-flake-checks-build-timeout =
+        pkgs.runCommand "reusable-flake-checks-build-timeout" { nativeBuildInputs = [ pkgs.yq-go ]; }
+          ''
+            workflow=${flakeChecksWorkflow}
+            input_type="$(yq -r '.on.workflow_call.inputs."build-timeout-minutes".type' "$workflow")"
+            default="$(yq -r '.on.workflow_call.inputs."build-timeout-minutes".default' "$workflow")"
+            timeout="$(yq -r '.jobs.build."timeout-minutes"' "$workflow")"
+            test "$input_type" = number || { echo "build-timeout-minutes must be a number input, got $input_type" >&2; exit 1; }
+            [[ "$default" =~ ^[0-9]+$ ]] || { echo "build-timeout-minutes default is not an integer: $default" >&2; exit 1; }
+            (( default > 217 && default <= 300 )) \
+              || { echo "build-timeout-minutes default $default must exceed the longest observed build (217) and stay well under 360" >&2; exit 1; }
+            test "$timeout" = "\''${{ inputs.build-timeout-minutes }}" \
+              || { echo "jobs.build.timeout-minutes is '$timeout', not the build-timeout-minutes input" >&2; exit 1; }
+            touch "$out"
+          '';
       checks.reusable-flake-checks-mcl-ref =
         pkgs.runCommand "reusable-flake-checks-mcl-ref"
           {

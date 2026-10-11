@@ -1,0 +1,150 @@
+{
+  "resource": {
+    "cloudflare_dns_record": {
+      "mail_auth": {
+        "comment": "Mail (runbook)",
+        "content": "${each.value.content}",
+        "for_each": {
+          "_dmarc.example.com|TXT": {
+            "content": "\"v=DMARC1; p=reject; pct=100; adkim=s; aspf=s\"",
+            "name": "_dmarc.example.com",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          },
+          "_dmarc.example.net|TXT": {
+            "content": "\"v=DMARC1; p=none; rua=mailto:dmarc@example.com\"",
+            "name": "_dmarc.example.net",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "fedcba9876543210fedcba9876543210"
+          },
+          "example.com|MX|1": {
+            "content": "aspmx.l.google.com",
+            "name": "example.com",
+            "priority": 1,
+            "type": "MX",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          },
+          "example.com|MX|2": {
+            "content": "alt1.aspmx.l.google.com",
+            "name": "example.com",
+            "priority": 5,
+            "type": "MX",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          },
+          "example.com|TXT|google-site-verification=AbCdEfGh_12345-xyz": {
+            "content": "\"google-site-verification=AbCdEfGh_12345-xyz\"",
+            "name": "example.com",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          },
+          "example.com|TXT|spf": {
+            "content": "\"v=spf1 include:mailgun.org include:_spf.google.com ~all\"",
+            "name": "example.com",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          },
+          "example.net._report._dmarc.example.com|TXT": {
+            "content": "\"v=DMARC1\"",
+            "name": "example.net._report._dmarc.example.com",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          },
+          "example.net|MX|1": {
+            "content": "smtp.google.com",
+            "name": "example.net",
+            "priority": 1,
+            "type": "MX",
+            "zone_id": "fedcba9876543210fedcba9876543210"
+          },
+          "example.net|TXT|google-site-verification=NetToken_000000": {
+            "content": "\"google-site-verification=NetToken_000000\"",
+            "name": "example.net",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "fedcba9876543210fedcba9876543210"
+          },
+          "example.net|TXT|spf": {
+            "content": "\"v=spf1 include:_spf.google.com ~all\"",
+            "name": "example.net",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "fedcba9876543210fedcba9876543210"
+          },
+          "example.org._report._dmarc.example.com|TXT": {
+            "content": "\"v=DMARC1\"",
+            "name": "example.org._report._dmarc.example.com",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          }
+        },
+        "name": "${each.value.name}",
+        "priority": "${try(each.value.priority, null)}",
+        "proxied": false,
+        "ttl": 1,
+        "type": "${each.value.type}",
+        "zone_id": "${each.value.zone_id}"
+      },
+      "mail_auth_dkim": {
+        "comment": "DKIM (runbook)",
+        "content": "${each.value.content}",
+        "for_each": {
+          "google._domainkey.example.com|TXT": {
+            "content": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAexample+/=",
+            "name": "google._domainkey.example.com",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          }
+        },
+        "name": "${each.value.name}",
+        "proxied": false,
+        "ttl": 1,
+        "type": "TXT",
+        "zone_id": "${each.value.zone_id}"
+      },
+      "mail_auth_dkim_example_org": {
+        "comment": "DKIM (runbook)",
+        "content": "${each.value.content}",
+        "for_each": {
+          "google._domainkey.example.org|TXT": {
+            "content": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAorg",
+            "name": "google._domainkey.example.org"
+          }
+        },
+        "name": "${each.value.name}",
+        "proxied": false,
+        "ttl": 1,
+        "type": "TXT",
+        "zone_id": "${data.cloudflare_zone.example_org.id}"
+      },
+      "mail_auth_example_org": {
+        "comment": "Mail (runbook)",
+        "content": "${each.value.content}",
+        "for_each": {
+          "_dmarc.example.org|TXT": {
+            "content": "\"v=DMARC1; p=none; rua=mailto:dmarc@example.com\"",
+            "name": "_dmarc.example.org",
+            "priority": null,
+            "type": "TXT"
+          },
+          "example.org|MX|1": {
+            "content": "smtp.google.com",
+            "name": "example.org",
+            "priority": 1,
+            "type": "MX"
+          }
+        },
+        "name": "${each.value.name}",
+        "priority": "${try(each.value.priority, null)}",
+        "proxied": false,
+        "ttl": 1,
+        "type": "${each.value.type}",
+        "zone_id": "${data.cloudflare_zone.example_org.id}"
+      }
+    }
+  }
+}

@@ -57,6 +57,7 @@ import (
 const (
 	guardMarker    = "# garm-provider-vmharness: cached-runner version guard"
 	offeredVersion = "2.337.0"
+	newerVersion   = "2.338.0"
 )
 
 func guardBootstrap(osType commonParams.OSType, arch commonParams.OSArch, toolsOS, toolsArch, filename, url string) commonParams.BootstrapInstance {
@@ -407,6 +408,13 @@ func guardCases(launcher string) []guardCase {
 		{name: "missing-deps-discarded", setup: stagedRunner("", launcher), discarded: true,
 			wantStatus: []string{"cached runner unknown", "offered " + offeredVersion}},
 		{name: "no-runner-untouched", setup: func(*testing.T, string) {}},
+		// Newer than offered: the golden pin moved ahead of what GitHub offers.
+		// Kept, never downgraded (2026-10-11: 2.338.0 baked, 2.337.0 offered).
+		{name: "newer-version-kept", setup: stagedRunner(newerVersion, launcher)},
+		// Numeric, not lexical: "2.40.0" sorts after "2.337.0" as a string but
+		// is the older release.
+		{name: "lexically-greater-older-discarded", setup: stagedRunner("2.40.0", launcher), discarded: true,
+			wantStatus: []string{"cached runner 2.40.0", "older than offered " + offeredVersion}},
 	}
 }
 
@@ -667,6 +675,7 @@ func TestUpstreamLinuxGuardReplacesRunnerInPlace(t *testing.T) {
 		sha   string
 		setup func(t *testing.T, home string)
 		// outcome
+		wantVersion  string // "" = the offered version
 		wantReplaced bool
 		wantFail     string
 		wantStatus   []string
@@ -679,6 +688,7 @@ func TestUpstreamLinuxGuardReplacesRunnerInPlace(t *testing.T) {
 		{name: "missing-deps-replaced", url: "file://" + goodTar, setup: stagedRunner("", "run.sh"), wantReplaced: true,
 			wantStatus: []string{"cached runner unknown"}},
 		{name: "no-runner-untouched", url: "file://" + goodTar, setup: func(*testing.T, string) {}},
+		{name: "newer-version-kept", url: "file://" + goodTar, setup: stagedRunner(newerVersion, "run.sh"), wantVersion: newerVersion},
 		{name: "download-failure-fails", url: "file://" + filepath.Join(fixtures, "absent.tar.gz"), setup: stagedRunner("2.328.0", "run.sh"),
 			wantFail: "failed to download runner " + offeredVersion},
 		{name: "checksum-mismatch-fails", url: "file://" + goodTar, sha: strings.Repeat("0", 64), setup: stagedRunner("2.328.0", "run.sh"),
@@ -742,8 +752,15 @@ func TestUpstreamLinuxGuardReplacesRunnerInPlace(t *testing.T) {
 			if !exists(filepath.Join(home, ".env")) {
 				t.Fatalf(".env did not survive:\n%s", out)
 			}
-			if got := cachedRunnerVersion(t, home); got != offeredVersion {
-				t.Fatalf("runner version after guard = %q, want %q:\n%s", got, offeredVersion, out)
+			want := offeredVersion
+			if c.wantVersion != "" {
+				want = c.wantVersion
+			}
+			if got := cachedRunnerVersion(t, home); got != want {
+				t.Fatalf("runner version after guard = %q, want %q:\n%s", got, want, out)
+			}
+			if c.wantVersion != "" && strings.Contains(out, "STATUS:") {
+				t.Fatalf("guard reported a replacement of a runner it must keep:\n%s", out)
 			}
 			stale := exists(filepath.Join(home, "bin", "stale-only-in-old-runner"))
 			if c.wantReplaced {

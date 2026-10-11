@@ -221,6 +221,11 @@ execution uses the existing `switch` phase and distinguishes `pre-switch` from
 `post-switch` with `metadata.lifecycleStage`. Readiness deferral uses command
 status `skipped`, exit code 75, error code `deployment_deferred`, and
 `error.retryable = true`; it does not introduce a new phase or status value.
+Both the hook's `switch` event and the terminal `complete` event record the
+hook's stderr summary in `error.details.stderrSummary`, so the outcome itself
+names the readiness condition that failed. The durable deployment state
+message carries the same reason. A readiness hook should therefore print one
+specific reason line on stderr when it defers.
 Darwin activation events report target kind `darwin`.
 
 ## NixOS Module

@@ -44,12 +44,18 @@ blocks; `--resource-types a,b` overrides. `plan` = read on every managed group,
 `apply` = edit on writable groups + `zone:read`, `import` = broad read for
 inventory. Managing zone-level settings? add `--zone-writable`.
 
-## `mail-auth.nix` — DKIM TXT records from a JSON data file
+## `mail-auth.nix` — mail DNS records from a JSON data file
 
-A Terranix helper that renders DKIM records for Cloudflare zones from a data
-file the consumer keeps in its root. It is the Terraform half of the
-[Google Workspace DKIM runbook](../../docs/Google-Workspace-DKIM.md), whose
-`google-workspace-dkim publish` tool edits the same file.
+A Terranix helper that renders a domain's mail records for Cloudflare zones —
+DKIM keys and, from data version 2, MX, SPF, DMARC, TLS-RPT, MTA-STS and the
+Google site-verification token — from a data file the consumer keeps in its
+root. It
+is the Terraform half of the
+[Google Workspace DKIM runbook](../../docs/Google-Workspace-DKIM.md) and the
+[Google Workspace domains runbook](../../docs/Google-Workspace-Domains.md),
+whose `google-workspace-dkim publish` and `google-workspace-domains onboard`
+tools edit the same file. The version-1 shape below is still accepted and
+renders exactly as before; the helper's header documents version 2 in full.
 
 ```json
 {
@@ -96,11 +102,41 @@ label, and a value that does not start with `v=DKIM1;` or uses a character
 outside the DKIM tag alphabet (which also keeps Terraform template sequences
 out of the rendered JSON).
 
+**Version 2** adds, per domain, `google_verification` (a list of
+`google-site-verification=…` values), `mx` (`[{priority, host}]`), `spf`
+(`{include, all}`), `dmarc` (`{p, sp?, pct?, rua?, ruf?, fo?, adkim?, aspf?}`)
+and `zone_lookup` (the key of a consumer-declared `data "cloudflare_zone"`, in
+place of `zone_id`). They render into a second resource,
+`cloudflare_dns_record.<recordsResourceName>` (default `mail_auth`), keyed
+`<domain>|MX|<n>` (by position: a changed host is an in-place update),
+`<domain>|TXT|spf`, `<domain>|TXT|<verification value>`, `_dmarc.<domain>|TXT`
+and, for DMARC reports sent to another declared domain,
+`<domain>._report._dmarc.<report-domain>|TXT`. Non-DKIM TXT values are rendered
+as one quoted string. A `zone_lookup` domain's records go to
+`mail_auth_<key>` / `mail_auth_dkim_<key>` with
+`zone_id = "${data.cloudflare_zone.<key>.id}"`, so an offline plan that excludes
+the lookup loses only those.
+
+Also in version 2, all optional: `tls_rpt` (`{rua}`, mailto: or https: URIs)
+renders `_smtp._tls.<domain>|TXT`; `mta_sts` (`{enabled, id, mode, max_age?}`)
+renders `_mta-sts.<domain>|TXT` only when `enabled` (default off — the policy
+host it announces is the consumer's to run); `google` (`{kind: primary |
+secondary | alias, parent?, spf_replace?}`) and the top-level `google_users`
+are read by the tools and render nothing; and `"zone_pending": true` declares a
+domain whose zone is not in Cloudflare yet, which renders nothing at all (not
+even another zone's report-authorisation record for it). A file without them
+renders exactly as before.
+
 Tested by `nix build .#checks.<system>.cloudflare-mail-auth`
 ([`tests/mail-auth.nix`](./tests/mail-auth.nix): key stability, empty
-rendering, attribute values, each refusal; plus a comparison of
-[`tests/mail-auth/data.json`](./tests/mail-auth/data.json)'s rendering with the
-reviewed [`expected.json`](./tests/mail-auth/expected.json)).
+rendering, attribute values, each refusal, for both versions; plus comparisons
+of [`tests/mail-auth/data.json`](./tests/mail-auth/data.json),
+[`data-v2.json`](./tests/mail-auth/data-v2.json) and
+[`data-v2-kinds.json`](./tests/mail-auth/data-v2-kinds.json)'s renderings with
+the reviewed [`expected.json`](./tests/mail-auth/expected.json),
+[`expected-v2.json`](./tests/mail-auth/expected-v2.json) and
+[`expected-v2-kinds.json`](./tests/mail-auth/expected-v2-kinds.json), and of the
+tools' `scripts/lib/mail-auth.jq` addresses with the rendering).
 
 ## `cloudflare-import-blocks` — shared import-block generator
 

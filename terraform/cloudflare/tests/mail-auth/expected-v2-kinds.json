@@ -1,0 +1,92 @@
+{
+  "resource": {
+    "cloudflare_dns_record": {
+      "mail_auth": {
+        "comment": "Mail (runbook)",
+        "content": "${each.value.content}",
+        "for_each": {
+          "_dmarc.example.com|TXT": {
+            "content": "\"v=DMARC1; p=none; rua=mailto:dmarc@example.com\"",
+            "name": "_dmarc.example.com",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          },
+          "_dmarc.example.info|TXT": {
+            "content": "\"v=DMARC1; p=none; rua=mailto:dmarc@example.dev\"",
+            "name": "_dmarc.example.info",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "00000000000000000000000000000002"
+          },
+          "_dmarc.example.net|TXT": {
+            "content": "\"v=DMARC1; p=none; rua=mailto:dmarc@example.com\"",
+            "name": "_dmarc.example.net",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "fedcba9876543210fedcba9876543210"
+          },
+          "_mta-sts.example.net|TXT": {
+            "content": "\"v=STSv1; id=20261011T1\"",
+            "name": "_mta-sts.example.net",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "fedcba9876543210fedcba9876543210"
+          },
+          "_smtp._tls.example.com|TXT": {
+            "content": "\"v=TLSRPTv1; rua=mailto:dmarc@example.com\"",
+            "name": "_smtp._tls.example.com",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          },
+          "_smtp._tls.example.net|TXT": {
+            "content": "\"v=TLSRPTv1; rua=mailto:dmarc@example.com,https://reports.example.com/tlsrpt\"",
+            "name": "_smtp._tls.example.net",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "fedcba9876543210fedcba9876543210"
+          },
+          "example.com|MX|1": {
+            "content": "smtp.google.com",
+            "name": "example.com",
+            "priority": 1,
+            "type": "MX",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          },
+          "example.net._report._dmarc.example.com|TXT": {
+            "content": "\"v=DMARC1\"",
+            "name": "example.net._report._dmarc.example.com",
+            "priority": null,
+            "type": "TXT",
+            "zone_id": "0123456789abcdef0123456789abcdef"
+          }
+        },
+        "name": "${each.value.name}",
+        "priority": "${try(each.value.priority, null)}",
+        "proxied": false,
+        "ttl": 1,
+        "type": "${each.value.type}",
+        "zone_id": "${each.value.zone_id}"
+      },
+      "mail_auth_example_org": {
+        "comment": "Mail (runbook)",
+        "content": "${each.value.content}",
+        "for_each": {
+          "_smtp._tls.example.org|TXT": {
+            "content": "\"v=TLSRPTv1; rua=mailto:dmarc@example.com\"",
+            "name": "_smtp._tls.example.org",
+            "priority": null,
+            "type": "TXT"
+          }
+        },
+        "name": "${each.value.name}",
+        "priority": "${try(each.value.priority, null)}",
+        "proxied": false,
+        "ttl": 1,
+        "type": "${each.value.type}",
+        "zone_id": "${data.cloudflare_zone.example_org.id}"
+      }
+    }
+  }
+}

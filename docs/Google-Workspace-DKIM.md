@@ -164,7 +164,11 @@ _Authenticating email with DKIM_.
 
 ## 4. The data file and the Terraform side
 
-The data file is plain JSON so the tool can edit it and a reviewer can read it:
+The data file is plain JSON so the tool can edit it and a reviewer can read it.
+This is its version-1 shape; version 2 also carries the domain's MX, SPF,
+DMARC and Google verification records, and is what
+[Google-Workspace-Domains.md](./Google-Workspace-Domains.md) uses to put a new
+domain on the tenant. The DKIM tool accepts both.
 
 ```json
 {

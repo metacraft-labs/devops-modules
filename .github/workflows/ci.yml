@@ -83,6 +83,11 @@ jobs:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # The fixture resolves github:NixOS/nixpkgs/nixos-unstable through the
+          # GitHub API. Unauthenticated that is 60 requests/hour per egress IP,
+          # shared by the whole runner fleet, and it failed this job with HTTP
+          # 403 on most pull requests (2026-10-07/09).
+          nix-github-token: ${{ github.token }}
           devshell: failing
 
       - name: Assert the failing devShell was detected
@@ -100,6 +105,11 @@ jobs:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # The fixture resolves github:NixOS/nixpkgs/nixos-unstable through the
+          # GitHub API. Unauthenticated that is 60 requests/hour per egress IP,
+          # shared by the whole runner fleet, and it failed this job with HTTP
+          # 403 on most pull requests (2026-10-07/09).
+          nix-github-token: ${{ github.token }}
           devshell: default
 
       - name: Assert the working devShell was exported to PATH
