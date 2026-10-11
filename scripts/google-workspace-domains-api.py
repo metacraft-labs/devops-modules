@@ -22,8 +22,10 @@
                             ({"sendAsEmail", "verificationStatus", "result"})
   group  GROUP [--allow-external]
                             the group's posting settings; with
-                            --allow-external, set whoCanPostMessage to
-                            ANYONE_CAN_POST first
+                            --allow-external, first set what a report
+                            mailbox needs (REPORT_GROUP_SETTINGS): anyone may
+                            post, and neither suspected spam nor any other
+                            message is held for a moderator
   send-test USER FROM TO    send a short test message as USER, From: FROM
                             (one of USER's send-as addresses), To: TO
   smtp-test USER FROM TO    send a test message through the Workspace SMTP
@@ -87,6 +89,16 @@ def api_of(scope):
 
 
 PROG = "google-workspace-domains"
+
+# What a group receiving DMARC/TLS-RPT reports from outside needs: external
+# senders may post, and nothing is held in the moderation queue — reports are
+# machine-sent and often zipped, which spam filtering tends to flag, and a held
+# report is a lost one (nobody moderates this group).
+REPORT_GROUP_SETTINGS = {
+    "whoCanPostMessage": "ANYONE_CAN_POST",
+    "spamModerationLevel": "ALLOW",
+    "messageModerationLevel": "MODERATE_NONE",
+}
 DIR = "/admin/directory/v1/customer/my_customer/"
 
 
@@ -442,7 +454,7 @@ def group(args):
     s = session(args.key, args.subject, SCOPE_GROUPS)
     url = f"{GROUPS_API}/groups/v1/groups/{q(args.group)}"
     if args.allow_external:
-        r = call(s, "PATCH", url, params={"alt": "json"}, json={"whoCanPostMessage": "ANYONE_CAN_POST"})
+        r = call(s, "PATCH", url, params={"alt": "json"}, json=REPORT_GROUP_SETTINGS)
         if r.status_code == 404:
             raise Failure(f"no group {args.group} (create it in the Admin console first)")
         if r.status_code == 400:

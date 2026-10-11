@@ -37,15 +37,15 @@ the result itself** before moving on, printing the guidance again when the
 check fails. Everything is checked live first, so a re-run skips what is done
 and resumes where the last one stopped.
 
-| Step             | What it does                                                                                                                                                                                    | Verified by                                                                |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `scopes`         | Mints a token per scope; for the missing ones prints the client id, the console page and the **complete** replacement scope line (granted + missing, one comma-separated line, and one per box) | a token for every scope                                                    |
-| `dmarc-group`    | Sets the report group's `whoCanPostMessage` to `ANYONE_CAN_POST`; guides through enabling the Groups Settings API, or the organisation's Groups sharing setting, when Google refuses            | the group's settings, read back                                            |
-| `onboard-all`    | Every declared domain, in the order of §1.1: onboard (§4), Activate Gmail (console), the users' addresses (§3)                                                                                  | `status` of the domain; the Directory and Gmail APIs                       |
-| `user-addresses` | Every `google_users` user's aliases and send-as entries on every domain                                                                                                                         | the Directory and Gmail APIs; `pending` re-checked after the user clicks   |
-| `dkim-all`       | Every domain on Google without a DKIM key: the console steps (domain, 2048 bits, selector `google`), the paste, the PR, the DNS wait, "Start authentication"                                    | DNS serves the key; with `--test-to`, a message sent through the Gmail API |
-| `smtp-relay`     | The SMTP relay rule for automated sending (§5), console only                                                                                                                                    | with `--test-to` and an app password, a message sent through the relay     |
-| `status`         | One line per domain                                                                                                                                                                             | —                                                                          |
+| Step             | What it does                                                                                                                                                                                                                                                                                            | Verified by                                                                |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `scopes`         | Mints a token per scope; for the missing ones prints the client id, the console page and the **complete** replacement scope line (granted + missing, one comma-separated line, and one per box)                                                                                                         | a token for every scope                                                    |
+| `dmarc-group`    | Sets the report group's `whoCanPostMessage` to `ANYONE_CAN_POST`, `spamModerationLevel` to `ALLOW` and `messageModerationLevel` to `MODERATE_NONE` (no report held for a moderator); guides through enabling the Groups Settings API, or the organisation's Groups sharing setting, when Google refuses | the group's settings, read back                                            |
+| `onboard-all`    | Every declared domain, in the order of §1.1: onboard (§4), Activate Gmail (console), the users' addresses (§3)                                                                                                                                                                                          | `status` of the domain; the Directory and Gmail APIs                       |
+| `user-addresses` | Every `google_users` user's aliases and send-as entries on every domain                                                                                                                                                                                                                                 | the Directory and Gmail APIs; `pending` re-checked after the user clicks   |
+| `dkim-all`       | Every domain on Google without a DKIM key: the console steps (domain, 2048 bits, selector `google`), the paste, the PR, the DNS wait, "Start authentication"                                                                                                                                            | DNS serves the key; with `--test-to`, a message sent through the Gmail API |
+| `smtp-relay`     | The SMTP relay rule for automated sending (§5), console only                                                                                                                                                                                                                                            | with `--test-to` and an app password, a message sent through the relay     |
+| `status`         | One line per domain                                                                                                                                                                                                                                                                                     | —                                                                          |
 
 `run` (the default) does all of them in that order, with DKIM inside each
 domain's turn.
@@ -56,16 +56,19 @@ From the data and live DNS, per domain:
 
 1. the tenant's **primary** domain (records only);
 2. domains whose mail is **already on Google** — no routing change;
-3. domains with **no working mail today** — no MX, or MX hosts that do not
-   resolve — nothing to lose;
-4. domains whose mail **goes elsewhere today**. Before the first of these is
-   switched, the wizard asks the operator to confirm that a message sent from
-   **outside** the tenant arrived at an address on a domain already moved to
-   `smtp.google.com`; and before each, that the old mailboxes are exported and
-   every address in use exists on the tenant. Without the confirmation the
+3. domains with **no MX** — nothing to lose;
+4. domains whose MX names a host elsewhere that **does not resolve** (it may
+   only be down for now), then
+5. domains whose mail **goes elsewhere today**. Before the first domain of 4
+   or 5 is switched, the wizard asks the operator to confirm that a message
+   sent from **outside** the tenant arrived at an address on a secondary or
+   alias domain already moved to `smtp.google.com`; and before each, that the
+   old mailboxes are exported and every address in use exists on the tenant.
+   Without the confirmation — or with no such domain to send it to — the
    domain is skipped, untouched.
 
-An alias always comes after its parent (Google needs the parent first).
+An alias always comes after its parent (Google needs the parent first), and
+`onboard` leaves an alias's mail records alone until its parent is verified.
 Domains declared `zone_pending` are listed and skipped (§6.2).
 
 ### 1.2 The tools underneath

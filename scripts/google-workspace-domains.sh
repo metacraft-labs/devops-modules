@@ -52,7 +52,8 @@
 #      resolvers serve the token.
 #   3. webResource.insert asks Google to check the record; then the domain is
 #      polled (domains.get / domainAliases.get) until it is reported verified.
-#   4. Only then the mail records, in a SECOND PR (branch mail/<D>-records):
+#   4. Only then — and for an alias only once its parent is verified too — the
+#      mail records, in a SECOND PR (branch mail/<D>-records):
 #      .mx = --mx (default 1:smtp.google.com), except that MX records that
 #      all point at Google already (the legacy aspmx set) are kept unless --mx
 #      is given; .spf gains include:_spf.google.com and keeps the includes
@@ -103,7 +104,9 @@
 #
 # dmarc-group: lets GROUP (the DMARC/TLS-RPT report mailbox) receive mail from
 # outside the organisation — Groups Settings API whoCanPostMessage =
-# ANYONE_CAN_POST, scope apps.groups.settings.
+# ANYONE_CAN_POST, and spamModerationLevel = ALLOW and messageModerationLevel =
+# MODERATE_NONE so that no report waits in a moderation queue; scope
+# apps.groups.settings.
 #
 # scopes: mints a token for every scope in the list (default: every scope these
 # tools use) and reports which the delegation grants; for the missing ones it
@@ -526,6 +529,14 @@ Opened by \`google-workspace-domains onboard\`. The MX/SPF/DMARC/TLS-RPT switch 
     say "$domain is verified"
   fi
 
+  # An alias's addresses are its parent's users' addresses: with the parent not
+  # verified there are none yet, and mail switched here would bounce.
+  if [ "$kind" = alias ]; then
+    st="$(api state "$kind_parent")" || exit 1
+    [ "$(state_field verified "$st")" = true ] ||
+      die "$domain is verified, but its parent $kind_parent is not (tenant: $(state_field kind "$st")): its mail records stay as they are. Onboard $kind_parent first, then re-run this for $domain"
+  fi
+
   # 4. the mail records
   phase=records phase_prog="$records_prog"
   run_phase "mail/$domain-records" "dns: mail records for $domain (Google Workspace)" \
@@ -718,7 +729,7 @@ group_guidance() { # REASON
       guide_step 1 "Open https://admin.google.com/ac/groups and click 'Create group'."
       guide_step 2 "Name: DMARC reports. Group email: $group. Owner: yourself. Next."
       guide_step 3 "Access type: Custom; 'Who can post': Anyone on the web (External). Create group."
-      guide_text "Success looks like: the group is listed; this tool then checks its posting setting."
+      guide_text "Success looks like: the group is listed; this tool then sets and checks its posting and moderation settings."
       ;;
   esac
 }
@@ -731,18 +742,23 @@ cmd_dmarc_group() {
   need_credentials
   project_id="$(jq -r '.project_id // empty' "$key" 2>/dev/null || true)"
   local out err rc reason
+  # Anyone may post, and nothing is held for a moderator.
+  report_ready() {
+    jq -e '.whoCanPostMessage == "ANYONE_CAN_POST" and .spamModerationLevel == "ALLOW"
+      and .messageModerationLevel == "MODERATE_NONE"' <<<"$1" >/dev/null
+  }
   while :; do
     err="$(mktemp)"
     rc=0
     out="$(api group "$group" 2>"$err")" || rc=$?
-    if [ "$rc" = 0 ] && [ "$(state_field whoCanPostMessage "$out")" != ANYONE_CAN_POST ]; then
-      say "$group: whoCanPostMessage is $(state_field whoCanPostMessage "$out"); setting ANYONE_CAN_POST"
+    if [ "$rc" = 0 ] && ! report_ready "$out"; then
+      say "$group: whoCanPostMessage $(state_field whoCanPostMessage "$out"), spam moderation $(state_field spamModerationLevel "$out"), message moderation $(state_field messageModerationLevel "$out"); setting ANYONE_CAN_POST, ALLOW, MODERATE_NONE"
       out="$(api group "$group" --allow-external 2>"$err")" || rc=$?
     fi
-    if [ "$rc" = 0 ] && [ "$(state_field whoCanPostMessage "$out")" = ANYONE_CAN_POST ]; then
+    if [ "$rc" = 0 ] && report_ready "$out"; then
       rm -f "$err"
       echo "$group: whoCanPostMessage ANYONE_CAN_POST"
-      echo "   spam moderation: $(state_field spamModerationLevel "$out"), message moderation: $(state_field messageModerationLevel "$out")"
+      echo "   spam moderation: ALLOW, message moderation: MODERATE_NONE (nothing is held)"
       say "OK: $group accepts reports from outside the organisation"
       return 0
     fi

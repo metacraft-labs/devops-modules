@@ -493,6 +493,12 @@ expect "... (a secondary domain; Activate Gmail; user-addresses)" \
   bash -c 'grep -qF "as a secondary domain" "$1" && grep -qF "Activate Gmail" "$1" && grep -qF "user-addresses --user" "$1"' _ "$work/stderr"
 expect "an alias declared in the data needs no --parent" run onboard --no-pr --domain example.app --data "$data"
 expect "... it is a domain alias of the data's parent" test "$(jq -r '.aliases["example.app"].parent' "$state")" = example.dev
+set_state '.aliases["example.app"].verified = true | .domains["example.dev"].verified = false'
+expect_not "an alias whose parent is not verified keeps its mail records" \
+  run onboard --no-pr --domain example.app --data "$data" --dmarc-rua dmarc@example.com
+expect "... naming the parent" stderr_has "its parent example.dev is not"
+expect "... and writing no MX" test "$(jq -c '.domains["example.app"].mx // null' "$data")" = null
+set_state '.domains["example.dev"].verified = true'
 git -C "$repo" checkout --quiet -- "$data"
 
 edit_data '.domains["example.org"].google = {kind: "secondary"}'
@@ -605,9 +611,16 @@ expect "... through the Groups Settings API with apps.groups.settings" \
   log_has "^PATCH /groups/v1/groups/dmarc%40example.com apps.groups.settings$"
 expect "... whoCanPostMessage is now ANYONE_CAN_POST" \
   test "$(jq -r '.groups["dmarc@example.com"].whoCanPostMessage' "$state")" = ANYONE_CAN_POST
+expect "... and no report is held for a moderator (spam ALLOW, moderation none)" \
+  test "$(jq -c '.groups["dmarc@example.com"] | [.spamModerationLevel, .messageModerationLevel]' "$state")" = '["ALLOW","MODERATE_NONE"]'
 : >"$api_log"
 expect "a re-run only reads" run dmarc-group --group dmarc@example.com
 expect "... (no PATCH)" bash -c '! grep -q "^PATCH" "$1"' _ "$api_log"
+set_state '.groups["dmarc@example.com"].spamModerationLevel = "MODERATE"'
+: >"$api_log"
+expect "a group that accepts outside posts but holds suspected spam is fixed too" run dmarc-group --group dmarc@example.com
+expect "... (PATCH, spam moderation ALLOW)" \
+  bash -c 'grep -q "^PATCH" "$1" && test "$(jq -r ".groups[\"dmarc@example.com\"].spamModerationLevel" "$2")" = ALLOW' _ "$api_log" "$state"
 set_state '.deny_scopes = ["apps.groups.settings"] | .groups["dmarc@example.com"].whoCanPostMessage = "ALL_IN_DOMAIN_CAN_POST"'
 expect_not "without apps.groups.settings it stops" run dmarc-group --group dmarc@example.com
 expect "... naming the scope in full" stderr_has "does not include https://www.googleapis.com/auth/apps.groups.settings"
@@ -703,22 +716,35 @@ wizard() {
     bash "$setup_tool" "$@" --data "$wdata" --base main --dmarc-rua dmarc@example.com --test-to ext@example.net
 }
 STUB_ORIGIN="$worigin" "$STUB_APPLY"
-# onboard-all, with the inbound test skipped: the domains with no mail today
-# are onboarded, the two whose mail goes elsewhere are NOT touched.
+# With no domain on smtp.google.com yet there is nowhere to send the inbound
+# test to: a domain whose mail goes elsewhere is left alone without asking (an
+# empty stdin: any question would stop the run with exit 4).
+mkdir -p "$work/noprobe"
+jq '.domains |= {"example.net": .["example.net"]} | del(.google_users)' "$wdata" >"$work/noprobe/mail-auth.json"
+rc=0
+GOOGLE_WORKSPACE_DOMAINS_CMD="bash $tool" bash "$setup_tool" onboard-all --data "$work/noprobe/mail-auth.json" \
+  </dev/null >"$work/stdout" 2>"$work/stderr" || rc=$?
+expect "with no domain already moved, the inbound-test gate refuses without asking" \
+  bash -c '[ "$1" = 0 ] && grep -qF "skipping example.net: no inbound test confirmed yet" "$2"' _ "$rc" "$work/stdout"
+expect "... and adds nothing" bash -c '! jq -e ".domains[\"example.net\"]" "$1" >/dev/null' _ "$state"
+# onboard-all, with the inbound test skipped: the domain with no MX is
+# onboarded; those whose MX names a host elsewhere — resolving or not — are NOT
+# touched.
 {
   echo             # example.org: Activate Gmail done
-  echo             # example.xyz: Activate Gmail done
+  echo s           # gate before example.xyz: skip
   echo s           # gate before example.net: skip
   echo s           # gate before example.info: skip
 } >"$work/answers"
 rc=0
 wizard onboard-all <"$work/answers" >"$work/stdout" 2>"$work/stderr" || rc=$?
-expect "onboard-all onboards the domains with no mail today" \
-  bash -c '[ "$1" = 0 ] && test "$(jq -c "[.domains[\"example.org\",\"example.xyz\"].verified]" "$2")" = "[true,true]"' _ "$rc" "$state"
-expect "... asks for an inbound test before a domain whose mail goes elsewhere" flat_has "Before switching a domain that receives mail today"
+expect "onboard-all onboards the domain with no MX" \
+  bash -c '[ "$1" = 0 ] && test "$(jq -c "[.domains[\"example.org\"].verified]" "$2")" = "[true]"' _ "$rc" "$state"
+expect "... asks for an inbound test before a domain whose MX names a host elsewhere" flat_has "Before switching a domain that receives mail today"
 expect "... and, without one, leaves those domains alone (no domain added, no PR)" \
-  bash -c '! grep -qE "example\.(net|info)" "$1" && ! jq -e ".domains[\"example.net\"] // .aliases[\"example.info\"]" "$2" >/dev/null' _ "$STUB_GH_LOG" "$state"
-expect "... saying so" output_has "skipping example.net: no inbound test confirmed yet"
+  bash -c '! grep -qE "example\.(net|info|xyz)" "$1" && ! jq -e ".domains[\"example.net\"] // .domains[\"example.xyz\"] // .aliases[\"example.info\"]" "$2" >/dev/null' _ "$STUB_GH_LOG" "$state"
+expect "... saying so, also for the one whose mail host does not resolve" \
+  bash -c 'grep -qF "skipping example.net: no inbound test confirmed yet" "$1" && grep -qF "skipping example.xyz: no inbound test confirmed yet" "$1"' _ "$work/stdout"
 expect "... and printing the Activate Gmail steps" \
   bash -c 'grep -qF "https://admin.google.com/ac/domains/manage" "$1" && grep -qF "Activate Gmail" "$1"' _ "$work/stdout"
 # The full run. example.org and example.xyz are on Google now.
@@ -729,9 +755,11 @@ expect "... and printing the Activate Gmail steps" \
   echo             # (end of the paste)
   echo             # example.org: Start authentication clicked
   echo y           # example.org: the test message shows DKIM pass
-  echo s           # example.xyz: DKIM later
-  echo n           # gate: no inbound test yet
+  echo n           # gate (before example.xyz): no inbound test yet
   echo y           # gate: now it arrived
+  echo yes         # switch example.xyz
+  echo             # example.xyz: Activate Gmail done
+  echo s           # example.xyz: DKIM later
   echo yes         # switch example.net
   echo             # example.net: Activate Gmail done
   echo s           # example.net: DKIM later
@@ -757,7 +785,7 @@ expect "... sending the DKIM test message as the user from the new domain" log_h
 expect "... an address and an accepted send-as at every domain, mirrored at the alias" \
   test "$(jq -c '[.sendas["admin@example.com"][] | select(.isPrimary | not) | select(.verificationStatus == "accepted") | .sendAsEmail] | sort' "$state")" = '["admin@example.info","admin@example.net","admin@example.org","admin@example.xyz"]'
 expect "... the report group accepting mail from outside" test "$(jq -r '.groups["dmarc@example.com"].whoCanPostMessage' "$state")" = ANYONE_CAN_POST
-expect "... asking for the inbound test before switching example.net, and holding off on 'n'" \
+expect "... asking for the inbound test before switching example.xyz, and holding off on 'n'" \
   bash -c 'grep -qF "send a message to admin@example.org" <(tr -s " \n" "  " <"$1") && grep -qF "Then do not switch more mail yet" "$1"' _ "$work/stdout"
 expect "... printing the DKIM console steps with the exact choices" \
   bash -c 'f="$(tr -s " \n" "  " <"$1")"; for p in "https://admin.google.com/ac/apps/gmail/authenticateemail" "DKIM key bit length: 2048. Prefix selector: google." "START AUTHENTICATION"; do grep -qF -- "$p" <<<"$f" || exit 1; done' _ "$work/stdout"

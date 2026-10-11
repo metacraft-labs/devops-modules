@@ -27,11 +27,13 @@
 #
 # THE ORDER of the domains comes from FILE and live DNS: the primary domain;
 # then domains whose mail is already on Google (no routing change); then
-# domains with no working mail today (no MX, or MX hosts that do not resolve);
-# then domains whose mail goes elsewhere today — and before the first of those
-# is switched, the operator confirms that a test message from outside arrived
-# at a domain already switched to Google. A domain alias always comes after
-# its parent. Domains declared "zone_pending" are listed and skipped.
+# domains with no MX at all; then domains whose MX points elsewhere but does
+# not resolve; then domains whose mail goes elsewhere today. Before the first
+# domain with an MX elsewhere (resolving or not) is switched, the operator
+# confirms that a test message from outside arrived at a domain already
+# switched to Google; without a domain to send it to, those domains are left
+# alone. A domain alias always comes after its parent. Domains declared
+# "zone_pending" are listed and skipped.
 #
 # Answers are read from stdin: Enter = done, verify now; s = skip; q = quit.
 # (Loops here read their lists on fd 3, so stdin stays the operator's.)
@@ -152,7 +154,9 @@ resolves() {
   grep -qE '^[0-9a-fA-F:.]+$' <<<"$out"
 }
 
-# class: primary | google | none | live
+# class: primary | google | none (no MX) | broken (an MX elsewhere that does
+# not resolve) | live. Both broken and live name a mail host outside Google, so
+# both wait for the inbound test: the host may only be down for now.
 class_of() {
   local d="$1" h
   [ "$(kind_of "$d")" = primary ] && { echo primary; return; }
@@ -162,9 +166,9 @@ class_of() {
     [[ $h =~ (^|\.)google\.com$ ]] && continue
     if resolves "$h"; then echo live; return; fi
   done 3< <(mx_hosts "$d")
-  echo none
+  echo broken
 }
-phase_of() { case "$1" in primary) echo 0 ;; google) echo 1 ;; none) echo 2 ;; live) echo 3 ;; esac; }
+phase_of() { case "$1" in primary) echo 0 ;; google) echo 1 ;; none) echo 2 ;; broken) echo 3 ;; live) echo 4 ;; esac; }
 
 # "<phase> <depth> <domain> <class>" lines in the order to work through.
 plan() {
@@ -196,7 +200,8 @@ describe_class() {
   case "$1" in
     primary) echo "the tenant's own" ;;
     google) echo "mail already on Google" ;;
-    none) echo "no working mail today" ;;
+    none) echo "no MX today" ;;
+    broken) echo "MX elsewhere, not resolving" ;;
     live) echo "LIVE mail elsewhere" ;;
   esac
 }
@@ -315,18 +320,18 @@ inbound_gate() {
   u="$(first_user)"
   guide_h2 "Before switching a domain that receives mail today"
   if [ -z "$probe" ]; then
-    guide_text "No domain of this tenant has been switched to smtp.google.com yet, so nothing proves that Google accepts mail for a newly added domain."
-  else
-    guide_step 1 "From a mailbox OUTSIDE this tenant (a personal account), send a message to $(first_local "${u:-postmaster@x}" "$probe")."
-    guide_step 2 "Wait a minute, then look for it in ${u:-the user}'s Gmail inbox (also Spam)."
+    guide_text "No secondary or alias domain of this tenant has been switched to smtp.google.com yet, so nothing proves that Google accepts mail for a newly added domain. Onboard a domain with no MX first (its turn comes earlier), send the test there, then re-run."
+    return 10
   fi
+  guide_step 1 "From a mailbox OUTSIDE this tenant (a personal account), send a message to $(first_local "${u:-postmaster@x}" "$probe")."
+  guide_step 2 "Wait a minute, then look for it in ${u:-the user}'s Gmail inbox (also Spam)."
   while :; do
     ans="$(guide_ask "Did a test message from outside arrive at a domain already on smtp.google.com?" y n s)" || exit $?
     case "$ans" in
       y) gate_passed=1; return 0 ;;
       s) return 10 ;;
       n)
-        guide_text "Then do not switch more mail yet. Check, for ${probe:-the domain}: Activate Gmail was clicked; 'google-workspace-domains status --domain ${probe:-<domain>}' is OK; the address exists (the user-addresses step). Send another test, then answer y."
+        guide_text "Then do not switch more mail yet. Check, for $probe: Activate Gmail was clicked; 'google-workspace-domains status --domain $probe' is OK; the address exists (the user-addresses step). Send another test, then answer y."
         ;;
     esac
   done
@@ -377,8 +382,12 @@ dkim_for() { # DOMAIN
 domain_flow() { # DOMAIN CLASS N TOTAL WITH_DKIM
   local d="$1" c="$2" n="$3" total="$4" with_dkim="$5" ans a=() w
   guide_h1 "Domain $n/$total: $d ($(kind_phrase "$d"); $(describe_class "$c"))"
-  if [ "$c" = live ] && ! mx_on_google "$d"; then
-    guide_text "$d receives mail at $(mx_hosts "$d" | paste -sd, -) today. Onboarding switches its MX to Google: from then on ALL mail for $d goes to Google, and the old server stops receiving."
+  if { [ "$c" = live ] || [ "$c" = broken ]; } && ! mx_on_google "$d"; then
+    if [ "$c" = live ]; then
+      guide_text "$d receives mail at $(mx_hosts "$d" | paste -sd, -) today. Onboarding switches its MX to Google: from then on ALL mail for $d goes to Google, and the old server stops receiving."
+    else
+      guide_text "$d's MX names $(mx_hosts "$d" | paste -sd, -), which does not resolve now (no mail arrives). Onboarding switches its MX to Google: from then on ALL mail for $d goes to Google, even once that host is back."
+    fi
     guide_step 1 "Export what matters from the old mailboxes."
     guide_step 2 "Make sure every address in use there exists on the tenant (a user alias, a group, or the user-addresses step) — an address that exists nowhere bounces."
     w=0
