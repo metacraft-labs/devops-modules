@@ -615,7 +615,7 @@ addresses_at() {
 
 ua_status=0
 ensure_user() {
-  local u="$1" d st view sendas addr r status addrs=() k
+  local u="$1" d st view sendas addr r status addrs=() made=() k missing i
   shift
   echo "== $u"
   # Secondary domains first: an alias domain mirrors addresses its parent has.
@@ -630,9 +630,26 @@ ensure_user() {
     while IFS= read -r addr; do
       r="$(api user-alias "$u" "$addr")" || exit 1
       printf '   %-36s user alias: %s\n' "$addr" "$(state_field result "$r")"
+      made+=("$addr")
     done < <(locals_for "$u" | sed "s/\$/@$d/")
   done
-  view="$(api user "$u")" || exit 1
+  # A just-created alias takes a while to appear in the user's directory
+  # entry; wait for every one, or the send-as step below would silently skip
+  # them.
+  for i in $(seq 1 "${GOOGLE_ALIAS_WAIT_TRIES:-24}"); do
+    view="$(api user "$u")" || exit 1
+    missing=0
+    for addr in "${made[@]}"; do
+      jq -e --arg a "$addr" '[(.aliases // [])[] | ascii_downcase] | index($a)' <<<"$view" >/dev/null || missing=$((missing + 1))
+    done
+    [ "$missing" = 0 ] && break
+    [ "$i" = 1 ] && echo "   (waiting for $missing new alias(es) to appear in the directory)"
+    sleep "${GOOGLE_ALIAS_WAIT_SECONDS:-5}"
+  done
+  if [ "$missing" != 0 ]; then
+    echo "   $missing alias(es) are not visible in the directory yet; re-run to add their send-as entries"
+    ua_status=2
+  fi
   for d in "$@"; do
     k="$(data_kind "$d")"
     case "$k" in
@@ -650,7 +667,7 @@ ensure_user() {
     while IFS= read -r addr; do
       [ -n "$addr" ] || continue
       # A secondary domain that was skipped above contributes nothing.
-      if [ "$k" = secondary ] && ! jq -e --arg a "$addr" '.aliases | index([$a])' <<<"$view" >/dev/null; then
+      if [ "$k" = secondary ] && ! jq -e --arg a "$addr" '[(.aliases // [])[] | ascii_downcase] | index($a)' <<<"$view" >/dev/null; then
         continue
       fi
       addrs+=("$addr")
@@ -666,7 +683,11 @@ ensure_user() {
       echo "      open it in $u's mailbox, click it, and re-run."
     fi
   done
-  [ "${#addrs[@]}" -gt 0 ] || echo "   (no addresses: no verified secondary or alias domain among the ones asked)"
+  if [ "${#addrs[@]}" = 0 ]; then
+    echo "   (no addresses: no verified secondary or alias domain among the ones asked)"
+    # Asked for addresses and got none: not done, whatever the reason.
+    ua_status=2
+  fi
 }
 
 cmd_user_addresses() {

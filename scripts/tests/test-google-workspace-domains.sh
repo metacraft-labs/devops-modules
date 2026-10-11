@@ -585,6 +585,21 @@ expect "... and says the addresses exist" grep -qE '^ +jane@example\.dev +send-a
 expect "status --user shows each address and its send-as" run status --domain example.app --user jane@example.com --data "$data"
 expect "... mirrored at the alias domain, accepted" \
   output_has "ADDR     OK  j@example.app mirrored, send-as accepted; jane@example.app mirrored, send-as accepted"
+# Google's directory shows a just-added alias only after a while: the send-as
+# step must wait for it, not skip it and report success.
+set_state '.alias_lag = 2'
+export GOOGLE_ALIAS_WAIT_SECONDS=0
+expect "a new alias the directory does not show yet is waited for" \
+  run user-addresses --user jane@example.com --domain example.dev --local lagged --data "$data"
+expect "... and still gets its send-as" \
+  bash -c 'jq -e ".sendas[\"jane@example.com\"] | map(.sendAsEmail) | index(\"lagged@example.dev\")" "$1" >/dev/null' _ "$state"
+set_state '.alias_lag = 1000'
+rc=0
+GOOGLE_ALIAS_WAIT_TRIES=2 run user-addresses --user jane@example.com --domain example.dev --local slow --data "$data" || rc=$?
+expect "an alias that never shows up within the wait exits 2, not success" test "$rc" = 2
+expect "... saying to re-run" output_has "not visible in the directory yet"
+set_state '.alias_lag = 0 | .alias_hidden = {}'
+unset GOOGLE_ALIAS_WAIT_SECONDS
 set_state '.sendas_pending = ["hostmaster@example.dev"]'
 rc=0
 run user-addresses --user jane@example.com --domain example.dev --local hostmaster --data "$data" || rc=$?
