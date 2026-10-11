@@ -16,17 +16,19 @@
 
 guide_width="${GUIDE_WIDTH:-78}"
 
-# guide_wrap WIDTH: word-wraps stdin at WIDTH. A word is never broken: one
-# longer than the line (a URL) goes alone on its own line, whole, so that it
-# can be copied or clicked.
+# guide_wrap WIDTH: word-wraps stdin at WIDTH, keeping each line's leading
+# indentation on its continuation lines. A word is never broken: one longer
+# than the line (a URL) goes alone on its own line, whole, so that it can be
+# copied or clicked.
 guide_wrap() {
   awk -v w="$1" '{
-    n = split($0, word, " "); line = ""
+    match($0, /^ */); ind = substr($0, 1, RLENGTH)
+    n = split(substr($0, RLENGTH + 1), word, " "); line = ""
     for (i = 1; i <= n; i++) {
       if (word[i] == "") continue
-      if (line == "") line = word[i]
+      if (line == "") line = ind word[i]
       else if (length(line) + 1 + length(word[i]) <= w) line = line " " word[i]
-      else { print line; line = word[i] }
+      else { print line; line = ind word[i] }
     }
     print line
   }'

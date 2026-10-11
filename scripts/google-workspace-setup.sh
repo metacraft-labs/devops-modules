@@ -454,7 +454,7 @@ step_smtp_relay() {
   ru="${relay_user:-$(first_user)}"
   ru="${ru:-$subject}"
   guide_text "Two ways to send automated mail through Google:"
-  guide_text "  a) the Gmail API, as a user, through this service account (scope gmail.send) — no console step; google-workspace-domains-api send-test does it;"
+  guide_text "  a) the Gmail API, as a user, through this service account (scope gmail.send) — no console step; the DKIM step's test message goes this way;"
   guide_text "  b) the SMTP relay smtp-relay.gmail.com for servers and apps — console only, set up here."
   guide_step 1 "Open https://admin.google.com/ac/apps/gmail/routing"
   guide_step 2 "Find 'SMTP relay service' and click CONFIGURE (or ADD ANOTHER RULE if one exists)."
@@ -470,7 +470,7 @@ step_smtp_relay() {
     guide_wait "Saved the SMTP relay rule?" || w=$?
     [ "$w" = 10 ] && return 0
     if [ -z "$test_to" ]; then
-      guide_text "No --test-to address: not testing. To test later: SMTP_RELAY_PASSWORD=<app password> google-workspace-domains-api --key … --subject … smtp-test $ru $ru <to>"
+      guide_text "No --test-to address: not testing. Re-run this step with --test-to <an address outside the tenant> to send a test through the relay."
       return 0
     fi
     from="$ru"
