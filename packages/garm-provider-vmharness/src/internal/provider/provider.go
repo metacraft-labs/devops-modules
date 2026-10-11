@@ -105,17 +105,19 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 		}
 	case config.BackendTartLinuxArm:
 		b = &backend.VMHarnessRunBackend{
-			VMHarnessPath: cfg.VMHarnessPath,
-			BackendID:     string(config.BackendTartLinuxArm),
-			GuestOS:       "linux",
-			StateDir:      cfg.StateDir,
+			VMHarnessPath:   cfg.VMHarnessPath,
+			BackendID:       string(config.BackendTartLinuxArm),
+			GuestOS:         "linux",
+			StateDir:        cfg.StateDir,
+			DetachBootstrap: cfg.DetachBootstrap,
 		}
 	case config.BackendTartMacos:
 		b = &backend.VMHarnessRunBackend{
-			VMHarnessPath: cfg.VMHarnessPath,
-			BackendID:     string(config.BackendTartMacos),
-			GuestOS:       "macos",
-			StateDir:      cfg.StateDir,
+			VMHarnessPath:   cfg.VMHarnessPath,
+			BackendID:       string(config.BackendTartMacos),
+			GuestOS:         "macos",
+			StateDir:        cfg.StateDir,
+			DetachBootstrap: cfg.DetachBootstrap,
 		}
 	case config.BackendUtmWindowsArm:
 		b = &backend.VMHarnessRunBackend{

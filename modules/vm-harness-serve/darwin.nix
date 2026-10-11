@@ -2,8 +2,8 @@
 {
   # Runner-Fleet-Capability-Pools-And-Remote-Driving campaign, milestone RA5.
   #
-  # `services.vm-harness-serve` — the DARWIN (nix-darwin / launchd) sibling of
-  # the Linux `services.vm-harness-serve` systemd module. It runs the SAME RA1
+  # `services.gosti-serve` — the DARWIN (nix-darwin / launchd) sibling of
+  # the Linux `services.gosti-serve` systemd module. It runs the SAME RA1
   # `vm-harness serve` remoting daemon, but as a launchd system daemon rather
   # than a systemd unit, because nix-darwin has neither systemd, the NixOS
   # firewall, nor `LoadCredential`.
@@ -69,7 +69,7 @@
       ...
     }:
     let
-      cfg = config.services.vm-harness-serve;
+      cfg = config.services.gosti-serve;
       inherit (lib)
         mkEnableOption
         mkIf
@@ -82,7 +82,7 @@
       # includes `vm-harness serve`), resolved for the host's system — mirrors
       # the Linux module and how `services.garm` defaults `package`.
       defaultPackage = withSystem pkgs.stdenv.hostPlatform.system (
-        { config, ... }: config.packages.vm-harness
+        { config, ... }: config.packages.gosti
       );
 
       portFile = "${cfg.stateDir}/port";
@@ -421,7 +421,17 @@
       };
     in
     {
-      options.services.vm-harness-serve = {
+      # GOSTI1b step 2: `services.gosti-serve` is the canonical option path;
+      # `services.vm-harness-serve` keeps working (with a deprecation warning)
+      # until every consumer has moved. The unit/launchd label, user, group and
+      # state directory deliberately keep their `vm-harness-serve` names: they
+      # carry live identity (agenix secret owners, the self-bootstrapped
+      # enrollment secret whose keyId the central controller trusts).
+      imports = [
+        (lib.mkRenamedOptionModule [ "services" "vm-harness-serve" ] [ "services" "gosti-serve" ])
+      ];
+
+      options.services.gosti-serve = {
         enable = mkEnableOption ''
           the `vm-harness serve` remoting daemon on darwin (launchd) — an
           authenticated network front-end exposing this host's VM/container
@@ -773,19 +783,19 @@
         assertions = [
           {
             assertion = pkgs.stdenv.hostPlatform.isDarwin;
-            message = "services.vm-harness-serve (darwin) is only valid on a nix-darwin host.";
+            message = "services.gosti-serve (darwin) is only valid on a nix-darwin host.";
           }
           {
             assertion = cfg.authTokenFile != null;
             message = ''
-              services.vm-harness-serve.authTokenFile must be set — the daemon
+              services.gosti-serve.authTokenFile must be set — the daemon
               refuses to start without a bearer token (an agenix secret path).
             '';
           }
           {
             assertion = cfg.listenAddress != "0.0.0.0" && cfg.listenAddress != "::";
             message = ''
-              services.vm-harness-serve.listenAddress must be a single overlay
+              services.gosti-serve.listenAddress must be a single overlay
               address, never a wildcard (0.0.0.0 / ::) — on darwin the bind is
               the only thing keeping the control channel off a public interface.
             '';
@@ -854,6 +864,8 @@
               # Ownership records for kept ephemeral instances (see the Linux
               # module); launchd provides no $STATE_DIRECTORY, so name it.
               VMH_EPHEMERAL_LABEL_DIR = "${cfg.stateDir}/ephemeral-labels";
+              # GOSTI1b step 4: canonical name alongside the legacy one.
+              GOSTI_EPHEMERAL_LABEL_DIR = "${cfg.stateDir}/ephemeral-labels";
             }
             // cfg.environment;
 
@@ -865,6 +877,17 @@
             };
             RunAtLoad = true;
             ThrottleInterval = 10;
+
+            # KEPT GUESTS MUST OUTLIVE A DAEMON RESTART. `run --ephemeral
+            # --keep` returns and leaves the guest's `tart run` process alive,
+            # still in THIS job's process group (sudo/asuser do not start a new
+            # one). When a job dies launchd kills every remaining process in its
+            # process group (launchd.plist(5)), so each daemon restart — every
+            # deploy that changes this plist, i.e. any package bump — kills
+            # every kept central-GARM guest on the host mid-job. The guests
+            # are owned and reaped through their handles (ephemeral-destroy /
+            # ephemeral-list), not through this daemon's lifetime.
+            AbandonProcessGroup = true;
 
             # THE macOS DEFAULT IS 256 AND IT IS NOT ENOUGH — measured, not
             # precautionary. `launchctl limit maxfiles` on m3 reports a SOFT

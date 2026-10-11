@@ -114,7 +114,7 @@ top@{ ... }:
                 "d ${imagePool} 0750 ${serveUser} ${serveUser} -"
               ];
 
-              services.vm-harness-serve = {
+              services.gosti-serve = {
                 enable = true;
                 listenAddress = "127.0.0.1"; # non-routable placeholder is fine here
                 port = servePort;

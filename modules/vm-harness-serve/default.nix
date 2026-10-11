@@ -2,7 +2,7 @@
 {
   # Runner-Fleet-Capability-Pools-And-Remote-Driving campaign, milestone RA2.
   #
-  # `services.vm-harness-serve` — a hardened systemd unit running `vm-harness
+  # `services.gosti-serve` — a hardened systemd unit running `vm-harness
   # serve` (the RA1 remoting daemon). This is the GENERAL, company-agnostic
   # machinery: it bakes in NO Metacraft host list, IPs, or credentials. The
   # concrete instantiation (which hosts, which overlay IPs, the agenix token
@@ -57,7 +57,7 @@
       ...
     }:
     let
-      cfg = config.services.vm-harness-serve;
+      cfg = config.services.gosti-serve;
       inherit (lib)
         mkEnableOption
         mkIf
@@ -72,7 +72,7 @@
       # includes `vm-harness serve`), resolved for the host's system — mirrors
       # how `services.garm` defaults `package` to `config.packages.garm`.
       defaultPackage = withSystem pkgs.stdenv.hostPlatform.system (
-        { config, ... }: config.packages.vm-harness
+        { config, ... }: config.packages.gosti
       );
 
       credName = "token";
@@ -288,7 +288,17 @@
       };
     in
     {
-      options.services.vm-harness-serve = {
+      # GOSTI1b step 2: `services.gosti-serve` is the canonical option path;
+      # `services.vm-harness-serve` keeps working (with a deprecation warning)
+      # until every consumer has moved. The unit/launchd label, user, group and
+      # state directory deliberately keep their `vm-harness-serve` names: they
+      # carry live identity (agenix secret owners, the self-bootstrapped
+      # enrollment secret whose keyId the central controller trusts).
+      imports = [
+        (lib.mkRenamedOptionModule [ "services" "vm-harness-serve" ] [ "services" "gosti-serve" ])
+      ];
+
+      options.services.gosti-serve = {
         enable = mkEnableOption ''
           the `vm-harness serve` remoting daemon — an authenticated network
           front-end exposing this host's VM/container lifecycle ops to a remote
@@ -685,7 +695,7 @@
           {
             assertion = cfg.authTokenFile != null;
             message = ''
-              services.vm-harness-serve.authTokenFile must be set — the daemon
+              services.gosti-serve.authTokenFile must be set — the daemon
               refuses to start without a bearer token, and it must arrive via a
               LoadCredential-mounted file (an agenix secret), never the store.
             '';
@@ -693,7 +703,7 @@
           {
             assertion = cfg.listenAddress != "0.0.0.0" && cfg.listenAddress != "::";
             message = ''
-              services.vm-harness-serve.listenAddress must be a single overlay
+              services.gosti-serve.listenAddress must be a single overlay
               address, never a wildcard (0.0.0.0 / ::) — the control channel must
               not be exposed on a public interface.
             '';
@@ -813,6 +823,10 @@
             Environment = [
               "HOME=/var/lib/${runtimeDir}"
               "VMH_EPHEMERAL_LABEL_DIR=${labelDir}"
+              # GOSTI1b step 4: the canonical name, exported ALONGSIDE the
+              # legacy one for one deploy cycle, so a host whose gosti predates
+              # the GOSTI_* reader keeps working.
+              "GOSTI_EPHEMERAL_LABEL_DIR=${labelDir}"
             ];
 
             # ---- systemd hardening (mirrors the garm incus-strict posture) ----
@@ -913,6 +927,10 @@
             Environment = [
               "HOME=/var/lib/${runtimeDir}"
               "VMH_EPHEMERAL_LABEL_DIR=${labelDir}"
+              # GOSTI1b step 4: the canonical name, exported ALONGSIDE the
+              # legacy one for one deploy cycle, so a host whose gosti predates
+              # the GOSTI_* reader keeps working.
+              "GOSTI_EPHEMERAL_LABEL_DIR=${labelDir}"
             ];
             ProtectSystem = "strict";
             NoNewPrivileges = true;

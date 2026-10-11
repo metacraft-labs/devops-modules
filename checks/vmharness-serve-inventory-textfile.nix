@@ -38,7 +38,7 @@ top@{ ... }:
                 fsType = "tmpfs";
               };
               system.stateVersion = "24.05";
-              services.vm-harness-serve = {
+              services.gosti-serve = {
                 enable = true;
                 listenAddress = "10.10.10.1";
                 backend = "incus";
@@ -54,7 +54,7 @@ top@{ ... }:
         ];
       };
       cfg = eval.config;
-      icfg = cfg.services.vm-harness-serve.inventoryExporter;
+      icfg = cfg.services.gosti-serve.inventoryExporter;
       sc = cfg.systemd.services.vm-harness-serve-inventory.serviceConfig;
       str = v: builtins.unsafeDiscardStringContext (toString v);
       postExec = str (sc.ExecStartPost or "");

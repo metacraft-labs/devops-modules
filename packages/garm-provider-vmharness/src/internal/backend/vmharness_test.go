@@ -679,3 +679,55 @@ func TestVMHarnessRunBackendSweepNoopForNonEphemeralBackend(t *testing.T) {
 		t.Fatal("Sweep unexpectedly invoked vm-harness for a non-ephemeral backend")
 	}
 }
+
+// TestVMHarnessRunBackendDetachBootstrap pins the opt-in detached bootstrap
+// for linux/macOS guests: with DetachBootstrap the provider hands vm-harness
+// `--detach-script <guest path>` and NO `-- … exec <bootstrap>` command, so no
+// single SSH session carries the runner. Without it the legacy foreground form
+// is kept, because a vm-harness that predates the flag would reject it.
+func TestVMHarnessRunBackendDetachBootstrap(t *testing.T) {
+	for _, detach := range []bool{true, false} {
+		t.Run(fmt.Sprintf("detach=%v", detach), func(t *testing.T) {
+			tmp := t.TempDir()
+			logPath := filepath.Join(tmp, "argv.log")
+			mock := filepath.Join(tmp, "vm-harness")
+			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellSingleQuote(logPath) + "\nsleep 30\n"
+			if err := os.WriteFile(mock, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			b := &VMHarnessRunBackend{
+				VMHarnessPath:   mock,
+				BackendID:       "tart-linux-arm",
+				GuestOS:         "linux",
+				StateDir:        filepath.Join(tmp, "state"),
+				DetachBootstrap: detach,
+			}
+			inst, err := b.Create(context.Background(), CreateArgs{
+				Name:        "garm-detach-test",
+				SourceImage: "ghcr.io/cirruslabs/ubuntu:latest",
+				OSName:      "linux",
+				OSArch:      "arm64",
+				Bootstrap:   []byte("#!/bin/sh\necho hi\n"),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = b.Delete(context.Background(), inst.Name) }()
+			var argv string
+			for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+				if data, err := os.ReadFile(logPath); err == nil && len(data) > 0 {
+					argv = string(data)
+					break
+				}
+			}
+			detached := strings.Contains(argv, "--detach-script\n/tmp/garm-bootstrap.sh\n")
+			foreground := strings.Contains(argv, "&& exec /tmp/garm-bootstrap.sh")
+			if detach && (!detached || foreground) {
+				t.Fatalf("want detached bootstrap only, argv:\n%s", argv)
+			}
+			if !detach && (detached || !foreground) {
+				t.Fatalf("want legacy foreground bootstrap, argv:\n%s", argv)
+			}
+		})
+	}
+}

@@ -1,4 +1,16 @@
-# `services.vm-harness-serve` — declarative `vm-harness serve` deployment
+# `services.gosti-serve` — declarative `gosti serve` deployment
+
+> **Renamed (GOSTI1b).** The option path is `services.gosti-serve`; the old
+> `services.vm-harness-serve` path still works and prints a deprecation
+> warning. The default package is `packages.gosti` (`bin/gosti`, with
+> `bin/vm-harness` as a symlink; `packages.vm-harness` is an alias). The unit
+> (`vm-harness-serve.service` / launchd `org.metacraft-labs.vm-harness-serve`),
+> user, group, credential names and state directory (`/var/lib/vm-harness-serve`)
+> are deliberately UNCHANGED: they carry the enrollment keyId and the agenix
+> secret ownership. Renaming the unit (with a `vm-harness-serve.service`
+> alias) is a later step, after every consumer that names the unit has moved.
+> Units export `GOSTI_EPHEMERAL_LABEL_DIR` alongside `VMH_EPHEMERAL_LABEL_DIR`.
+> Gate: `t_gosti_serve_rename`.
 
 Campaign: _CI Runner Fleet — vm-harness Remoting, Central GARM, Capability
 Pools_ · milestone **RA2** (Linux/incus serve deployment).

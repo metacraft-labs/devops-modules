@@ -45,6 +45,8 @@ type VMHarnessRunBackend struct {
 	BackendID     string
 	GuestOS       string
 	StateDir      string
+	// DetachBootstrap: see config.Config.DetachBootstrap.
+	DetachBootstrap bool
 }
 
 type vmhState struct {
@@ -242,7 +244,8 @@ func (b *VMHarnessRunBackend) Create(ctx context.Context, args CreateArgs) (Inst
 		argv = append(argv, "--copy-to", bootstrapPath+":"+guestPath, "--")
 		argv = append(argv, windowsBootstrapCommand(guestPath)...)
 	} else {
-		argv = append(argv, "--copy-to", bootstrapPath+":"+guestPath, "--", "/bin/sh", "-c", "chmod +x "+guestPath+" && exec "+guestPath)
+		argv = append(argv, "--copy-to", bootstrapPath+":"+guestPath)
+		argv = append(argv, unixBootstrapArgs(guestPath, b.DetachBootstrap)...)
 	}
 	if err := os.WriteFile(bootstrapPath, args.Bootstrap, 0o755); err != nil {
 		return Instance{}, err
@@ -569,4 +572,23 @@ func (b *VMHarnessRunBackend) Start(ctx context.Context, idOrName string) error 
 
 func (b *VMHarnessRunBackend) Stop(ctx context.Context, idOrName string, force bool) error {
 	return b.Delete(ctx, idOrName)
+}
+
+// unixBootstrapArgs is how a linux/macOS guest's runner bootstrap is started.
+//
+// Detached (`--detach-script`): vm-harness starts the bootstrap outside the
+// SSH session and follows it with short probe sessions, tolerating transient
+// SSH failures; the `vm-harness run` process still lasts as long as the
+// bootstrap, so it still anchors the instance's life.
+//
+// Foreground (the legacy form): the bootstrap is the exec'd command of ONE SSH
+// session for the job's whole life. On m3 that session stalled mid-job on
+// macOS guests ("Read from remote host …: Operation timed out"); sshd's hangup
+// killed the runner, the run's cleanup deleted the guest, and GitHub reported
+// "lost communication with the server" ten minutes later.
+func unixBootstrapArgs(guestPath string, detach bool) []string {
+	if detach {
+		return []string{"--detach-script", guestPath}
+	}
+	return []string{"--", "/bin/sh", "-c", "chmod +x " + guestPath + " && exec " + guestPath}
 }

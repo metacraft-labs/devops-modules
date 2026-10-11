@@ -27,10 +27,22 @@ The 2026-10-06 audit found, among others:
 
 What it flags
 -------------
-Only jobs whose resolved ``runs-on`` is a self-hosted Linux label set (it
-contains ``self-hosted`` and ``linux`` or ``nixos``, and no Windows/macOS
-label) are checked. Dynamic ``runs-on`` expressions are skipped, as in the
-sibling ``check_over_constrained_runs_on.py``.
+Only jobs whose resolved ``runs-on`` is a self-hosted Linux label set are
+checked: it names no Windows/macOS label and no GitHub-hosted image
+(``ubuntu-*``, ``windows-*``, ``macos-*``, third-party hosted sizes), and it
+either contains ``self-hosted`` together with ``linux``/``nixos`` (or is the
+bare ``self-hosted`` label), or names a self-hosted Linux label of the fleet
+vocabulary on its own -- ``linux``, ``nixos``, a (retired but still aliased)
+``eph-linux-*`` class, or a ``garm-*`` pool name. So ``runs-on: eph-linux-x64``
+as a plain string is checked like ``[self-hosted, linux, x64]``. Dynamic
+``runs-on`` expressions are skipped, as in the sibling
+``check_over_constrained_runs_on.py``; ``${{ matrix.<key> }}`` is expanded over
+the matrix values.
+
+A step whose ``if:`` confines it to GitHub-hosted runners
+(``runner.environment == 'github-hosted'``, alone or as a conjunct of an
+``&&`` chain, with or without the ``${{ }}`` wrapper) never runs on a NixOS
+runner and is not checked. A disjunction (``||``) does not exempt the step.
 
 * NRH1 -- ``uses:`` an action from ``HAZARDOUS_ACTIONS``;
 * NRH2 -- a ``run:`` step that installs with a distro package manager
@@ -39,7 +51,11 @@ sibling ``check_over_constrained_runs_on.py``.
 * NRH4 -- a job ``container:``/``services:`` or a ``docker://`` step: the
   runner starts those with the ``docker`` CLI, which the NixOS runners do not
   have ("docker: command not found"). Steps inside a ``container:`` job are
-  then not checked for NRH2, since they would run in the container image.
+  then not checked for NRH2, since they would run in the container image;
+* NRH5 -- a ``run:`` step that runs ``pip install`` / ``python3 -m pip install``
+  without creating or activating a virtualenv: there is no pip on the runner
+  PATH, and nixpkgs' python3 has no pip module and a read-only site-packages
+  (``--user`` does not help). Skipped inside a ``container:`` job, like NRH2.
 
 Suppressing a finding
 ---------------------
@@ -82,6 +98,9 @@ HAZARDOUS_ACTIONS: dict[str, str] = {
     "shivammathur/setup-php": "installs PHP with apt; use php from nixpkgs",
     "browser-actions/setup-firefox": "downloads a glibc Firefox; use firefox from nixpkgs",
     "foundry-rs/foundry-toolchain": "downloads glibc foundry binaries; use foundry from nixpkgs or the repo dev shell",
+    # rustup is not on the runner PATH, so the action pipes sh.rustup.rs, which
+    # fetches the x86_64-unknown-linux-gnu rustup-init (and then glibc rustc).
+    "dtolnay/rust-toolchain": "bootstraps rustup from sh.rustup.rs, a glibc rustup-init/rustc that cannot start; use the Rust toolchain from the repo dev shell or nixpkgs (cargo, rustc)",
 }
 
 # Distro package managers. Bare `sudo` is NOT flagged: the ephemeral Incus
@@ -90,12 +109,41 @@ RUN_HAZARD = re.compile(
     r"(?:^|[\s;&|(`])(apt-get|apt|yum|dnf|apk|zypper|pacman)\s+(?:-\S+\s+)*(install|update|upgrade|add|-S)\b",
     re.MULTILINE,
 )
+# `pip install` / `python -m pip install` outside a virtualenv. The runner PATH
+# carries no python3/pip, and nixpkgs' python3 ships without the pip module and
+# with a read-only site-packages, so a global (or --user) install fails. A
+# script that creates or activates a venv is not flagged.
+PIP_INSTALL = re.compile(
+    r"(?:^|[\s;&|(`])((?:python3?(?:\.\d+)?\s+-m\s+)?pip3?)\s+(?:-\S+\s+)*install\b",
+    re.MULTILINE,
+)
+VENV = re.compile(r"\bvenv\b|\bvirtualenv\b|VIRTUAL_ENV|\.venv/|\bpipx\b")
 # A step guarded to a non-Linux leg of a mixed matrix is not run on NixOS.
 NON_LINUX_IF = re.compile(r"runner\.os\s*==\s*'(macOS|Windows)'|matrix\.os\s*==\s*'(macos|windows)", re.I)
+# A step guarded to GitHub-hosted runners only. Matched against each conjunct of
+# a `||`-free `if:` (see _github_hosted_only). GitHub expression string
+# comparison is case-insensitive, and ``!= 'self-hosted'`` says the same thing.
+GITHUB_HOSTED_ATOM = re.compile(
+    r"""(?:runner\.environment\s*==\s*(['"])github-hosted\1"""
+    r"""|(['"])github-hosted\2\s*==\s*runner\.environment"""
+    r"""|runner\.environment\s*!=\s*(['"])self-hosted\3"""
+    r"""|(['"])self-hosted\4\s*!=\s*runner\.environment)""",
+    re.I,
+)
 EXPR = re.compile(r"\$\{\{")
 MATRIX_REF = re.compile(r"^\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}$")
 SUPPRESS = re.compile(r"#\s*nixos-runner-ok:\s*(\S+)")
 NON_LINUX = {"windows", "macos", "macOS", "darwin", "osx"}
+# A single runner name that is a non-Linux class (eph-win-x64, eph-macos-arm64,
+# aarch64-darwin, garm-windows-...).
+NON_LINUX_NAME = re.compile(r"(?:^|[-_])(?:win|windows|mac|macos|darwin|osx)(?:[-_\d]|$)", re.I)
+# GitHub-hosted images (and third-party hosted sizes): never a NixOS runner.
+HOSTED_NAME = re.compile(r"^(?:ubuntu|windows|macos|warp|depot|blacksmith|namespace|buildjet)-", re.I)
+# Self-hosted Linux labels that select a NixOS runner on their own, without a
+# `self-hosted` companion: the OS labels, the retired single-name ephemeral
+# classes the pools still alias (eph-linux-x64, eph-linux-x64-gpu, ...), and
+# GARM pool names.
+SELF_HOSTED_LINUX_NAME = re.compile(r"^(?:linux|nixos|eph-linux(?:-[a-z0-9]+)*|garm-[a-z0-9-]+)$", re.I)
 
 
 def _as_list(v) -> list:
@@ -129,16 +177,55 @@ def _label_sets(job: dict) -> list[list[str]]:
                     out.append([s])
         return out
     static = [l for l in labels if not EXPR.search(l)]
+    if len(static) < len(labels) and {l.lower() for l in static} == {"self-hosted"}:
+        # `[self-hosted, ${{ ... }}]`: the OS is dynamic, so do not guess Linux.
+        return []
     return [static] if static else []
 
 
 def _is_nixos_linux(labels: list[str]) -> bool:
-    low = {l.lower() for l in labels}
-    if "self-hosted" not in low:
+    low = {l.strip().lower() for l in labels if l.strip()}
+    if not low:
         return False
-    if low & {x.lower() for x in NON_LINUX}:
+    if low & {x.lower() for x in NON_LINUX} or any(NON_LINUX_NAME.search(l) for l in low):
         return False
-    return "linux" in low or "nixos" in low
+    if any(HOSTED_NAME.match(l) for l in low):
+        return False
+    if low == {"self-hosted"}:
+        return True
+    return any(SELF_HOSTED_LINUX_NAME.match(l) for l in low)
+
+
+def _strip_parens(atom: str) -> str:
+    """Drop parentheses that wrap the WHOLE atom (not `(a) && (b)`)."""
+    atom = atom.strip()
+    while atom.startswith("(") and atom.endswith(")"):
+        depth = 0
+        for i, ch in enumerate(atom):
+            depth += ch == "("
+            depth -= ch == ")"
+            if depth == 0 and i < len(atom) - 1:
+                return atom
+        atom = atom[1:-1].strip()
+    return atom
+
+
+def _github_hosted_only(cond) -> bool:
+    """True when a step `if:` restricts the step to GitHub-hosted runners.
+
+    The condition must be a pure `&&` chain (no `||`, which could still admit a
+    self-hosted runner) with `runner.environment == 'github-hosted'` as one
+    conjunct; a negated conjunct (`!(...)`) does not count.
+    """
+    if not isinstance(cond, str):
+        return False
+    c = cond.strip()
+    m = re.fullmatch(r"\$\{\{(.*)\}\}", c, re.S)
+    if m:
+        c = m.group(1)
+    if "||" in c:
+        return False
+    return any(GITHUB_HOSTED_ATOM.fullmatch(_strip_parens(a)) for a in _strip_parens(c).split("&&"))
 
 
 def check_file(path: Path) -> list[str]:
@@ -165,7 +252,7 @@ def check_file(path: Path) -> list[str]:
         for i, step in enumerate(job.get("steps") or []):
             if not isinstance(step, dict):
                 continue
-            if NON_LINUX_IF.search(str(step.get("if") or "")):
+            if NON_LINUX_IF.search(str(step.get("if") or "")) or _github_hosted_only(step.get("if")):
                 continue
             where = f"{path}: job `{job_name}` step {i + 1}"
             if step.get("name"):
@@ -189,6 +276,11 @@ def check_file(path: Path) -> list[str]:
                 m = RUN_HAZARD.search(code)
                 if m:
                     findings.append(f"NRH2 {where}: runs `{m.group(1)} {m.group(2)}` -- NixOS runners have no distro package manager; take the tool from nixpkgs")
+            if isinstance(run, str) and not in_container and "NRH5" not in allowed:
+                code = "\n".join(l for l in run.splitlines() if not l.lstrip().startswith("#"))
+                m = PIP_INSTALL.search(code)
+                if m and not VENV.search(code):
+                    findings.append(f"NRH5 {where}: runs `{m.group(1)} install` outside a virtualenv -- the NixOS runners have no pip on PATH and nixpkgs python3 has no pip module; take the package from nixpkgs or install into a venv")
     return findings
 
 

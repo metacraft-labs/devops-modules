@@ -7,7 +7,7 @@
 }:
 # Runner-Fleet-Capability-Pools-And-Remote-Driving campaign, milestone RA2.
 #
-# The `vm-harness` CLI/daemon binary (public toolkit, metacraft-labs/gosti).
+# The `gosti` (formerly `vm-harness`) CLI/daemon binary (public toolkit, metacraft-labs/gosti).
 # Its SINGLE binary already includes `vm-harness serve` — the RA1 remoting
 # daemon (PR #25, merged on the `dev` branch) — so nothing separate needs
 # building for the serve deployment; `services.vm-harness-serve` just packages
@@ -22,8 +22,18 @@
 # binary against this repo's own nixpkgs.
 #
 # Bump `rev`/`hash` to roll the serve binary forward; the mainline is `dev`.
+#
+# GOSTI1b step 1: installed with gosti's step-0 layout (gosti#55,
+# scripts/install-binaries.sh): `bin/gosti` is the binary and `bin/vm-harness`
+# a RELATIVE symlink to it, so every consumer naming `bin/vm-harness` (the
+# garm provider's `vm_harness_path`, scripts, muscle memory) keeps working,
+# and `lib.getExe` yields `bin/gosti`. `share/vm-harness/` keeps its name
+# (gosti itself still resolves its guest recipes there). The pinned source
+# predates step 0, so the layout is reproduced here rather than by calling
+# the script; behaviour does not depend on the invoked name (the serve worker
+# re-execs the resolved executable, i.e. `/proc/self/exe`).
 stdenv.mkDerivation (finalAttrs: {
-  pname = "vm-harness";
+  pname = "gosti";
   version = "0.1.0-unstable-2026-09-23";
 
   src = fetchFromGitHub {
@@ -45,7 +55,7 @@ stdenv.mkDerivation (finalAttrs: {
     # build directory (identical to the upstream flake's package build).
     nim c --hints:off --opt:speed \
       --nimcache:$TMPDIR/nimcache \
-      -o:vm-harness src/vm_harness/cli.nim
+      -o:gosti src/vm_harness/cli.nim
     runHook postBuild
   '';
 
@@ -54,7 +64,8 @@ stdenv.mkDerivation (finalAttrs: {
     mkdir -p $out/bin \
       $out/share/vm-harness/guest-scripts \
       $out/share/vm-harness/guest-recipes
-    install -m755 vm-harness $out/bin/vm-harness
+    install -m755 gosti $out/bin/gosti
+    ln -s gosti $out/bin/vm-harness
     cp -R guest-scripts/* $out/share/vm-harness/guest-scripts/
     cp -R guest-recipes/* $out/share/vm-harness/guest-recipes/
     runHook postInstall
@@ -64,7 +75,7 @@ stdenv.mkDerivation (finalAttrs: {
     description = "Cross-platform VM lifecycle orchestration (incl. the `vm-harness serve` remoting daemon)";
     homepage = "https://github.com/metacraft-labs/gosti";
     license = lib.licenses.mit;
-    mainProgram = "vm-harness";
+    mainProgram = "gosti";
     platforms = [
       "x86_64-linux"
       "aarch64-linux"
