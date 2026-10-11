@@ -1,0 +1,39 @@
+name: plain-runs-on-and-guards
+on: push
+# Hazards the linter used to miss: self-hosted Linux jobs whose runs-on is a
+# plain string (or single-name list / matrix value), and steps whose
+# GitHub-hosted guard is a disjunction or negated (both can run self-hosted).
+jobs:
+  # metacraft-overlay shape: retired single-name class + container job.
+  overlay-container:
+    runs-on: eph-linux-x64
+    container: ubuntu:24.04
+    steps:
+      - run: apt-get update
+  bare-self-hosted:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/setup-node@v4
+  matrix-plain:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [eph-linux-x64-gpu, eph-macos-arm64]
+    steps:
+      - uses: lycheeverse/lychee-action@v2
+  guard-disjunction:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - if: runner.environment == 'github-hosted' || inputs.force-install
+        uses: DeterminateSystems/nix-installer-action@main
+      - if: ${{ !(runner.environment == 'github-hosted') }}
+        uses: DeterminateSystems/magic-nix-cache-action@main
+  nixos-label:
+    runs-on: nixos
+    steps:
+      - run: sudo apt-get install -y jq
+  single-name-list:
+    runs-on: [eph-linux-arm64]
+    steps:
+      - shell: /bin/bash -e {0}
+        run: echo hi
