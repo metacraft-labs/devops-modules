@@ -37,10 +37,17 @@ package provider
 //   - this provider's own templates: removes run.sh/run.cmd, bin/ and
 //     externals/, so their download branch fires and the extract overwrites.
 //
-// The match is exact, trading cache hit rate for correctness: while a runner
-// newer than the golden's exists, each job downloads it. When no offered
-// version can be derived the guard is omitted entirely: it must never be the
-// reason a bootstrap fails.
+// A cached runner is kept when it is the offered version or NEWER, and replaced
+// only when it is OLDER (or its version cannot be read). GitHub deprecates
+// runners from the oldest end, and GARM offers what GitHub currently
+// publishes, so a runner at or above the offered version is above GitHub's
+// minimum: it cannot be the deprecated one, and the "or once GitHub's minimum
+// passes it" case needs no separate test. Newer-than-offered is routine: the
+// golden pin (lib/actions-runner.json in infra) is bumped as soon as a release
+// is out, and GitHub keeps offering the previous one for a while. Replacing
+// it then would DOWNGRADE every job's runner at the cost of a download. When
+// no offered version can be derived the guard is omitted entirely: it must
+// never be the reason a bootstrap fails.
 
 import (
 	"bytes"
@@ -154,13 +161,19 @@ func bashRunnerVersionGuard(offered, runHomeVar, statusFn, failFn string, mode b
 	}
 	return `# garm-provider-vmharness: cached-runner version guard. GitHub rejects
 # deprecated runner releases, so a runner pre-staged in the image is only
-# reused when it is exactly the version GARM offers.
+# reused when it is the version GARM offers or newer.
 GARM_OFFERED_RUNNER_VERSION=` + shellQuote(offered) + `
 if ` + present + `; then
-` + readVersion("	") + `	if [ "$GARM_CACHED_RUNNER_VERSION" != "$GARM_OFFERED_RUNNER_VERSION" ]; then
-		` + statusFn + ` "cached runner ${GARM_CACHED_RUNNER_VERSION:-unknown} in ` + h + ` != offered $GARM_OFFERED_RUNNER_VERSION; ` + verb + `"
-` + indentLines(action, "	") + `	else
+` + readVersion("	") + `	GARM_CACHED_RUNNER_CURRENT=0
+	if [ -n "$GARM_CACHED_RUNNER_VERSION" ] && awk -v c="$GARM_CACHED_RUNNER_VERSION" -v o="$GARM_OFFERED_RUNNER_VERSION" 'BEGIN { split(c, x, "."); split(o, y, "."); for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 } exit 0 }'; then
+		GARM_CACHED_RUNNER_CURRENT=1
+	fi
+	if [ "$GARM_CACHED_RUNNER_CURRENT" != 1 ]; then
+		` + statusFn + ` "cached runner ${GARM_CACHED_RUNNER_VERSION:-unknown} in ` + h + ` is older than offered $GARM_OFFERED_RUNNER_VERSION; ` + verb + `"
+` + indentLines(action, "	") + `	elif [ "$GARM_CACHED_RUNNER_VERSION" = "$GARM_OFFERED_RUNNER_VERSION" ]; then
 		echo "cached runner $GARM_CACHED_RUNNER_VERSION matches offered version"
+	else
+		echo "cached runner $GARM_CACHED_RUNNER_VERSION is newer than offered $GARM_OFFERED_RUNNER_VERSION; keeping it"
 	fi
 fi
 `
@@ -212,16 +225,26 @@ if (` + present + `) {
 	} catch {
 		$garmCachedRunnerVersion = ''
 	}
-	if ($garmCachedRunnerVersion -ne $garmOfferedRunnerVersion) {
+	$garmCachedRunnerCurrent = $false
+	try {
+		if ($garmCachedRunnerVersion -and ([version]$garmCachedRunnerVersion -ge [version]$garmOfferedRunnerVersion)) {
+			$garmCachedRunnerCurrent = $true
+		}
+	} catch {
+		$garmCachedRunnerCurrent = $false
+	}
+	if (-not $garmCachedRunnerCurrent) {
 		$garmShownVersion = if ($garmCachedRunnerVersion) { $garmCachedRunnerVersion } else { 'unknown' }
-		` + statusCall(`cached runner $garmShownVersion in ${`+runHomeVar+`} != offered $garmOfferedRunnerVersion; discarding cached runner`) + `
+		` + statusCall(`cached runner $garmShownVersion in ${`+runHomeVar+`} is older than offered $garmOfferedRunnerVersion; discarding cached runner`) + `
 		try {
 			` + discard + `
 		} catch {
 			` + failCall(`failed to discard cached runner in ${`+runHomeVar+`}: $($_.Exception.Message)`) + `
 		}
-	} else {
+	} elseif ($garmCachedRunnerVersion -eq $garmOfferedRunnerVersion) {
 		Write-Host "cached runner $garmCachedRunnerVersion matches offered version"
+	} else {
+		Write-Host "cached runner $garmCachedRunnerVersion is newer than offered $garmOfferedRunnerVersion; keeping it"
 	}
 }
 `
