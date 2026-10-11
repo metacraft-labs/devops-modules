@@ -38,6 +38,7 @@ publishes no API for it.
 | Per-user Gmail settings: send-as, filters, forwarding, IMAP                         | Gmail API (as that user) | `gmail.settings.basic`, `gmail.settings.sharing`             |
 | Insert a message into a user's mailbox                                              | Gmail API (as that user) | `gmail.insert`                                               |
 | Send a message as a user (e.g. a mail-rendering test loop)                          | Gmail API (as that user) | `gmail.send`                                                 |
+| A group's posting settings (e.g. let a report mailbox receive external mail)        | Groups Settings          | `apps.groups.settings`                                       |
 | The `googleworkspace` Terraform provider                                            | the above                | whatever its resources need                                  |
 
 **Not covered — console-only at the time of writing.** Google publishes no API
@@ -97,11 +98,12 @@ re-run — each step is skipped when already done:
    `gcloud projects describe` does not find it. The project belongs to the
    organisation, not to the person running it. No billing account is needed: the
    Admin SDK and Gmail APIs are free.
-2. **APIs.** `gcloud services enable admin.googleapis.com gmail.googleapis.com siteverification.googleapis.com orgpolicy.googleapis.com`.
+2. **APIs.** `gcloud services enable admin.googleapis.com gmail.googleapis.com siteverification.googleapis.com groupssettings.googleapis.com orgpolicy.googleapis.com`.
    The Site Verification API is what
    [`google-workspace-domains`](./Google-Workspace-Domains.md) uses to verify a
-   new domain; enabling it in a project made before it was added is the same
-   command (`setup` again is fine).
+   new domain, and Groups Settings what its `dmarc-group` uses; enabling them
+   in a project made before they were added is the same command (`setup`
+   again is fine).
 3. **Service account.** `gcloud iam service-accounts create workspace-admin`
    (`--sa` changes the name). It needs **no** IAM role on the project: domain-wide
    delegation is granted in the Workspace Admin console, not in IAM.

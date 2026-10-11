@@ -143,7 +143,7 @@ printf 'census line\n' >"$repo/census.expected"
 git -C "$repo" add -A && git -C "$repo" commit --quiet -m init
 cp "$data" "$work/data.orig"
 # The hook appends the record key to a census and logs its environment.
-hook='printf "%s\n" "$RECORD_KEY" >>census.expected; echo "$DOMAIN $SELECTOR $RECORD_NAME" >>"'"$work"'/hook.log"'
+hook='printf "%s\n" "$RECORD_KEY" >>census.expected; echo "$DOMAIN $SELECTOR $RECORD_NAME" >>"'"$work"'/hook.log"; printf "%s\n" "$RECORD_ADDRESSES_ADDED" >>"'"$work"'/added.log"'
 
 expect_not "publish refuses a domain the data file does not declare" \
   run publish --no-pr --no-open --domain example.org --data "$data" --value "$v2048"
@@ -160,6 +160,17 @@ expect "... and runs the hook with DOMAIN/SELECTOR/RECORD_NAME" \
   test "$(cat "$work/hook.log")" = "example.com google google._domainkey.example.com"
 expect "... in the repository root (RECORD_KEY reached its census)" \
   grep -qxF 'google._domainkey.example.com|TXT' "$repo/census.expected"
+expect "... with the resource address it adds in RECORD_ADDRESSES_ADDED" \
+  test "$(cat "$work/added.log")" = 'cloudflare_dns_record.mail_auth_dkim["google._domainkey.example.com|TXT"]'
+cp "$data" "$work/data.before-lookup"
+jq '.version = 2 | .domains["example.org"] = {zone_lookup: "example_org", dkim: {}}' "$data" >"$data.new" && mv "$data.new" "$data"
+: >"$work/added.log"
+run publish --no-pr --no-open --domain example.org --data "$data" --value "$v2048" --post-edit "$hook" || true
+expect "... for a zone_lookup domain, the address of its own resource" \
+  test "$(cat "$work/added.log")" = 'cloudflare_dns_record.mail_auth_dkim_example_org["google._domainkey.example.org|TXT"]'
+cp "$work/data.before-lookup" "$data"
+sed -i '$d' "$work/hook.log"
+sed -i '$d' "$repo/census.expected"
 
 cp "$data" "$work/data.after"
 expect "re-running with the same value succeeds" \

@@ -323,6 +323,217 @@ let
         google_verification = [ "\"google-site-verification=abcdefgh123\"" ];
       })
     );
+
+    # ── TLS-RPT, MTA-STS, google kinds, pending zones ───────────────────────
+    "TLS-RPT is one quoted TXT at _smtp._tls.<domain>" =
+      (mail (two {
+        tls_rpt.rua = [
+          "mailto:tls@example.com"
+          "https://r.example.com/tlsrpt"
+        ];
+      }))."_smtp._tls.example.com|TXT" == {
+        zone_id = zoneA;
+        name = "_smtp._tls.example.com";
+        type = "TXT";
+        content = "\"v=TLSRPTv1; rua=mailto:tls@example.com,https://r.example.com/tlsrpt\"";
+        priority = null;
+      };
+    "a TLS-RPT URI that is http:// is refused" = throws (
+      render (two {
+        tls_rpt.rua = [ "http://r.example.com/" ];
+      })
+    );
+    "an empty TLS-RPT rua is refused" = throws (
+      render (two {
+        tls_rpt.rua = [ ];
+      })
+    );
+    "an MTA-STS block that is not enabled renders nothing" =
+      render (two {
+        mta_sts = {
+          id = "1";
+          mode = "testing";
+        };
+      }) == { };
+    "an enabled MTA-STS renders only the _mta-sts TXT" =
+      mail (two {
+        mta_sts = {
+          enabled = true;
+          id = "20261011";
+          mode = "enforce";
+        };
+      }) == {
+        "_mta-sts.example.com|TXT" = {
+          zone_id = zoneA;
+          name = "_mta-sts.example.com";
+          type = "TXT";
+          content = "\"v=STSv1; id=20261011\"";
+          priority = null;
+        };
+      };
+    "an MTA-STS id with a dash is refused" = throws (
+      render (two {
+        mta_sts = {
+          id = "2026-10";
+          mode = "testing";
+        };
+      })
+    );
+    "an MTA-STS mode outside testing/enforce/none is refused, even when disabled" = throws (
+      render (two {
+        mta_sts = {
+          id = "1";
+          mode = "strict";
+        };
+      })
+    );
+    "the google field renders nothing" =
+      render (two {
+        google = {
+          kind = "alias";
+          parent = "example.net";
+        };
+      }) == { };
+    "a google kind outside primary/secondary/alias is refused" = throws (
+      render (two {
+        google.kind = "subdomain";
+      })
+    );
+    "an alias without a parent is refused" = throws (
+      render (two {
+        google.kind = "alias";
+      })
+    );
+    "a secondary domain with a parent is refused" = throws (
+      render (two {
+        google = {
+          kind = "secondary";
+          parent = "example.net";
+        };
+      })
+    );
+    "an alias of itself is refused" = throws (
+      render (two {
+        google = {
+          kind = "alias";
+          parent = "example.com";
+        };
+      })
+    );
+    "a pending domain renders nothing, not even its report authorisation" =
+      let
+        r = (
+          render {
+            version = 2;
+            domains = {
+              "example.com" = {
+                zone_id = zoneA;
+              };
+              "example.dev" = {
+                zone_pending = true;
+                dmarc = {
+                  p = "none";
+                  rua = [ "mailto:dmarc@example.com" ];
+                };
+                tls_rpt.rua = [ "mailto:dmarc@example.com" ];
+                google.kind = "secondary";
+              };
+            };
+          }
+        );
+      in
+      r == { };
+    "a domain reporting to a pending domain gets no authorisation record" =
+      builtins.attrNames (mail {
+        version = 2;
+        domains = {
+          "example.com" = {
+            zone_id = zoneA;
+            dmarc = {
+              p = "none";
+              rua = [ "mailto:dmarc@example.dev" ];
+            };
+          };
+          "example.dev".zone_pending = true;
+        };
+      }) == [ "_dmarc.example.com|TXT" ];
+    "a pending domain's records are still validated" = throws (render {
+      version = 2;
+      domains."example.dev" = {
+        zone_pending = true;
+        dmarc.p = "monitor";
+      };
+    });
+    "zone_pending together with a zone_id is refused" = throws (
+      render (two {
+        zone_pending = true;
+      })
+    );
+    "zone_pending in a version-1 file is refused" = throws (render {
+      version = 1;
+      domains."example.dev".zone_pending = true;
+    });
+    "adding DMARC and TLS-RPT to declared domains only adds keys" =
+      let
+        before = mail fixture2;
+        withReports = fixture2 // {
+          domains = fixture2.domains // {
+            "example.io" = fixture2.domains."example.io" // {
+              dmarc = {
+                p = "none";
+                rua = [ "mailto:dmarc@example.com" ];
+              };
+              tls_rpt.rua = [ "mailto:dmarc@example.com" ];
+            };
+          };
+        };
+        after = mail withReports;
+      in
+      builtins.all (k: after.${k} == before.${k}) (builtins.attrNames before)
+      &&
+        builtins.attrNames after == builtins.sort builtins.lessThan (
+          builtins.attrNames before
+          ++ [
+            "_dmarc.example.io|TXT"
+            "_smtp._tls.example.io|TXT"
+            "example.io._report._dmarc.example.com|TXT"
+          ]
+        );
+    "google_users with an upper-case address is refused" = throws (
+      render (
+        fixture2
+        // {
+          google_users."Jane@example.com".local_parts = [ "jane" ];
+        }
+      )
+    );
+    "google_users with an empty local_parts is refused" = throws (
+      render (
+        fixture2
+        // {
+          google_users."jane@example.com".local_parts = [ ];
+        }
+      )
+    );
+    "google_users in a version-1 file is refused" = throws (
+      render (
+        fixture
+        // {
+          google_users."jane@example.com".local_parts = [ "jane" ];
+        }
+      )
+    );
+    "an unknown top-level field is refused" = throws (render (fixture2 // { domain = { }; }));
+    "google_users renders nothing" =
+      render (
+        fixture2
+        // {
+          google_users."jane@example.com".local_parts = [
+            "jane"
+            "jane.doe"
+          ];
+        }
+      ) == render fixture2;
   };
 in
 builtins.filter (name: !cases.${name}) (builtins.attrNames cases)
