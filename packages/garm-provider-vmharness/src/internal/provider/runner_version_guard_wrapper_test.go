@@ -337,9 +337,13 @@ func TestGarmWrapperGuardExecutesAgainstServedTemplate(t *testing.T) {
 		forbidStatues []string
 	}{
 		{name: "stale-image-runner-replaced", url: "file://" + goodTar, staged: "2.328.0", wantVersion: offeredVersion,
-			wantStatuses: []string{"cached runner 2.328.0", "!= offered " + offeredVersion, "replacing runner binaries in place", "using cached runner found in"}},
+			wantStatuses: []string{"cached runner 2.328.0", "older than offered " + offeredVersion, "replacing runner binaries in place", "using cached runner found in"}},
 		{name: "current-image-runner-kept", url: "file://" + goodTar, staged: offeredVersion, wantVersion: offeredVersion,
-			wantStatuses: []string{"using cached runner found in"}, forbidStatues: []string{"!= offered"}},
+			wantStatuses: []string{"using cached runner found in"}, forbidStatues: []string{"older than offered"}},
+		// The live state of 2026-10-11: the golden carries 2.338.0 while GitHub
+		// still offers 2.337.0. The image runner must be used as is.
+		{name: "newer-image-runner-kept", url: "file://" + goodTar, staged: newerVersion, wantVersion: newerVersion,
+			wantStatuses: []string{"using cached runner found in"}, forbidStatues: []string{"older than offered", "replacing runner binaries"}},
 		{name: "replacement-download-fails-bootstrap", url: "file://" + filepath.Join(fixtures, "absent.tar.gz"), staged: "2.328.0", wantExit: true,
 			wantStatuses: []string{"failed to download runner " + offeredVersion}, forbidStatues: []string{"using cached runner found in"}},
 		{name: "custom-stored-template-runs-as-served", url: "file://" + goodTar, staged: "2.328.0", customServed: true, wantVersion: "2.328.0",
