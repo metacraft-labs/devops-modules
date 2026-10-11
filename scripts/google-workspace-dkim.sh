@@ -26,8 +26,11 @@
 #   3. sets .domains[D].dkim[S] in FILE with jq — only for a domain FILE already
 #      declares (a person adds the domain and its zone id once; the error says how);
 #   4. runs --post-edit CMD in the repository root with DOMAIN, SELECTOR,
-#      RECORD_NAME (<S>._domainkey.<D>), RECORD_KEY (RECORD_NAME|TXT) and
-#      DATA_FILE exported — the consumer's hook for whatever else must change in
+#      RECORD_NAME (<S>._domainkey.<D>), RECORD_KEY (RECORD_NAME|TXT),
+#      DATA_FILE and RECORD_ADDRESSES_ADDED / RECORD_ADDRESSES_REMOVED (the
+#      cloudflare_dns_record addresses the edit adds or drops, as for
+#      google-workspace-domains — mail_auth_dkim_<key> for a zone_lookup
+#      domain) exported — the consumer's hook for whatever else must change in
 #      the same commit (a reviewed plan census, say);
 #   5. unless --no-pr: in a temporary git worktree on branch dkim/<D>-<S> from
 #      origin/<base> (default: the repository's default branch), commits FILE and
@@ -60,8 +63,9 @@ console_url="https://admin.google.com/ac/apps/gmail/authenticateemail"
 # The PR flow and the DNS wait are shared with google-workspace-domains
 # (lib/pr-publish.sh). The package points GOOGLE_WORKSPACE_TOOLS_LIB at the
 # library directory; from a checkout it is beside this script.
+lib="${GOOGLE_WORKSPACE_TOOLS_LIB:-$(dirname -- "${BASH_SOURCE[0]}")/lib}"
 # shellcheck source=lib/pr-publish.sh
-. "${GOOGLE_WORKSPACE_TOOLS_LIB:-$(dirname -- "${BASH_SOURCE[0]}")/lib}/pr-publish.sh"
+. "$lib/pr-publish.sh"
 
 usage="usage: $prog publish|check|validate ... (see the header of this script)"
 cmd="${1:-}"
@@ -245,12 +249,18 @@ apply_edit() {
       [ "$replace" = 1 ] || die "$f already holds a DIFFERENT value for $record_name. To rotate, use a new selector (--selector google$(date +%Y)) and publish it alongside; pass --replace only to overwrite this one deliberately"
       ;;
   esac
+  local before after added removed
+  before="$(jq -L "$lib" -r 'include "mail-auth"; mail_auth_addresses' "$f" | sort)"
   set_value "$f" "$v"
+  after="$(jq -L "$lib" -r 'include "mail-auth"; mail_auth_addresses' "$f" | sort)"
+  added="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed '/^$/d')"
+  removed="$(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed '/^$/d')"
   say "set .domains[\"$domain\"].dkim[\"$selector\"] in $f"
   if [ -n "$post_edit" ]; then
     say "running the post-edit hook: $post_edit"
     (cd "$root" && DOMAIN="$domain" SELECTOR="$selector" RECORD_NAME="$record_name" \
-      RECORD_KEY="$record_name|TXT" DATA_FILE="$f" bash -c "$post_edit") ||
+      RECORD_KEY="$record_name|TXT" DATA_FILE="$f" RECORD_ADDRESSES_ADDED="$added" \
+      RECORD_ADDRESSES_REMOVED="$removed" bash -c "$post_edit") ||
       die "the post-edit hook failed"
   fi
 }

@@ -1,5 +1,6 @@
-# A domain's mail DNS records for Cloudflare zones — DKIM keys, MX, SPF, DMARC
-# and the Google site-verification token — from a JSON data file the consumer
+# A domain's mail DNS records for Cloudflare zones — DKIM keys, MX, SPF, DMARC,
+# TLS-RPT, MTA-STS and the Google site-verification token — from a JSON data
+# file the consumer
 # keeps in its own repository (docs/Google-Workspace-Domains.md,
 # docs/Google-Workspace-DKIM.md).
 #
@@ -28,9 +29,18 @@
 #         "google_verification": [ "google-site-verification=AbC…" ],
 #         "mx": [ { "priority": 1, "host": "smtp.google.com" } ],
 #         "spf": { "include": [ "_spf.google.com" ], "all": "~all" },
-#         "dmarc": { "p": "none", "rua": [ "mailto:dmarc@example.com" ] }
+#         "dmarc": { "p": "none", "rua": [ "mailto:dmarc@example.com" ] },
+#         "tls_rpt": { "rua": [ "mailto:tls-reports@example.com" ] },
+#         "mta_sts": { "enabled": false, "id": "20261011", "mode": "testing" },
+#         "google": { "kind": "primary" }
 #       },
-#       "example.org": { "zone_lookup": "example_org", "dkim": {} }
+#       "example.org": { "zone_lookup": "example_org", "dkim": {},
+#                        "google": { "kind": "alias", "parent": "example.com" } },
+#       "example.dev": { "zone_pending": true, "dkim": {},
+#                        "google": { "kind": "secondary" } }
+#     },
+#     "google_users": {
+#       "jane.doe@example.com": { "local_parts": [ "jane", "jane.doe" ] }
 #     }
 #   }
 #
@@ -58,6 +68,39 @@
 #   dmarc         {p, sp?, pct?, rua?, ruf?, fo?, adkim?, aspf?} — rendered as
 #                 the _dmarc TXT, tags in that order. rua/ruf are lists of
 #                 "mailto:" URIs.
+#   tls_rpt       {rua: [URI]} — SMTP TLS reporting (RFC 8460), rendered as the
+#                 "_smtp._tls.<domain>" TXT "v=TLSRPTv1; rua=<uri>,<uri>". Each
+#                 URI is "mailto:<mailbox>" or "https://…". Unlike DMARC, a
+#                 report mailbox in another domain needs no authorisation record.
+#   mta_sts       {enabled?, id, mode, max_age?} — MTA-STS (RFC 8461). Renders
+#                 ONLY the "_mta-sts.<domain>" TXT "v=STSv1; id=<id>", and only
+#                 when "enabled": true (default false). The policy itself
+#                 (https://mta-sts.<domain>/.well-known/mta-sts.txt, carrying
+#                 mode, the MX names and max_age) needs an HTTPS host that this
+#                 helper does not provide: publish the TXT only once that host
+#                 serves the policy, and change `id` whenever the policy changes.
+#                 `mode` (testing | enforce | none) and `max_age` (seconds) are
+#                 validated here so the policy host can be generated from the
+#                 same data.
+#   google        {kind, parent?, spf_replace?} — what the Google Workspace
+#                 tenant should make of the domain. Not rendered; read by
+#                 `google-workspace-domains`. kind: "primary" (the tenant's own
+#                 domain), "secondary" (users can be created with a primary
+#                 address there; nobody gets an address automatically) or
+#                 "alias" (every user of `parent` automatically receives mail at
+#                 the same local part here). `parent` is required for an alias
+#                 and only there. spf_replace: the onboarding cutover makes SPF
+#                 Google's alone instead of adding Google to it.
+#   zone_pending  true for a domain whose DNS is not in a Cloudflare zone yet
+#                 (being transferred, say): it is declared — with its google
+#                 kind and the records it will get — but takes no zone_id or
+#                 zone_lookup and renders NOTHING, not even the DMARC report
+#                 authorisation record another zone would hold for it. Replace
+#                 it with the zone once the zone exists.
+#
+# google_users (top level, optional, version 2): the users whose addresses
+# `google-workspace-domains user-addresses --all` maintains —
+# {"<primary email>": {"local_parts": ["<local>", …]}}. Not rendered.
 #
 # WHAT IT RENDERS. Records are `cloudflare_dns_record` (provider v5), unproxied,
 # ttl 1 (automatic), with a comment, in `for_each` resources keyed by a STABLE
@@ -72,6 +115,8 @@
 #     "<domain>|TXT|<google-site-verification=…>"
 #     "_dmarc.<domain>|TXT"
 #     "<domain>._report._dmarc.<report-domain>|TXT"   (see below)
+#     "_smtp._tls.<domain>|TXT"
+#     "_mta-sts.<domain>|TXT"                         (only when enabled)
 #
 # MX is keyed by POSITION, not by host, on purpose: replacing a mail host
 # (moving a domain's mail to Google, or from the legacy set to smtp.google.com)
@@ -106,7 +151,11 @@
 # verification value not of the form google-site-verification=<token>; an MX
 # priority outside 0..65535; an SPF `all` other than ~all/-all/?all, or an SPF
 # record longer than 255 characters; a DMARC tag with a value outside its RFC
-# 7489 range. Those alphabets are also what make the inline `for_each` safe:
+# 7489 range; a TLS-RPT URI that is neither mailto: nor https:, or a record
+# over 255 characters; an MTA-STS id outside [A-Za-z0-9]{1,32} or a mode
+# outside testing/enforce/none; a google kind outside primary/secondary/alias,
+# an alias without a parent (or a non-alias with one); zone_pending together
+# with a zone. Those alphabets are also what make the inline `for_each` safe:
 # Terraform's JSON syntax reads a string as a template, and no permitted value
 # can contain `${` or `%{`.
 {
@@ -160,6 +209,14 @@ let
     m:
     isString m && match "mailto:[a-z0-9._+-]+@([a-z0-9-]+[.])+[a-z]{2,63}(![0-9]+[kmgt]?)?" m != null;
   mailtoDomain = m: head (match "mailto:[^@]+@([^!]+).*" m);
+  # A TLS-RPT report URI (RFC 8460 §3): a mailbox or an https endpoint. No `%`
+  # and no `$`, so no Terraform template sequence can be formed.
+  isTlsRptUri =
+    u:
+    isMailto u
+    || (isString u && match "https://([a-z0-9-]+[.])+[a-z]{2,63}(/[A-Za-z0-9._~/-]*)?" u != null);
+  isMailbox = e: isString e && match "[a-z0-9._+-]+@([a-z0-9-]+[.])+[a-z]{2,63}" e != null;
+  isLocalPart = l: isString l && match "[a-z0-9]([a-z0-9._+-]*[a-z0-9])?" l != null;
 
   v1Fields = [
     "zone_id"
@@ -171,7 +228,20 @@ let
     "mx"
     "spf"
     "dmarc"
+    "tls_rpt"
+    "mta_sts"
+    "google"
+    "zone_pending"
   ];
+
+  # A domain whose zone is not in Cloudflare yet: declared, validated, and
+  # rendered as nothing.
+  isPending =
+    domain:
+    let
+      p = domains.${domain}.zone_pending or false;
+    in
+    check (builtins.isBool p) "domain ${domain}: zone_pending must be true or false" p;
 
   # Where a domain's records go: the resource-name suffix and the zone_id
   # expression. A literal zone keeps its id per record (inside for_each); a
@@ -183,23 +253,33 @@ let
       hasId = d ? zone_id;
       hasLookup = d ? zone_lookup;
     in
-    check (hasId != hasLookup) "domain ${domain}: declare exactly one of zone_id and zone_lookup" (
-      if hasId then
-        check (isZoneId d.zone_id) "domain ${domain}: zone_id must be the 32-hex Cloudflare zone id" {
-          suffix = "";
-          id = d.zone_id;
+    if isPending domain then
+      check (version == 2 && !hasId && !hasLookup)
+        "domain ${domain}: zone_pending needs \"version\": 2 and neither zone_id nor zone_lookup (declare the zone once it exists, and drop zone_pending)"
+        {
+          # Only ever used to validate the records; they are dropped below.
+          suffix = "_pending";
+          id = null;
+          ref = null;
         }
-      else
-        check (version == 2) "domain ${domain}: zone_lookup needs \"version\": 2" (
-          check (isLookupKey d.zone_lookup)
-            "domain ${domain}: zone_lookup must be a data.cloudflare_zone key ([a-z_][a-z0-9_]*)"
-            {
-              suffix = "_${d.zone_lookup}";
-              id = null;
-              ref = "\${data.cloudflare_zone.${d.zone_lookup}.id}";
-            }
-        )
-    );
+    else
+      check (hasId != hasLookup) "domain ${domain}: declare exactly one of zone_id and zone_lookup" (
+        if hasId then
+          check (isZoneId d.zone_id) "domain ${domain}: zone_id must be the 32-hex Cloudflare zone id" {
+            suffix = "";
+            id = d.zone_id;
+          }
+        else
+          check (version == 2) "domain ${domain}: zone_lookup needs \"version\": 2" (
+            check (isLookupKey d.zone_lookup)
+              "domain ${domain}: zone_lookup must be a data.cloudflare_zone key ([a-z_][a-z0-9_]*)"
+              {
+                suffix = "_${d.zone_lookup}";
+                id = null;
+                ref = "\${data.cloudflare_zone.${d.zone_lookup}.id}";
+              }
+          )
+      );
 
   checkFields =
     domain:
@@ -397,6 +477,118 @@ let
         ]
       );
 
+  tlsRptFor =
+    domain:
+    let
+      d = domains.${domain};
+      t = d.tls_rpt;
+      rua = t.rua or [ ];
+      bad = filter (f: f != "rua") (attrNames t);
+      content = "v=TLSRPTv1; rua=${concatStringsSep "," rua}";
+      name = "_smtp._tls.${domain}";
+    in
+    if !(d ? tls_rpt) then
+      [ ]
+    else
+      check (bad == [ ]) "domain ${domain}: tls_rpt has unknown field(s) ${concatStringsSep ", " bad}" (
+        check (isList rua && rua != [ ] && all isTlsRptUri rua)
+          "domain ${domain}: tls_rpt.rua must be a non-empty list of mailto: or https:// URIs"
+          (
+            check (stringLength content <= 255)
+              "domain ${domain}: the TLS-RPT record is ${toString (stringLength content)} characters, over one 255-character TXT string"
+              [ (rec' (zoneOf domain) "${name}|TXT" name "TXT" (quote content) null) ]
+          )
+      );
+
+  mtaStsFor =
+    domain:
+    let
+      d = domains.${domain};
+      m = d.mta_sts;
+      enabled = m.enabled or false;
+      known = [
+        "enabled"
+        "id"
+        "mode"
+        "max_age"
+      ];
+      bad = filter (f: !(elem f known)) (attrNames m);
+      name = "_mta-sts.${domain}";
+      valid =
+        check (bad == [ ]) "domain ${domain}: mta_sts has unknown field(s) ${concatStringsSep ", " bad}"
+          (
+            check (builtins.isBool enabled) "domain ${domain}: mta_sts.enabled must be true or false" (
+              check (isString (m.id or null) && match "[A-Za-z0-9]{1,32}" m.id != null)
+                "domain ${domain}: mta_sts.id must be 1-32 letters and digits"
+                (
+                  check
+                    (elem (m.mode or null) [
+                      "testing"
+                      "enforce"
+                      "none"
+                    ])
+                    "domain ${domain}: mta_sts.mode must be testing, enforce or none"
+                    (
+                      check (
+                        !(m ? max_age) || (isInt m.max_age && m.max_age >= 0 && m.max_age <= 31557600)
+                      ) "domain ${domain}: mta_sts.max_age must be 0..31557600 seconds" true
+                    )
+                )
+            )
+          );
+    in
+    if !(d ? mta_sts) then
+      [ ]
+    else
+      builtins.seq valid (
+        if enabled then
+          [ (rec' (zoneOf domain) "${name}|TXT" name "TXT" (quote "v=STSv1; id=${m.id}") null) ]
+        else
+          [ ]
+      );
+
+  # Validated, never rendered.
+  checkGoogle =
+    domain:
+    let
+      d = domains.${domain};
+      g = d.google;
+      kind = g.kind or null;
+      bad = filter (
+        f:
+        !(elem f [
+          "kind"
+          "parent"
+          "spf_replace"
+        ])
+      ) (attrNames g);
+    in
+    if !(d ? google) then
+      true
+    else
+      check (bad == [ ]) "domain ${domain}: google has unknown field(s) ${concatStringsSep ", " bad}" (
+        check
+          (elem kind [
+            "primary"
+            "secondary"
+            "alias"
+          ])
+          "domain ${domain}: google.kind must be primary, secondary or alias"
+          (
+            check ((kind == "alias") == (g ? parent))
+              "domain ${domain}: google.parent is required for an alias, and only for an alias"
+              (
+                check (!(g ? parent) || (isDomain g.parent && g.parent != domain))
+                  "domain ${domain}: google.parent must be another lowercase domain name"
+                  (
+                    check (builtins.isBool (
+                      g.spf_replace or false
+                    )) "domain ${domain}: google.spf_replace must be true or false" true
+                  )
+              )
+          )
+      );
+
   # The report domains of a domain's DMARC that are neither the domain itself
   # nor under it, and that this data file declares.
   externalReportDomains =
@@ -417,7 +609,7 @@ let
           map (r: {
             name = r;
             value = null;
-          }) (filter (r: external r && domains ? ${r}) rds)
+          }) (filter (r: external r && domains ? ${r} && !(isPending r)) rds)
         )
       );
 
@@ -435,22 +627,57 @@ let
     domain:
     check (isDomain domain) "\"${domain}\" is not a lowercase domain name" (
       # The zone is validated even for a domain that declares no record yet.
-      builtins.seq (builtins.deepSeq (zoneOf domain) null) (checkFields domain domain)
+      builtins.seq (builtins.deepSeq (zoneOf domain) null) (
+        builtins.seq (checkGoogle domain) (checkFields domain domain)
+      )
     )
   ) (attrNames domains);
 
+  recordsOf =
+    domain:
+    verificationFor domain
+    ++ mxFor domain
+    ++ spfFor domain
+    ++ dmarcFor domain
+    ++ reportAuthFor domain
+    ++ tlsRptFor domain
+    ++ mtaStsFor domain;
+
+  # A pending domain's records are built (so they are validated) and dropped.
+  pendingNames = filter isPending domainNames;
+  liveNames = filter (d: !(isPending d)) domainNames;
+  pendingValidated = builtins.deepSeq (map (d: (dkimFor d) ++ (recordsOf d)) pendingNames) true;
+
+  # top level: version, domains and (version 2) google_users.
+  topBad = filter (
+    f:
+    !(elem f (
+      [
+        "version"
+        "domains"
+      ]
+      ++ (if version == 2 then [ "google_users" ] else [ ])
+    ))
+  ) (attrNames data);
+  users = data.google_users or { };
+  usersValid = builtins.all (
+    u:
+    check (isMailbox u) "google_users: \"${u}\" is not a lowercase email address" (
+      check (attrNames users.${u} == [ "local_parts" ]) "google_users.${u}: the only field is local_parts"
+        (
+          check (
+            isList users.${u}.local_parts
+            && users.${u}.local_parts != [ ]
+            && all isLocalPart users.${u}.local_parts
+          ) "google_users.${u}: local_parts must be a non-empty list of lowercase local parts" true
+        )
+    )
+  ) (attrNames users);
+
   # The version-1 domains need nothing but this to stay byte-identical.
-  dkimRecords = concatMap dkimFor domainNames;
+  dkimRecords = concatMap dkimFor liveNames;
   otherRecords =
-    if version == 2 then
-      concatLists (
-        map (
-          domain:
-          verificationFor domain ++ mxFor domain ++ spfFor domain ++ dmarcFor domain ++ reportAuthFor domain
-        ) domainNames
-      )
-    else
-      [ ];
+    if version == 2 then builtins.seq pendingValidated (concatLists (map recordsOf liveNames)) else [ ];
 
   # One resource per zone group: "" (literal zone ids) or "_<lookup key>".
   resources =
@@ -510,7 +737,15 @@ check
   ])
   "data.version must be 1 or 2"
   (
-    check (!(any (n: dkimResources ? ${n}) (attrNames otherResources)))
-      "resourceName and recordsResourceName collide"
-      (if all' == { } then { } else { resource.cloudflare_dns_record = all'; })
+    check (topBad == [ ])
+      "unknown top-level field(s) ${concatStringsSep ", " topBad}${
+        if version == 1 then " (google_users needs \"version\": 2)" else ""
+      }"
+      (
+        builtins.seq usersValid (
+          check (!(any (n: dkimResources ? ${n}) (attrNames otherResources)))
+            "resourceName and recordsResourceName collide"
+            (if all' == { } then { } else { resource.cloudflare_dns_record = all'; })
+        )
+      )
   )

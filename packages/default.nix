@@ -127,9 +127,11 @@
             exec ${pkgs.runtimeShell} ${../scripts/google-workspace-dkim.sh} "$@"
           '';
         };
-        # Google Workspace domains: add a domain as a domain alias, verify it
-        # through DNS and switch its MX/SPF/DMARC, each DNS change through the
-        # consumer's Terraform data + PR (docs/Google-Workspace-Domains.md).
+        # Google Workspace domains: add a domain as a secondary domain or a
+        # domain alias, verify it through DNS and switch its MX/SPF/DMARC/TLS-RPT,
+        # each DNS change through the consumer's Terraform data + PR; the users'
+        # addresses and send-as; the DMARC report group; the delegation scopes
+        # (docs/Google-Workspace-Domains.md).
         google-workspace-domains = pkgs.writeShellApplication {
           name = "google-workspace-domains";
           runtimeInputs = [
@@ -153,6 +155,34 @@
             exec ${pkgs.runtimeShell} ${../scripts/google-workspace-domains.sh} "$@"
           '';
         };
+        # The guided setup over the two tools above: every console step printed
+        # with its page, clicks and values, waited for and verified, in a safe
+        # order (docs/Google-Workspace-Domains.md, "Guided setup").
+        google-workspace-setup = pkgs.writeShellApplication {
+          name = "google-workspace-setup";
+          runtimeInputs = [
+            self'.packages.google-workspace-domains
+            self'.packages.google-workspace-dkim
+            pkgs.coreutils
+            pkgs.dnsutils
+            pkgs.gawk
+            pkgs.gh
+            pkgs.git
+            pkgs.gnugrep
+            pkgs.gnused
+            pkgs.jq
+          ];
+          text = ''
+            export GOOGLE_WORKSPACE_TOOLS_LIB=${../scripts/lib}
+            export GOOGLE_WORKSPACE_DOMAINS_API="${
+              pkgs.python3.withPackages (p: [
+                p.google-auth
+                p.requests
+              ])
+            }/bin/python3 ${../scripts/google-workspace-domains-api.py}"
+            exec ${pkgs.runtimeShell} ${../scripts/google-workspace-setup.sh} "$@"
+          '';
+        };
         # The Workspace administration tools as one bundle, for consumer dev
         # shells: `packages = [ inputs'.nixos-modules.packages.workspace-admin-tools ]`
         # puts gcloud and the helpers on PATH, so a consumer's recipes call them
@@ -163,6 +193,7 @@
             self'.packages.google-workspace-dwd
             self'.packages.google-workspace-dkim
             self'.packages.google-workspace-domains
+            self'.packages.google-workspace-setup
             pkgs.google-cloud-sdk
           ];
         };

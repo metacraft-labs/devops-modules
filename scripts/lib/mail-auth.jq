@@ -9,6 +9,9 @@
 # The domain's resource-name suffix: "" or "_<zone_lookup>".
 def mail_auth_suffix($d): (.domains[$d].zone_lookup // null) as $l | if $l then "_" + $l else "" end;
 
+# A domain whose zone is not in Cloudflare yet: declared, rendered as nothing.
+def mail_auth_pending($d): (.domains[$d].zone_pending // false) == true;
+
 def mail_auth_mailto_domain: sub("^mailto:[^@]*@"; "") | sub("!.*$"; "");
 
 # The report domains of $d's DMARC record that need an authorisation record:
@@ -17,13 +20,15 @@ def mail_auth_report_domains($d):
   . as $f
   | [ ((.domains[$d].dmarc // {}) | (.rua // []) + (.ruf // []))[]
       | mail_auth_mailto_domain
-      | select(. != $d and (endswith("." + $d) | not) and ($f.domains[.] != null)) ]
+      | select(. as $r | $r != $d and ($r | endswith("." + $d) | not) and ($f.domains[$r] != null)
+               and (($f | mail_auth_pending($r)) | not)) ]
   | unique;
 
 # Every resource address the helper renders, one per output.
 def mail_auth_addresses($dkim; $rec):
   . as $f
   | .domains | keys[] as $d
+  | select(($f | mail_auth_pending($d)) | not)
   | $f.domains[$d] as $v
   | ($f | mail_auth_suffix($d)) as $s
   | "cloudflare_dns_record." + (
@@ -33,7 +38,9 @@ def mail_auth_addresses($dkim; $rec):
         ( if $v.spf then "\($rec)\($s)[\"\($d)|TXT|spf\"]" else empty end ),
         ( if $v.dmarc then "\($rec)\($s)[\"_dmarc.\($d)|TXT\"]" else empty end ),
         ( $f | mail_auth_report_domains($d)[] as $r
-          | "\($rec)\($f | mail_auth_suffix($r))[\"\($d)._report._dmarc.\($r)|TXT\"]" )
+          | "\($rec)\($f | mail_auth_suffix($r))[\"\($d)._report._dmarc.\($r)|TXT\"]" ),
+        ( if $v.tls_rpt then "\($rec)\($s)[\"_smtp._tls.\($d)|TXT\"]" else empty end ),
+        ( if ($v.mta_sts.enabled // false) then "\($rec)\($s)[\"_mta-sts.\($d)|TXT\"]" else empty end )
       );
 def mail_auth_addresses: mail_auth_addresses("mail_auth_dkim"; "mail_auth");
 
@@ -58,3 +65,17 @@ def mail_auth_dmarc($d):
 # "<priority> <host>" lines, sorted by codepoint — the form lookup_mx prints
 # (it sorts with LC_ALL=C; callers comparing the two should sort both alike).
 def mail_auth_mx($d): [(.domains[$d].mx // [])[] | "\(.priority) \(.host)"] | sort | .[];
+
+def mail_auth_tls_rpt($d):
+  .domains[$d].tls_rpt as $t
+  | if $t == null then null else "v=TLSRPTv1; rua=" + ($t.rua | join(",")) end;
+
+# The _mta-sts TXT when enabled, else null.
+def mail_auth_mta_sts($d):
+  .domains[$d].mta_sts as $m
+  | if ($m.enabled // false) then "v=STSv1; id=\($m.id)" else null end;
+
+# What the tenant should make of $d: {kind, parent} — kind "primary",
+# "secondary", "alias" or null when the data does not say.
+def mail_auth_google($d):
+  (.domains[$d].google // {}) | {kind: (.kind // null), parent: (.parent // null), spf_replace: (.spf_replace // false)};

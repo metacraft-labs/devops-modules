@@ -1,0 +1,51 @@
+{
+  "version": 2,
+  "domains": {
+    "example.com": {
+      "zone_id": "0123456789abcdef0123456789abcdef",
+      "dkim": {},
+      "mx": [{ "priority": 1, "host": "smtp.google.com" }],
+      "dmarc": { "p": "none", "rua": ["mailto:dmarc@example.com"] },
+      "tls_rpt": { "rua": ["mailto:dmarc@example.com"] },
+      "mta_sts": { "id": "20261011", "mode": "testing" },
+      "google": { "kind": "primary" }
+    },
+    "example.net": {
+      "zone_id": "fedcba9876543210fedcba9876543210",
+      "dkim": {},
+      "dmarc": { "p": "none", "rua": ["mailto:dmarc@example.com"] },
+      "tls_rpt": {
+        "rua": ["mailto:dmarc@example.com", "https://reports.example.com/tlsrpt"]
+      },
+      "mta_sts": {
+        "enabled": true,
+        "id": "20261011T1",
+        "mode": "enforce",
+        "max_age": 604800
+      },
+      "google": { "kind": "secondary", "spf_replace": true }
+    },
+    "example.org": {
+      "zone_lookup": "example_org",
+      "dkim": {},
+      "tls_rpt": { "rua": ["mailto:dmarc@example.com"] },
+      "google": { "kind": "alias", "parent": "example.net" }
+    },
+    "example.dev": {
+      "zone_pending": true,
+      "dkim": {},
+      "dmarc": { "p": "none", "rua": ["mailto:dmarc@example.com"] },
+      "tls_rpt": { "rua": ["mailto:dmarc@example.com"] },
+      "google": { "kind": "secondary" }
+    },
+    "example.info": {
+      "zone_id": "00000000000000000000000000000002",
+      "dkim": {},
+      "dmarc": { "p": "none", "rua": ["mailto:dmarc@example.dev"] },
+      "google": { "kind": "alias", "parent": "example.dev" }
+    }
+  },
+  "google_users": {
+    "jane.doe@example.com": { "local_parts": ["jane", "jane.doe"] }
+  }
+}

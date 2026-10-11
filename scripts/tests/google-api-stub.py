@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """A local stand-in for the Google endpoints google-workspace-domains calls:
 the OAuth token endpoint (domain-wide delegation JWT bearer grant), the Admin
-SDK Directory domains/domainAliases resources and the Site Verification API.
+SDK Directory domains/domainAliases/users/aliases resources, the Site
+Verification API, the Gmail sendAs and messages.send resources and the Groups
+Settings API.
 
     google-api-stub.py STATE.json DNS_DIR LOG PORT_FILE
 
@@ -12,7 +14,21 @@ it between runs:
      "aliases": {"example.org": {"parent": "example.com", "verified": false}},
      "deny_scopes": ["admin.directory.domain"],   # token refused: unauthorized_client
      "site_api_disabled": false,                  # 403 accessNotConfigured
-     "verify_lag": 2}                             # see below
+     "verify_lag": 2,                             # see below
+     "users": {"admin@example.com": {"aliases": ["a@example.com"]}},
+     "sendas": {"admin@example.com": [{"sendAsEmail": "…", "verificationStatus": "accepted"}]},
+     "sendas_pending": ["x@example.org"],         # sendAs.create answers pending
+     "groups": {"dmarc@example.com": {"whoCanPostMessage": "ALL_IN_DOMAIN_CAN_POST"}},
+     "groups_api_disabled": false,                # 403 SERVICE_DISABLED
+     "groups_external_forbidden": false}          # PATCH ANYONE_CAN_POST -> 400
+
+A user's nonEditableAliases are derived as Google derives them: every address
+of the user at the parent of a VERIFIED domain alias, at the alias. A user
+alias can only be added at a verified primary or secondary domain (else 400),
+and not when any user already has the address (409). Gmail calls must be made
+with a token minted for the user in the path (else 403, delegation denied);
+a send-as entry created for one of the user's own addresses is "accepted", any
+other "pending". messages.send appends "SENT <user> From=<from> To=<to>" to LOG.
 
 getToken and webResource.insert answer 400 unless the site is INET_DOMAIN and
 the method DNS_TXT, the only form the tool may use for a domain.
@@ -37,15 +53,40 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 STATE, DNS, LOG, PORT_FILE = sys.argv[1:5]
 DIR = "/admin/directory/v1/customer/my_customer/"
 SCOPE_DOMAIN = "admin.directory.domain"
+SCOPE_DOMAIN_READ = ("admin.directory.domain", "admin.directory.domain.readonly")
+SCOPE_USER = "admin.directory.user"
+SCOPE_USER_READ = ("admin.directory.user", "admin.directory.user.readonly")
 SCOPE_SITE = "siteverification"
+SCOPE_SENDAS = "gmail.settings.sharing"
+SCOPE_SENDAS_READ = ("gmail.settings.basic", "gmail.settings.sharing")
+SCOPE_SEND = "gmail.send"
+SCOPE_GROUPS = "apps.groups.settings"
+USERS = "/admin/directory/v1/users/"
+GMAIL = "/gmail/v1/users/"
+GROUPS = "/groups/v1/groups/"
 
 
 def load():
     with open(STATE) as f:
         s = json.load(f)
-    s.setdefault("domains", {})
-    s.setdefault("aliases", {})
+    for k in ("domains", "aliases", "users", "sendas", "groups"):
+        s.setdefault(k, {})
     return s
+
+
+def user_view(s, u):
+    """users.get as Google answers it, nonEditableAliases derived."""
+    own = [u] + s["users"][u].get("aliases", [])
+    derived = []
+    for alias, a in s["aliases"].items():
+        if a.get("verified"):
+            derived += [x.split("@")[0] + "@" + alias for x in own if x.split("@")[1] == a["parent"]]
+    return {"primaryEmail": u, "aliases": s["users"][u].get("aliases", []), "nonEditableAliases": sorted(derived)}
+
+
+def addresses_of(s, u):
+    v = user_view(s, u)
+    return [v["primaryEmail"]] + v["aliases"] + v["nonEditableAliases"]
 
 
 def save(s):
@@ -80,16 +121,23 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(n) if n else b""
 
-    def scope(self):
+    def token(self):
         a = self.headers.get("Authorization", "")
-        return a[len("Bearer at:") :] if a.startswith("Bearer at:") else ""
+        return a[len("Bearer at:") :] if a.startswith("Bearer at:") else "|"
+
+    def scope(self):
+        return self.token().split("|", 1)[0]
+
+    def sub(self):
+        return self.token().split("|", 1)[1]
 
     def log(self, scope):
         with open(LOG, "a") as f:
             f.write(f"{self.command} {urllib.parse.urlsplit(self.path).path} {scope}\n")
 
     def need(self, scope):
-        if self.scope() != scope:
+        ok = (scope,) if isinstance(scope, str) else scope
+        if self.scope() not in ok:
             self.reply(403, {"error": {"code": 403, "message": "Request had insufficient authentication scopes."}})
             return False
         return True
@@ -112,8 +160,58 @@ class H(BaseHTTPRequestHandler):
                         "or client not authorized for any of the scopes requested.",
                     },
                 )
-            return self.reply(200, {"access_token": "at:" + short, "expires_in": 3600, "token_type": "Bearer"})
+            token = "at:" + short + "|" + str(claims.get("sub"))
+            return self.reply(200, {"access_token": token, "expires_in": 3600, "token_type": "Bearer"})
         self.log(self.scope())
+        if u.path == DIR + "domains":
+            if not self.need(SCOPE_DOMAIN):
+                return
+            name = json.loads(raw)["domainName"]
+            if name in s["aliases"] or name in s["domains"]:
+                return self.reply(409, {"error": {"code": 409, "message": "Entity already exists."}})
+            s["domains"][name] = {"isPrimary": False, "verified": False}
+            save(s)
+            return self.reply(200, {"domainName": name, "isPrimary": False, "verified": False})
+        if u.path.startswith(USERS) and u.path.endswith("/aliases"):
+            if not self.need(SCOPE_USER):
+                return
+            user = urllib.parse.unquote(u.path[len(USERS) : -len("/aliases")])
+            if user not in s["users"]:
+                return self.reply(404, {"error": {"code": 404, "message": "Resource Not Found: userKey"}})
+            alias = json.loads(raw)["alias"]
+            d = alias.split("@")[1]
+            if not s["domains"].get(d, {}).get("verified"):
+                return self.reply(400, {"error": {"code": 400, "message": "Invalid Input: domain " + d}})
+            if any(alias in addresses_of(s, x) for x in s["users"]):
+                return self.reply(409, {"error": {"code": 409, "message": "Entity already exists."}})
+            s["users"][user].setdefault("aliases", []).append(alias)
+            save(s)
+            return self.reply(200, {"alias": alias, "primaryEmail": user})
+        if u.path.startswith(GMAIL):
+            user = urllib.parse.unquote(u.path[len(GMAIL) :].split("/")[0])
+            rest = u.path[len(GMAIL) + len(urllib.parse.quote(user, safe="")) :]
+            if rest == "/settings/sendAs":
+                if not self.need(SCOPE_SENDAS) or not self.as_user(user):
+                    return
+                b = json.loads(raw)
+                addr = b["sendAsEmail"]
+                lst = s["sendas"].setdefault(user, [{"sendAsEmail": user, "isPrimary": True, "verificationStatus": "accepted"}])
+                if any(a["sendAsEmail"] == addr for a in lst):
+                    return self.reply(409, {"error": {"code": 409, "message": "Already exists"}})
+                own = addr in addresses_of(s, user) and addr not in s.get("sendas_pending", [])
+                entry = {"sendAsEmail": addr, "treatAsAlias": bool(b.get("treatAsAlias")),
+                         "verificationStatus": "accepted" if own else "pending"}
+                lst.append(entry)
+                save(s)
+                return self.reply(200, entry)
+            if rest == "/messages/send":
+                if not self.need(SCOPE_SEND) or not self.as_user(user):
+                    return
+                import email
+                m = email.message_from_bytes(base64.urlsafe_b64decode(json.loads(raw)["raw"]))
+                with open(LOG, "a") as f:
+                    f.write(f"SENT {user} From={m['From']} To={m['To']}\n")
+                return self.reply(200, {"id": "msg-1", "threadId": "t-1"})
         if u.path == DIR + "domainaliases":
             if not self.need(SCOPE_DOMAIN):
                 return
@@ -171,13 +269,63 @@ class H(BaseHTTPRequestHandler):
                 return self.reply(200, {"id": "dns://" + domain, "site": b["site"], "owners": ["admin@example.com"]})
         return self.reply(404, {"error": {"code": 404, "message": "no such stub route"}})
 
+    def as_user(self, user):
+        if self.sub() != user:
+            self.reply(403, {"error": {"code": 403, "message": f"Delegation denied for {self.sub()}"}})
+            return False
+        return True
+
+    def groups(self, s, u, raw=None):
+        if s.get("groups_api_disabled"):
+            return self.reply(
+                403,
+                {"error": {"code": 403, "message": "Groups Settings API has not been used in project stub before or it is disabled.",
+                           "details": [{"reason": "SERVICE_DISABLED"}]}},
+            )
+        if not self.need(SCOPE_GROUPS):
+            return
+        g = urllib.parse.unquote(u.path[len(GROUPS) :])
+        if g not in s["groups"]:
+            return self.reply(404, {"error": {"code": 404, "message": "Resource Not Found: groupUniqueId"}})
+        if raw is not None:
+            b = json.loads(raw)
+            if b.get("whoCanPostMessage") == "ANYONE_CAN_POST" and s.get("groups_external_forbidden"):
+                return self.reply(400, {"error": {"code": 400, "message": "Invalid Value"}})
+            s["groups"][g].update(b)
+            save(s)
+        return self.reply(200, dict(email=g, **s["groups"][g]))
+
+    def do_PATCH(self):
+        u = urllib.parse.urlsplit(self.path)
+        raw = self.body()
+        self.log(self.scope())
+        s = load()
+        if u.path.startswith(GROUPS):
+            return self.groups(s, u, raw)
+        return self.reply(404, {"error": {"code": 404, "message": "no such stub route"}})
+
     def do_GET(self):
         u = urllib.parse.urlsplit(self.path)
         self.log(self.scope())
         s = load()
+        if u.path.startswith(GROUPS):
+            return self.groups(s, u)
+        if u.path.startswith(USERS):
+            if not self.need(SCOPE_USER_READ):
+                return
+            user = urllib.parse.unquote(u.path[len(USERS) :])
+            if user not in s["users"]:
+                return self.reply(404, {"error": {"code": 404, "message": "Resource Not Found: userKey"}})
+            return self.reply(200, user_view(s, user))
+        if u.path.startswith(GMAIL) and u.path.endswith("/settings/sendAs"):
+            user = urllib.parse.unquote(u.path[len(GMAIL) : -len("/settings/sendAs")])
+            if not self.need(SCOPE_SENDAS_READ) or not self.as_user(user):
+                return
+            lst = s["sendas"].get(user, [{"sendAsEmail": user, "isPrimary": True, "verificationStatus": "accepted"}])
+            return self.reply(200, {"sendAs": lst})
         for coll, prefix in (("domains", DIR + "domains/"), ("aliases", DIR + "domainaliases/")):
             if u.path.startswith(prefix):
-                if not self.need(SCOPE_DOMAIN):
+                if not self.need(SCOPE_DOMAIN_READ):
                     return
                 name = urllib.parse.unquote(u.path[len(prefix) :])
                 if name not in s[coll]:
