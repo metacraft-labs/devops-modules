@@ -1,0 +1,14 @@
+name: rust-and-pip
+on: push
+# Recorder packaging-port hazards: rustup bootstrap and pip outside a venv.
+jobs:
+  package:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Upload tool
+        run: python3 -m pip install --user awscli
+      - name: Lint deps
+        run: |
+          set -euo pipefail
+          pip3 install -q ruff

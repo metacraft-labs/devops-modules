@@ -33,3 +33,63 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - run: sudo -n true
+  # Plain-string runs-on that is NOT a self-hosted Linux runner.
+  plain-macos:
+    runs-on: eph-macos-arm64
+    steps:
+      - uses: actions/setup-node@v4
+  plain-windows:
+    runs-on: eph-win-x64
+    steps:
+      - uses: actions/setup-dotnet@v4
+  plain-darwin:
+    runs-on: aarch64-darwin
+    steps:
+      - uses: actions/setup-python@v5
+  hosted-strings:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-14]
+    steps:
+      - uses: actions/setup-node@v4
+  self-hosted-dynamic-os:
+    runs-on: [self-hosted, '${{ matrix.os }}']
+    steps:
+      - uses: actions/setup-node@v4
+  plain-linux-nix-only:
+    runs-on: eph-linux-x64
+    steps:
+      - uses: metacraft-labs/devops-modules/.github/setup-nix@dev
+      - run: nix flake check
+  # Steps confined to GitHub-hosted runners never run on a NixOS runner.
+  github-hosted-guards:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - if: runner.environment == 'github-hosted'
+        uses: DeterminateSystems/nix-installer-action@main
+      - if: ${{ runner.environment == "github-hosted" }}
+        uses: DeterminateSystems/magic-nix-cache-action@main
+      - if: github.event_name == 'push' && runner.environment=='github-hosted'
+        run: sudo apt-get install -y musl-tools
+      - if: ${{ (runner.environment == 'github-hosted') && (matrix.lint) }}
+        uses: actions/setup-node@v4
+      - if: "'github-hosted' == runner.environment"
+        uses: actions/setup-dotnet@v4
+      - if: runner.environment != 'self-hosted'
+        uses: actions/setup-java@v4
+  # gpg is on the NixOS runner PATH (gnupg); the import action just execs it.
+  # pip into a virtualenv works with nixpkgs python3 (ensurepip bootstraps it).
+  pip-venv-and-gpg:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: crazy-max/ghaction-import-gpg@v6
+      - run: |
+          python3 -m venv .venv
+          .venv/bin/pip install awscli
+      - run: nix shell nixpkgs#python3Packages.pip -c echo "pip from nixpkgs, no install"
+  hosted-rust-and-pip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pip install awscli
