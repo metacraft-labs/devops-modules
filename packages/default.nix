@@ -155,14 +155,17 @@
             exec ${pkgs.runtimeShell} ${../scripts/google-workspace-domains.sh} "$@"
           '';
         };
-        # The guided setup over the two tools above: every console step printed
-        # with its page, clicks and values, waited for and verified, in a safe
-        # order (docs/Google-Workspace-Domains.md, "Guided setup").
+        # The setup over the two tools above, in two phases: an interactive one
+        # that collects every console value and decision and opens one batch
+        # PR, and a background one that lands it, waits for DNS, has Google
+        # verify and opens the next batch (docs/Google-Workspace-Domains.md).
+        # gcloud enables a disabled Google API when a step finds one.
         google-workspace-setup = pkgs.writeShellApplication {
           name = "google-workspace-setup";
           runtimeInputs = [
             self'.packages.google-workspace-domains
             self'.packages.google-workspace-dkim
+            pkgs.google-cloud-sdk
             pkgs.coreutils
             pkgs.dnsutils
             pkgs.gawk

@@ -102,7 +102,9 @@ done
 rm -f "$f"
 EOF
 # gh: a stateful stand-in. PRs live in $STUB_GH_STATE/<n> (head branch); a merge
-# moves origin/main to the head and runs the apply.
+# moves origin/main to the head and runs the apply — unless $STUB_GH_STATE/
+# defer-apply exists (the CI apply has not run yet). While $STUB_GH_STATE/hang
+# exists, `pr checks --watch` keeps watching (a run interrupted mid-watch).
 cat >>"$work/bin/gh" <<'EOF'
 echo "gh $*" >>"$STUB_GH_LOG"
 echo "gh $*" >>"$STUB_SEQ_LOG"
@@ -111,27 +113,72 @@ arg() { local want="$1"; shift; while [ $# -gt 0 ]; do [ "$1" = "$want" ] && { e
 case "$1 $2" in
   "pr list")
     h="$(arg --head "$@")"
-    for p in "$st"/*; do [ -f "$p" ] && [ "$(cat "$p")" = "$h" ] && { basename "$p"; exit 0; }; done
+    if [ -z "$h" ]; then
+      # Every open PR: "<number> <head branch>".
+      for p in "$st"/*; do
+        [ -f "$p" ] && [[ $(basename "$p") =~ ^[0-9]+$ ]] && echo "$(basename "$p") $(cat "$p")"
+      done
+      exit 0
+    fi
+    for p in "$st"/*; do [ -f "$p" ] && [[ $(basename "$p") =~ ^[0-9]+$ ]] && [ "$(cat "$p")" = "$h" ] && { basename "$p"; exit 0; }; done
     echo "" ;;
   "pr create")
-    n=$(( $(ls "$st" | wc -l) + 1 )); arg --head "$@" >"$st/$n"
+    n=$(( $(ls "$st" | grep -cE '(^|-)[0-9]+$') + 1 )); arg --head "$@" >"$st/$n"
     echo "https://github.invalid/o/r/pull/$n" ;;
   "pr checks")
-    if [[ " $* " == *" --watch "* ]]; then exit "${STUB_GH_CHECKS_RC:-0}"; fi
+    if [[ " $* " == *" --watch "* ]]; then
+      while [ -f "$st/hang" ]; do sleep 0.2; done
+      exit "${STUB_GH_CHECKS_RC:-0}"
+    fi
     echo 0 ;;
-  "pr view") git -C "$STUB_ORIGIN" rev-parse "refs/heads/$(cat "$st/$3")" ;;
+  "pr view")
+    if [ "$(arg --json "$@")" = state ]; then
+      if [ -f "$st/$3" ]; then echo OPEN; elif [ -f "$st/merged-$3" ]; then echo MERGED; else echo CLOSED; fi
+      exit 0
+    fi
+    git -C "$STUB_ORIGIN" rev-parse "refs/heads/$(cat "$st/$3")" ;;
   "pr merge")
     head="$(arg --match-head-commit "$@")"
     [ "$head" = "$(git -C "$STUB_ORIGIN" rev-parse "refs/heads/$(cat "$st/$3")")" ] || exit 1
     git -C "$STUB_ORIGIN" update-ref refs/heads/main "$head"
     mv "$st/$3" "$st/merged-$3"
-    "$STUB_APPLY" ;;
+    [ -f "$st/defer-apply" ] || "$STUB_APPLY" ;;
   "run list") echo ok ;;
   "repo view") echo main ;;
   *) echo "gh stub: unexpected $*" >&2; exit 9 ;;
 esac
 EOF
-chmod +x "$work/bin/dig" "$work/bin/gh" "$work/apply"
+# gcloud: `services enable` succeeds (and enables the API on the Google stub)
+# unless $STUB_GCLOUD_STATE says "reauth" (until `gcloud auth login` ran) or
+# "denied". Every call is logged.
+printf '#!%s\n' "$(command -v bash)" >"$work/bin/gcloud"
+cat >>"$work/bin/gcloud" <<'EOF'
+echo "gcloud $*" >>"$STUB_SEQ_LOG"
+case "$1 $2" in
+  "auth login") touch "$STUB_GCLOUD_STATE.login"; exit 0 ;;
+  "config get-value") echo operator@example.com; exit 0 ;;
+  "services enable")
+    mode="$(cat "$STUB_GCLOUD_STATE" 2>/dev/null || echo ok)"
+    if [ "$mode" = reauth ] && [ ! -f "$STUB_GCLOUD_STATE.login" ]; then
+      echo "ERROR: (gcloud.services.enable) There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution." >&2
+      echo "Please run:  \$ gcloud auth login" >&2
+      exit 1
+    fi
+    if [ "$mode" = denied ]; then
+      echo "ERROR: (gcloud.services.enable) PERMISSION_DENIED: Permission denied to enable service [$3]" >&2
+      exit 1
+    fi
+    case "$3" in
+      groupssettings.googleapis.com) k=groups_api_disabled ;;
+      siteverification.googleapis.com) k=site_api_disabled ;;
+      *) k=other ;;
+    esac
+    jq ".$k = false" "$STUB_GOOGLE_STATE" >"$STUB_GOOGLE_STATE.g" && mv "$STUB_GOOGLE_STATE.g" "$STUB_GOOGLE_STATE"
+    echo "Operation finished successfully." >&2 ;;
+  *) echo "gcloud stub: unexpected $*" >&2; exit 9 ;;
+esac
+EOF
+chmod +x "$work/bin/dig" "$work/bin/gh" "$work/bin/gcloud" "$work/apply"
 export PATH="$work/bin:$PATH" STUB_DNS="$work/dns" STUB_GH_LOG="$work/gh.log" STUB_DIG_LOG="$work/dig.log"
 export STUB_GH_STATE="$work/gh-prs" STUB_APPLY="$work/apply"
 # The API stub and the gh stub append to one log, so the order of what Google
@@ -144,6 +191,7 @@ export GOOGLE_WORKSPACE_DOMAINS_DNS_TIMEOUT=5
 
 state="$work/google-state.json"
 api_log="$work/api.log"
+export STUB_GOOGLE_STATE="$state" STUB_GCLOUD_STATE="$work/gcloud-mode" GOOGLE_WORKSPACE_API_ENABLE_WAIT=0
 cat >"$state" <<'EOF'
 { "domains": { "example.com": { "isPrimary": true, "verified": true } }, "aliases": {} }
 EOF
@@ -657,7 +705,7 @@ expect "... (Groups for Business sharing settings)" flat_has "Tick 'Group owners
 set_state '.groups_external_forbidden = false'
 
 # ── 11. delegation scopes ────────────────────────────────────────────────────
-all_scopes="https://www.googleapis.com/auth/admin.directory.domain,https://www.googleapis.com/auth/admin.directory.domain.readonly,https://www.googleapis.com/auth/siteverification,https://www.googleapis.com/auth/admin.directory.user,https://www.googleapis.com/auth/gmail.settings.basic,https://www.googleapis.com/auth/gmail.settings.sharing,https://www.googleapis.com/auth/gmail.send,https://www.googleapis.com/auth/apps.groups.settings"
+all_scopes="https://www.googleapis.com/auth/admin.directory.domain,https://www.googleapis.com/auth/admin.directory.domain.readonly,https://www.googleapis.com/auth/siteverification,https://www.googleapis.com/auth/admin.directory.user,https://www.googleapis.com/auth/gmail.settings.basic,https://www.googleapis.com/auth/gmail.settings.sharing,https://www.googleapis.com/auth/gmail.send,https://www.googleapis.com/auth/gmail.metadata,https://www.googleapis.com/auth/apps.groups.settings"
 set_state '.deny_scopes = ["apps.groups.settings", "gmail.send"]'
 rc=0
 run scopes || rc=$?
@@ -672,13 +720,13 @@ expect "... within 78 columns, except the line to paste" narrow "$work/stdout"
 expect "... and never printing the key" bash -c '! grep -qF -- "$1" "$2" "$3"' _ "$key_marker" "$work/stdout" "$work/stderr"
 expect "--guide waits for the console edit and checks again" \
   guided_run "set_state '.deny_scopes = []'|" -- bash "$tool" scopes --guide
-expect "... until every scope is granted" output_has "all 8 scopes are granted"
+expect "... until every scope is granted" output_has "all 9 scopes are granted"
 run scopes --scopes admin.directory.user,https://www.googleapis.com/auth/admin.directory.group || true
 expect "--scopes checks exactly the given list" \
   bash -c 'grep -qx "  ok       admin.directory.group" "$1" && ! grep -q siteverification "$1"' _ "$work/stdout"
 
 # ── 12. the setup wizard, end to end ─────────────────────────────────────────
-# A fresh consumer and tenant, driven through `google-workspace-setup run` by a
+# A fresh consumer and tenant, driven through `google-workspace-setup guided` by a
 # scripted operator: the order, the inbound-test gate before mail that goes
 # elsewhere today, Activate Gmail, addresses, one DKIM key, the SMTP relay.
 rm -f "$work"/dns/*
@@ -787,7 +835,7 @@ expect "... and printing the Activate Gmail steps" \
   echo s           # no live relay test
 } >"$work/answers"
 rc=0
-wizard run <"$work/answers" >"$work/stdout" 2>"$work/stderr" || rc=$?
+wizard guided <"$work/answers" >"$work/stdout" 2>"$work/stderr" || rc=$?
 expect "the wizard runs every step to the end" test "$rc" = 0
 expect "... taking the domains in the safe order: primary, on Google, then mail elsewhere (alias after parent)" \
   test "$(grep -oE '^Domain [0-9]/5: [a-z.]+' "$work/stdout" | cut -d' ' -f3 | paste -sd' ' -)" = "example.com example.org example.xyz example.net example.info"
@@ -815,7 +863,7 @@ expect "... without printing the key" bash -c '! grep -qF -- "$1" "$2" "$3"' _ "
 prs="$(grep -c '^gh pr create' "$STUB_GH_LOG")"
 printf 's\ns\ns\ns\n\ns\n' >"$work/answers"
 rc=0
-wizard run <"$work/answers" >"$work/stdout" 2>"$work/stderr" || rc=$?
+wizard guided <"$work/answers" >"$work/stdout" 2>"$work/stderr" || rc=$?
 expect "a second run resumes: nothing left to change" test "$rc" = 0
 expect "... no domain, alias, user alias, send-as or group write" \
   bash -c '! grep -qE "^(POST|PATCH) /(admin|groups|gmail)" "$1"' _ "$api_log"
@@ -871,6 +919,268 @@ expect "... a refused login says to use an app password, and asks again" flat_ha
 expect "... then the relay takes the message, logged in" grep -qi '^RELAYED MAIL FROM:<admin@example.com>' "$work/smtp.log"
 expect "... and the tool says so" flat_has "the relay accepted a message from admin@example.com to ext@example.net"
 expect "... never echoing the password" bash -c '! grep -qF app-pw-123 "$1" "$2"' _ "$work/stdout" "$work/stderr"
+
+# ── 14. the batched setup: the interactive phase, then the background phase ─
+# A fresh consumer and tenant. `run` does the instant steps, collects the
+# decisions and the console values, and opens ONE PR; `follow` lands it, waits
+# for DNS, has Google verify, and opens the next batches — no-mail domains
+# first, mail that goes elsewhere only as decided and only after an inbound
+# test. Interrupted runs resume.
+rm -f "$work"/dns/*
+bsrc="$work/brepo" borigin="$work/borigin.git" bgh="$work/bgh"
+git init --quiet --bare "$borigin"
+git -C "$borigin" symbolic-ref HEAD refs/heads/main
+git init --quiet "$bsrc"
+mkdir -p "$bsrc/dns" "$bgh"
+bdata="$bsrc/dns/mail-auth.json"
+cat >"$bdata" <<'EOF'
+{
+  "version": 2,
+  "domains": {
+    "example.com": {
+      "zone_id": "0123456789abcdef0123456789abcdef", "dkim": {},
+      "mx": [{"priority": 1, "host": "aspmx.l.google.com"}, {"priority": 5, "host": "alt1.aspmx.l.google.com"}],
+      "spf": {"include": ["_spf.google.com"], "all": "~all"},
+      "dmarc": {"p": "reject"}, "tls_rpt": {"rua": ["mailto:dmarc@example.com"]},
+      "google": {"kind": "primary"}
+    },
+    "example.org": {"zone_id": "00000000000000000000000000000021", "dkim": {}, "google": {"kind": "secondary"}},
+    "example.biz": {"zone_id": "00000000000000000000000000000022", "dkim": {}, "google": {"kind": "alias", "parent": "example.org"}},
+    "example.net": {"zone_id": "00000000000000000000000000000023", "dkim": {},
+      "mx": [{"priority": 10, "host": "mail.example.net"}], "spf": {"include": ["_spf.oldhost.example"], "all": "?all"},
+      "google": {"kind": "secondary", "spf_replace": true}},
+    "example.info": {"zone_id": "00000000000000000000000000000024", "dkim": {},
+      "mx": [{"priority": 10, "host": "mail.example.info"}], "google": {"kind": "alias", "parent": "example.net"}},
+    "example.xyz": {"zone_id": "00000000000000000000000000000025", "dkim": {},
+      "mx": [{"priority": 10, "host": "mail.example.xyz"}], "google": {"kind": "secondary"}},
+    "example.dev": {"zone_pending": true, "dkim": {}, "google": {"kind": "secondary"}}
+  },
+  "google_users": {"admin@example.com": {"local_parts": ["admin"]}}
+}
+EOF
+printf 'census\n' >"$bsrc/census.expected"
+git -C "$bsrc" add -A && git -C "$bsrc" commit --quiet -m init
+git -C "$bsrc" remote add origin "$borigin"
+git -C "$bsrc" push --quiet origin HEAD:main
+STUB_ORIGIN="$borigin" "$STUB_APPLY"
+printf '192.0.2.10\n' >"$work/dns/mail.example.net.A"
+printf '192.0.2.11\n' >"$work/dns/mail.example.info.A"
+cat >"$state" <<'EOF'
+{ "domains": { "example.com": { "isPrimary": true, "verified": true } }, "aliases": {},
+  "users": { "admin@example.com": { "aliases": [] } },
+  "groups": { "dmarc@example.com": { "whoCanPostMessage": "ALL_IN_DOMAIN_CAN_POST" } },
+  "groups_api_disabled": true }
+EOF
+echo reauth >"$STUB_GCLOUD_STATE"
+rm -f "$STUB_GCLOUD_STATE.login"
+export GOOGLE_WORKSPACE_STATE_DIR="$work/gws-state" GOOGLE_ALIAS_WAIT_SECONDS=0 GOOGLE_INBOUND_INTERVAL=0.2 GOOGLE_INBOUND_TIMEOUT=3
+bstate="$GOOGLE_WORKSPACE_STATE_DIR/example.com.json"
+: >"$work/hook.log"
+: >"$work/notify.log"
+benv=(env STUB_ORIGIN="$borigin" STUB_GH_STATE="$bgh" GOOGLE_WORKSPACE_DOMAINS_CMD="bash $tool"
+  GOOGLE_WORKSPACE_DKIM_CMD="bash $dkim_tool"
+  GOOGLE_WORKSPACE_NOTIFY="{ echo \"TITLE \$NOTIFY_TITLE\"; cat; } >>$work/notify.log")
+bargs=(--data "$bdata" --base main --dmarc-rua dmarc@example.com --group dmarc@example.com --post-edit "$hook")
+batch() { timeout 600 "${benv[@]}" GOOGLE_WORKSPACE_FOLLOW_DETACH="${DETACH:-none}" bash "$setup_tool" "$1" "${bargs[@]}" "${@:2}"; }
+bst() { jq -r "$@" "$bstate"; }
+bst_set() { jq "$1" "$bstate" >"$bstate.t" && mv "$bstate.t" "$bstate"; }
+head_of() { git -C "$borigin" rev-parse "refs/heads/$(cat "$bgh/$1" "$bgh/merged-$1" 2>/dev/null | head -n1)"; }
+on_main() { git -C "$borigin" show main:dns/mail-auth.json | jq -c "$1"; }
+on_pr() { git -C "$borigin" show "$(head_of "$1"):dns/mail-auth.json" | jq -c "$2"; }
+mx_before="$(jq -c '[.domains[] | .mx]' "$bdata")"
+
+# 14.1 the interactive phase
+{
+  echo e # decisions: one by one
+  echo y # example.net: move once verified
+  echo y # example.info: move once verified
+  echo n # example.xyz: keep
+  echo "$dkim_value"
+  echo # (end of the paste)
+} >"$work/answers"
+: >"$api_log"
+: >"$STUB_GH_LOG"
+rc=0
+batch run <"$work/answers" >"$work/stdout" 2>"$work/stderr" || rc=$?
+expect "the interactive phase finishes without waiting for any check" test "$rc" = 0
+expect "... opening exactly ONE PR, from one batch branch" \
+  bash -c '[ "$(grep -c "^gh pr create" "$1")" = 1 ] && grep -q "^mail/google-batch-" "$2/1"' _ "$STUB_GH_LOG" "$bgh"
+expect "... with one commit: a verification token for each of the five new domains, and example.com's pasted DKIM key" \
+  bash -c '[ "$(git -C "$1" rev-list --count "main..$2")" = 1 ] && git -C "$1" show "$2:dns/mail-auth.json" | jq -e --arg v "$3" "([.domains[\"example.org\",\"example.biz\",\"example.net\",\"example.info\",\"example.xyz\"].google_verification | length] == [1,1,1,1,1]) and .domains[\"example.com\"].dkim.google == \$v" >/dev/null' _ "$borigin" "$(head_of 1)" "$dkim_value"
+expect "... and no MX change at all (a domain's MX moves only once Google has verified it)" \
+  test "$(on_pr 1 '[.domains[] | .mx]')" = "$mx_before"
+expect "... the census hook run once, for the whole batch" \
+  bash -c '[ "$(grep -c "^PHASE=" "$1")" = 1 ] && grep -qx "PHASE=batch DOMAIN=example.biz,example.com,example.info,example.net,example.org,example.xyz" "$1"' _ "$work/hook.log"
+expect "... nothing merged, no verification asked for (that is the background phase's)" \
+  bash -c '! grep -q "pr merge" "$1" && ! grep -q "^POST /siteVerification/v1/webResource" "$2"' _ "$STUB_GH_LOG" "$api_log"
+expect "... every domain on the tenant, each alias added after its parent, the pending zone left alone" \
+  bash -c 'jq -e "[.domains[\"example.org\",\"example.net\",\"example.xyz\"].isPrimary == false, .aliases[\"example.biz\"].parent == \"example.org\", .aliases[\"example.info\"].parent == \"example.net\", (.domains | has(\"example.dev\") | not)] | all" "$1" >/dev/null && [ "$(grep -n "^POST .*/domains admin" "$2" | tail -n1 | cut -d: -f1)" -lt "$(grep -n "^POST .*/domainaliases" "$2" | head -n1 | cut -d: -f1)" ]' _ "$state" "$api_log"
+expect "... the decisions and the queued key kept in the local state file" \
+  test "$(bst -c '[.decisions["example.net"], .decisions["example.info"], .decisions["example.xyz"], (.dkim | keys), .batch.pr, .batch.stage]')" = '["switch","switch","hold",["example.com"],1,"checks"]'
+expect "... a disabled Groups Settings API enabled with gcloud, after a fresh 'gcloud auth login'" \
+  bash -c 'grep -q "^gcloud services enable groupssettings.googleapis.com --project stub$" "$1" && [ "$(grep -n "^gcloud auth login" "$1" | cut -d: -f1)" -gt "$(grep -n "^gcloud services enable" "$1" | head -n1 | cut -d: -f1)" ] && [ "$(grep -c "^gcloud services enable" "$1")" = 2 ] && [ "$(jq -r ".groups[\"dmarc@example.com\"].whoCanPostMessage" "$2")" = ANYONE_CAN_POST ]' _ "$api_log" "$state"
+expect "... saying what happens next and how to check on it" \
+  bash -c 'f="$(tr -s " \n" "  " <"$1")"; grep -qF "What happens next, without you" <<<"$f" && grep -qF "google-workspace-setup status" <<<"$f"' _ "$work/stdout"
+expect "... within 78 columns" narrow "$work/stdout"
+expect "... without printing the key" bash -c '! grep -qF -- "$1" "$2" "$3"' _ "$key_marker" "$work/stdout" "$work/stderr"
+batch status >"$work/stdout" 2>"$work/stderr" || true
+expect "status shows the batch in flight, its PR and stage, and the decisions" \
+  bash -c 'grep -qF "batch 1: PR #1" "$1" && grep -qF "stage checks" "$1" && grep -qF "not running" "$1" && grep -qF "example.xyz hold" "$1"' _ "$work/stdout"
+
+rc=0
+batch run </dev/null >"$work/stdout" 2>"$work/stderr" || rc=$?
+expect "a second interactive run while the batch is in flight asks nothing and opens no second PR" \
+  bash -c '[ "$1" = 0 ] && [ "$(grep -c "^gh pr create" "$2")" = 1 ] && tr -s " \n" "  " <"$3" | grep -qF "Batch 1 is in flight (PR #1, stage checks)"' _ "$rc" "$STUB_GH_LOG" "$work/stdout"
+
+# 14.2 interrupted while watching the checks, then while waiting for DNS
+touch "$bgh/hang"
+setsid "${benv[@]}" GOOGLE_WORKSPACE_FOLLOW_DETACH=none bash "$setup_tool" follow "${bargs[@]}" >"$work/stdout" 2>"$work/stderr" &
+fpid=$!
+for _ in $(seq 1 300); do grep -q "watching the checks of PR #1" "$work/stderr" 2>/dev/null && break; sleep 0.1; done
+kill -TERM -- "-$fpid" 2>/dev/null || true
+wait "$fpid" 2>/dev/null || true
+rm -f "$bgh/hang"
+expect "a follower interrupted mid-watch leaves the batch in flight, unmerged" \
+  bash -c '[ "$(jq -r ".batch.pr, .batch.stage" "$1" | paste -sd" " -)" = "1 checks" ] && ! grep -q "pr merge" "$2"' _ "$bstate" "$STUB_GH_LOG"
+expect "... and records that it stopped" test "$(bst '.follower.state')" = stopped
+touch "$bgh/defer-apply"
+: >"$STUB_GH_LOG"
+rc=0
+GOOGLE_WORKSPACE_DOMAINS_DNS_TIMEOUT=1 batch follow >"$work/stdout" 2>"$work/stderr" || rc=$?
+expect "resumed, it merges the SAME PR at the head it watched (no second PR)" \
+  bash -c '! grep -q "^gh pr create" "$1" && grep -qx "gh pr merge 1 --merge --match-head-commit $2" "$1"' _ "$STUB_GH_LOG" "$(head_of 1)"
+expect "... and while DNS does not serve the batch yet, stops in the DNS stage (exit non-zero)" \
+  bash -c '[ "$1" != 0 ] && [ "$(jq -r .batch.stage "$2")" = dns ]' _ "$rc" "$bstate"
+expect "... telling the notifier" grep -qx "TITLE Google Workspace setup: background phase stopped" "$work/notify.log"
+rm -f "$bgh/defer-apply"
+STUB_ORIGIN="$borigin" "$STUB_APPLY"
+
+# 14.3 resumed again: it runs to the end
+: >"$api_log"
+: >"$STUB_GH_LOG"
+: >"$work/notify.log"
+rc=0
+batch follow >"$work/stdout" 2>"$work/stderr" || rc=$?
+expect "resumed after the apply, the follower runs to the end" test "$rc" = 0
+expect "... asking Google to verify all five domains once their tokens are served" \
+  test "$(grep -c '^POST /siteVerification/v1/webResource' "$api_log")" -ge 5
+expect "... then batch 2: the no-mail domains' mail records (example.org, its alias example.biz), nothing else" \
+  bash -c '[ "$(jq -c "[.domains[\"example.org\",\"example.biz\"].mx[0].host]" <(git -C "$1" show "$2:dns/mail-auth.json"))" = "[\"smtp.google.com\",\"smtp.google.com\"]" ] && [ "$(git -C "$1" show "$2:dns/mail-auth.json" | jq -c "[.domains[\"example.net\",\"example.info\",\"example.xyz\"].mx[0].host]")" = "[\"mail.example.net\",\"mail.example.info\",\"mail.example.xyz\"]" ]' _ "$borigin" "$(head_of 2)"
+expect "... in the order merge 1 -> verify -> batch 2 -> merge 2 -> inbound test through the Gmail API -> batch 3 -> merge 3" \
+  bash -c 'a=0; for n in "$@"; do [ -n "$n" ] && [ "$n" -gt "$a" ] || exit 1; a="$n"; done' _ \
+  "$(line_of '^POST /siteVerification/v1/webResource')" \
+  "$(line_of '^gh pr create .*mail/google-batch-')" \
+  "$(line_of '^gh pr merge 2 ')" \
+  "$(line_of '^SENT admin@example.com From=admin@example.com To=admin@example.org$')" \
+  "$(grep -n '^gh pr create' "$api_log" | sed -n 2p | cut -d: -f1)" \
+  "$(line_of '^gh pr merge 3 ')"
+expect "... batch 3 moves example.net and example.info, as decided" \
+  test "$(on_pr 3 '[.domains["example.net","example.info"].mx[0].host, .domains["example.net"].spf.include]')" = '["smtp.google.com","smtp.google.com",["_spf.google.com"]]'
+expect "... example.xyz, decided 'hold', keeps its MX" test "$(on_main '.domains["example.xyz"].mx')" = '[{"priority":10,"host":"mail.example.xyz"}]'
+expect "... every merge at the head it watched" \
+  bash -c 'grep -qx "gh pr merge 2 --merge --match-head-commit $2" "$1" && grep -qx "gh pr merge 3 --merge --match-head-commit $3" "$1"' _ "$STUB_GH_LOG" "$(head_of 2)" "$(head_of 3)"
+merged_prs=("$bgh"/merged-*)
+expect "... three PRs in all for six domains" test "${#merged_prs[@]}" = 3
+expect "... the user's addresses on every newly verified domain, accepted for sending" \
+  test "$(jq -c '[.sendas["admin@example.com"][] | select(.isPrimary | not) | select(.verificationStatus == "accepted") | .sendAsEmail] | sort' "$state")" = '["admin@example.biz","admin@example.info","admin@example.net","admin@example.org","admin@example.xyz"]'
+expect "... ending with what still needs the operator" \
+  bash -c 'f="$(tr -s " \n" "  " <"$1")"; for p in "Activate Gmail (https://admin.google.com/ac/domains/manage) for: example.biz, example.info, example.net, example.org" "Start authentication (https://admin.google.com/ac/apps/gmail/authenticateemail) for: example.com" "DKIM keys can now be generated for example.org example.biz example.net example.info" "as decided (or undecided), for example.xyz" "zone pending (skipped): example.dev"; do grep -qF -- "$p" <<<"$f" || { echo "missing: $p"; exit 1; }; done' _ "$work/stderr"
+expect "... kept for status, and sent to the notifier" \
+  bash -c '[ "$(jq ".summary | length" "$1")" -ge 4 ] && grep -qx "TITLE Google Workspace setup: background phase finished" "$2"' _ "$bstate" "$work/notify.log"
+expect "... no batch left in flight, three landed" test "$(bst -c '[.batch, (.history | length), .follower.state]')" = '[null,3,"finished"]'
+rc=0
+batch follow >"$work/stdout" 2>"$work/stderr" || rc=$?
+expect "a follower with nothing to do ends at once, opening no PR" \
+  bash -c '[ "$1" = 0 ] && [ "$(grep -c "^gh pr create" "$2")" = 2 ]' _ "$rc" "$STUB_GH_LOG"
+
+# 14.4 mail that goes elsewhere moves only after an inbound test
+bst_set '.decisions["example.xyz"] = "switch" | del(.inbound)'
+set_state '.inbound_broken = true'
+: >"$STUB_GH_LOG"
+rc=0
+batch follow >"$work/stdout" 2>"$work/stderr" || rc=$?
+expect "when the inbound test message does not arrive, nothing that receives mail elsewhere moves" \
+  bash -c '[ "$1" = 0 ] && ! grep -q "^gh pr create" "$2" && [ "$(jq -r .inbound.via "$3")" = failed ]' _ "$rc" "$STUB_GH_LOG" "$bstate"
+expect "... saying so in the summary" flat_has "the inbound test failed"
+set_state '.inbound_broken = false | .deny_scopes = ["gmail.metadata", "gmail.readonly"]'
+bst_set 'del(.inbound)'
+rc=0
+batch follow >"$work/stdout" 2>"$work/stderr" || rc=$?
+expect "without a Gmail read scope it cannot tell, and still moves nothing" \
+  bash -c '[ "$1" = 0 ] && ! grep -q "^gh pr create" "$2" && [ "$(jq -r .inbound.via "$3")" = unavailable ]' _ "$rc" "$STUB_GH_LOG" "$bstate"
+expect "... asking for gmail.metadata or the operator's confirmation" flat_has "the inbound test needs gmail.metadata in the delegation, or your confirmation"
+expect "... example.xyz still on its old MX" test "$(on_main '.domains["example.xyz"].mx[0].host')" = '"mail.example.xyz"'
+# The next interactive run: the console steps the batches made due, the scope
+# step (skipped), the DKIM keys now possible (skipped), and the inbound test by
+# hand; the follower it starts (detached) moves example.xyz.
+{
+  echo y # Activate Gmail done for all
+  echo y # Start authentication done
+  echo s # the scopes: skip
+  echo s # DKIM example.org: later
+  echo s # DKIM example.biz
+  echo s # DKIM example.net
+  echo s # DKIM example.info
+  echo y # the test message from outside arrived
+} >"$work/answers"
+rc=0
+DETACH="nohup" batch run <"$work/answers" >"$work/stdout" 2>"$work/stderr" || rc=$?
+expect "the interactive phase asks for the inbound test by hand, and opens the batch moving example.xyz" \
+  bash -c '[ "$1" = 0 ] && [ "$(jq -r ".inbound.via, .inbound.domain" "$2" | paste -sd" " -)" = "operator example.org" ] && [ "$(jq -c "[.batch.items[] | [.domain, .change]]" "$2")" = "[[\"example.xyz\",\"records\"]]" ]' _ "$rc" "$bstate"
+expect "... having confirmed the console steps the batches made due" test "$(bst -c '[.todo.activate_gmail, .todo.start_auth]')" = '[[],[]]'
+expect "... offering every DKIM key that can be generated now" flat_has "DKIM keys: example.org example.biz example.net example.info"
+for _ in $(seq 1 600); do [ "$(bst '.follower.state // empty')" = finished ] && break; sleep 0.1; done
+expect "... and starting the background phase detached, which lands it" \
+  bash -c '[ "$(jq -r .follower.state "$1")" = finished ] && [ "$(git -C "$2" show main:dns/mail-auth.json | jq -r ".domains[\"example.xyz\"].mx[0].host")" = smtp.google.com ]' _ "$bstate" "$borigin"
+expect "... logging to the state directory" grep -qF "follower started" "$GOOGLE_WORKSPACE_STATE_DIR/example.com.log"
+batch status >"$work/stdout" 2>"$work/stderr" || true
+expect "status then shows the finished follower, the batches landed, the inbound proof and its log" \
+  bash -c 'grep -qF "not running (last run finished)" "$1" && grep -qF "no batch in flight (4 landed so far)" "$1" && grep -qF "inbound proof: yes (operator, example.org)" "$1" && grep -qF "nothing more can be published now" "$1"' _ "$work/stdout"
+expect "... within 78 columns" narrow "$work/stdout"
+set_state '.deny_scopes = []'
+
+# 14.5 a domain with an open per-domain PR is left to it
+echo dkim/example.org-google >"$bgh/50"
+printf 'y\ns\ns\ns\ns\n' >"$work/answers"
+rc=0
+batch run <"$work/answers" >"$work/stdout" 2>"$work/stderr" || rc=$?
+expect "a domain with an open per-domain PR is left to it: no DKIM prompt for it" \
+  bash -c '[ "$1" = 0 ] && f="$(tr -s " \n" "  " <"$2")" && grep -qF "DKIM keys: example.biz example.net example.info example.xyz" <<<"$f" && grep -qF "example.org: left to the open PR #50 (dkim/example.org-google)" <<<"$f"' _ "$rc" "$work/stdout"
+rm -f "$bgh/50"
+
+# 14.6 a batch made by hand, as an open PR with any branch name: a domain its
+# head changes is left to it, and the follower waits for it, then carries on
+# from what it published (the domain is on the tenant already, its token
+# fetched by hand).
+git -C "$bsrc" pull --quiet --ff-only origin main
+jq --indent 2 '.domains["example.app"] = {zone_id: "00000000000000000000000000000026", dkim: {}, google: {kind: "secondary"}}' "$bdata" >"$bdata.new" && mv "$bdata.new" "$bdata"
+git -C "$bsrc" commit --quiet -am "declare example.app" && git -C "$bsrc" push --quiet origin HEAD:main
+STUB_ORIGIN="$borigin" "$STUB_APPLY"
+set_state '.domains["example.app"] = {isPrimary: false, verified: false}'
+git -C "$bsrc" checkout --quiet -b by-hand
+jq --indent 2 '.domains["example.app"].google_verification = ["google-site-verification=example-app-Tok_123"]' "$bdata" >"$bdata.new" && mv "$bdata.new" "$bdata"
+git -C "$bsrc" commit --quiet -am "batch 1 by hand" && git -C "$bsrc" push --quiet origin by-hand:mail/batch-1-verification
+git -C "$bsrc" checkout --quiet main
+echo mail/batch-1-verification >"$bgh/52"
+printf 's\ns\ns\ns\ns\n' >"$work/answers"
+: >"$STUB_GH_LOG"
+rc=0
+batch run <"$work/answers" >"$work/stdout" 2>"$work/stderr" || rc=$?
+expect "the interactive phase leaves a domain that an open hand-made PR changes to that PR" \
+  bash -c '[ "$1" = 0 ] && ! grep -q "^gh pr create" "$2" && tr -s " \n" "  " <"$3" | grep -qF "example.app: left to the open PR #52 (mail/batch-1-verification)"' _ "$rc" "$STUB_GH_LOG" "$work/stdout"
+GOOGLE_WORKSPACE_FOREIGN_PR_INTERVAL=1 batch follow >"$work/stdout" 2>"$work/stderr" &
+fpid=$!
+for _ in $(seq 1 300); do grep -q "waiting for the open PR(s) that carry example.app: #52" "$work/stderr" 2>/dev/null && break; sleep 0.1; done
+expect "the follower waits for that PR rather than publishing the same change" \
+  bash -c 'grep -qF "waiting for the open PR(s) that carry example.app: #52" "$1" && ! grep -q "^gh pr create" "$2"' _ "$work/stderr" "$STUB_GH_LOG"
+# Merged by hand, and applied.
+git -C "$borigin" update-ref refs/heads/main "$(git -C "$borigin" rev-parse refs/heads/mail/batch-1-verification)"
+mv "$bgh/52" "$bgh/merged-52"
+STUB_ORIGIN="$borigin" "$STUB_APPLY"
+rc=0
+wait "$fpid" || rc=$?
+expect "... and once it is merged, verifies the domain and publishes its mail records in its own batch" \
+  bash -c '[ "$1" = 0 ] && [ "$(jq -r ".domains[\"example.app\"].verified" "$2")" = true ] && [ "$(git -C "$3" show main:dns/mail-auth.json | jq -c "[.domains[\"example.app\"].mx[0].host, (.domains[\"example.app\"].google_verification | length)]")" = "[\"smtp.google.com\",1]" ] && [ "$(grep -c "^gh pr create" "$4")" = 1 ]' _ "$rc" "$state" "$borigin" "$STUB_GH_LOG"
 
 echo
 if [ "$fails" -ne 0 ]; then

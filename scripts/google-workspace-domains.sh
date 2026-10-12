@@ -16,6 +16,9 @@
 #                                    --data FILE [--local L]… [--key KEY --subject ADMIN]
 #   google-workspace-domains dmarc-group --group GROUP [--guide] [--key KEY --subject ADMIN]
 #   google-workspace-domains scopes  [--scopes S,S,…] [--guide] [--key KEY --subject ADMIN]
+#   google-workspace-domains edit    --domain D --data FILE (--phase verification --token T |
+#                                    --phase records [--mx …] [--spf-drop H]… [--spf-replace]
+#                                    [--dmarc-rua M] [--tls-rpt-rua M]) [--dry-run]
 #
 # --key/--subject (or $GOOGLE_WORKSPACE_KEY / $GOOGLE_WORKSPACE_SUBJECT): the
 # decrypted service-account key with domain-wide delegation and the super admin
@@ -127,20 +130,21 @@ lib="${GOOGLE_WORKSPACE_TOOLS_LIB:-$here/lib}"
 . "$lib/guide.sh"
 read -r -a api_cmd <<<"${GOOGLE_WORKSPACE_DOMAINS_API:-python3 $here/google-workspace-domains-api.py}"
 
-usage="usage: $prog onboard|status|user-addresses|dmarc-group|scopes ... (see the header of this script, or --help)"
+usage="usage: $prog onboard|status|user-addresses|dmarc-group|scopes|edit ... (see the header of this script, or --help)"
 cmd="${1:-}"
 [ -n "$cmd" ] || die "$usage"
 shift
 case "$cmd" in -h | --help) set -- --help ;; esac
 
 # Every scope these tools use, in the order the guidance lists them.
-tool_scopes="admin.directory.domain,admin.directory.domain.readonly,siteverification,admin.directory.user,gmail.settings.basic,gmail.settings.sharing,gmail.send,apps.groups.settings"
+tool_scopes="admin.directory.domain,admin.directory.domain.readonly,siteverification,admin.directory.user,gmail.settings.basic,gmail.settings.sharing,gmail.send,gmail.metadata,apps.groups.settings"
 
 domain="" parent="" kind_flag="" data="" post_edit="" base="" merge=0 no_pr=0 all=0 all_domains=0
 key="${GOOGLE_WORKSPACE_KEY:-}" subject="${GOOGLE_WORKSPACE_SUBJECT:-}"
 mx_spec="1:smtp.google.com" mx_explicit=0 spf_drop=() spf_replace=0 dmarc_rua="" tls_rpt_rua="" tls_rpt_given=0
 dns_timeout="${GOOGLE_WORKSPACE_DOMAINS_DNS_TIMEOUT:-1800}" verify_timeout="${GOOGLE_WORKSPACE_DOMAINS_VERIFY_TIMEOUT:-900}"
 user="" locals=() table=0 group="" guide=0 scope_list="$tool_scopes"
+edit_phase="" edit_token="" dry_run=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --domain) domain="${2:?--domain needs a value}"; shift 2 ;;
@@ -168,6 +172,9 @@ while [ $# -gt 0 ]; do
     --group) group="${2:?--group needs a value}"; shift 2 ;;
     --guide) guide=1; shift ;;
     --scopes) scope_list="${2:?--scopes needs a value}"; shift 2 ;;
+    --phase) edit_phase="${2:?--phase needs a value}"; shift 2 ;;
+    --token) edit_token="${2:?--token needs a value}"; shift 2 ;;
+    --dry-run) dry_run=1; shift ;;
     -h | --help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument $1 ($usage)" ;;
   esac
@@ -402,21 +409,6 @@ records_answer() {
     "$(lookup_txt "_smtp._tls.$domain" "$1" | grep '^v=TLSRPTv1' | paste -sd' ' -)"
 }
 
-# Cloudflare serves an MX whose target is a PROXIED name in the zone as
-# "_dc-mx.<hex>.<zone>" (a DNS-only name it maintains for the purpose, since a
-# proxied address cannot receive SMTP). Both sides normalised the same way, the
-# substitute and the in-zone host it stands for compare equal.
-mx_normalise() { # DOMAIN SIDE(declared|served) < "<prio> <host>" lines
-  awk -v d="$1" -v side="$2" '
-    function inzone(h) { return h == d || substr(h, length(h) - length(d)) == "." d }
-    {
-      h = $2
-      if (side == "served" && h ~ /^_dc-mx\.[0-9a-f]+\./ && inzone(h)) h = "<proxied host in " d ">"
-      else if (side == "declared" && inzone(h)) h = "<proxied host in " d ">"
-      print $1, h
-    }' | LC_ALL=C sort
-}
-
 # ── onboard ──────────────────────────────────────────────────────────────────
 
 data_abs="" root="" rel=""
@@ -578,6 +570,36 @@ EOT
        $prog user-addresses --user <user> --domain $domain --data $data
 Then: $prog status --domain $domain --data $data
 EOF
+}
+
+# ── edit (one phase, in place, nothing else) ─────────────────────────────────
+
+cmd_edit() {
+  [ -n "$domain" ] || die "--domain is required"
+  [ -n "$data" ] || die "--data is required (the mail-auth JSON data file)"
+  [ -f "$data" ] || die "no such data file: $data"
+  require_declared "$data"
+  case "$edit_phase" in
+    verification)
+      [[ $edit_token =~ ^google-site-verification=[A-Za-z0-9_-]+$ ]] ||
+        die "--token must be a google-site-verification=… value"
+      verification_token="$edit_token" phase_prog="$verification_prog"
+      ;;
+    records)
+      mx_list="$(mx_json)"
+      phase_prog="$records_prog"
+      ;;
+    *) die "--phase must be verification or records" ;;
+  esac
+  phase="$edit_phase"
+  [ "$(phase_state "$data")" != same ] || return 3
+  [ "$dry_run" = 0 ] || return 0
+  local tmp
+  tmp="$(mktemp "$data.XXXXXX")"
+  apply_jq "$data" "$phase_prog" >"$tmp"
+  chmod --reference="$data" "$tmp" 2>/dev/null || true
+  mv "$tmp" "$data"
+  say "edited $domain's $phase in $data"
 }
 
 # ── user addresses ───────────────────────────────────────────────────────────
@@ -1064,5 +1086,6 @@ case "$cmd" in
   user-addresses) cmd_user_addresses ;;
   dmarc-group) cmd_dmarc_group ;;
   scopes) cmd_scopes ;;
+  edit) cmd_edit ;;
   *) die "$usage" ;;
 esac

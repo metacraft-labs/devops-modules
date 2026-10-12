@@ -1,20 +1,76 @@
 #!/usr/bin/env bash
-# Google Workspace setup wizard: walks an operator through every step that puts
-# a tenant's domains into production mail — delegation scopes, the DMARC report
-# group, each domain (secondary or alias) with its records, the users'
-# addresses and send-as entries, DKIM, and the SMTP relay for automated
-# sending — in a safe order, skipping what is already done. Built for a narrow
-# terminal pane: guidance on stdout, wrapped at 78 columns; every console step
-# prints the URL, what to click, the exact value to paste and what success
-# looks like, then waits for Enter and VERIFIES the result before moving on.
+# Google Workspace setup wizard: puts a tenant's domains into production mail —
+# delegation scopes, the DMARC report group, each domain (secondary or alias)
+# with its records, the users' addresses and send-as entries, DKIM, and the
+# SMTP relay for automated sending — in a safe order, skipping what is already
+# done. Built for a narrow terminal pane: guidance on stdout, wrapped at 78
+# columns; every console step prints the URL, what to click, the exact value
+# to paste and what success looks like.
 #
 #   google-workspace-setup [STEP] --data FILE [--key KEY --subject ADMIN]
 #                          [--user USER] [--group GROUP] [--scopes S,S,…]
 #                          [--post-edit CMD] [--dkim-post-edit CMD] [--base BRANCH]
 #                          [--dmarc-rua MAILBOX] [--tls-rpt-rua MAILBOX]
 #                          [--test-to ADDRESS] [--relay-user USER] [--no-merge]
+#                          [--redecide] [--detach]
 #
-# STEP (default: run, which is all of them in this order):
+# TWO PHASES (the default, `run` then `follow`). CI and DNS are slow and the
+# operator's part is not, so they are separated:
+#
+#   run             INTERACTIVE, minutes: the delegation scopes and the report
+#                   group; the decisions the background phase needs (move the
+#                   MX of a domain whose mail goes elsewhere today, once it is
+#                   verified? per domain or for all); every declared domain
+#                   added to the tenant (secondary domains, then aliases); the
+#                   users' addresses on the domains already verified; every
+#                   DKIM key the console can generate now, pasted one after the
+#                   other (s skips one); then ONE commit on ONE branch with
+#                   every DNS change possible now — verification tokens, DKIM
+#                   keys, mail records of verified domains as decided — the
+#                   consumer's hook run once, ONE PR; then it starts `follow`
+#                   detached and returns, saying what happens next.
+#   follow          BACKGROUND (or in the foreground when run by hand; with
+#                   --detach, started detached): watches the batch PR's checks
+#                   and merges it at the head it watched, waits until the zones'
+#                   nameservers and then the public resolvers serve every record
+#                   of the batch, asks Google to verify every domain whose token
+#                   is now served and waits for it, gives the users their
+#                   addresses on the newly verified domains, proves inbound mail
+#                   on a domain just moved (a message sent through the Gmail API
+#                   to the user's address there, found in their inbox; needs
+#                   gmail.metadata), and opens the NEXT batch PR for what that
+#                   made possible — until nothing is left. It ends with what
+#                   still needs the operator (Activate Gmail, Start
+#                   authentication, DKIM keys that can now be generated, …),
+#                   kept for `status` and, with $GOOGLE_WORKSPACE_NOTIFY set,
+#                   piped to that command (title in $NOTIFY_TITLE).
+#   status          one line per domain (google-workspace-domains status
+#                   --table), then the background phase: running or not, the
+#                   batch PR in flight and its stage, the queue, the log.
+#
+# The answers and the batch in flight are kept in a local state file, never
+# committed: ${XDG_STATE_HOME:-~/.local/state}/google-workspace-setup/
+# <tenant>.json ($GOOGLE_WORKSPACE_STATE_DIR overrides the directory), with the
+# follower's log beside it. Both phases re-read the data file on
+# origin/<base>, the tenant and DNS every time, so they resume after any
+# interruption. $GOOGLE_WORKSPACE_FOLLOW_DETACH = systemd | nohup | none picks
+# how `run` starts the follower (default: a systemd user unit when the user
+# manager answers, else nohup).
+#
+# A domain whose mail goes elsewhere today (an MX outside Google, resolving or
+# not) is moved only as decided, and only after a domain already moved has
+# received a test message (automatically, or confirmed by the operator at the
+# next `run` when the Gmail read scope is not granted). An alias's records wait
+# for its parent's verification. A domain another open PR changes (its head
+# changes the domain's entry in FILE: a per-domain PR, or a batch made by hand)
+# is left to it, and `follow` waits for that PR to land when the domain has
+# work due ($GOOGLE_WORKSPACE_FOREIGN_PR_WAIT seconds, default 21600). When a Google API turns out to be disabled, it is enabled with gcloud
+# (re-running `gcloud auth login` in the interactive phase when its
+# credentials have expired); only a missing permission ends in instructions.
+#
+# THE STEPS ONE BY ONE (the per-domain path, one PR per change):
+#   guided          all of the below in order, per domain — the original
+#                   guided run, waiting for each PR
 #   scopes          the service account's delegation scopes (Admin console)
 #   dmarc-group     GROUP accepts the DMARC/TLS-RPT reports from outside
 #   onboard-all     every declared domain onto the tenant with its records
@@ -23,16 +79,15 @@
 #   dkim-all        DKIM for every onboarded domain that has no key yet
 #   smtp-relay      the Workspace SMTP relay for automated sending (console),
 #                   tested by sending through it when an app password is given
-#   status          one line per domain (google-workspace-domains status --table)
 #
-# THE ORDER of the domains comes from FILE and live DNS: the primary domain;
-# then domains whose mail is already on Google (no routing change); then
-# domains with no MX at all; then domains whose MX points elsewhere but does
-# not resolve; then domains whose mail goes elsewhere today. Before the first
-# domain with an MX elsewhere (resolving or not) is switched, the operator
-# confirms that a test message from outside arrived at a domain already
-# switched to Google; without a domain to send it to, those domains are left
-# alone. A domain alias always comes after its parent. Domains declared
+# THE ORDER of the guided path comes from FILE and live DNS: the primary
+# domain; then domains whose mail is already on Google (no routing change);
+# then domains with no MX at all; then domains whose MX points elsewhere but
+# does not resolve; then domains whose mail goes elsewhere today. Before the
+# first domain with an MX elsewhere (resolving or not) is switched, the
+# operator confirms that a test message from outside arrived at a domain
+# already switched to Google; without a domain to send it to, those domains are
+# left alone. A domain alias always comes after its parent. Domains declared
 # "zone_pending" are listed and skipped.
 #
 # Answers are read from stdin: Enter = done, verify now; s = skip; q = quit.
@@ -53,18 +108,27 @@ lib="${GOOGLE_WORKSPACE_TOOLS_LIB:-$here/lib}"
 . "$lib/pr-publish.sh"
 # shellcheck source=lib/guide.sh
 . "$lib/guide.sh"
+# shellcheck source=lib/setup-batch.sh
+. "$lib/setup-batch.sh"
+self="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
 read -r -a domains_cmd <<<"${GOOGLE_WORKSPACE_DOMAINS_CMD:-google-workspace-domains}"
 read -r -a dkim_cmd <<<"${GOOGLE_WORKSPACE_DKIM_CMD:-google-workspace-dkim}"
 read -r -a api_cmd <<<"${GOOGLE_WORKSPACE_DOMAINS_API:-python3 $here/google-workspace-domains-api.py}"
 
 step="run"
 case "${1:-}" in
-  run | scopes | dmarc-group | onboard-all | user-addresses | dkim-all | smtp-relay | status) step="$1"; shift ;;
+  run | follow | guided | scopes | dmarc-group | onboard-all | user-addresses | dkim-all | smtp-relay | status) step="$1"; shift ;;
   -h | --help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
 esac
 
 data="" key="${GOOGLE_WORKSPACE_KEY:-}" subject="${GOOGLE_WORKSPACE_SUBJECT:-}" user="" group="" scopes=""
 post_edit="" dkim_post_edit="" base="" dmarc_rua="" tls_rpt_rua="" test_to="" relay_user="" merge=1
+redecide=0 detach=0
+# The options as given, for the follower `run` starts (it takes the same ones).
+setup_args=()
+for a in "$@"; do
+  case "$a" in --detach | --redecide) ;; *) setup_args+=("$a") ;; esac
+done
 while [ $# -gt 0 ]; do
   case "$1" in
     --data) data="${2:?}"; shift 2 ;;
@@ -81,6 +145,8 @@ while [ $# -gt 0 ]; do
     --test-to) test_to="${2:?}"; shift 2 ;;
     --relay-user) relay_user="${2:?}"; shift 2 ;;
     --no-merge) merge=0; shift ;;
+    --redecide) redecide=1; shift ;;
+    --detach) detach=1; shift ;;
     -h | --help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument $1 (see --help)" ;;
   esac
@@ -108,7 +174,12 @@ fi
 # back to the working copy; $view_file holds the same for the tools' read-only
 # commands (status, user-addresses), which must not see a stale working copy.
 view_file="$(mktemp "${TMPDIR:-/tmp}/$prog.view.XXXXXX")"
-trap 'rm -f "$view_file"' EXIT
+setup_cleanup() {
+  rm -f "$view_file"
+  pr_cleanup_worktrees
+}
+pr_exit_trap=setup_cleanup
+trap setup_cleanup EXIT
 refresh_view() {
   view=""
   if [ -n "$root" ] && git -C "$root" remote get-url origin >/dev/null 2>&1; then
@@ -261,6 +332,9 @@ step_dmarc_group() {
     return 0
   fi
   guide_text "The DMARC and TLS-RPT reports go to $g. Receivers outside the organisation send them, so the group must accept external mail."
+  # A disabled Groups Settings API is enabled here with gcloud; the guided
+  # loop is for what only the console can fix.
+  if with_api gwd dmarc-group --group "$g"; then return 0; fi
   gwd dmarc-group --group "$g" --guide || rc=$?
   [ "$rc" = 0 ] || guide_bad "$g may still refuse reports from outside."
 }
@@ -506,6 +580,7 @@ step_status() {
   u="$(first_user)"
   refresh_view
   gwd status --all --table --data "$view_file" ${u:+--user "$u"} || true
+  follower_status
 }
 
 steps_total=6
@@ -515,8 +590,19 @@ header() {
   guide_h1 "Step $n_step of $steps_total: $*"
 }
 
+state_init
+[ "$step" = follow ] || interactive=1
+
 case "$step" in
-  run)
+  run) cmd_run ;;
+  follow)
+    if [ "$detach" = 1 ]; then
+      start_follower
+    else
+      cmd_follow
+    fi
+    ;;
+  guided)
     guide_h1 "Google Workspace setup: $(basename "$data")"
     guide_text "Everything below is checked live first; finished steps are skipped. Answers: Enter = done, verify now; s = skip; q = quit (re-run to resume)."
     header "delegation scopes" && step_scopes

@@ -93,6 +93,21 @@ authoritative_servers() {
   done
 }
 
+# Cloudflare serves an MX whose target is a PROXIED name in the zone as
+# "_dc-mx.<hex>.<zone>" (a DNS-only name it maintains for the purpose, since a
+# proxied address cannot receive SMTP). Both sides normalised the same way, the
+# substitute and the in-zone host it stands for compare equal.
+mx_normalise() { # DOMAIN SIDE(declared|served) < "<prio> <host>" lines
+  awk -v d="$1" -v side="$2" '
+    function inzone(h) { return h == d || substr(h, length(h) - length(d)) == "." d }
+    {
+      h = $2
+      if (side == "served" && h ~ /^_dc-mx\.[0-9a-f]+\./ && inzone(h)) h = "<proxied host in " d ">"
+      else if (side == "declared" && inzone(h)) h = "<proxied host in " d ">"
+      print $1, h
+    }' | LC_ALL=C sort
+}
+
 # wait_until_served DOMAIN WHAT MATCH_FN DESCRIBE_FN [HINT]
 #
 # Two phases. Public resolvers cache a negative answer for the zone's SOA
@@ -183,16 +198,14 @@ pr_cleanup_worktrees() {
 #
 # $pr_mismatch_msg, when set, is the error for an open PR whose branch carries
 # a different change; $pr_subject names the change in messages.
+#
+# It is pr_base, pr_commit_branch, pr_create and pr_land in sequence; the
+# batched setup calls those separately, opening a PR in one process and
+# landing it in another.
 publish_pr() {
   local root="$1" rel="$2" branch="$3" title="$4" body="$5" msg="$6" state_fn="$7" edit_fn="$8"
-  local pr wt before after paths=() p head state subject="${pr_subject:-the change}"
-  command -v gh >/dev/null || die "gh is required for the PR flow (or pass --no-pr)"
-  if [ -z "$base" ]; then
-    base="$(cd "$root" && gh repo view --json defaultBranchRef -q .defaultBranchRef.name)" ||
-      die "could not determine the default branch; pass --base"
-  fi
-  say "fetching origin/$base"
-  git -C "$root" fetch --quiet origin "$base"
+  local pr subject="${pr_subject:-the change}"
+  pr_base "$root"
 
   if git -C "$root" show "origin/$base:$rel" >/dev/null 2>&1 &&
     [ "$(git -C "$root" show "origin/$base:$rel" | "$state_fn" /dev/stdin)" = same ]; then
@@ -200,7 +213,7 @@ publish_pr() {
     return 0
   fi
 
-  pr="$(cd "$root" && gh pr list --head "$branch" --base "$base" --state open --json number -q '.[0].number // empty')"
+  pr="$(pr_open_for "$root" "$branch")"
   if [ -n "$pr" ]; then
     git -C "$root" fetch --quiet origin "$branch" ||
       die "PR #$pr is open but origin/$branch could not be fetched"
@@ -208,50 +221,96 @@ publish_pr() {
       die "${pr_mismatch_msg:-PR #$pr ($branch) carries a different change than $subject. Close it and delete the branch, then re-run}"
     say "PR #$pr for $branch is already open with $subject; resuming it"
   else
-    wt="$(mktemp -d "${TMPDIR:-/tmp}/$prog.XXXXXX")"
-    pr_worktrees+=("$root" "$wt")
-    trap pr_cleanup_worktrees EXIT
-    git -C "$root" worktree add --quiet -B "$branch" "$wt" "origin/$base"
-    # Dev shells often generate the commit-hook configuration as an untracked,
-    # ignored file (a .pre-commit-config.yaml symlink into the Nix store). A
-    # fresh worktree does not have it, and the hook then refuses the commit, so
-    # link the operator's copy in. Only an ignored file is linked, so it can
-    # never be staged.
-    # shellcheck disable=SC2043 # a list of one, for now
-    for f in .pre-commit-config.yaml; do
-      if [ -e "$root/$f" ] && [ ! -e "$wt/$f" ] && git -C "$root" check-ignore -q -- "$f"; then
-        ln -s "$(readlink -f "$root/$f")" "$wt/$f"
-      fi
-    done
-    before="$(git -C "$wt" status --porcelain=v1 --untracked-files=all)"
     local rc=0
-    "$edit_fn" "$wt/$rel" "$wt" || rc=$?
+    pr_commit_branch "$root" "$rel" "$branch" "$msg" "$edit_fn" || rc=$?
     [ "$rc" = 0 ] || die "nothing to commit on $branch ($subject is already there)"
-    after="$(git -C "$wt" status --porcelain=v1 --untracked-files=all)"
-    # Stage the data file and exactly the paths the hook changed.
-    paths=("$rel")
-    while IFS= read -r p; do
-      [ -n "$p" ] || continue
-      p="${p:3}"
-      p="${p##* -> }"
-      [ "$p" = "$rel" ] || paths+=("$p")
-    done < <(comm -13 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort))
-    say "staging: ${paths[*]}"
-    git -C "$wt" add -- "${paths[@]}"
-    if ! git -C "$wt" commit --quiet -m "$msg"; then
-      # A formatting hook may have rewritten the staged files; take its result once.
-      say "the commit hooks changed files; re-staging and committing again"
-      git -C "$wt" add -- "${paths[@]}"
-      git -C "$wt" commit --quiet -m "$msg" || die "commit failed in $wt"
-    fi
-    git -C "$wt" push --quiet --force-with-lease -u origin "$branch"
-    pr="$(cd "$wt" && gh pr create --base "$base" --head "$branch" --title "$title" --body "$body")"
-    say "opened $pr"
-    pr="${pr##*/}"
+    pr="$(pr_create "$root" "$branch" "$title" "$body")"
   fi
+  pr_land "$root" "$pr"
+}
 
-  # The head is fixed before watching, so the merge below can only land the
-  # commit whose checks were watched.
+# pr_base ROOT: resolves $base (the repository's default branch when empty)
+# and fetches origin/$base.
+pr_base() {
+  local root="$1"
+  command -v gh >/dev/null || die "gh is required for the PR flow (or pass --no-pr)"
+  if [ -z "$base" ]; then
+    base="$(cd "$root" && gh repo view --json defaultBranchRef -q .defaultBranchRef.name)" ||
+      die "could not determine the default branch; pass --base"
+  fi
+  say "fetching origin/$base"
+  git -C "$root" fetch --quiet origin "$base"
+}
+
+# pr_open_for ROOT BRANCH: the number of the open PR from BRANCH into $base,
+# or nothing.
+pr_open_for() {
+  (cd "$1" && gh pr list --head "$2" --base "$base" --state open --json number -q '.[0].number // empty')
+}
+
+# pr_commit_branch ROOT REL BRANCH MESSAGE EDIT_FN
+#
+# In a temporary worktree on BRANCH from origin/$base: EDIT_FN FILE WORKTREE,
+# then a commit of the data file and exactly the paths the hook changed, pushed
+# to origin. 0 when pushed, 3 when EDIT_FN changed nothing (nothing is pushed).
+# The operator's own checkout is never touched.
+pr_commit_branch() {
+  local root="$1" rel="$2" branch="$3" msg="$4" edit_fn="$5" wt before after paths=() p rc=0
+  wt="$(mktemp -d "${TMPDIR:-/tmp}/$prog.XXXXXX")"
+  pr_worktrees+=("$root" "$wt")
+  # A caller with an EXIT trap of its own names it in $pr_exit_trap (and
+  # calls pr_cleanup_worktrees from it). Expanded now, on purpose:
+  # shellcheck disable=SC2064
+  trap "${pr_exit_trap:-pr_cleanup_worktrees}" EXIT
+  git -C "$root" worktree add --quiet -B "$branch" "$wt" "origin/$base"
+  # Dev shells often generate the commit-hook configuration as an untracked,
+  # ignored file (a .pre-commit-config.yaml symlink into the Nix store). A
+  # fresh worktree does not have it, and the hook then refuses the commit, so
+  # link the operator's copy in. Only an ignored file is linked, so it can
+  # never be staged.
+  # shellcheck disable=SC2043 # a list of one, for now
+  for f in .pre-commit-config.yaml; do
+    if [ -e "$root/$f" ] && [ ! -e "$wt/$f" ] && git -C "$root" check-ignore -q -- "$f"; then
+      ln -s "$(readlink -f "$root/$f")" "$wt/$f"
+    fi
+  done
+  before="$(git -C "$wt" status --porcelain=v1 --untracked-files=all)"
+  "$edit_fn" "$wt/$rel" "$wt" || rc=$?
+  [ "$rc" = 0 ] || return 3
+  after="$(git -C "$wt" status --porcelain=v1 --untracked-files=all)"
+  # Stage the data file and exactly the paths the hook changed.
+  paths=("$rel")
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    p="${p:3}"
+    p="${p##* -> }"
+    [ "$p" = "$rel" ] || paths+=("$p")
+  done < <(comm -13 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort))
+  say "staging: ${paths[*]}"
+  git -C "$wt" add -- "${paths[@]}"
+  if ! git -C "$wt" commit --quiet -m "$msg"; then
+    # A formatting hook may have rewritten the staged files; take its result once.
+    say "the commit hooks changed files; re-staging and committing again"
+    git -C "$wt" add -- "${paths[@]}"
+    git -C "$wt" commit --quiet -m "$msg" || die "commit failed in $wt"
+  fi
+  git -C "$wt" push --quiet --force-with-lease -u origin "$branch"
+}
+
+# pr_create ROOT BRANCH TITLE BODY: opens the PR into $base; prints its number.
+pr_create() {
+  local pr
+  pr="$(cd "$1" && gh pr create --base "$base" --head "$2" --title "$3" --body "$4")"
+  say "opened $pr"
+  printf '%s\n' "${pr##*/}"
+}
+
+# pr_land ROOT PR: fixes PR's head, waits for every check and workflow run of
+# it, and (with $merge = 1) merges at exactly that head. Exits otherwise. The
+# head is fixed before watching, so the merge can only land the commit whose
+# checks were watched; a head that moves meanwhile makes the merge refuse.
+pr_land() {
+  local root="$1" pr="$2" head state
   head="$(cd "$root" && gh pr view "$pr" --json headRefOid -q .headRefOid)"
   [ -n "$head" ] || die "could not read the head commit of PR #$pr"
   watch_checks "$root" "$pr" "$head"

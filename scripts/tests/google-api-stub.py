@@ -22,6 +22,13 @@ it between runs:
      "groups_api_disabled": false,                # 403 SERVICE_DISABLED
      "groups_external_forbidden": false}          # PATCH ANYONE_CAN_POST -> 400
 
+"deny_scopes" may name gmail.metadata and gmail.readonly too (the inbound
+test's read scopes). messages.send delivers into the stub mailbox of the user
+who owns the To address — labels INBOX and SENT — only when the To domain's MX,
+as the stub resolver serves it (DNS_DIR/<domain>.MX), names a Google host, and
+"inbound_broken" is not set; otherwise SENT only. messages.list and
+messages.get (format=metadata, Subject) read that mailbox.
+
 A user's nonEditableAliases are derived as Google derives them: every address
 of the user at the parent of a VERIFIED domain alias, at the alias. A user
 alias can only be added at a verified primary or secondary domain (else 400),
@@ -61,6 +68,7 @@ SCOPE_SENDAS = "gmail.settings.sharing"
 SCOPE_SENDAS_READ = ("gmail.settings.basic", "gmail.settings.sharing")
 SCOPE_SEND = "gmail.send"
 SCOPE_GROUPS = "apps.groups.settings"
+SCOPE_MAIL_READ = ("gmail.metadata", "gmail.readonly")
 USERS = "/admin/directory/v1/users/"
 GMAIL = "/gmail/v1/users/"
 GROUPS = "/groups/v1/groups/"
@@ -69,7 +77,7 @@ GROUPS = "/groups/v1/groups/"
 def load():
     with open(STATE) as f:
         s = json.load(f)
-    for k in ("domains", "aliases", "users", "sendas", "groups"):
+    for k in ("domains", "aliases", "users", "sendas", "groups", "mail"):
         s.setdefault(k, {})
     return s
 
@@ -213,6 +221,26 @@ class H(BaseHTTPRequestHandler):
                 m = email.message_from_bytes(base64.urlsafe_b64decode(json.loads(raw)["raw"]))
                 with open(LOG, "a") as f:
                     f.write(f"SENT {user} From={m['From']} To={m['To']}\n")
+                to = str(m["To"]).lower()
+                owner = next((x for x in s["users"] if to in addresses_of(s, x)), None)
+                try:
+                    with open(os.path.join(DNS, to.split("@")[1] + ".MX")) as f:
+                        mx = f.read()
+                except OSError:
+                    mx = ""
+                delivered = bool(owner) and "google.com" in mx and not s.get("inbound_broken")
+
+                def put(box_user, labels):
+                    box = s["mail"].setdefault(box_user, [])
+                    box.append({"id": f"m{len(box) + 1}", "subject": m["Subject"], "labelIds": labels})
+
+                if delivered and owner == user:
+                    put(user, ["INBOX", "SENT"])
+                else:
+                    put(user, ["SENT"])
+                    if delivered:
+                        put(owner, ["INBOX"])
+                save(s)
                 return self.reply(200, {"id": "msg-1", "threadId": "t-1"})
         if u.path == DIR + "domainaliases":
             if not self.need(SCOPE_DOMAIN):
@@ -330,6 +358,20 @@ class H(BaseHTTPRequestHandler):
                         del hidden[a]
             save(s)
             return self.reply(200, v)
+        if u.path.startswith(GMAIL) and "/messages" in u.path:
+            user = urllib.parse.unquote(u.path[len(GMAIL) :].split("/")[0])
+            if not self.need(SCOPE_MAIL_READ) or not self.as_user(user):
+                return
+            box = list(reversed(s["mail"].get(user, [])))
+            rest = u.path.split("/messages", 1)[1]
+            if rest in ("", "/"):
+                return self.reply(200, {"messages": [{"id": m["id"]} for m in box[:25]]})
+            mid = urllib.parse.unquote(rest.lstrip("/"))
+            for m in box:
+                if m["id"] == mid:
+                    return self.reply(200, {"id": mid, "labelIds": m["labelIds"],
+                                            "payload": {"headers": [{"name": "Subject", "value": m["subject"]}]}})
+            return self.reply(404, {"error": {"code": 404, "message": "Requested entity was not found."}})
         if u.path.startswith(GMAIL) and u.path.endswith("/settings/sendAs"):
             user = urllib.parse.unquote(u.path[len(GMAIL) : -len("/settings/sendAs")])
             if not self.need(SCOPE_SENDAS_READ) or not self.as_user(user):

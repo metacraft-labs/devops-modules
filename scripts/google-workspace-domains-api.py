@@ -28,6 +28,15 @@
                             message is held for a moderator
   send-test USER FROM TO    send a short test message as USER, From: FROM
                             (one of USER's send-as addresses), To: TO
+  inbound-test USER TO      send a message as USER (From: USER) to TO, one of
+                            USER's own addresses on a domain just moved to
+                            Google, and wait (up to $GOOGLE_INBOUND_TIMEOUT
+                            seconds, default 180) until it is in USER's
+                            mailbox with the INBOX label; reads with
+                            gmail.metadata (or gmail.readonly). Prints
+                            {"result": "delivered", "labels": [...]}; exit 3
+                            when neither read scope is granted, 1 when the
+                            message does not arrive (or lands in Spam)
   smtp-test USER FROM TO    send a test message through the Workspace SMTP
                             relay (smtp-relay.gmail.com:587, STARTTLS), logging
                             in as USER with the password in $SMTP_RELAY_PASSWORD
@@ -48,7 +57,8 @@ GOOGLE_SITE_VERIFICATION_API, GOOGLE_GMAIL_API and GOOGLE_GROUPS_SETTINGS_API
 (the token endpoint is the key file's token_uri); GOOGLE_SMTP_RELAY=host:port
 redirects smtp-test, and GOOGLE_SMTP_RELAY_STARTTLS=0 lets it talk to a
 plain-text test server (never use it against a real relay).
-Exit status: 0 ok, 1 failure (the message names the cause and the remedy).
+Exit status: 0 ok, 1 failure (the message names the cause and the remedy), 3
+for inbound-test when the delegation grants neither read scope.
 """
 
 import argparse
@@ -74,6 +84,8 @@ SCOPE_SENDAS_READ = AUTH + "gmail.settings.basic"
 SCOPE_SENDAS = AUTH + "gmail.settings.sharing"
 SCOPE_SEND = AUTH + "gmail.send"
 SCOPE_GROUPS = AUTH + "apps.groups.settings"
+SCOPE_MAIL_META = AUTH + "gmail.metadata"
+SCOPE_MAIL_READ = AUTH + "gmail.readonly"
 
 
 def api_of(scope):
@@ -409,6 +421,52 @@ def send_test(args):
     return {"id": res.get("id"), "from": args.sender, "to": args.to}
 
 
+def inbound_test(args):
+    import time
+    import uuid
+
+    # The read scope first: without it there is no point in sending.
+    reader = session_any(args.key, args.user, [SCOPE_MAIL_META, SCOPE_MAIL_READ])
+    tag = f"inbound-test {uuid.uuid4().hex[:12]}"
+    s = session(args.key, args.user, SCOPE_SEND)
+    m = EmailMessage()
+    m["From"] = args.user
+    m["To"] = args.to
+    m["Subject"] = f"{PROG}: {tag}"
+    m.set_content(
+        f"Sent by {PROG} through the Gmail API as {args.user} to {args.to}, to prove that the tenant\n"
+        "now accepts mail for that domain. Safe to delete.\n"
+    )
+    raw = base64.urlsafe_b64encode(m.as_bytes()).decode()
+    json_or_fail(call(s, "POST", f"{GMAIL_API}/gmail/v1/users/{q(args.user)}/messages/send", json={"raw": raw}),
+                 f"messages.send as {args.user}")
+    timeout = int(os.environ.get("GOOGLE_INBOUND_TIMEOUT", "180"))
+    interval = float(os.environ.get("GOOGLE_INBOUND_INTERVAL", "10"))
+    start = time.time()
+    while True:
+        r = call(reader, "GET", f"{GMAIL_API}/gmail/v1/users/{q(args.user)}/messages",
+                 params={"maxResults": 25, "includeSpamTrash": "true"})
+        for ref in json_or_fail(r, f"messages.list for {args.user}").get("messages", []):
+            r = call(reader, "GET", f"{GMAIL_API}/gmail/v1/users/{q(args.user)}/messages/{q(ref['id'])}",
+                     params={"format": "metadata", "metadataHeaders": "Subject"})
+            msg = json_or_fail(r, f"messages.get {ref['id']}")
+            subject = next((h.get("value", "") for h in msg.get("payload", {}).get("headers", [])
+                            if h.get("name", "").lower() == "subject"), "")
+            if tag not in subject:
+                continue
+            labels = sorted(msg.get("labelIds", []))
+            if "INBOX" in labels:
+                return {"result": "delivered", "to": args.to, "labels": labels}
+            if "SPAM" in labels:
+                raise Failure(f"the test message to {args.to} arrived, but in Spam ({labels})")
+        if time.time() - start >= timeout:
+            raise Failure(
+                f"the test message to {args.to} did not reach {args.user}'s inbox within {timeout}s: "
+                "the domain may not accept mail on the tenant yet (Activate Gmail, the address, the MX)"
+            )
+        time.sleep(interval)
+
+
 def smtp_test(args):
     import smtplib
     import socket
@@ -492,6 +550,9 @@ def main():
         p = sub.add_parser(op)
         p.add_argument("user")
         p.add_argument("address")
+    p = sub.add_parser("inbound-test")
+    p.add_argument("user")
+    p.add_argument("to")
     p = sub.add_parser("group")
     p.add_argument("group")
     p.add_argument("--allow-external", action="store_true")
@@ -518,9 +579,14 @@ def main():
         "group": group,
         "send-test": send_test,
         "smtp-test": smtp_test,
+        "inbound-test": inbound_test,
     }
     try:
         out = ops[args.op](args)
+    except Denied as e:
+        # inbound-test without a read scope is "cannot tell", not a failure.
+        print(f"{PROG}: {e}", file=sys.stderr)
+        return 3 if args.op == "inbound-test" else 1
     except Failure as e:
         msg = str(e)
         if "--project <project>" in msg:
