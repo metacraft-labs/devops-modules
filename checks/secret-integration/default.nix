@@ -33,6 +33,7 @@ let
           age.identityPaths = [ ./test-keys/.ssh/id_ed25519 ];
           boot.loader.grub.enable = false;
           fileSystems."/".device = "none";
+          fileSystems."/".fsType = "tmpfs";
           system.stateVersion = "25.11";
         }
       ];
