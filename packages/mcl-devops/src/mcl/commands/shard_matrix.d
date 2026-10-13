@@ -82,6 +82,19 @@ ShardMatrix generateShardMatrix(string flakeRef = ".", Nullable!NixSystem system
         flakeRef = flakeRef.absolutePath.buildNormalizedPath;
     }
 
+    // A flake that does not import `modules.flake.shardSplit` declares no
+    // `shardCount`, so this eval FAILS for most consumers. That is not an
+    // error: it is how "this flake is unsharded" is reported, and the empty
+    // result below turns it into `shardCount == 0` and the ci-matrix fallback
+    // in `shard_matrix`.
+    //
+    // `logErrors: false` therefore suppresses the ERR line `execute` would
+    // otherwise write for the missing attribute. It was logged at ERR purely
+    // because `execute` logs every non-zero exit that way before throwing, and
+    // the `.ifThrown` here discards that throw — so the ERR line described a
+    // handled condition and read as a fatal one. It has been misdiagnosed as
+    // the cause of unrelated job failures more than once; the real outcome is
+    // reported by the two log lines below.
     const shardCountOutput = nix.eval(
         // Absolute attribute path (leading `.`): see `getSupportedSystems`.
         "%s#.mcl.shard-matrix.result.%s".fmt(
@@ -89,10 +102,15 @@ ShardMatrix generateShardMatrix(string flakeRef = ".", Nullable!NixSystem system
             system.isNull
                 ? "shardCount"
                 : "shardCountPerSystem.%s".fmt(system.get.enumToString),
-        )
+        ),
+        [], // args
+        false, // printCommand
+        false, // logErrors — see the comment above
     )
     .ifThrown("");
 
+    // Empty means the probe above failed (no such attribute, or the eval could
+    // not run at all) — both are reported as "no shards" by the warning below.
     infof("shardCount: '%s'", shardCountOutput);
 
     const shardCount = shardCountOutput
@@ -101,7 +119,13 @@ ShardMatrix generateShardMatrix(string flakeRef = ".", Nullable!NixSystem system
         .ifThrown!ConvException(0);
 
     if (shardCount == 0)
-        warningf("No shards found");
+        warningf(
+            "No shards found: '%s' did not yield a shard count, so this flake "
+                ~ "is treated as unsharded. Expected when it does not import "
+                ~ "`modules.flake.shardSplit`; re-run the eval by hand if you "
+                ~ "expected shards here.",
+            flakeRef,
+        );
 
     return splitToShards(shardCount, system);
 }
