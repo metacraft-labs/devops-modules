@@ -24,6 +24,12 @@ on:
         type: boolean
 
     secrets:
+      ATTIC_PULL_TOKEN:
+        description: 'Read-only Attic token so the private substituter in vars.SUBSTITUTERS authenticates. Read access is all this workflow uses.'
+        required: false
+      ATTIC_TOKEN:
+        description: 'Fallback Attic token when ATTIC_PULL_TOKEN is not provided (read access only).'
+        required: false
       NIX_GITHUB_TOKEN:
         description: GitHub token to add as access-token in nix.conf
         required: false
@@ -65,6 +71,10 @@ jobs:
         uses: metacraft-labs/devops-modules/.github/setup-nix@dev
         with:
           push-to-cache: false
+          # Read-only: no `attic-cache` is passed, so the action's
+          # watch-store/upload step stays gated off (setup-nix
+          # action.yml requires BOTH attic-token and attic-cache).
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           nix-github-token: ${{ secrets.NIX_GITHUB_TOKEN }}
           nix-gitlab-token: ${{ secrets.NIX_GITLAB_TOKEN }}
           nix-gitlab-domain: ${{ vars.NIX_GITLAB_DOMAIN }}
