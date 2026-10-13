@@ -296,6 +296,22 @@ for bad in \
     echo "ok: a merge queue for $what is rejected"
   fi
 done
+# An OPTIONAL queue (`enabled = false`, the policy since 2026-09-30) is off by
+# default; a repository may opt in only with a documented reason.
+outOptIn="$(helper_eval "$mqArgs mergeQueueRepos = [ \"infra\" ]; mergeQueueOptIns = { infra = \"many independent pull requests (test fixture)\"; };" "$policyMQ" 2>/dev/null || true)"
+check "a documented opt-in renders the optional (disabled) class queue with its settings" \
+  '(.rulesets[] | select(.repository == "infra") | .rules.mergeQueue.mergeMethod) == "MERGE" and (.mergeQueues | keys) == ["infra"]' "${outOptIn:-null}"
+for bad in \
+  'mergeQueueRepos = [ "infra" ]; mergeQueueOptIns = { infra = "short"; };|an opt-in with a too-short reason' \
+  'mergeQueueRepos = [ "product" ]; mergeQueueOptIns = { public-dev = "a reason that is long enough to count"; };|an opt-in for a repository without a queue'; do
+  expr="${bad%%|*}"; what="${bad#*|}"
+  if helper_eval "excludeRepos = [ \"fork\" ]; ${expr}" "$policyMQ" 2>/dev/null | jq -e '.rulesets | length' >/dev/null 2>&1; then
+    echo "FAIL: $what was accepted"
+    fail=1
+  else
+    echo "ok: $what is rejected"
+  fi
+done
 renderedMQ="$(nix eval --json --impure --expr "
   let m = import ${helper} ({ policy = ${policyMQ}; repositories = ${repos}; } // { ${mqArgs} mergeQueueRepos = [ \"product\" ]; });
   in import ${engine} {
