@@ -13,8 +13,9 @@ with `403 API rate limit of 12500 still exceeded` (metacraft-labs/infra run
 job's GITHUB_TOKEN (a different, 5,000/hour bucket), so it says nothing about
 this one.
 
-This script reads `GET /rate_limit` (which does not count against the limit)
-with the token in $GITHUB_TOKEN, prints the `core` bucket, and — given the
+This script makes one cheap counted request with the token in $GITHUB_TOKEN and
+reads the X-RateLimit-* headers of its response (see fetch() for why not
+`GET /rate_limit`), prints the `core` bucket, and — given the
 reading taken before tofu ran — the number of requests consumed in between,
 which is a direct measurement of what a plan/apply costs (an upper bound when
 other jobs share the bucket at the same time; exact when they do not).
@@ -38,9 +39,9 @@ import urllib.error
 import urllib.request
 
 
-def fetch(api_url: str, token: str) -> dict:
+def _get(url: str, token: str):
     req = urllib.request.Request(
-        f"{api_url.rstrip('/')}/rate_limit",
+        url,
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
@@ -48,8 +49,36 @@ def fetch(api_url: str, token: str) -> dict:
             "User-Agent": "terraform-ci-github-app-rate-budget",
         },
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.load(resp)
+    return urllib.request.urlopen(req, timeout=20)
+
+
+def fetch(api_url: str, token: str) -> dict:
+    """The core bucket as a REAL request sees it.
+
+    2026-10-03..06: `GET /rate_limit` with the App installation token read
+    used=0, reset=now+1h both before and after a 38-minute, ~2,600-request
+    governance plan made with that same token, i.e. it did not reflect the
+    bucket the provider drew from. So probe with one cheap counted request
+    (`GET /installation/repositories?per_page=1`, 1 request) and read the
+    X-RateLimit-* headers GitHub returns for it, which describe the bucket
+    that request was charged to. Fall back to /rate_limit for tokens that are
+    not installation tokens.
+    """
+    base = api_url.rstrip("/")
+    try:
+        with _get(f"{base}/installation/repositories?per_page=1", token) as resp:
+            h = resp.headers
+            core = {
+                k: int(h[f"X-RateLimit-{k.capitalize()}"])
+                for k in ("limit", "used", "remaining", "reset")
+            }
+            return {"resources": {"core": core}, "source": f"headers ({h.get('X-RateLimit-Resource', '?')})"}
+    except (urllib.error.HTTPError, KeyError, TypeError, ValueError):
+        pass
+    with _get(f"{base}/rate_limit", token) as resp:
+        doc = json.load(resp)
+    doc["source"] = "/rate_limit"
+    return doc
 
 
 def core_bucket(doc: dict) -> dict:
@@ -102,6 +131,7 @@ def main() -> int:
     lines = [
         f"GitHub App REST budget ({args.label or 'now'}): "
         f"limit={core['limit']} used={core['used']} remaining={core['remaining']} reset={reset_utc}"
+        f" [from {doc.get('source', 'file')}]"
     ]
 
     if args.since:

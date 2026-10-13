@@ -169,7 +169,11 @@ whatever is left of the first token.
 
 An App installation has ONE hourly REST bucket (12,500 requests for an org
 installation on a paid plan), shared by every job that mints from it. The plan
-and apply jobs read `GET /rate_limit` (free) with the App token before and after
-tofu (`github-app-rate-budget`) and print the requests consumed in between to
-the log and step summary: a direct measurement of what a root's refresh costs
-(an upper bound when other jobs drew on the bucket at the same time).
+and apply jobs make one cheap counted request with the App token before and
+after tofu (`github-app-rate-budget`), read the `X-RateLimit-*` headers GitHub
+returns for it, and print the requests consumed in between (+1 for the probe)
+to the log and step summary. That is a direct measurement of what a root's
+refresh costs, and an upper bound when other jobs drew on the bucket at the
+same time. `GET /rate_limit` is only the fallback: with an installation token it
+read used=0 / reset=now+1h before AND after a ~2,600-request governance plan
+(2026-10-03..06), so it did not show the bucket the provider was charged to.
