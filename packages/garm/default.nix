@@ -16,7 +16,7 @@
 # vendors. The daemon (`garm`) and admin CLI (`garm-cli`) are both produced.
 buildGo126Module rec {
   pname = "garm";
-  version = "0.2.1-unstable-2026-07-08";
+  version = "0.2.1";
 
   # v0.2.1 can wedge a scale-set listener forever when a delayed job message
   # races an already-terminal runner transition. Pin the upstream fix merged
