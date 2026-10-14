@@ -78,6 +78,15 @@ top@{ ... }:
               publicKey = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
             };
             env.RUNNER_ALLOW_RUNASROOT = "0";
+            # AH5 warm start: every launch branches the job workspace from
+            # this starting point (rendered as [starting_point], parsed and
+            # validated by the real binary below).
+            startingPoint = {
+              repo = "https://github.com/example-org/ci-seed";
+              ref = "refs/heads/main";
+              kind = "clean-build";
+              maxAgeSeconds = 604800;
+            };
             # The sandbox payload execs the same Nix runner the host's
             # services.github-runners use.
             runner = {
@@ -181,7 +190,13 @@ top@{ ... }:
                 TestProviderKeepsNoState \
                 TestNixRunnerVersionGuard \
                 TestSandboxPayloadRequiresNixRunner \
-                TestExitedJobDistinguishesCrashFromCleanExit; do
+                TestExitedJobDistinguishesCrashFromCleanExit \
+                TestCreateNamesConfiguredStartingPoint \
+                TestStartingPointUnavailableRelaunchesCold \
+                TestOtherErrorsAreNotRetriedCold \
+                TestPoolExtraSpecsOverrideOrDisableStartingPoint \
+                TestStartingPointConfigValidation \
+                TestPayloadUsesWarmCacheOnlyWhenPresent; do
                 grep -q -- "--- PASS: $t " unit.log || fail "$t did not run and pass"
               done
 
@@ -316,6 +331,12 @@ top@{ ... }:
                 "listener = \"$githubRunner/bin/Runner.Listener\"" \
                 "version = \"$githubRunnerVersion\"" \
                 'max_minor_lag = 2' \
+                'warm_cache_dir = ".warm-cache"' \
+                '[starting_point]' \
+                'repo = "https://github.com/example-org/ci-seed"' \
+                'ref = "refs/heads/main"' \
+                'kind = "clean-build"' \
+                'max_age_seconds = 604800' \
                 '[runner.env]' \
                 'ACTIONS_RUNNER_HOOK_JOB_STARTED = "/etc/runner-hook.sh"'; do
                 grep -qxF "$line" "$cfg" || fail "provider config lacks: $line"

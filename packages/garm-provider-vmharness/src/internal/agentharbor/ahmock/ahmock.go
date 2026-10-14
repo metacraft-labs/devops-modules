@@ -108,8 +108,10 @@ type job struct {
 	Host               map[string]string `json:"host"`
 	Addresses          []string          `json:"addresses"`
 	Links              map[string]string `json:"links"`
+	StartingPoint      map[string]any    `json:"startingPoint,omitempty"`
 
 	workdir string
+	seed    string
 	cmd     *exec.Cmd
 	done    chan struct{}
 	gone    bool // tombstone expired: answers 404
@@ -139,6 +141,13 @@ type Server struct {
 	LegacyExitStatus bool
 	// TamperManifest flips a byte of the signed payload after signing.
 	TamperManifest bool
+	// StartingPoints are the starting points this server holds, keyed by
+	// snapshot id and by "repo|ref|kind"; the value is a directory whose
+	// contents seed the job workspace. A launch naming one this map lacks
+	// answers 422 starting-point-unavailable, before any ledger entry. With
+	// Exec the seed is COPIED into the per-job directory, standing in for
+	// the per-job CoW branch: the job's writes never reach the seed.
+	StartingPoints map[string]string
 
 	mu       sync.Mutex
 	jobs     []*job
@@ -446,6 +455,22 @@ type createReq struct {
 	Sandbox            map[string]any    `json:"sandbox"`
 	Image              *string           `json:"image"`
 	Flavor             *string           `json:"flavor"`
+	StartingPoint      *startingPointReq `json:"startingPoint"`
+}
+
+type startingPointReq struct {
+	SnapshotID    string  `json:"snapshotId"`
+	Repo          string  `json:"repo"`
+	Ref           string  `json:"ref"`
+	Kind          string  `json:"kind"`
+	MaxAgeSeconds *uint64 `json:"maxAgeSeconds"`
+}
+
+func (sp *startingPointReq) key() string {
+	if sp.SnapshotID != "" {
+		return sp.SnapshotID
+	}
+	return sp.Repo + "|" + sp.Ref + "|" + sp.Kind
 }
 
 func (s *Server) create(w http.ResponseWriter, r *http.Request, body []byte) {
@@ -499,6 +524,19 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request, body []byte) {
 		problem(w, http.StatusUnprocessableEntity, "invalid-sandbox-option", "image/flavor are not valid for local-sandbox", nil)
 		return
 	}
+	seed := ""
+	if req.StartingPoint != nil {
+		if req.WorkingDirectory != nil {
+			problem(w, http.StatusUnprocessableEntity, "invalid-sandbox-option", "startingPoint and workingDirectory are mutually exclusive", nil)
+			return
+		}
+		dir, ok := s.StartingPoints[req.StartingPoint.key()]
+		if !ok {
+			problem(w, http.StatusUnprocessableEntity, "starting-point-unavailable", "no starting point for "+req.StartingPoint.key(), nil)
+			return
+		}
+		seed = dir
+	}
 	ttl := s.DefaultTTLSeconds
 	if req.TTLSeconds != nil {
 		ttl = *req.TTLSeconds
@@ -549,6 +587,13 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request, body []byte) {
 	}
 	if j.Labels == nil {
 		j.Labels = map[string]string{}
+	}
+	if req.StartingPoint != nil {
+		j.seed = seed
+		j.StartingPoint = map[string]any{"snapshotId": req.StartingPoint.SnapshotID, "repo": req.StartingPoint.Repo, "ref": req.StartingPoint.Ref, "kind": req.StartingPoint.Kind}
+		if req.StartingPoint.SnapshotID == "" {
+			j.StartingPoint["snapshotId"] = "snap-" + strings.NewReplacer("|", "-", "/", "-", ":", "-").Replace(req.StartingPoint.key())
+		}
 	}
 	j.Links = map[string]string{"self": "/api/v1/sandbox-jobs/" + j.ID, "logs": "/api/v1/sandbox-jobs/" + j.ID + "/logs"}
 	if !s.OmitCleanupToken {
@@ -601,6 +646,11 @@ func (s *Server) spawnLocked(j *job, req createReq) error {
 		return err
 	}
 	j.workdir = dir
+	if j.seed != "" {
+		if err := os.CopyFS(dir, os.DirFS(j.seed)); err != nil {
+			return fmt.Errorf("branching starting point: %w", err)
+		}
+	}
 	cmd := exec.Command(req.Command[0], req.Command[1:]...)
 	cmd.Dir = dir
 	env := []string{}
