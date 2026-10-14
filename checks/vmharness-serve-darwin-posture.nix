@@ -65,8 +65,8 @@ top@{ ... }:
           ];
         }).config;
 
-      serveJob = darwinCfg.launchd.daemons.vm-harness-serve.serviceConfig;
-      healthJob = darwinCfg.launchd.daemons.vm-harness-serve-healthcheck.serviceConfig;
+      serveJob = darwinCfg.launchd.daemons.gosti-serve.serviceConfig;
+      healthJob = darwinCfg.launchd.daemons.gosti-serve-healthcheck.serviceConfig;
       fdLimit = serveJob.SoftResourceLimits.NumberOfFiles or null;
 
       # The macOS default. A daemon left on it is the bug, so the check states
@@ -298,20 +298,20 @@ top@{ ... }:
             reset_state
             printf '2' > state/healthcheck/consecutive-failures
             probe kick
-            expect kick 0 "kickstart -k system/org.metacraft-labs.vm-harness-serve;" "threshold on a running job -> kickstart -k"
+            expect kick 0 "kickstart -k system/org.metacraft-labs.gosti-serve;" "threshold on a running job -> kickstart -k"
 
             # --- threshold, kickstart hangs: bounded, then re-bootstrap ------
             reset_state
             printf '2' > state/healthcheck/consecutive-failures
             SHIM_KICKSTART_HANGS=1 probe hang
-            expect hang 0 "kickstart -k system/org.metacraft-labs.vm-harness-serve;bootout system/org.metacraft-labs.vm-harness-serve;bootstrap system /Library/LaunchDaemons/org.metacraft-labs.vm-harness-serve.plist;" \
+            expect hang 0 "kickstart -k system/org.metacraft-labs.gosti-serve;bootout system/org.metacraft-labs.gosti-serve;bootstrap system /Library/LaunchDaemons/org.metacraft-labs.gosti-serve.plist;" \
               "a kickstart that never returns is timed out and replaced by bootout + bootstrap"
 
             # --- THE m3 BOOT FAILURE: loaded, never spawned (EX_CONFIG) ------
             reset_state
             printf '2' > state/healthcheck/consecutive-failures
             SHIM_JOB=stuck probe stuck
-            expect stuck 0 "bootout system/org.metacraft-labs.vm-harness-serve;bootstrap system /Library/LaunchDaemons/org.metacraft-labs.vm-harness-serve.plist;" \
+            expect stuck 0 "bootout system/org.metacraft-labs.gosti-serve;bootstrap system /Library/LaunchDaemons/org.metacraft-labs.gosti-serve.plist;" \
               "a loaded-but-not-running job is re-bootstrapped, never kickstarted"
 
             # --- rate limit ---------------------------------------------------
@@ -336,11 +336,11 @@ top@{ ... }:
             reset_state
             printf '2' > state/healthcheck/consecutive-failures
             SHIM_JOB=stuck SHIM_BOOTSTRAP_FAIL=1 VMH_HC_BOOTSTRAP_ATTEMPTS=3 probe bsfail1
-            plist=/Library/LaunchDaemons/org.metacraft-labs.vm-harness-serve.plist
+            plist=/Library/LaunchDaemons/org.metacraft-labs.gosti-serve.plist
             bs="bootstrap system $plist;"
             if [ "$(cat work/rc.bsfail1)" = 0 ]; then
               bad "a pass whose bootstrap never succeeded exited 0: $(cat work/out.bsfail1)"
-            elif [ "$(actions)" != "bootout system/org.metacraft-labs.vm-harness-serve;$bs$bs$bs" ]; then
+            elif [ "$(actions)" != "bootout system/org.metacraft-labs.gosti-serve;$bs$bs$bs" ]; then
               bad "failed bootstrap: actions '$(actions)', expected bootout + 3 bootstrap attempts: $(cat work/out.bsfail1)"
             elif [ ! -e "$marker" ]; then
               bad "failed bootstrap left no re-bootstrap marker: $(cat work/out.bsfail1)"

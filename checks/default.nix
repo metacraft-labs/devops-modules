@@ -60,6 +60,7 @@
     ./vmharness-serve-inventory-textfile.nix
     ./vmharness-serve-darwin-posture.nix
     ./gosti-serve-rename.nix
+    ./gosti-serve-unit-rename-switch.nix
     ./vmharness-serve-win-libvirt.nix
     ./runner-label-taxonomy.nix
     ./s3-artifact-store.nix

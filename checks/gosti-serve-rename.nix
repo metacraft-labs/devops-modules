@@ -11,11 +11,13 @@ top@{ ... }:
   #   * step 2 — `services.gosti-serve` is the canonical option path and the
   #     legacy `services.vm-harness-serve` still works (with a deprecation
   #     warning). The SAME settings under either path render byte-identical
-  #     units: `vm-harness-serve.service`, its inventory/healthcheck units and
-  #     timers on NixOS, and the launchd daemons on nix-darwin. Unit name,
-  #     user, group, state directory and credential names keep their
+  #     units: `gosti-serve.service` (aliased `vm-harness-serve.service`), its
+  #     inventory/healthcheck units and timers on NixOS, and the launchd
+  #     daemons on nix-darwin (label org.metacraft-labs.gosti-serve). User,
+  #     group, state directory and credential names keep their
   #     `vm-harness-serve` values (they carry the enrollment keyId and the
-  #     agenix secret ownership).
+  #     agenix secret ownership). The switch itself is
+  #     t_gosti_serve_unit_rename_switch.
   #   * step 4 — the units export `GOSTI_EPHEMERAL_LABEL_DIR` ALONGSIDE
   #     `VMH_EPHEMERAL_LABEL_DIR` (same value), so a host on a pre-step-3 gosti
   #     keeps working.
@@ -73,14 +75,14 @@ top@{ ... }:
         "gosti-serve"
       ];
       unitNames = [
-        "vm-harness-serve.service"
-        "vm-harness-serve-inventory.service"
-        "vm-harness-serve-inventory.timer"
-        "vm-harness-serve-healthcheck.service"
-        "vm-harness-serve-healthcheck.timer"
+        "gosti-serve.service"
+        "gosti-serve-inventory.service"
+        "gosti-serve-inventory.timer"
+        "gosti-serve-healthcheck.service"
+        "gosti-serve-healthcheck.timer"
       ];
       unitText = cfg: name: builtins.unsafeDiscardStringContext cfg.systemd.units.${name}.unit.outPath;
-      sc = newCfg.systemd.services.vm-harness-serve.serviceConfig;
+      sc = newCfg.systemd.services.gosti-serve.serviceConfig;
       env = lib.toList (sc.Environment or [ ]);
       envOf =
         prefix: lib.findFirst (e: lib.hasPrefix "${prefix}EPHEMERAL_LABEL_DIR=" e) null (map toString env);
@@ -111,7 +113,7 @@ top@{ ... }:
         cfg:
         builtins.toJSON (
           lib.mapAttrs (_: d: d.serviceConfig) (
-            lib.filterAttrs (n: _: lib.hasPrefix "vm-harness-serve" n) cfg.launchd.daemons
+            lib.filterAttrs (n: _: lib.hasPrefix "gosti-serve" n) cfg.launchd.daemons
           )
         );
 
@@ -132,9 +134,15 @@ top@{ ... }:
           ok =
             sc.User == "vm-harness-serve"
             && sc.Group == "vm-harness-serve"
-            && sc.StateDirectory == "vm-harness-serve"
+            && sc.StateDirectory == "vm-harness-serve:gosti-serve"
             && newCfg.users.users ? vm-harness-serve;
-          msg = "user/group/StateDirectory must keep their vm-harness-serve names (live identity)";
+          msg = "user/group/state dir must keep their vm-harness-serve names (live identity); /var/lib/gosti-serve is only a symlink";
+        }
+        {
+          ok =
+            newCfg.systemd.services.gosti-serve.aliases == [ "vm-harness-serve.service" ]
+            && !(newCfg.systemd.services ? vm-harness-serve);
+          msg = "gosti-serve.service must carry exactly the vm-harness-serve.service alias, and no separate vm-harness-serve unit may exist";
         }
         {
           ok = lib.hasInfix "/bin/gosti " (toString sc.ExecStart);
@@ -156,12 +164,16 @@ top@{ ... }:
             "services"
             "gosti-serve"
           ];
-          envVars = newD.launchd.daemons.vm-harness-serve.serviceConfig.EnvironmentVariables;
+          envVars = newD.launchd.daemons.gosti-serve.serviceConfig.EnvironmentVariables;
         in
         [
           {
             ok = darwinJobs oldD == darwinJobs newD;
             msg = "darwin: the legacy and canonical option paths render different launchd jobs";
+          }
+          {
+            ok = newD.launchd.daemons.gosti-serve.serviceConfig.Label == "org.metacraft-labs.gosti-serve";
+            msg = "darwin: the serve job label must be org.metacraft-labs.gosti-serve";
           }
           {
             ok = envVars.GOSTI_EPHEMERAL_LABEL_DIR or null == envVars.VMH_EPHEMERAL_LABEL_DIR;

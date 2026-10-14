@@ -3,14 +3,19 @@
 > **Renamed (GOSTI1b).** The option path is `services.gosti-serve`; the old
 > `services.vm-harness-serve` path still works and prints a deprecation
 > warning. The default package is `packages.gosti` (`bin/gosti`, with
-> `bin/vm-harness` as a symlink; `packages.vm-harness` is an alias). The unit
-> (`vm-harness-serve.service` / launchd `org.metacraft-labs.vm-harness-serve`),
-> user, group, credential names and state directory (`/var/lib/vm-harness-serve`)
-> are deliberately UNCHANGED: they carry the enrollment keyId and the agenix
-> secret ownership. Renaming the unit (with a `vm-harness-serve.service`
-> alias) is a later step, after every consumer that names the unit has moved.
+> `bin/vm-harness` as a symlink; `packages.vm-harness` is an alias). The units
+> are `gosti-serve.service` (with `vm-harness-serve.service` as an alias, so
+> `systemctl … vm-harness-serve` keeps working), `gosti-serve-healthcheck.*`
+> and `gosti-serve-inventory.*`; on darwin the launchd jobs are
+> `launchd.daemons.gosti-serve*` with label `org.metacraft-labs.gosti-serve`.
+> Setting `systemd.services.vm-harness-serve*` or
+> `launchd.daemons.vm-harness-serve*` is an evaluation error. The user, group,
+> credential names, log paths and state directory (`/var/lib/vm-harness-serve`;
+> `/var/lib/gosti-serve` is a symlink to it) are deliberately UNCHANGED: they
+> carry the enrollment keyId and the agenix secret ownership. Journal queries
+> must name the real unit: `journalctl -u gosti-serve`.
 > Units export `GOSTI_EPHEMERAL_LABEL_DIR` alongside `VMH_EPHEMERAL_LABEL_DIR`.
-> Gate: `t_gosti_serve_rename`.
+> Gates: `t_gosti_serve_rename`, `t_gosti_serve_unit_rename_switch`.
 
 Campaign: _CI Runner Fleet — vm-harness Remoting, Central GARM, Capability
 Pools_ · milestone **RA2** (Linux/incus serve deployment).
@@ -29,7 +34,7 @@ consumes these options.
 
 ## What it provides
 
-- A `vm-harness-serve.service` systemd unit running `vm-harness serve` as a
+- A `gosti-serve.service` systemd unit running `gosti serve` as a
   dedicated system user (`vm-harness-serve`), in the `incus-admin` group so it
   can reach the incus socket, under the same hardening profile as the
   `services.garm` incus-strict posture (`ProtectSystem=strict`,
