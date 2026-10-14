@@ -334,6 +334,11 @@ def main() -> int:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
+        # mkstemp creates the file 0600. This root-run writer renames it into
+        # the shared textfile dir, where node-exporter (its own user) must read
+        # it: a 0600 snapshot is "permission denied" on every scrape and its
+        # metrics never reach Prometheus. A textfile is world-readable by design.
+        os.chmod(tmp, 0o644)
         os.replace(tmp, output)
     except Exception:
         if os.path.exists(tmp):
