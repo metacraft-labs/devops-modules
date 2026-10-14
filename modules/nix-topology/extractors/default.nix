@@ -36,7 +36,12 @@
           };
         };
 
-        promtail = mkIf config.services.promtail.enable {
+        # NixOS 26.05 removed promtail: reading `config.services.promtail`
+        # there throws (a removed option, not an unset one), failing the
+        # topology build for every machine on 26.05. `&&` short-circuits, so
+        # the option is only read on releases that still have it. (Alloy, its
+        # replacement, is covered by nix-topology's own extractor.)
+        promtail = mkIf (lib.versionOlder lib.trivial.release "26.05" && config.services.promtail.enable) {
           name = "Promtail";
           icon = "services.loki";
         };
