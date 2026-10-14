@@ -18,9 +18,9 @@ top@{ ... }:
   #     `vm-harness-serve` values (they carry the enrollment keyId and the
   #     agenix secret ownership). The switch itself is
   #     t_gosti_serve_unit_rename_switch.
-  #   * step 4 — the units export `GOSTI_EPHEMERAL_LABEL_DIR` ALONGSIDE
-  #     `VMH_EPHEMERAL_LABEL_DIR` (same value), so a host on a pre-step-3 gosti
-  #     keeps working.
+  #   * step 4 + 6 — the units export `GOSTI_EPHEMERAL_LABEL_DIR`; since step 6
+  #     the legacy `VMH_EPHEMERAL_LABEL_DIR` is no longer exported (every
+  #     deployed gosti and the default package read GOSTI_* first).
   #
   # No mocks: real module evaluation and a real package build.
   perSystem =
@@ -149,8 +149,8 @@ top@{ ... }:
           msg = "ExecStart does not run bin/gosti (got ${toString sc.ExecStart})";
         }
         {
-          ok = envOf "VMH_" != null && valueOf (envOf "VMH_") == valueOf (envOf "GOSTI_");
-          msg = "GOSTI_EPHEMERAL_LABEL_DIR must be exported alongside VMH_EPHEMERAL_LABEL_DIR with the same value";
+          ok = envOf "GOSTI_" != null && envOf "VMH_" == null;
+          msg = "the unit must export GOSTI_EPHEMERAL_LABEL_DIR and no longer VMH_EPHEMERAL_LABEL_DIR (GOSTI1b step 6)";
         }
       ];
 
@@ -176,8 +176,8 @@ top@{ ... }:
             msg = "darwin: the serve job label must be org.metacraft-labs.gosti-serve";
           }
           {
-            ok = envVars.GOSTI_EPHEMERAL_LABEL_DIR or null == envVars.VMH_EPHEMERAL_LABEL_DIR;
-            msg = "darwin: GOSTI_EPHEMERAL_LABEL_DIR must equal VMH_EPHEMERAL_LABEL_DIR";
+            ok = envVars ? GOSTI_EPHEMERAL_LABEL_DIR && !(envVars ? VMH_EPHEMERAL_LABEL_DIR);
+            msg = "darwin: export GOSTI_EPHEMERAL_LABEL_DIR only (GOSTI1b step 6)";
           }
         ]
       );

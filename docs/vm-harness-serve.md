@@ -14,7 +14,8 @@
 > `/var/lib/gosti-serve` is a symlink to it) are deliberately UNCHANGED: they
 > carry the enrollment keyId and the agenix secret ownership. Journal queries
 > must name the real unit: `journalctl -u gosti-serve`.
-> Units export `GOSTI_EPHEMERAL_LABEL_DIR` alongside `VMH_EPHEMERAL_LABEL_DIR`.
+> Units export `GOSTI_EPHEMERAL_LABEL_DIR` (the legacy `VMH_` name was dropped in
+> GOSTI1b step 6; gosti still reads it as a fallback).
 > Gates: `t_gosti_serve_rename`, `t_gosti_serve_unit_rename_switch`.
 
 Campaign: _CI Runner Fleet — vm-harness Remoting, Central GARM, Capability
@@ -79,7 +80,7 @@ consumes these options.
 - **Ownership records for kept GARM instances.** The remote GARM provider
   records which pool owns each instance it creates (`vm-harness
 ephemeral-label`) and lists a pool's instances with `ephemeral-list --label
-garm-pool=<id>`. The records live in `VMH_EPHEMERAL_LABEL_DIR`, which the
+garm-pool=<id>`. The records live in `GOSTI_EPHEMERAL_LABEL_DIR`, which the
   unit sets to `/var/lib/vm-harness-serve/ephemeral-labels` (inside its
   StateDirectory, the only writable state under `ProtectSystem=strict`; the
   darwin module uses `<stateDir>/ephemeral-labels`). A pool must see only its

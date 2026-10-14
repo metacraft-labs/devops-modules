@@ -879,8 +879,8 @@
               HOME = cfg.stateDir;
               # Ownership records for kept ephemeral instances (see the Linux
               # module); launchd provides no $STATE_DIRECTORY, so name it.
-              VMH_EPHEMERAL_LABEL_DIR = "${cfg.stateDir}/ephemeral-labels";
-              # GOSTI1b step 4: canonical name alongside the legacy one.
+              # GOSTI1b step 6: the canonical name only (gosti reads GOSTI_*
+              # first since step 3).
               GOSTI_EPHEMERAL_LABEL_DIR = "${cfg.stateDir}/ephemeral-labels";
             }
             // cfg.environment;

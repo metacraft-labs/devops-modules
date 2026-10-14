@@ -841,17 +841,15 @@
             StateDirectoryMode = "0700";
             WorkingDirectory = "/var/lib/${runtimeDir}";
             # The incus CLI writes its config under $HOME; keep it in the state dir.
-            # VMH_EPHEMERAL_LABEL_DIR: where `ephemeral-label` records which GARM
+            # GOSTI_EPHEMERAL_LABEL_DIR: where `ephemeral-label` records which GARM
             # pool owns each kept instance, so the provider's ListInstances can
             # return exactly one pool's instances. It must be writable under
             # ProtectSystem=strict, i.e. inside the StateDirectory; named
             # explicitly rather than left to vm-harness's $STATE_DIRECTORY default.
             Environment = [
               "HOME=/var/lib/${runtimeDir}"
-              "VMH_EPHEMERAL_LABEL_DIR=${labelDir}"
-              # GOSTI1b step 4: the canonical name, exported ALONGSIDE the
-              # legacy one for one deploy cycle, so a host whose gosti predates
-              # the GOSTI_* reader keeps working.
+              # GOSTI1b step 6: only the canonical name; every gosti since step 3
+              # (11008d9) reads GOSTI_* first, and the default package is newer.
               "GOSTI_EPHEMERAL_LABEL_DIR=${labelDir}"
             ];
 
@@ -952,10 +950,8 @@
             SupplementaryGroups = cfg.extraGroups;
             Environment = [
               "HOME=/var/lib/${runtimeDir}"
-              "VMH_EPHEMERAL_LABEL_DIR=${labelDir}"
-              # GOSTI1b step 4: the canonical name, exported ALONGSIDE the
-              # legacy one for one deploy cycle, so a host whose gosti predates
-              # the GOSTI_* reader keeps working.
+              # GOSTI1b step 6: only the canonical name; every gosti since step 3
+              # (11008d9) reads GOSTI_* first, and the default package is newer.
               "GOSTI_EPHEMERAL_LABEL_DIR=${labelDir}"
             ];
             ProtectSystem = "strict";
