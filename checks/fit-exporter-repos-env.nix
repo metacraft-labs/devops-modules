@@ -162,6 +162,12 @@ top@{ ... }:
                 # And the writer created it as root (the working sibling's posture).
                 prom_owner = host.succeed(f"stat -c '%U' {prom}").strip()
                 assert prom_owner == "root", f".prom owner {prom_owner!r} (expected root)"
+
+            with subtest("node-exporter, a non-root user, can read the .prom"):
+                # The textfile collector runs as its own user. A root-owned 0600
+                # snapshot (mkstemp's default mode) is "permission denied" on
+                # every scrape (hms, 2026-10-14); read it as an unprivileged user.
+                host.succeed(f"runuser -u nobody -- cat {prom} >/dev/null")
           '';
         };
       };
