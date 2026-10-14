@@ -939,8 +939,14 @@ Package[] nixEvalJobs(T)(string flakeAttrPath, auto ref T args)
 
     bool hasError = false;
 
-    int maxMemoryMB = getAvailableMemoryMB(args);
-    int maxWorkers = getNixEvalWorkerCount(args);
+    // nix-eval-jobs' `--max-memory-size` is a PER-WORKER limit, so passing
+    // the whole machine's available memory lets N workers use N times what the
+    // job has. In a memory-capped runner container that is a cgroup OOM kill
+    // of nix-eval-jobs (and the runner with it), not a slow eval.
+    const budget = evalWorkerBudget(getAvailableMemoryMB(args),
+        getNixEvalWorkerCount(args), args.maxWorkers != 0);
+    int maxMemoryMB = budget.perWorkerMB;
+    int maxWorkers = budget.workers;
 
     const nixArgs = [
         "nix-eval-jobs", "--quiet", "--option", "warn-dirty", "false",
@@ -1053,6 +1059,49 @@ Package[] nixEvalForAllSystems(T)(auto ref T args)
         .array
         .sort!((a, b) => a.name < b.name)
         .array;
+}
+
+/// Memory one nix-eval-jobs worker is planned for: a full NixOS system
+/// evaluation peaks at roughly 2-3 GiB.
+enum evalWorkerMemoryMB = 3072;
+
+struct EvalWorkerBudget
+{
+    int workers;
+    int perWorkerMB;
+}
+
+/// Split the memory available to this job across nix-eval-jobs workers.
+/// Plans for 3/4 of `availableMB` (the per-worker limit only restarts a worker
+/// after the attribute it is evaluating, so peaks overshoot it). Unless the
+/// worker count was pinned, reduces the count so each worker gets at least
+/// `evalWorkerMemoryMB`.
+EvalWorkerBudget evalWorkerBudget(int availableMB, int workers, bool workersPinned)
+{
+    import std.algorithm.comparison : clamp, max;
+
+    const planMB = max(availableMB * 3 / 4, evalWorkerMemoryMB);
+    int n = workers < 1 ? 1 : workers;
+    if (!workersPinned)
+        n = clamp(planMB / evalWorkerMemoryMB, 1, n);
+    return EvalWorkerBudget(n, max(planMB / n, 1024));
+}
+
+@("evalWorkerBudget")
+unittest
+{
+    // 12 GiB container, 6 CPUs: 3 workers of 3 GiB each.
+    assert(evalWorkerBudget(12_288, 6, false) == EvalWorkerBudget(3, 3072));
+    // 10 GiB container: 2 workers.
+    assert(evalWorkerBudget(10_240, 6, false) == EvalWorkerBudget(2, 3840));
+    // 24 GiB container keeps all 6 workers.
+    assert(evalWorkerBudget(24_576, 6, false) == EvalWorkerBudget(6, 3072));
+    // A large host keeps the CPU-derived count and splits memory across it.
+    assert(evalWorkerBudget(300_000, 8, false) == EvalWorkerBudget(8, 28_125));
+    // A pinned worker count is kept; memory is still split per worker.
+    assert(evalWorkerBudget(12_288, 6, true) == EvalWorkerBudget(6, 1536));
+    // Tiny or unknown memory still yields one worker with a floor.
+    assert(evalWorkerBudget(0, 8, false) == EvalWorkerBudget(1, 3072));
 }
 
 int getNixEvalWorkerCount(T)(auto ref T args)
