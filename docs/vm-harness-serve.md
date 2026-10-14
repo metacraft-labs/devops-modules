@@ -77,6 +77,30 @@ consumes these options.
   registered hypervisor backend synchronously — measured 2026-09-18 at 16.7 s
   authenticated versus 5 ms unauthenticated.
 
+- **Surviving a dependency blip.** The daemon needs incus only per request (it
+  shells out to the CLI), so it depends on `incus.service` with `Wants=`, not
+  `Requires=`. A failed incus start therefore can't fail the serve start job
+  ("Dependency failed"), and an incus restart doesn't stop the daemon. The unit
+  restarts on failure with no start limit (`StartLimitIntervalSec=0`,
+  `RestartSec=5`). The GARM incus convergence oneshots
+  (`garm-incus-storage-network`, `garm-incus-image-import`) do the same: they
+  `Want` incus and retry every 10 s until it is back.
+
+  The watchdog is the second layer. When the listener does not answer and the
+  unit is inactive, the watchdog starts the unit if its latest start failed on
+  a dependency. It does NOT rely on `Result=dependency`, which systemd doesn't
+  record for a failed start job: the Result field keeps its previous value. It
+  checks the unit's journal for a `Dependency failed for` line since the unit
+  last went inactive. A deliberate `systemctl stop` is still left alone. The
+  watchdog's state-file writes are best-effort, so a write failure is logged
+  and can't abort the run.
+
+  Incidents behind this: gpu-server-002 (serve down 17 h after incus
+  core-dumped and restarted) and gpu-server-001 on 2026-10-14 (a deploy stopped
+  serve at 21:04, the restart at 21:14 hit a 3 s incus blip, and serve stayed
+  down until restarted by hand at 01:41). Gate:
+  `t_gosti_serve_survives_incus_blip`.
+
 - **Ownership records for kept GARM instances.** The remote GARM provider
   records which pool owns each instance it creates (`vm-harness
 ephemeral-label`) and lists a pool's instances with `ephemeral-list --label
