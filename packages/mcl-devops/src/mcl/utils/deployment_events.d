@@ -9,9 +9,9 @@ import std.file : append, exists, mkdirRecurse, readText;
 import std.json : JSONOptions, JSONType, JSONValue, parseJSON;
 import std.path : dirName;
 import std.process : environment;
-import std.range : empty;
+import std.range : empty, replicate;
 import std.regex : matchFirst;
-import std.string : replace, strip;
+import std.string : replace, strip, stripLeft, stripRight;
 import std.typecons : Nullable;
 
 import mcl.utils.process : ProcessResult, ProcessRunner;
@@ -76,7 +76,55 @@ string stderrSummary(string stderr, size_t limit = 500)
         .join(" ")
         .strip;
 
-    return summary.length <= limit ? summary : summary[0 .. limit] ~ "...";
+    if (summary.length <= limit)
+        return summary;
+
+    // Keep the TAIL, not just the head. A failing command's error is almost
+    // always its last output: nix-darwin's `activate` prints a long progress
+    // log ("setting up groups... setting up users...") and only then the line
+    // that killed it. Head-only truncation cut m3's 2026-10-14 switch and
+    // rollback events off at "ln: failed to create symbolic link '/etc/m...",
+    // so the jsonl never named the conflicting /etc path. A short head stays
+    // for context; the rest of the budget goes to the end.
+    enum marker = " ... ";
+    const headLen = limit / 4;
+    const tailLen = limit - headLen;
+    // Byte budget, but never split a UTF-8 sequence.
+    size_t head = headLen;
+    while (head > 0 && (summary[head] & 0xC0) == 0x80)
+        head--;
+    size_t tail = summary.length - tailLen;
+    while (tail < summary.length && (summary[tail] & 0xC0) == 0x80)
+        tail++;
+    return summary[0 .. head].stripRight ~ marker ~ summary[tail .. $].stripLeft;
+}
+
+@("test_stderr_summary_keeps_the_failing_tail")
+unittest
+{
+    // The shape of m3's 2026-10-14 nix-darwin activation stderr: a long
+    // progress log, then the one line that explains the failure.
+    string stderr;
+    foreach (i; 0 .. 40)
+        stderr ~= "updating group members _github-runner-" ~ i.to!string ~ "...\n";
+    stderr ~= "setting up /etc...\n"
+        ~ "ln: failed to create symbolic link "
+        ~ "'/etc/mcl-dev-certs/isonim.test/fullchain.pem': File exists\n";
+
+    auto summary = stderrSummary(stderr);
+    assert(summary.length <= 500 + " ... ".length, summary);
+    assert(summary.canFind("'/etc/mcl-dev-certs/isonim.test/fullchain.pem': File exists"),
+        summary);
+    assert(summary.canFind("updating group members _github-runner-0..."), summary);
+    assert(summary.canFind(" ... "), summary);
+
+    // Short output is unchanged.
+    assert(stderrSummary("host is busy\n") == "host is busy");
+
+    // A multi-byte character at either cut point is not split.
+    auto wide = stderrSummary("é".replicate(400));
+    import std.utf : validate;
+    validate(wide);
 }
 
 Nullable!ClosureSummary closureSummaryFromEnv(string systemPath)
