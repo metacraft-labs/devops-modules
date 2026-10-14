@@ -614,7 +614,11 @@
 
         label = mkOption {
           type = types.str;
-          default = "org.metacraft-labs.vm-harness-serve";
+          # GOSTI1b step 2 (unit half): the job is `gosti-serve`. launchd has
+          # no aliases, so the label simply changes; nix-darwin boots the old
+          # job out and the new one in (one daemon restart). The state dir,
+          # log paths and credentials keep their `vm-harness-serve` names.
+          default = "org.metacraft-labs.gosti-serve";
           description = "launchd job Label.";
         };
 
@@ -782,6 +786,18 @@
       config = mkIf cfg.enable {
         assertions = [
           {
+            # A module still setting `launchd.daemons.vm-harness-serve.*` would
+            # define a second, program-less job. Fail and name the fix.
+            assertion =
+              !(config.launchd.daemons ? vm-harness-serve)
+              && !(config.launchd.daemons ? vm-harness-serve-healthcheck);
+            message = ''
+              launchd.daemons.vm-harness-serve* is set, but the gosti serve jobs
+              are now `launchd.daemons.gosti-serve*` (label
+              org.metacraft-labs.gosti-serve). Set those instead.
+            '';
+          }
+          {
             assertion = pkgs.stdenv.hostPlatform.isDarwin;
             message = "services.gosti-serve (darwin) is only valid on a nix-darwin host.";
           }
@@ -813,7 +829,7 @@
             ${lib.escapeShellArg (builtins.dirOf hcfg.standardOutLog)}
         '';
 
-        launchd.daemons.vm-harness-serve = {
+        launchd.daemons.gosti-serve = {
           serviceConfig = {
             Label = cfg.label;
             ProgramArguments = waitForNixStore "vm-harness-serve" (
@@ -936,7 +952,7 @@
         # It runs in the system domain (root) because `launchctl kickstart -k
         # system/<label>` requires it, and it is deliberately tiny: one curl,
         # one counter file, one kickstart.
-        launchd.daemons.vm-harness-serve-healthcheck = lib.mkIf hcfg.enable {
+        launchd.daemons.gosti-serve-healthcheck = lib.mkIf hcfg.enable {
           serviceConfig = {
             Label = "${cfg.label}-healthcheck";
             ProgramArguments = waitForNixStore "vm-harness-serve-healthcheck" [

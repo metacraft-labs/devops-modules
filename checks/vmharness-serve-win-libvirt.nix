@@ -152,8 +152,8 @@ top@{ ... }:
             host.wait_for_unit("incus.service")
 
             with subtest("(1) daemon deployed, hardened, and carrying BOTH backends' access"):
-                host.wait_for_unit("vm-harness-serve.service")
-                unit = host.succeed("systemctl cat vm-harness-serve.service")
+                host.wait_for_unit("gosti-serve.service")
+                unit = host.succeed("systemctl cat gosti-serve.service")
                 # Still fully hardened (libvirt access did NOT relax the sandbox).
                 assert "ProtectSystem=strict" in unit, unit
                 assert "NoNewPrivileges=true" in unit, unit
@@ -161,7 +161,7 @@ top@{ ... }:
                 assert "LoadCredential=token:/run/vmh-secrets/token" in unit, unit
                 # incus access is a runtime SupplementaryGroups grant on the unit.
                 sup = host.succeed(
-                    "systemctl show -p SupplementaryGroups --value vm-harness-serve.service"
+                    "systemctl show -p SupplementaryGroups --value gosti-serve.service"
                 ).strip()
                 assert "incus-admin" in sup, f"missing supplementary group incus-admin: {sup!r}"
                 # libvirt access is STATIC group-database membership (polkit reads
@@ -171,11 +171,11 @@ top@{ ... }:
                     assert g in ids, f"serve user must be a static member of {g!r}: {ids!r}"
                 # The strict-sandbox holes the libvirt path needs are rendered.
                 rw = host.succeed(
-                    "systemctl show -p ReadWritePaths --value vm-harness-serve.service"
+                    "systemctl show -p ReadWritePaths --value gosti-serve.service"
                 ).strip()
                 assert "${imagePool}" in rw, rw
                 ro = host.succeed(
-                    "systemctl show -p ReadOnlyPaths --value vm-harness-serve.service"
+                    "systemctl show -p ReadOnlyPaths --value gosti-serve.service"
                 ).strip()
                 assert "${goldenDir}" in ro, ro
                 host.wait_for_file("/run/vm-harness-serve/port")

@@ -174,9 +174,11 @@ top@{ ... }:
             controller.wait_for_unit("multi-user.target")
 
             with subtest("(1) the serve daemon is deployed, hardened, and listening"):
-                host.wait_for_unit("vm-harness-serve.service")
+                host.wait_for_unit("gosti-serve.service")
                 # Bearer token arrives via LoadCredential — never the store.
-                unit = host.succeed("systemctl cat vm-harness-serve.service")
+                unit = host.succeed("systemctl cat gosti-serve.service")
+                # The legacy name is an alias of the same unit (GOSTI1b).
+                host.succeed("systemctl is-active vm-harness-serve.service")
                 assert "LoadCredential=token:/run/vmh-secrets/token" in unit, unit
                 assert "User=vm-harness-serve" in unit, unit
                 assert "NoNewPrivileges=true" in unit, unit
@@ -276,7 +278,7 @@ top@{ ... }:
 
                 # An ORPHAN: a stopped runner-named container nobody owns.
                 host.succeed("incus launch vmh-base garm-orphan1 && incus stop --force garm-orphan1")
-                host.succeed("systemctl start vm-harness-serve-inventory.service")
+                host.succeed("systemctl start gosti-serve-inventory.service")
                 prom = host.succeed("cat /var/lib/prometheus-node-exporter/textfile/vmh-ephemeral.prom")
                 assert 'vmh_ephemeral_list_success{backend="incus"} 1' in prom, prom
                 assert 'vmh_ephemeral_instances{backend="incus",state="running",attributed="true"} 1' in prom, prom
