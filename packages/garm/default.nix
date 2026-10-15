@@ -196,6 +196,18 @@ buildGo126Module rec {
     # TestPoolStressTestSuite/TestStuckDeletesDoNotConsumePoolCapacity (real
     # sqlite store), run by the package's checkPhase below.
     ./patches/fix-deleting-instances-hold-capacity.patch
+    # consumeQueuedJobs skips, without touching the store, a queued job that
+    # no matching pool has capacity for. Upstream locks the job, tries every
+    # pool (each "max workers reached"), and unlocks it: two write transactions
+    # per job per pass. During a CI backlog behind full pools on
+    # high-mem-server (2026-10-14) that was thousands a minute on SQLite's
+    # single connection (GARM sets MaxOpenConns=1). POST /webhooks requests
+    # waited 50 s to 3 min, every /api/v1 request waited behind them (the
+    # init middleware reads the DB), and the API watchdog restarted
+    # garm.service twice. Instance counts are read once per pass and kept
+    # current as runners are added. Tests in runner/pool (testing tag), run by
+    # t_garm_skip_queued_jobs_when_pools_full.
+    ./patches/skip-queued-jobs-when-pools-full.patch
   ];
 
   # go-sqlite3 is a cgo module; the daemon needs cgo to link SQLite.
