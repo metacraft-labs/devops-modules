@@ -23,31 +23,32 @@ index 5a3a3c8..d6ab51f 100644
  	atomic.StoreUint32(&p.next, 0)
  }
 diff --git a/runner/pool/pool.go b/runner/pool/pool.go
-index 4068c9f..a6fb7e0 100644
+index 4068c9f..ba1ed17 100644
 --- a/runner/pool/pool.go
 +++ b/runner/pool/pool.go
 @@ -2303,6 +2303,8 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  	}()
  	queued := r.getQueuedJobs()
  
-+	poolCapacity := poolCapacityCache{counts: map[string]int64{}}
++	fullThisPass := fullPools{}
 +
  	poolsCache := poolsForTags{
  		poolCacheType: r.entity.GetPoolBalancerType(),
  	}
-@@ -2395,6 +2397,19 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+@@ -2395,6 +2397,20 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  			continue
  		}
  
-+		// Skip, without touching the store, a job that no matching pool can
-+		// take a runner for. Locking it, trying every pool and unlocking it
-+		// again costs two write transactions per job per pass. With a backlog
-+		// of queued jobs behind full pools that ran to thousands a minute, all
-+		// on SQLite's single connection, so webhooks and API requests waited
-+		// minutes behind them.
-+		if !poolCapacity.anyFree(r, poolRR.Pools()) {
++		// Skip, without touching the store, a job whose every matching pool
++		// already refused a runner in this pass (addRunnerToPool returned
++		// ErrNoCapacity, by whatever accounting it uses). Locking the job,
++		// trying every pool and unlocking it again costs two write
++		// transactions per job per pass. With a backlog of queued jobs behind
++		// full pools that ran to thousands a minute on SQLite's single
++		// connection, and webhooks and API requests waited minutes behind it.
++		if fullThisPass.coversAll(poolRR.Pools()) {
 +			slog.DebugContext(
-+				r.ctx, "no matching pool has capacity; leaving job queued",
++				r.ctx, "every matching pool is full this pass; leaving job queued",
 +				"job_id", job.WorkflowJobID)
 +			continue
 +		}
@@ -55,58 +56,42 @@ index 4068c9f..a6fb7e0 100644
  		runnerCreated := false
  		if err := r.store.LockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
  			if errors.Is(err, runnerErrors.ErrNotFound) {
-@@ -2442,6 +2457,7 @@ func (r *basePoolManager) consumeQueuedJobs() error {
- 			slog.DebugContext(r.ctx, "a new runner was added as a response to queued job",
- 				"pool_id", pool.ID,
+@@ -2429,6 +2445,7 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  				"job_id", job.WorkflowJobID)
-+			poolCapacity.added(pool.ID)
- 			runnerCreated = true
- 			break
- 		}
-@@ -2640,3 +2656,38 @@ func (r *basePoolManager) GetWebhookInfo(ctx context.Context) (params.HookInfo,
+ 			if err := r.addRunnerToPool(pool, jobLabels); err != nil {
+ 				if errors.Is(err, runnerErrors.ErrNoCapacity) {
++					fullThisPass[pool.ID] = true
+ 					slog.With(slog.Any("error", err)).InfoContext(
+ 						r.ctx, "could not add runner to pool",
+ 						"pool_id", pool.ID)
+@@ -2640,3 +2657,22 @@ func (r *basePoolManager) GetWebhookInfo(ctx context.Context) (params.HookInfo,
  func (r *basePoolManager) RootCABundle() (params.CertificateBundle, error) {
  	return r.entity.Credentials.RootCertificateBundle()
  }
 +
-+// poolCapacityCache holds each pool's instance count for one
-+// consumeQueuedJobs pass, so a backlog of jobs behind the same full pools
-+// reads every count once and writes nothing.
-+type poolCapacityCache struct {
-+	counts map[string]int64
-+}
++// fullPools records, for one consumeQueuedJobs pass, the pools that refused a
++// runner with ErrNoCapacity. Within a pass a pool only gains runners, so a
++// full pool stays full until the next pass re-checks it.
++type fullPools map[string]bool
 +
-+func (c *poolCapacityCache) anyFree(r *basePoolManager, pools []params.Pool) bool {
++// coversAll reports whether no pool in pools could take a runner this pass:
++// each is disabled or already refused one.
++func (f fullPools) coversAll(pools []params.Pool) bool {
++	if len(pools) == 0 {
++		return false
++	}
 +	for _, pool := range pools {
-+		if !pool.Enabled {
-+			continue
-+		}
-+		n, ok := c.counts[pool.ID]
-+		if !ok {
-+			count, err := r.store.PoolInstanceCount(r.ctx, pool.ID)
-+			if err != nil {
-+				// Unknown: let addRunnerToPool make the authoritative check.
-+				return true
-+			}
-+			n = count
-+			c.counts[pool.ID] = n
-+		}
-+		if n < int64(pool.MaxRunners) {
-+			return true
++		if pool.Enabled && !f[pool.ID] {
++			return false
 +		}
 +	}
-+	return false
-+}
-+
-+func (c *poolCapacityCache) added(poolID string) {
-+	if n, ok := c.counts[poolID]; ok {
-+		c.counts[poolID] = n + 1
-+	}
++	return true
 +}
 diff --git a/runner/pool/pool_test.go b/runner/pool/pool_test.go
-index 138483d..b1997a5 100644
+index 138483d..b576e19 100644
 --- a/runner/pool/pool_test.go
 +++ b/runner/pool/pool_test.go
-@@ -906,3 +906,90 @@ func mustParseUUID(s string) uuid.UUID {
+@@ -906,3 +906,96 @@ func mustParseUUID(s string) uuid.UUID {
  func TestPoolStressTestSuite(t *testing.T) {
  	suite.Run(t, new(PoolStressTestSuite))
  }
@@ -118,7 +103,7 @@ index 138483d..b1997a5 100644
 +// transactions per job per pass on SQLite's single connection, thousands a
 +// minute, so webhooks and API requests waited minutes behind them and the
 +// watchdog restarted garm.service. A pass with no free capacity must leave
-+// the jobs untouched in the store.
++// every job after the first untouched in the store.
 +func (s *PoolStressTestSuite) TestConsumeQueuedJobsSkipsJobsWhenEveryPoolIsFull() {
 +	s.setupProviderMocks()
 +
@@ -161,11 +146,17 @@ index 138483d..b1997a5 100644
 +	after, err := s.store.ListJobsByStatus(s.adminCtx, params.JobStatusQueued)
 +	s.Require().NoError(err)
 +	s.Require().Len(after, 5)
++	written := 0
 +	for _, j := range after {
-+		s.Equal(updatedBefore[j.WorkflowJobID], j.UpdatedAt,
-+			"job %d was written to although no pool had capacity (lock/unlock churn)", j.WorkflowJobID)
++		if !j.UpdatedAt.Equal(updatedBefore[j.WorkflowJobID]) {
++			written++
++		}
 +		s.Equal(uuid.Nil, j.LockedBy, "job %d left locked", j.WorkflowJobID)
 +	}
++	// The first job discovers that the pool is full (one lock/try/unlock);
++	// every later job in the pass must be skipped without a write.
++	s.LessOrEqual(written, 1,
++		"%d of 5 jobs were written to although their only pool was full (lock/unlock churn)", written)
 +	count, err = s.store.PoolInstanceCount(s.adminCtx, pool.ID)
 +	s.Require().NoError(err)
 +	s.EqualValues(1, count, "no runner may be created above max_runners")
