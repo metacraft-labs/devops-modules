@@ -17,7 +17,8 @@ import argparse : Command, Description, EnvFallback, NamedArgument, Placeholder;
 
 import mcl.commands.deploy_apply : DeploymentActivationMode, DeployApplyArgs,
     DeployApplyDependencies, currentGeneration, deployApplyDeferredExitCode,
-    deployApplyManifestConflictExitCode, deployApplyImpl, validateDurableManifest;
+    deployApplyRebootRequiredExitCode, deployApplyManifestConflictExitCode, deployApplyImpl,
+    validateDurableManifest;
 import mcl.utils.deploy_manifest : manifestDeploymentId, manifestDesiredSystemPath,
     manifestSequence, manifestSystem, manifestTarget, verifyManifestSignature;
 import mcl.utils.deploy_state : acquireDeployTargetStateLock,
@@ -607,6 +608,22 @@ int deployAgentImpl(DeployAgentArgs args, DeployAgentDependencies deps)
             "deferred", previousAttempts, args.maxAttempts, true,
             "Deployment readiness conditions are not met; retry budget was not consumed.",
             "deployment_deferred");
+        writeln(status.toString(JSONOptions.doNotEscapeSlashes));
+        return 0;
+    }
+
+    // The generation is installed as the boot default and only a reboot can
+    // activate it (deploy-apply's switch-inhibitor fallback). Like a readiness
+    // deferral this is not a failed attempt: it must not exhaust the retry
+    // budget while the host waits for a convenient reboot, and after the
+    // reboot the next run finds the generation already current and converges.
+    if (result == deployApplyRebootRequiredExitCode)
+    {
+        auto status = writeAgentStatus(args.stateDir, args.target, deploymentId, sequence,
+            "reboot-required", previousAttempts, args.maxAttempts, true,
+            "The desired generation is the boot default and takes effect at the next reboot "
+                ~ "(a switch inhibitor changed); retry budget was not consumed.",
+            "reboot_required");
         writeln(status.toString(JSONOptions.doNotEscapeSlashes));
         return 0;
     }
@@ -1377,6 +1394,101 @@ unittest
     assert(status["attempts"].integer == 2);
     assert(status["errorCode"].str == "retry_budget_exhausted");
     assert(restoreRuns == 2);
+}
+
+@("test_deploy_agent_reboot_required_keeps_the_retry_budget_and_converges_after_reboot")
+unittest
+{
+    import std.file : rmdirRecurse;
+    import mcl.commands.deploy_apply : nixosBootCommand, nixosSwitchCommand;
+    import mcl.utils.deploy_manifest : ManifestBuildRequest, ManifestSigningRequest,
+        buildManifest, signManifest;
+
+    auto base = uniqueDeployStateTestPath("deploy-agent-reboot-required");
+    auto keyPath = base ~ ".ed25519";
+    auto stateDir = base ~ ".state";
+    auto manifestPath = base ~ ".manifest.json";
+    auto eventLog = base ~ ".events.jsonl";
+    scope(exit)
+    {
+        foreach (path; [base, keyPath, keyPath ~ ".pub", manifestPath, eventLog])
+            if (path.exists) path.remove;
+        if (stateDir.exists) stateDir.rmdirRecurse;
+    }
+
+    auto keygen = runProcessCapture([
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", keyPath,
+    ]);
+    assert(keygen.succeeded, keygen.stderr);
+    auto desired = "/nix/store/77777777777777777777777777777777-nixos-system-host";
+    auto previous = "/nix/store/88888888888888888888888888888888-nixos-system-host";
+    auto manifest = signManifest(buildManifest(ManifestBuildRequest(
+        deploymentId: "deploy-reboot-required",
+        target: "target",
+        gitRevision: "0123456789abcdef0123456789abcdef01234567",
+        sequence: 1,
+        desiredSystemPath: desired,
+    )), ManifestSigningRequest(keyPath: keyPath, keyId: "mcl-deployment"));
+    manifestPath.write(manifest.toString(JSONOptions.doNotEscapeSlashes));
+
+    auto switchCommand = nixosSwitchCommand(base ~ ".profile", desired);
+    auto bootCommand = nixosBootCommand(base ~ ".profile", desired);
+    string running = previous;
+    string bootDefault = previous;
+    ProcessResult fakeRun(string[] command)
+    {
+        if (command == ["/bin/sh", "-c", switchCommand])
+        {
+            if (running == previous)
+                return ProcessResult(1, "", "Checking switch inhibitors...\nSwitching into this system is not recommended.\n"
+            ~ "Pre-switch check 'switchInhibitors' failed\nPre-switch checks failed\n");
+            return ProcessResult(0, "", "");
+        }
+        if (command == ["/bin/sh", "-c", bootCommand])
+            bootDefault = desired;
+        return ProcessResult(0, "", "");
+    }
+    ProcessResult fakeQuery(string[] command)
+    {
+        if (command == ["/bin/sh", "-c", "current-generation"])
+            return ProcessResult(0, running ~ "\n", "");
+        return ProcessResult(0, "{}", "");
+    }
+
+    DeployAgentArgs args;
+    args.target = "target";
+    args.manifests = [manifestPath];
+    args.trustedManifestPublicKey = (keyPath ~ ".pub").readText.strip;
+    args.stateDir = stateDir;
+    args.maxAttempts = 1;
+    args.restoreCommand = "restore";
+    args.generationCommand = "current-generation";
+    args.systemProfile = base ~ ".profile";
+    args.noDetachSwitch = true;
+    args.eventLog = eventLog;
+
+    // Before the reboot: every run stages the boot default and reports
+    // reboot-required, and a budget of one attempt is never exhausted.
+    foreach (_; 0 .. 3)
+        assert(deployAgentImpl(args, DeployAgentDependencies(
+            runProcess: &fakeRun,
+            queryProcess: &fakeQuery,
+        )) == 0);
+    auto status = agentStatusPath(stateDir, "target").readText.parseJSON;
+    assert(status["currentState"].str == "reboot-required");
+    assert(status["attempts"].integer == 0);
+    assert(status["retryable"].boolean);
+    assert(status["errorCode"].str == "reboot_required");
+    assert(bootDefault == desired);
+
+    // The host reboots onto the staged generation: the deployment converges.
+    running = bootDefault;
+    assert(deployAgentImpl(args, DeployAgentDependencies(
+        runProcess: &fakeRun,
+        queryProcess: &fakeQuery,
+    )) == 0);
+    status = agentStatusPath(stateDir, "target").readText.parseJSON;
+    assert(status["currentState"].str == "succeeded", status.toString);
 }
 
 @("test_deploy_agent_deferred_pre_switch_does_not_consume_retry_budget")
