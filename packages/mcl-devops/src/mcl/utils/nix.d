@@ -61,7 +61,14 @@ struct NixCommand
 
     template opDispatch(string commandName)
     {
-        T opDispatch(T = string)(string path, string[] args = [], bool printCommand = false)
+        // `logErrors: false` suppresses the `errorf` that `execute` writes
+        // before it throws. Pass it when a non-zero exit is an EXPECTED answer
+        // that the caller handles (e.g. probing for an optional flake
+        // attribute), so the log does not carry an ERR line for a condition
+        // nothing is wrong with. The throw is unaffected — the caller still has
+        // to catch it.
+        T opDispatch(T = string)(string path, string[] args = [], bool printCommand = false,
+            bool logErrors = true)
         {
             import std.algorithm : canFind;
 
@@ -90,7 +97,8 @@ struct NixCommand
             version (unittest)
                 command = ["timeout", "--kill-after=30s", "10m"] ~ command;
 
-            auto output = command.execute(printCommand: printCommand, throwOnError: true).strip();
+            auto output = command.execute(printCommand: printCommand, throwOnError: true,
+                logErrors: logErrors).strip();
 
             static if (is(T == JSONValue))
                 return parseJSON(output);

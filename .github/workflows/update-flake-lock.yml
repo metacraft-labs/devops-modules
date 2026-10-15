@@ -16,6 +16,10 @@ jobs:
       CREATE_PR_APP_ID: ${{ secrets.CREATE_PR_APP_ID }}
       CREATE_PR_APP_PRIVATE_KEY: ${{ secrets.CREATE_PR_APP_PRIVATE_KEY }}
       GIT_GPG_SIGNING_SECRET_KEY: ${{ secrets.GIT_GPG_SIGNING_SECRET_KEY }}
+      # This caller lists its secrets explicitly rather than inheriting, so the
+      # read-only Attic token has to be named here to reach `setup-nix`.
+      ATTIC_PULL_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN }}
+      ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
     with:
       runner: '["self-hosted", "linux", "x64"]'
       sign-commits: true
