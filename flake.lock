@@ -432,17 +432,17 @@
     "codetracer-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1792095082,
-        "narHash": "sha256-hwwsCpg0pkJBAOWCzCUk4MQI5Y6ITtQw5/y10U6fSD8=",
+        "lastModified": 1792141908,
+        "narHash": "sha256-XANtEw1SAs0GH1fpO3f5ILAmT4P6tBs9gLmPvl1Z8J8=",
         "owner": "metacraft-labs",
         "repo": "codetracer",
-        "rev": "6b6d05a081287ae66cd875ece212e5e713a9f9e3",
+        "rev": "2097ae648aa03198727c402b5bfbede548d068a9",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "codetracer",
-        "rev": "6b6d05a081287ae66cd875ece212e5e713a9f9e3",
+        "rev": "2097ae648aa03198727c402b5bfbede548d068a9",
         "type": "github"
       }
     },
@@ -2604,17 +2604,17 @@
     "nim-stackable-hooks-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1792014092,
-        "narHash": "sha256-QWpuPfJWEtNWv7JUugRkUBat7mUa/tPcbJqlhaSawlg=",
+        "lastModified": 1792121399,
+        "narHash": "sha256-itD4iFoT/HMbY0qbxM7NJmxzBJJIzaWY64NHmd7wC8I=",
         "owner": "metacraft-labs",
         "repo": "nim-stackable-hooks",
-        "rev": "3af63afc5c0b55a27fc5e0a26f3a32833caf8873",
+        "rev": "ff7eb18af166f9355c5e62bf1434ba5f9fd2c99e",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "nim-stackable-hooks",
-        "rev": "3af63afc5c0b55a27fc5e0a26f3a32833caf8873",
+        "rev": "ff7eb18af166f9355c5e62bf1434ba5f9fd2c99e",
         "type": "github"
       }
     },
@@ -4451,17 +4451,17 @@
         "stackable-hooks-macos-tools": "stackable-hooks-macos-tools"
       },
       "locked": {
-        "lastModified": 1792148224,
-        "narHash": "sha256-mUUwAZMNQeXpgHMJ194gihJLupDYS+qBtrQe6eu3WTc=",
+        "lastModified": 1792169092,
+        "narHash": "sha256-Qu8xHY6xrNISufKJU75JPfq3IZIakW+inytJbaH8Dzo=",
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "ab28af70227bf9bc3d98f5463e4cd9d95b63ea46",
+        "rev": "f6a3a9bdbc26fdd03236fbea74af23abe4f9c3ee",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "ab28af70227bf9bc3d98f5463e4cd9d95b63ea46",
+        "rev": "f6a3a9bdbc26fdd03236fbea74af23abe4f9c3ee",
         "type": "github"
       }
     },
