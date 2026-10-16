@@ -130,12 +130,14 @@
         # Google Workspace domains: add a domain as a secondary domain or a
         # domain alias, verify it through DNS and switch its MX/SPF/DMARC/TLS-RPT,
         # each DNS change through the consumer's Terraform data + PR; the users'
-        # addresses and send-as; the DMARC report group; the delegation scopes
-        # (docs/Google-Workspace-Domains.md).
+        # addresses and send-as; the DMARC report group; the delegation scopes;
+        # the registrar debris a transferred-in zone carries
+        # (docs/Onboard-A-Domain.md, docs/Google-Workspace-Domains.md).
         google-workspace-domains = pkgs.writeShellApplication {
           name = "google-workspace-domains";
           runtimeInputs = [
             pkgs.coreutils
+            pkgs.curl
             pkgs.dnsutils
             pkgs.gawk
             pkgs.gh

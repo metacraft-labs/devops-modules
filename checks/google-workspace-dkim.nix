@@ -12,7 +12,9 @@
 #   google-workspace-domains-test  scripts/google-workspace-domains.sh, its API
 #                          helper and scripts/google-workspace-setup.sh (the
 #                          guided per-domain path and the batched two-phase one,
-#                          interrupted and resumed) against a local Google API
+#                          interrupted and resumed; the merge gate, aliases,
+#                          dkim-collect, registrar-debris, the credentials)
+#                          against a local Google API stub, a Cloudflare API
 #                          stub, an SMTP stub, stub dig/gh/gcloud and local
 #                          bare origins; no network.
 { ... }:
@@ -115,13 +117,16 @@
             nativeBuildInputs = [
               pkgs.bash
               pkgs.coreutils
+              # registrar-debris talks to the Cloudflare API with curl.
+              pkgs.curl
               pkgs.gawk
               pkgs.git
               pkgs.gnugrep
               pkgs.gnused
               pkgs.jq
               pkgs.openssl
-              # setsid: the test interrupts a background follower's process group.
+              # setsid: the test interrupts a background follower's process
+              # group; script: a terminal for the key-unlock offer.
               pkgs.util-linux
               (pkgs.python3.withPackages (p: [
                 p.google-auth

@@ -18,6 +18,45 @@
 #
 # and $GOOGLE_WORKSPACE_DKIM_CHECK_INTERVAL may shorten the re-watch interval
 # (tests). Every function either returns or exits through `die`.
+#
+# THE MERGE GATE. Without configuration a PR is merged once EVERY check and
+# workflow run of its head passed. A consumer whose CI always fails a check on
+# a DNS change (an import gate that refuses creates, say), or runs checks that
+# have nothing to do with DNS data, names the checks that matter instead, in
+# the environment (so the background follower inherits them):
+#
+#   $GOOGLE_WORKSPACE_REQUIRED_CHECKS  ";"-separated check names (bash
+#                     patterns) as `gh pr checks` lists them. The PR is merged
+#                     once EACH is present AND passed — not once nothing is
+#                     pending: checks register late (a job that `needs:`
+#                     another appears only when that one finishes), so "nothing
+#                     pending" can come before the check exists. Other checks
+#                     are ignored. A required check that failed, was cancelled,
+#                     or was skipped because a job it needs failed (a runner
+#                     timeout, a full disk, a cache 401) has its workflow run's
+#                     failed jobs re-run, up to $GOOGLE_WORKSPACE_RERUNS times
+#                     per run (default 3), before the tool gives up.
+#   $GOOGLE_WORKSPACE_PR_LABELS        labels every PR is opened with (comma-
+#                     or space-separated), e.g. the one that unlocks a
+#                     credentialed plan.
+#   $GOOGLE_WORKSPACE_DESTROY_LABEL    a label added when the edit REMOVES
+#                     records (RECORD_ADDRESSES_REMOVED not empty), e.g. the
+#                     one that lets the apply destroy.
+#   $GOOGLE_WORKSPACE_PLAN_CHECK       a command run in the repository root
+#                     once the required checks passed, with PR, HEAD_SHA,
+#                     RECORD_ADDRESSES_ADDED / _REMOVED and
+#                     RECORD_ADDRESSES_KNOWN (1 when this process made the
+#                     edit, 0 when it resumed a PR) exported: exit 0 when the
+#                     PR's plan matches the change, 2 when the plan for HEAD_SHA
+#                     is not there yet (asked again), anything else to stop.
+#   $GOOGLE_WORKSPACE_APPLY_WORKFLOW   the workflow whose run on the merge
+#                     commit applies the change: after the merge the tool
+#                     waits for that run and re-runs it when it was cancelled
+#                     or failed (same limit), before waiting for DNS.
+#   $GOOGLE_WORKSPACE_CHECKS_TIMEOUT   seconds the gate and the apply wait
+#                     each take at most (default 14400); then it stops, and a
+#                     re-run resumes the same PR.
+#   $GOOGLE_WORKSPACE_CHECKS_INTERVAL  seconds between looks (default 30).
 
 die() {
   echo "$prog: $*" >&2
@@ -297,10 +336,21 @@ pr_commit_branch() {
   git -C "$wt" push --quiet --force-with-lease -u origin "$branch"
 }
 
-# pr_create ROOT BRANCH TITLE BODY: opens the PR into $base; prints its number.
+# What the edit of this process added and removed (cloudflare_dns_record
+# addresses, newline-separated), set by the EDIT_FN; for the labels and the
+# plan check. pr_known=1 once an edit of this process set them.
+pr_added="" pr_removed="" pr_known=0
+
+# pr_create ROOT BRANCH TITLE BODY: opens the PR into $base with the
+# configured labels; prints its number.
 pr_create() {
-  local pr
-  pr="$(cd "$1" && gh pr create --base "$base" --head "$2" --title "$3" --body "$4")"
+  local pr l labels=()
+  for l in ${GOOGLE_WORKSPACE_PR_LABELS:+${GOOGLE_WORKSPACE_PR_LABELS//,/ }}; do labels+=(--label "$l"); done
+  if [ -n "$pr_removed" ] && [ -n "${GOOGLE_WORKSPACE_DESTROY_LABEL:-}" ]; then
+    say "the change removes records; labelling the PR ${GOOGLE_WORKSPACE_DESTROY_LABEL}"
+    labels+=(--label "$GOOGLE_WORKSPACE_DESTROY_LABEL")
+  fi
+  pr="$(cd "$1" && gh pr create --base "$base" --head "$2" --title "$3" --body "$4" "${labels[@]}")"
   say "opened $pr"
   printf '%s\n' "${pr##*/}"
 }
@@ -313,16 +363,157 @@ pr_land() {
   local root="$1" pr="$2" head state
   head="$(cd "$root" && gh pr view "$pr" --json headRefOid -q .headRefOid)"
   [ -n "$head" ] || die "could not read the head commit of PR #$pr"
-  watch_checks "$root" "$pr" "$head"
+  if [ -n "${GOOGLE_WORKSPACE_REQUIRED_CHECKS:-}" ]; then
+    gate_checks "$root" "$pr" "$head"
+  else
+    watch_checks "$root" "$pr" "$head"
+  fi
   if [ "$merge" != 1 ]; then
     say "checks passed on PR #$pr. Merge it, then re-run this command: it will skip to the DNS wait."
     exit 0
   fi
-  state="$(cd "$root" && gh pr checks "$pr" --json bucket -q '[.[].bucket] | map(select(. != "pass" and . != "skipping")) | length')"
-  [ "$state" = 0 ] || die "PR #$pr has checks that did not pass; not merging"
+  if [ -z "${GOOGLE_WORKSPACE_REQUIRED_CHECKS:-}" ]; then
+    state="$(cd "$root" && gh pr checks "$pr" --json bucket -q '[.[].bucket] | map(select(. != "pass" and . != "skipping")) | length')"
+    [ "$state" = 0 ] || die "PR #$pr has checks that did not pass; not merging"
+  fi
+  plan_check "$root" "$pr" "$head"
   say "merging PR #$pr at ${head:0:12}"
   (cd "$root" && gh pr merge "$pr" --merge --match-head-commit "$head") ||
     die "gh pr merge refused (review required, or the head moved); merge PR #$pr by hand and re-run"
+  wait_apply "$root" "$pr"
+}
+
+checks_interval() { printf '%s' "${GOOGLE_WORKSPACE_CHECKS_INTERVAL:-30}"; }
+checks_timeout() { printf '%s' "${GOOGLE_WORKSPACE_CHECKS_TIMEOUT:-14400}"; }
+
+# rerun_failed ROOT RUN WHAT: re-runs RUN's failed jobs (and the jobs that
+# need them) unless it was re-run $GOOGLE_WORKSPACE_RERUNS times already by
+# this process; exits then. WHAT names the check for messages.
+declare -A pr_reruns=()
+rerun_failed() {
+  local root="$1" run="$2" what="$3" n
+  n="${pr_reruns[$run]:-0}"
+  [ "$n" -lt "${GOOGLE_WORKSPACE_RERUNS:-3}" ] ||
+    die "$what still fails after $n re-run(s) of workflow run $run; look at it (a real failure, not a flaky runner?), fix, and re-run this command"
+  pr_reruns[$run]=$((n + 1))
+  say "$what did not pass (workflow run $run); re-running its failed jobs ($((n + 1))/${GOOGLE_WORKSPACE_RERUNS:-3})"
+  (cd "$root" && gh run rerun "$run" --failed >/dev/null 2>&1) ||
+    die "could not re-run workflow run $run for $what (skipped because a label is missing? nothing failed in it?); fix it and re-run this command"
+}
+
+# gate_checks ROOT PR HEAD: returns once every check named in
+# $GOOGLE_WORKSPACE_REQUIRED_CHECKS is present and passed on PR (see THE MERGE
+# GATE above); re-runs failed ones; exits on a lasting failure or the timeout.
+gate_checks() {
+  local root="$1" pr="$2" head="$3" start now json pat pats=() line b n l missing pending failed ok runs rerun_done last=""
+  IFS=';' read -r -a pats <<<"$GOOGLE_WORKSPACE_REQUIRED_CHECKS"
+  start="$(date +%s)"
+  say "PR #$pr at ${head:0:12}: waiting until each required check is present and passed: $(printf '%s; ' "${pats[@]}" | sed 's/; $//')"
+  while :; do
+    json="$(cd "$root" && gh pr checks "$pr" --json name,bucket,link 2>/dev/null)" || true
+    jq -e 'type == "array"' <<<"$json" >/dev/null 2>&1 || json='[]'
+    missing=() pending=() failed=() ok=0 rerun_done=0
+    declare -A runs=()
+    for pat in "${pats[@]}"; do
+      pat="${pat#"${pat%%[![:space:]]*}"}" pat="${pat%"${pat##*[![:space:]]}"}"
+      [ -n "$pat" ] || continue
+      local seen=0 st="pass"
+      while IFS=$'\t' read -r b n l; do
+        # shellcheck disable=SC2053 # a pattern on purpose
+        [[ $n == $pat ]] || continue
+        seen=1
+        case "$b" in
+          pass) ;;
+          pending) [ "$st" = fail ] || st=pending ;;
+          *)
+            st=fail
+            if [[ $l =~ /actions/runs/([0-9]+) ]]; then runs[${BASH_REMATCH[1]}]="$n"; fi
+            ;;
+        esac
+      done < <(jq -r '.[] | [.bucket, .name, (.link // "")] | @tsv' <<<"$json")
+      if [ "$seen" = 0 ]; then
+        missing+=("$pat")
+      else
+        case "$st" in
+          pass) ok=$((ok + 1)) ;;
+          pending) pending+=("$pat") ;;
+          fail) failed+=("$pat") ;;
+        esac
+      fi
+    done
+    if [ "${#missing[@]}" = 0 ] && [ "${#pending[@]}" = 0 ] && [ "${#failed[@]}" = 0 ]; then
+      say "PR #$pr: every required check is present and passed ($ok)"
+      return 0
+    fi
+    if [ "${#failed[@]}" -gt 0 ]; then
+      [ "${#runs[@]}" -gt 0 ] || die "PR #$pr: required check(s) did not pass and name no workflow run to re-run: ${failed[*]}"
+      for r in "${!runs[@]}"; do
+        rerun_failed "$root" "$r" "PR #$pr's check '${runs[$r]}'"
+        rerun_done=1
+      done
+    fi
+    now="$(date +%s)"
+    [ $((now - start)) -lt "$(checks_timeout)" ] ||
+      die "PR #$pr: required checks not all passed after $(checks_timeout)s (missing: ${missing[*]:-none}; pending: ${pending[*]:-none}); re-run this command to keep waiting"
+    l="missing: ${missing[*]:-none}; running: ${pending[*]:-none}"
+    [ "$l" = "$last" ] || say "  [$((now - start))s] PR #$pr: $l"
+    last="$l"
+    unset runs
+    [ "$rerun_done" = 1 ] && sleep "${GOOGLE_WORKSPACE_RERUN_SETTLE:-90}"
+    sleep "$(checks_interval)"
+  done
+}
+
+# plan_check ROOT PR HEAD: the consumer's $GOOGLE_WORKSPACE_PLAN_CHECK, until
+# it answers (see THE MERGE GATE above).
+plan_check() {
+  local root="$1" pr="$2" head="$3" rc start
+  [ -n "${GOOGLE_WORKSPACE_PLAN_CHECK:-}" ] || return 0
+  start="$(date +%s)"
+  while :; do
+    rc=0
+    (cd "$root" && PR="$pr" HEAD_SHA="$head" RECORD_ADDRESSES_ADDED="$pr_added" RECORD_ADDRESSES_REMOVED="$pr_removed" \
+      RECORD_ADDRESSES_KNOWN="$pr_known" bash -c "$GOOGLE_WORKSPACE_PLAN_CHECK") >&2 || rc=$?
+    case "$rc" in
+      0) say "PR #$pr: the plan matches the change"; return 0 ;;
+      2) ;;
+      *) die "PR #$pr: the plan does not match the change (above); not merging. Look at the PR's plan, fix, and re-run" ;;
+    esac
+    [ $(($(date +%s) - start)) -lt "$(checks_timeout)" ] ||
+      die "PR #$pr: no plan for ${head:0:12} after $(checks_timeout)s; re-run this command to keep waiting"
+    say "  PR #$pr: no plan for ${head:0:12} yet; asking again"
+    sleep "$(checks_interval)"
+  done
+}
+
+# wait_apply ROOT PR: once PR is merged, the $GOOGLE_WORKSPACE_APPLY_WORKFLOW
+# run on its merge commit, until it succeeded; a cancelled or failed one is
+# re-run. Nothing to do without the setting.
+wait_apply() {
+  local root="$1" pr="$2" wf="${GOOGLE_WORKSPACE_APPLY_WORKFLOW:-}" sha json id st c start
+  [ -n "$wf" ] || return 0
+  sha="$(cd "$root" && gh pr view "$pr" --json mergeCommit -q '.mergeCommit.oid // empty')"
+  [ -n "$sha" ] || die "PR #$pr: no merge commit to follow the '$wf' run of"
+  start="$(date +%s)"
+  say "waiting for the '$wf' run on ${sha:0:12} (the apply)"
+  while :; do
+    json="$(cd "$root" && gh run list --commit "$sha" --workflow "$wf" --json databaseId,status,conclusion --limit 20 2>/dev/null)" || json='[]'
+    id="$(jq -r 'first(.[] | .databaseId) // empty' <<<"$json" 2>/dev/null)" || id=""
+    st="$(jq -r 'first(.[] | .status) // empty' <<<"$json" 2>/dev/null)" || st=""
+    c="$(jq -r 'first(.[] | .conclusion) // empty' <<<"$json" 2>/dev/null)" || c=""
+    if [ -n "$id" ] && [ "$st" = completed ]; then
+      case "$c" in
+        success | skipped | neutral)
+          say "the '$wf' run $id on ${sha:0:12} succeeded"
+          return 0
+          ;;
+        *) rerun_failed "$root" "$id" "the '$wf' run on ${sha:0:12} ($c)" ;;
+      esac
+    fi
+    [ $(($(date +%s) - start)) -lt "$(checks_timeout)" ] ||
+      die "the '$wf' run on ${sha:0:12} did not succeed within $(checks_timeout)s; look at it, then re-run this command"
+    sleep "$(checks_interval)"
+  done
 }
 
 # Summarises the GitHub Actions workflow runs for commit $2: "ok" when every

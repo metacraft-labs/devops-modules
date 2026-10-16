@@ -15,6 +15,14 @@ Time: a minute of console work and one command, plus CI and DNS propagation.
 > Outside one, prefix a command with
 > `nix run github:metacraft-labs/devops-modules#google-workspace-dkim --`.
 
+> [!TIP]
+> For several domains at once — the usual case when onboarding — use
+> `google-workspace-setup dkim-collect` instead: one sitting in the console,
+> every pasted key validated, ONE PR, and the follower says when DNS serves the
+> keys so that Start authentication can be clicked
+> ([Onboard-A-Domain.md §7-8](./Onboard-A-Domain.md#7-activate-gmail-then-dkim-setup-dkim-collect)).
+> The console offers a key only once Gmail is activated for the domain.
+
 ## 1. Run the tool
 
 ```sh

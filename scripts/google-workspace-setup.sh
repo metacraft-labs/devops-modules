@@ -17,36 +17,51 @@
 # TWO PHASES (the default, `run` then `follow`). CI and DNS are slow and the
 # operator's part is not, so they are separated:
 #
-#   run             INTERACTIVE, minutes: the delegation scopes and the report
-#                   group; the decisions the background phase needs (move the
-#                   MX of a domain whose mail goes elsewhere today, once it is
-#                   verified? per domain or for all); every declared domain
-#                   added to the tenant (secondary domains, then aliases); the
-#                   users' addresses on the domains already verified; every
-#                   DKIM key the console can generate now, pasted one after the
-#                   other (s skips one); then ONE commit on ONE branch with
-#                   every DNS change possible now — verification tokens, DKIM
-#                   keys, mail records of verified domains as decided — the
-#                   consumer's hook run once, ONE PR; then it starts `follow`
-#                   detached and returns, saying what happens next.
+#   run             INTERACTIVE, minutes: the API project (gcloud logged in,
+#                   every API the tools call enabled), the delegation scopes
+#                   and the report group; the decisions the background phase
+#                   needs (move the MX of a domain whose mail goes elsewhere
+#                   today, once it is verified? per domain or for all); every
+#                   declared domain added to the tenant (secondary domains;
+#                   aliases once their parent is verified); the users'
+#                   addresses where the mail is on Google; every DKIM key the
+#                   console can generate now, pasted one after the other;
+#                   the inbound test when one is due; then ONE commit on ONE
+#                   branch with the batch due now, the consumer's hook run
+#                   once, ONE PR; then it starts `follow` detached and returns.
 #   follow          BACKGROUND (or in the foreground when run by hand; with
-#                   --detach, started detached): watches the batch PR's checks
-#                   and merges it at the head it watched, waits until the zones'
-#                   nameservers and then the public resolvers serve every record
-#                   of the batch, asks Google to verify every domain whose token
-#                   is now served and waits for it, gives the users their
-#                   addresses on the newly verified domains, proves inbound mail
-#                   on a domain just moved (a message sent through the Gmail API
-#                   to the user's address there, found in their inbox; needs
-#                   gmail.metadata), and opens the NEXT batch PR for what that
-#                   made possible — until nothing is left. It ends with what
-#                   still needs the operator (Activate Gmail, Start
-#                   authentication, DKIM keys that can now be generated, …),
-#                   kept for `status` and, with $GOOGLE_WORKSPACE_NOTIFY set,
-#                   piped to that command (title in $NOTIFY_TITLE).
+#                   --detach, started detached): waits until the batch PR's
+#                   required checks are present and passed (lib/pr-publish.sh,
+#                   THE MERGE GATE), merges it at that head, waits for the
+#                   apply and until DNS serves every record, asks Google to
+#                   verify every domain whose token is served (adding each
+#                   alias once its parent is verified, and asking again for
+#                   hours while an alias's verification lags), gives the users
+#                   their addresses, and opens the NEXT batch PR — until
+#                   nothing is left. It ends with what still needs the
+#                   operator (Activate Gmail, the inbound test, DKIM keys,
+#                   Start authentication, …), kept for `status` and, with
+#                   $GOOGLE_WORKSPACE_NOTIFY set, piped to that command (title
+#                   in $NOTIFY_TITLE).
 #   status          one line per domain (google-workspace-domains status
 #                   --table), then the background phase: running or not, the
 #                   batch PR in flight and its stage, the queue, the log.
+#   dkim-collect    one sitting for every DKIM key the console can generate
+#                   now (verified, mail on Google, Activate Gmail confirmed,
+#                   no key yet): each pasted value validated, all of them in
+#                   ONE PR; the background phase then says when DNS serves
+#                   them, which is when Start authentication can be clicked.
+#   inbound-test    the inbound test alone: the operator sends a message from
+#                   OUTSIDE the tenant to a domain already moved, the tool
+#                   finds it in the inbox (gmail.metadata; it asks otherwise);
+#                   then the background phase moves the mail decided "move".
+#
+# THE BATCHES, one kind of change each, in this order (lib/setup-batch.sh has
+# the details): verification tokens for every domain not verified → (Google
+# verifies) → mail records of the domains that receive no mail elsewhere →
+# (the inbound test) → mail records moving the mail that goes elsewhere today,
+# as decided → (the users' addresses and send-as) → DKIM keys → (Start
+# authentication, in the console).
 #
 # The answers and the batch in flight are kept in a local state file, never
 # committed: ${XDG_STATE_HOME:-~/.local/state}/google-workspace-setup/
@@ -57,16 +72,17 @@
 # how `run` starts the follower (default: a systemd user unit when the user
 # manager answers, else nohup).
 #
-# A domain whose mail goes elsewhere today (an MX outside Google, resolving or
-# not) is moved only as decided, and only after a domain already moved has
-# received a test message (automatically, or confirmed by the operator at the
-# next `run` when the Gmail read scope is not granted). An alias's records wait
-# for its parent's verification. A domain another open PR changes (its head
-# changes the domain's entry in FILE: a per-domain PR, or a batch made by hand)
-# is left to it, and `follow` waits for that PR to land when the domain has
-# work due ($GOOGLE_WORKSPACE_FOREIGN_PR_WAIT seconds, default 21600). When a Google API turns out to be disabled, it is enabled with gcloud
-# (re-running `gcloud auth login` in the interactive phase when its
-# credentials have expired); only a missing permission ends in instructions.
+# A domain another open PR changes (its head changes the domain's entry in
+# FILE: a per-domain PR, or a batch made by hand) is left to it, and `follow`
+# waits for that PR to land when the domain has work due
+# ($GOOGLE_WORKSPACE_FOREIGN_PR_WAIT seconds, default 21600).
+#
+# CREDENTIALS. gcloud is run by the tool, never asked of the operator: an
+# expired login (an organisation's reauthentication policy) is renewed with
+# `gcloud auth login` in the interactive phase. The service-account key is
+# usually unlocked onto a tmpfs that a restart empties: when it is missing,
+# the interactive steps offer to run $GOOGLE_WORKSPACE_KEY_UNLOCK (the
+# consumer's unlock command) and the follower stops saying so.
 #
 # THE STEPS ONE BY ONE (the per-domain path, one PR per change):
 #   guided          all of the below in order, per domain — the original
@@ -76,7 +92,8 @@
 #   onboard-all     every declared domain onto the tenant with its records
 #                   (google-workspace-domains onboard), in the order below
 #   user-addresses  every google_users user's addresses and send-as entries
-#   dkim-all        DKIM for every onboarded domain that has no key yet
+#   dkim-all        DKIM for every onboarded domain that has no key yet, one
+#                   PR each (dkim-collect is the batched form)
 #   smtp-relay      the Workspace SMTP relay for automated sending (console),
 #                   tested by sending through it when an app password is given
 #
@@ -117,7 +134,7 @@ read -r -a api_cmd <<<"${GOOGLE_WORKSPACE_DOMAINS_API:-python3 $here/google-work
 
 step="run"
 case "${1:-}" in
-  run | follow | guided | scopes | dmarc-group | onboard-all | user-addresses | dkim-all | smtp-relay | status) step="$1"; shift ;;
+  run | follow | guided | scopes | dmarc-group | onboard-all | user-addresses | dkim-all | dkim-collect | inbound-test | smtp-relay | status) step="$1"; shift ;;
   -h | --help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
 esac
 
@@ -154,8 +171,22 @@ done
 
 [ -n "$data" ] || die "--data FILE is required (the mail-auth JSON data file)"
 [ -f "$data" ] || die "no such data file: $data"
-[ -n "$key" ] && [ -r "$key" ] || die "--key (or \$GOOGLE_WORKSPACE_KEY): the decrypted service-account key is required and must be readable"
+[ -n "$key" ] || die "--key (or \$GOOGLE_WORKSPACE_KEY): the decrypted service-account key is required"
 [ -n "$subject" ] || die "--subject (or \$GOOGLE_WORKSPACE_SUBJECT): the super admin the service account acts as"
+# The key is usually unlocked onto a tmpfs ($XDG_RUNTIME_DIR) that a restart
+# empties. Offer the consumer's unlock command in an interactive step; the
+# follower stops instead (it cannot ask for a passphrase).
+if [ ! -r "$key" ]; then
+  unlock="${GOOGLE_WORKSPACE_KEY_UNLOCK:-}"
+  echo "$prog: the service-account key is not there: $key" >&2
+  echo "$prog: (a restart empties \$XDG_RUNTIME_DIR, where it is usually unlocked)" >&2
+  [ -n "$unlock" ] || die "unlock it, then re-run"
+  [ "$step" != follow ] && [ -t 0 ] || die "unlock it with: $unlock — then re-run"
+  printf '\n>> Run "%s" now, in this terminal? [Y/n]: ' "$unlock" >&2
+  IFS= read -r ans || ans=n
+  case "${ans,,}" in "" | y | yes) bash -c "$unlock" || true ;; *) exit 1 ;; esac
+  [ -r "$key" ] || die "still no key at $key"
+fi
 export GOOGLE_WORKSPACE_KEY="$key" GOOGLE_WORKSPACE_SUBJECT="$subject"
 
 read -r -a resolvers <<<"${GOOGLE_WORKSPACE_DKIM_RESOLVERS:-1.1.1.1 8.8.8.8}"
@@ -617,6 +648,8 @@ case "$step" in
   onboard-all) step_domains 0 ;;
   user-addresses) step_user_addresses ;;
   dkim-all) step_dkim_all ;;
+  dkim-collect) cmd_dkim_collect ;;
+  inbound-test) cmd_inbound_test ;;
   smtp-relay) step_smtp_relay ;;
   status) step_status ;;
 esac
