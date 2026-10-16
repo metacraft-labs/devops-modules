@@ -1490,12 +1490,17 @@ env GOOGLE_WORKSPACE_KEY="$missing_key" GOOGLE_WORKSPACE_KEY_UNLOCK="$unlock_key
   bash "$setup_tool" status "${bargs[@]}" </dev/null >"$work/stdout" 2>"$work/stderr" || rc=$?
 expect "a missing key stops a step without a terminal, naming the unlock command (not running it)" \
   bash -c '[ "$1" != 0 ] && grep -qF "unlock it with: $3" "$2" && grep -qF "a restart empties" "$2" && [ ! -e "$4" ]' _ "$rc" "$work/stderr" "$unlock_key" "$missing_key"
+# A terminal for the offer: python's pty, not script(1) -- util-linux's
+# `script -qec` is Linux-only and BSD script(1) takes other arguments.
+in_tty() { python3 -c 'import os, pty, sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"; }
 rc=0
-printf 'y\n' | script -qec "env GOOGLE_WORKSPACE_KEY='$missing_key' GOOGLE_WORKSPACE_KEY_UNLOCK='$unlock_key' $(printf '%q ' "${benv[@]}") bash $(printf '%q' "$setup_tool") status $(printf '%q ' "${bargs[@]}")" /dev/null \
+printf 'y\n' | in_tty env GOOGLE_WORKSPACE_KEY="$missing_key" GOOGLE_WORKSPACE_KEY_UNLOCK="$unlock_key" "${benv[@]}" bash "$setup_tool" status "${bargs[@]}" \
   >"$work/stdout" 2>&1 || rc=$?
 expect "... at a terminal it offers to run it, runs it, and goes on" \
   bash -c '[ -r "$1" ] && grep -qF "now, in this terminal?" "$2" && grep -qE "^example\.org +seco" "$2"' _ "$missing_key" "$work/stdout"
 # The follower: the key disappears while it waits for a PR (a host restart).
+# It starts with the key there, whatever the terminal case above did.
+mkdir -p "$work/runtime/google-admin" && cp "$work/sa.json" "$missing_key"
 jq --indent 2 '.domains["example.key"] = {zone_id: "00000000000000000000000000000030", dkim: {}, google: {kind: "secondary"}}' "$bdata" >"$bdata.new" && mv "$bdata.new" "$bdata"
 git -C "$bsrc" commit --quiet -am "declare example.key" && git -C "$bsrc" push --quiet origin HEAD:main
 STUB_ORIGIN="$borigin" "$STUB_APPLY"

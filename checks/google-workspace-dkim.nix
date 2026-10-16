@@ -126,7 +126,7 @@
               pkgs.jq
               pkgs.openssl
               # setsid: the test interrupts a background follower's process
-              # group; script: a terminal for the key-unlock offer.
+              # group. (The key-unlock offer's terminal is python's pty.)
               pkgs.util-linux
               (pkgs.python3.withPackages (p: [
                 p.google-auth
