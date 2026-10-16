@@ -32,9 +32,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout caller repository
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7
       - name: Checkout nixos-modules (checker source)
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7
         with:
           repository: metacraft-labs/devops-modules
           ref: ${{ inputs.ref }}
