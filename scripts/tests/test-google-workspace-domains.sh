@@ -52,7 +52,9 @@ expect_not() {
 }
 run() { bash "$tool" "$@" >"$work/stdout" 2>"$work/stderr"; }
 stderr_has() { grep -qF -- "$1" "$work/stderr"; }
-output_has() { cat "$work/stdout" "$work/stderr" | grep -qF -- "$1"; }
+# (grep without -q reads all of its input: an early exit would SIGPIPE the
+# writer and, under pipefail, fail the pipeline although the text is there)
+output_has() { cat "$work/stdout" "$work/stderr" | grep -F -- "$1" >/dev/null; }
 
 # ── stubs: dig, gh, the Google API ───────────────────────────────────────────
 printf '#!%s\n' "$(command -v bash)" | tee "$work/bin/dig" "$work/bin/gh" >"$work/apply"
@@ -424,7 +426,7 @@ commit_push() { git -C "$repo" commit --quiet -am "$1" && git -C "$repo" push --
 edit_data() { jq --indent 2 "$1" "$data" >"$data.new" && mv "$data.new" "$data"; }
 log_has() { grep -q -- "$1" "$api_log"; }
 # Guidance is word-wrapped: match a phrase across line breaks.
-flat_has() { cat "$work/stdout" "$work/stderr" | tr -s ' \n' '  ' | grep -qF -- "$1"; }
+flat_has() { cat "$work/stdout" "$work/stderr" | tr -s ' \n' '  ' | grep -F -- "$1" >/dev/null; }
 # Every stdout line fits 78 columns, except a line that is one unbreakable
 # value (a URL, a line to paste), which is kept whole on purpose.
 narrow() { ! awk 'length > 78 { t = $0; sub(/^ +/, "", t); if (t ~ / /) { print; bad = 1 } } END { exit !bad }' "$1" >/dev/null; }
