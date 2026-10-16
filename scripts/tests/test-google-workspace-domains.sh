@@ -1106,7 +1106,7 @@ expect "a second interactive run while the batch is in flight asks nothing and o
 touch "$bgh/hang"
 setsid "${benv[@]}" GOOGLE_WORKSPACE_FOLLOW_DETACH=none bash "$setup_tool" follow "${bargs[@]}" >"$work/stdout" 2>"$work/stderr" &
 fpid=$!
-for _ in $(seq 1 300); do grep -q "watching the checks of PR #1" "$work/stderr" 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 3000); do grep -q "watching the checks of PR #1" "$work/stderr" 2>/dev/null && break; sleep 0.1; done
 kill -TERM -- "-$fpid" 2>/dev/null || true
 wait "$fpid" 2>/dev/null || true
 rm -f "$bgh/hang"
@@ -1232,7 +1232,7 @@ expect "the interactive phase leaves a domain that an open hand-made PR changes 
   bash -c '[ "$1" = 0 ] && ! grep -q "^gh pr create" "$2" && tr -s " \n" "  " <"$3" | grep -qF "example.app: left to the open PR #52 (mail/batch-1-verification)"' _ "$rc" "$STUB_GH_LOG" "$work/stdout"
 GOOGLE_WORKSPACE_FOREIGN_PR_INTERVAL=1 batch follow >"$work/stdout" 2>"$work/stderr" &
 fpid=$!
-for _ in $(seq 1 300); do grep -q "waiting for the open PR(s) that carry example.app: #52" "$work/stderr" 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 3000); do grep -q "waiting for the open PR(s) that carry example.app: #52" "$work/stderr" 2>/dev/null && break; sleep 0.1; done
 expect "the follower waits for that PR rather than publishing the same change" \
   bash -c 'grep -qF "waiting for the open PR(s) that carry example.app: #52" "$1" && ! grep -q "^gh pr create" "$2"' _ "$work/stderr" "$STUB_GH_LOG"
 # Merged by hand, and applied.
@@ -1500,7 +1500,8 @@ touch "$bgh/hang"
 env GOOGLE_WORKSPACE_KEY="$missing_key" GOOGLE_WORKSPACE_KEY_UNLOCK="$unlock_key" "${benv[@]}" GOOGLE_WORKSPACE_FOLLOW_DETACH=none \
   bash "$setup_tool" follow "${bargs[@]}" >"$work/stdout" 2>"$work/stderr" &
 fpid=$!
-for _ in $(seq 1 300); do grep -q "watching the checks of PR" "$work/stderr" 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 3000); do grep -q "watching the checks of PR" "$work/stderr" 2>/dev/null && break; sleep 0.1; done
+expect "(the follower is watching its PR when the key disappears)" grep -q "watching the checks of PR" "$work/stderr"
 rm -f "$missing_key"
 rm -f "$bgh/hang"
 rc=0
