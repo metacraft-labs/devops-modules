@@ -51,10 +51,25 @@ google-workspace-domains registrar-debris --domain example.org            # publ
 google-workspace-domains registrar-debris --domain example.org --token-file <read-only Cloudflare token file>
 ```
 
-Transfer the domain to the registrar you keep (unlock it at the old one, take
-the auth code, start the transfer at the new one), then set its nameservers to
-the Cloudflare zone's (step 2). Before and after, run `registrar-debris`: it
-lists what the old registrar left that shadows or breaks our records:
+Transfer the domain to the registrar you keep, then set its nameservers to
+the Cloudflare zone's (step 2):
+
+1. **At the old registrar** (its domain list → the domain → its management
+   page): turn the **transfer lock** (registrar lock) off and request the
+   **auth / EPP code**; it arrives by mail to the registrant contact. A domain
+   registered or transferred in the last 60 days cannot move yet.
+2. **At the new registrar**: start a transfer-in with the domain and the auth
+   code, pay, and approve the confirmation mail the old registrar may send.
+   Success: the domain is listed in the new registrar's account, and RDAP/WHOIS
+   (`whois example.org`, line `Registrar:`) names it. This takes from minutes
+   to five days.
+3. **Nameservers**: at whichever registrar holds the domain, set the two
+   nameservers of its Cloudflare zone (step 2; a registrar that is Cloudflare
+   itself sets them alone). Success: `dig +short NS example.org @1.1.1.1`
+   answers exactly that pair (resolvers may need the old NS TTL, up to 48 h).
+
+Before and after, run `registrar-debris`: it lists what the old registrar
+left that shadows or breaks our records:
 
 - **NS delegations of names inside the zone to other nameservers.** A
   registrar that SUSPENDS a domain — typically for an unverified WHOIS or
@@ -97,10 +112,19 @@ registrar lifts the suspension.
 
 ## 2. The Cloudflare zone
 
-Create the zone (dashboard: Add a site; or the API), take its two assigned
-nameservers to the registrar (step 1), and wait until `dig NS example.org`
-answers them. The import scan copies the old registrar's records — debris
-included; clean it up before or while adopting (step 3).
+Create the zone: <https://dash.cloudflare.com> → the account → **Add a
+domain** (on the account home; or Websites → Add a domain) → enter the domain
+→ keep "Quick scan for DNS records" when the domain has records worth keeping
+(they are then adopted, step 3), skip it for a domain that should start empty
+→ plan **Free** → review the scanned records → **Continue to activation**.
+The page shows the zone's **two assigned nameservers**: take them to the
+registrar (step 1.3). Success: the zone's Overview reads **Active** (Cloudflare
+re-checks every few hours; "Check nameservers now" asks at once), and
+`dig +short NS example.org @1.1.1.1` answers the pair. The zone id (32 hex) is
+on the Overview, right column, "Zone ID".
+
+The scan copies the old registrar's records — debris included; run
+`registrar-debris` (step 1) and clean it up before or while adopting (step 3).
 
 ## 3. Own the zone in Terraform
 
@@ -184,7 +208,10 @@ SETUP follow       # the background phase in the foreground (it resumes)
    missing (unlocked onto a tmpfs that a restart empties), the tool offers to
    run the consumer's unlock command.
 2. **The delegation scopes** (a token minted per scope; the missing ones
-   printed as one complete line for the Admin console) and **the DMARC report
+   printed as one complete line for the Admin console:
+   <https://admin.google.com/ac/owl/domainwidedelegation> → the service
+   account's client id → **Edit** → replace the scopes with the printed line
+   → **Authorize**; success: `SETUP scopes` exits 0) and **the DMARC report
    group** (it must accept mail from outside; set through the Groups Settings
    API).
 3. **The decisions** for every domain whose mail goes elsewhere today: "move
@@ -281,8 +308,9 @@ users' addresses) — an address that exists nowhere bounces.
 
 1. **Activate Gmail** (console, per domain: Account → Domains → Manage domains,
    <https://admin.google.com/ac/domains/manage>, "Activate Gmail" on the
-   domain's row) once its MX points at Google. The follower lists the domains
-   due; `run` and `dkim-collect` ask you to confirm.
+   domain's row) once its MX points at Google. Success: the row no longer
+   offers "Activate Gmail". The follower lists the domains due; `run` and
+   `dkim-collect` ask you to confirm.
 2. **DKIM keys, one sitting:**
 
    ```sh
@@ -303,9 +331,11 @@ users' addresses) — an address that exists nowhere bounces.
 When the follower reports that DNS serves the keys ("Start authentication …
 for: …", also in `status` and the notifier), click **START AUTHENTICATION** for
 each of those domains on the same console page. Google refuses it before DNS
-serves the key. Signing starts within 48 hours (usually an hour); a message
+serves the key. Success: the page reads **"Authenticating email with DKIM"**
+for the domain. Signing starts within 48 hours (usually an hour); a message
 sent from the domain then shows `DKIM-Signature: d=<domain>` and
-`dkim=pass`. `run` asks you to confirm the click, which clears the reminder.
+`dkim=pass` (Gmail: ⋮ → Show original). `run` asks you to confirm the click,
+which clears the reminder.
 
 ## 9. Verify the result
 
@@ -369,5 +399,7 @@ domain in detail, with every address and its send-as state.
 | "the <api> API is not enabled" / `SERVICE_DISABLED`                                                                | An API missing in the service account's project                                                                       | `run` enables the Admin SDK, Gmail, Site Verification, Groups Settings and Org Policy APIs itself; only a missing permission (`roles/serviceusage.serviceUsageAdmin`) is left to someone else |
 | "the service-account key … is not there" / "is gone (a restart empties $XDG_RUNTIME_DIR …)"                        | The key was unlocked onto a tmpfs a reboot cleared                                                                    | The interactive steps offer the unlock command (`$GOOGLE_WORKSPACE_KEY_UNLOCK`); the follower stops with it — unlock, then run the follower again (it resumes)                                |
 | The inbound test is "not there"                                                                                    | Sent from inside the tenant (delivered internally), MX not on Google yet, Activate Gmail missing, the address missing | Send from outside; check the moved domain's `status`; click Activate Gmail; run the addresses step                                                                                            |
-| `token refused (unauthorized_client) for scope X`                                                                  | X is not in the delegation (or not approved yet)                                                                      | `SETUP scopes` prints the complete line to paste                                                                                                                                              |
-| `Google cannot turn one into the other`                                                                            | The tenant has the domain as the other kind                                                                           | Delete it in the console (it must have no users or groups), or declare the other kind                                                                                                         |
+| `token refused (unauthorized_client) for scope X`                                                                  | X is not in the delegation (or not approved yet)                                                                      | `SETUP scopes` prints the complete line to paste at <https://admin.google.com/ac/owl/domainwidedelegation> (step 5.2); a new scope can take minutes to be honoured                            |
+| `Google cannot turn one into the other`                                                                            | The tenant has the domain as the other kind                                                                           | Delete it in the console (<https://admin.google.com/ac/domains/manage> → the row → Remove domain; it must have no users or groups), or declare the other kind                                 |
+| `SETUP status` says the follower is not running, with work left                                                    | It stopped: a host restart, the key gone, a check that kept failing, its timeout                                      | Read the last lines of the log `status` names; fix what it says; `SETUP follow --detach` (or `run`) resumes the same batch PR                                                                 |
+| The registrar keeps the domain delegated to its suspension servers after the transfer request                      | The transfer has not completed, or the old registrar suspended it (registrant contact not verified)                   | Verify the registrant contact (the old registrar's mail, or its dashboard's domain page); `registrar-debris` without a token reports "the domain ITSELF is delegated" until it is lifted      |
