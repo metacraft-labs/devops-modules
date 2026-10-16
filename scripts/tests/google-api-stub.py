@@ -185,6 +185,8 @@ class H(BaseHTTPRequestHandler):
             if any(alias in addresses_of(s, x) for x in s["users"]):
                 return self.reply(409, {"error": {"code": 409, "message": "Entity already exists."}})
             s["users"][user].setdefault("aliases", []).append(alias)
+            if s.get("alias_lag"):
+                s.setdefault("alias_hidden", {})[alias] = s["alias_lag"]
             save(s)
             return self.reply(200, {"alias": alias, "primaryEmail": user})
         if u.path.startswith(GMAIL):
@@ -316,7 +318,18 @@ class H(BaseHTTPRequestHandler):
             user = urllib.parse.unquote(u.path[len(USERS) :])
             if user not in s["users"]:
                 return self.reply(404, {"error": {"code": 404, "message": "Resource Not Found: userKey"}})
-            return self.reply(200, user_view(s, user))
+            v = user_view(s, user)
+            # "alias_lag": N hides a just-added alias from the next N reads of
+            # the user, as Google's directory does for a while.
+            hidden = s.setdefault("alias_hidden", {})
+            for a in list(hidden):
+                if a in v["aliases"]:
+                    v["aliases"] = [x for x in v["aliases"] if x != a]
+                    hidden[a] -= 1
+                    if hidden[a] <= 0:
+                        del hidden[a]
+            save(s)
+            return self.reply(200, v)
         if u.path.startswith(GMAIL) and u.path.endswith("/settings/sendAs"):
             user = urllib.parse.unquote(u.path[len(GMAIL) : -len("/settings/sendAs")])
             if not self.need(SCOPE_SENDAS_READ) or not self.as_user(user):
