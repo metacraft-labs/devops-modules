@@ -553,7 +553,12 @@ guided_run() {
       sleep 0.05
     done
     eval "${st%%|*}"
-    printf '%s\n' "${st#*|}" >&7 2>/dev/null || true
+    # A tool that already exited has closed the FIFO: the write must fail
+    # (and the assertions report it), not kill this shell with SIGPIPE.
+    (
+      trap '' PIPE
+      printf '%s\n' "${st#*|}" >&7
+    ) 2>/dev/null || true
   done
   exec 7>&-
   wait "$pid" || rc=$?
