@@ -67,6 +67,9 @@ the Cloudflare zone's (step 2):
    nameservers of its Cloudflare zone (step 2; a registrar that is Cloudflare
    itself sets them alone). Success: `dig +short NS example.org @1.1.1.1`
    answers exactly that pair (resolvers may need the old NS TTL, up to 48 h).
+   A registrar that also hosts the zone (Cloudflare Registrar, for one)
+   accepts a transfer only once the zone is active: there, do this at the old
+   registrar BEFORE step 2.
 
 Before and after, run `registrar-debris`: it lists what the old registrar
 left that shadows or breaks our records:
