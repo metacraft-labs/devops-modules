@@ -36,8 +36,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +51,7 @@ import (
 	commonParams "github.com/cloudbase/garm-provider-common/params"
 
 	"github.com/metacraft-labs/garm-provider-vmharness/internal/agentharbor/ahmock"
+	"github.com/metacraft-labs/garm-provider-vmharness/internal/provider"
 )
 
 const (
@@ -812,5 +817,237 @@ func TestExitedJobDistinguishesCrashFromCleanExit(t *testing.T) {
 				t.Errorf("legacy=%v exit %s: status %q (fault %q), want %q", legacy, code, got.Status, got.ProviderFault, want)
 			}
 		}
+	}
+}
+
+// AH5 warm start, provider half. The ah side is generic: a launch may name a
+// starting point and the job's workspace becomes a per-job branch of it. Here:
+// the provider names the configured starting point on every launch, a pool can
+// override or disable it, an unavailable one relaunches cold (never fails the
+// runner), and the payload picks up the starting point's warm caches.
+
+const startingPointTOML = `[starting_point]
+repo = "https://github.com/example-org/ci-seed"
+ref = "refs/heads/main"
+kind = "clean-build"
+max_age_seconds = 604800
+`
+
+func TestCreateNamesConfiguredStartingPoint(t *testing.T) {
+	m := startMock(t, func(s *ahmock.Server) {
+		s.StartingPoints = map[string]string{"https://github.com/example-org/ci-seed|refs/heads/main|clean-build": t.TempDir()}
+	})
+	p := newProvider(t, m, startingPointTOML)
+	if _, err := p.CreateInstance(context.Background(), bootstrap("runner-warm")); err != nil {
+		t.Fatal(err)
+	}
+	_, body := lastCreate(t, m)
+	sp, ok := body["startingPoint"].(map[string]any)
+	if !ok {
+		t.Fatalf("launch carries no startingPoint: %v", body)
+	}
+	if sp["repo"] != "https://github.com/example-org/ci-seed" || sp["ref"] != "refs/heads/main" ||
+		sp["kind"] != "clean-build" || sp["maxAgeSeconds"] != float64(604800) {
+		t.Fatalf("startingPoint = %v", sp)
+	}
+	if _, has := body["workingDirectory"]; has {
+		t.Fatal("startingPoint and workingDirectory must not both be sent")
+	}
+	if m.Launches() != 1 {
+		t.Fatalf("launches = %d, want 1", m.Launches())
+	}
+}
+
+func TestStartingPointUnavailableRelaunchesCold(t *testing.T) {
+	m := startMock(t, nil) // holds no starting points: every warm launch is a 422
+	p := newProvider(t, m, startingPointTOML)
+	inst, err := p.CreateInstance(context.Background(), bootstrap("runner-cold"))
+	if err != nil {
+		t.Fatalf("an unavailable starting point must not fail the runner: %v", err)
+	}
+	if inst.Status == commonParams.InstanceError {
+		t.Fatalf("instance status %q", inst.Status)
+	}
+	var posts []ahmock.Recorded
+	for _, r := range m.Requests() {
+		if r.Method == "POST" && r.Path == "/sandbox-jobs" {
+			posts = append(posts, r)
+		}
+	}
+	if len(posts) != 2 {
+		t.Fatalf("want a warm attempt then a cold relaunch, got %d launch requests", len(posts))
+	}
+	var first, second map[string]any
+	_ = json.Unmarshal(posts[0].Body, &first)
+	_ = json.Unmarshal(posts[1].Body, &second)
+	if _, ok := first["startingPoint"]; !ok {
+		t.Fatal("first attempt was not warm")
+	}
+	if _, ok := second["startingPoint"]; ok {
+		t.Fatal("relaunch still names the unavailable starting point")
+	}
+	k1, k2 := posts[0].Header.Get("Idempotency-Key"), posts[1].Header.Get("Idempotency-Key")
+	if k1 == "" || k1 == k2 {
+		t.Fatalf("the cold relaunch must use its own idempotency key (%q vs %q): the warm key may replay its 422", k1, k2)
+	}
+	if m.Launches() != 1 {
+		t.Fatalf("ledger launches = %d, want exactly the cold one", m.Launches())
+	}
+}
+
+func TestOtherErrorsAreNotRetriedCold(t *testing.T) {
+	m := startMock(t, nil)
+	p := newProvider(t, m, startingPointTOML)
+	m.Inject(ahmock.Fault{Method: "POST", Prefix: "/sandbox-jobs", Status: 422, Code: CodeInvalidSandboxOption, Detail: "no branching provider"})
+	if _, err := p.CreateInstance(context.Background(), bootstrap("runner-misconfigured")); err == nil {
+		t.Fatal("a misconfigured host (invalid-sandbox-option) must fail, not silently go cold")
+	}
+	n := 0
+	for _, r := range m.Requests() {
+		if r.Method == "POST" && r.Path == "/sandbox-jobs" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("launch requests = %d, want 1 (no cold retry for other 422s)", n)
+	}
+}
+
+func TestPoolExtraSpecsOverrideOrDisableStartingPoint(t *testing.T) {
+	m := startMock(t, func(s *ahmock.Server) {
+		s.StartingPoints = map[string]string{"snap-pool": t.TempDir()}
+	})
+	p := newProvider(t, m, startingPointTOML)
+	ctx := context.Background()
+
+	b := bootstrap("runner-override")
+	b.ExtraSpecs = json.RawMessage(`{"starting_point": {"snapshot_id": "snap-pool"}}`)
+	if _, err := p.CreateInstance(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	_, body := lastCreate(t, m)
+	if sp, _ := body["startingPoint"].(map[string]any); sp["snapshotId"] != "snap-pool" || sp["repo"] != nil {
+		t.Fatalf("pool override not applied: %v", body["startingPoint"])
+	}
+
+	b = bootstrap("runner-disabled")
+	b.ExtraSpecs = json.RawMessage(`{"starting_point": "none"}`)
+	if _, err := p.CreateInstance(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	_, body = lastCreate(t, m)
+	if _, has := body["startingPoint"]; has {
+		t.Fatalf(`"none" must disable the starting point: %v`, body["startingPoint"])
+	}
+
+	b = bootstrap("runner-bad")
+	b.ExtraSpecs = json.RawMessage(`{"starting_point": {"repo": "r", "ref": "main", "kind": "dirty"}}`)
+	if _, err := p.CreateInstance(ctx, b); !errors.Is(err, garmErrors.ErrBadRequest) {
+		t.Fatalf("bad kind: err = %v, want bad request", err)
+	}
+}
+
+func TestStartingPointConfigValidation(t *testing.T) {
+	for name, frag := range map[string]string{
+		"snapshot and repo": "[starting_point]\nsnapshot_id = \"s\"\nrepo = \"r\"\n",
+		"repo without ref":  "[starting_point]\nrepo = \"r\"\nkind = \"clean-build\"\n",
+		"unknown kind":      "[starting_point]\nrepo = \"r\"\nref = \"main\"\nkind = \"dirty\"\n",
+	} {
+		_, err := ParseBytes([]byte("endpoint = \"http://127.0.0.1:1\"\n" + testRunnerTOML + frag))
+		if err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	cfg, err := ParseBytes([]byte("endpoint = \"http://127.0.0.1:1\"\n" + testRunnerTOML + "warm_cache_dir = \"../escape\"\n"))
+	if err == nil {
+		t.Errorf("warm_cache_dir outside the workspace accepted: %+v", cfg.Runner)
+	}
+}
+
+// The payload, run for real by the mock in a workspace branched from a seed,
+// exports the seed's warm cache as XDG_CACHE_HOME; in a cold workspace it
+// leaves XDG_CACHE_HOME alone. The runner itself is replaced by a probe
+// script, the same way the end-to-end gate substitutes nothing but the
+// listener path.
+func TestPayloadUsesWarmCacheOnlyWhenPresent(t *testing.T) {
+	// The payload's job PATH is this test's PATH (in the Nix check, the
+	// check's own tool closure); it needs bash, coreutils, sed and curl.
+	var runnerPath []string
+	for _, d := range filepath.SplitList(os.Getenv("PATH")) {
+		if filepath.IsAbs(d) {
+			runnerPath = append(runnerPath, strconv.Quote(d))
+		}
+	}
+	for _, tool := range []string{"bash", "sh", "sed", "head", "curl"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("needs %s on PATH", tool)
+		}
+	}
+	pkg := t.TempDir()
+	probeOut := filepath.Join(t.TempDir(), "xdg")
+	listener := filepath.Join(pkg, "bin", "Runner.Listener")
+	deps := filepath.Join(pkg, "lib", "github-runner", "Runner.Listener.deps.json")
+	for _, d := range []string{filepath.Dir(listener), filepath.Dir(deps)} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(deps, []byte(`{"targets":{"x":{"Runner.Listener/2.336.0.0":{}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// configure/run are both answered by the probe; `run` records XDG_CACHE_HOME.
+	shPath, _ := exec.LookPath("sh")
+	probe := "#!" + shPath + "\n[ \"$1\" = run ] && printf '%s' \"${XDG_CACHE_HOME:-unset}\" > " + provider.ShellQuote(probeOut) + "\nexit 0\n"
+	if err := os.WriteFile(listener, []byte(probe), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seed := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(seed, DefaultWarmCacheDir, "nix"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(seed, DefaultWarmCacheDir, "nix", "seed-marker")
+	if err := os.WriteFile(marker, []byte("seed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, warm := range []bool{true, false} {
+		_ = os.Remove(probeOut)
+		m := startMock(t, func(s *ahmock.Server) {
+			s.Exec = true
+			s.WorkRoot = t.TempDir()
+			s.StartingPoints = map[string]string{"snap-seed": seed}
+		})
+		cfgTOML := "[runner]\nlistener = " + strconv.Quote(listener) + "\nversion = \"2.336.0\"\npath = [" + strings.Join(runnerPath, ", ") + "]\n"
+		if warm {
+			cfgTOML = "[starting_point]\nsnapshot_id = \"snap-seed\"\n" + cfgTOML
+		}
+		p := newProvider(t, m, cfgTOML)
+		b := bootstrap(map[bool]string{true: "runner-warm-exec", false: "runner-cold-exec"}[warm])
+		// GARM's metadata/callback endpoints: answer everything (the JIT
+		// credential files are opaque to the payload).
+		garm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("{}")) }))
+		t.Cleanup(garm.Close)
+		b.CallbackURL = garm.URL + "/callbacks"
+		b.MetadataURL = garm.URL + "/metadata"
+		inst, err := p.CreateInstance(context.Background(), b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !m.WaitExited(inst.ProviderID, 30*time.Second) {
+			t.Fatalf("warm=%v: payload did not finish; log:\n%s", warm, m.JobLog(inst.ProviderID))
+		}
+		got, err := os.ReadFile(probeOut)
+		if err != nil {
+			t.Fatalf("warm=%v: runner never ran; log:\n%s", warm, m.JobLog(inst.ProviderID))
+		}
+		if warm && !strings.HasSuffix(string(got), "/"+DefaultWarmCacheDir) {
+			t.Fatalf("warm workspace: XDG_CACHE_HOME = %q, want the branch's %s", got, DefaultWarmCacheDir)
+		}
+		if !warm && string(got) != "unset" {
+			t.Fatalf("cold workspace: XDG_CACHE_HOME = %q, want unset", got)
+		}
+	}
+	if b, _ := os.ReadFile(marker); string(b) != "seed" {
+		t.Fatal("the job wrote through to the starting point")
 	}
 }

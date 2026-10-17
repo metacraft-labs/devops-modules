@@ -623,12 +623,19 @@
               "incus.service"
               "incus-preseed.service"
             ];
-            requires = [ "incus.service" ];
+            # Wants=, not Requires=: a failed incus start must not leave this
+            # oneshot dead with Result=dependency (nothing retries that). It
+            # runs anyway, fails while incusd is down, and Restart= retries it
+            # until incus is back.
+            wants = [ "incus.service" ];
+            startLimitIntervalSec = 0;
             wantedBy = [ "multi-user.target" ];
             serviceConfig = {
               Type = "oneshot";
               RemainAfterExit = true;
               ExecStart = lib.getExe convergeScript;
+              Restart = "on-failure";
+              RestartSec = 10;
             };
           };
 
@@ -646,12 +653,19 @@
               "incus-preseed.service"
             ]
             ++ lib.optional cfg.managePreseed "garm-incus-storage-network.service";
-            requires = [ "incus.service" ];
+            # Wants=, not Requires=: a failed incus start must not leave this
+            # oneshot dead with Result=dependency (nothing retries that). It
+            # runs anyway, fails while incusd is down, and Restart= retries it
+            # until incus is back.
+            wants = [ "incus.service" ];
+            startLimitIntervalSec = 0;
             wantedBy = [ "multi-user.target" ];
             serviceConfig = {
               Type = "oneshot";
               RemainAfterExit = true;
               ExecStart = lib.getExe importScript;
+              Restart = "on-failure";
+              RestartSec = 10;
             };
           };
         }

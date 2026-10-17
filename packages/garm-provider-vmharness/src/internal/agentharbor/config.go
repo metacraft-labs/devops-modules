@@ -103,6 +103,12 @@ type Config struct {
 	Capabilities CapabilitiesConfig `toml:"capabilities"`
 	// Runner is the Nix-packaged actions runner the `sandbox` payload execs.
 	Runner NixRunnerConfig `toml:"runner"`
+
+	// StartingPoint, when set, is named on every launch so the job's
+	// workspace starts as a branch of it (AH5 warm start). A runner cannot
+	// know its job's repository at launch, so this is per provider (and
+	// per pool through extra_specs), not per job.
+	StartingPoint *StartingPoint `toml:"starting_point"`
 }
 
 // DefaultMaxMinorLag is the staleness rule of infra's actions-runner pin check
@@ -129,7 +135,16 @@ type NixRunnerConfig struct {
 	// MaxMinorLag refuses launches when the package is this many minor
 	// releases behind the version GARM offers (default DefaultMaxMinorLag).
 	MaxMinorLag int `toml:"max_minor_lag"`
+	// WarmCacheDir is a directory, relative to the job's workspace, that a
+	// starting point may carry pre-populated tool caches in (the Nix flake
+	// fetcher and evaluation caches). When it exists the payload exports it
+	// as XDG_CACHE_HOME; in a cold workspace it does not exist and nothing
+	// changes. Default DefaultWarmCacheDir.
+	WarmCacheDir string `toml:"warm_cache_dir"`
 }
+
+// DefaultWarmCacheDir is NixRunnerConfig.WarmCacheDir's default.
+const DefaultWarmCacheDir = ".warm-cache"
 
 // SandboxOptions is the non-interactive subset of `ah agent sandbox` options a
 // job may set (Direct-Sandbox-Launch.md § Launch, `sandbox`). Zero values are
@@ -222,6 +237,9 @@ func (c *Config) applyDefaults() {
 	if c.Runner.MaxMinorLag == 0 {
 		c.Runner.MaxMinorLag = DefaultMaxMinorLag
 	}
+	if c.Runner.WarmCacheDir == "" {
+		c.Runner.WarmCacheDir = DefaultWarmCacheDir
+	}
 }
 
 // Validate checks the config after defaults were applied.
@@ -250,6 +268,9 @@ func (c *Config) Validate() error {
 	case TemplateSandbox, TemplateUpstream:
 	default:
 		return fmt.Errorf("runner_template %q must be sandbox or upstream", c.RunnerTemplate)
+	}
+	if err := c.StartingPoint.validate(); err != nil {
+		return err
 	}
 	if c.Substrate == SubstrateLocalSandbox && c.RunnerTemplate == TemplateUpstream {
 		return fmt.Errorf("runner_template upstream needs root in a full guest OS; local-sandbox takes the sandbox payload")
@@ -321,6 +342,9 @@ func (r NixRunnerConfig) validate() error {
 		if k == "" || strings.ContainsAny(k, "= ") {
 			return fmt.Errorf("env key %q is not a valid variable name", k)
 		}
+	}
+	if r.WarmCacheDir != "" && (strings.HasPrefix(r.WarmCacheDir, "/") || strings.Contains(r.WarmCacheDir, "..")) {
+		return fmt.Errorf("warm_cache_dir %q must be a relative path inside the job workspace", r.WarmCacheDir)
 	}
 	if r.MaxMinorLag < 1 {
 		return fmt.Errorf("max_minor_lag must be >= 1")

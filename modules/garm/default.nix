@@ -401,6 +401,18 @@
         + optionalString (sb.pidsMax > 0) "pids_max = ${toString sb.pidsMax}\n"
         + optStr "cpu_max" sb.cpuMax
         + optStr "tmpfs_size" sb.tmpfsSize
+        + optionalString (a.startingPoint != null) (
+          let
+            sp = a.startingPoint;
+            o = k: v: optionalString (v != null) "${k} = \"${tomlStr v}\"\n";
+          in
+          "\n[starting_point]\n"
+          + o "snapshot_id" sp.snapshotId
+          + o "repo" sp.repo
+          + o "ref" sp.ref
+          + o "kind" sp.kind
+          + optionalString (sp.maxAgeSeconds != null) "max_age_seconds = ${toString sp.maxAgeSeconds}\n"
+        )
         + optionalString (a.capabilities.publicKey != "") ''
 
           [capabilities]
@@ -452,6 +464,7 @@
           version = "${tomlStr runnerVersion}"
           path = [${lib.concatMapStringsSep ", " (d: "\"${tomlStr d}\"") binDirs}]
           max_minor_lag = ${toString r.maxMinorLag}
+          warm_cache_dir = "${tomlStr r.warmCacheDir}"
         ''
         + optionalString (r.extraEnvironment != { }) (
           "\n[runner.env]\n"
@@ -3106,8 +3119,61 @@
                             soon stops dispatching jobs to it.
                           '';
                         };
+                        warmCacheDir = mkOption {
+                          type = types.strMatching "[^/].*";
+                          default = ".warm-cache";
+                          description = ''
+                            Directory, relative to the job workspace, in which a starting
+                            point may carry warm tool caches (the Nix flake fetcher and
+                            evaluation caches). When present the payload exports it as
+                            XDG_CACHE_HOME; a cold workspace has none and is unaffected.
+                          '';
+                        };
                       };
                     };
+                  };
+                  startingPoint = mkOption {
+                    default = null;
+                    description = ''
+                      AH5 warm start: the agent-harbor starting point every launch
+                      names, so each job's workspace is a per-job branch of it
+                      (agent-harbor Direct-Sandbox-Launch.md § "Starting a job from a
+                      starting point"). Per provider, overridable per pool with the
+                      `starting_point` extra spec ("none" disables). An unavailable
+                      starting point relaunches the runner cold; it never fails it.
+                      Name it by `snapshotId`, or by `repo` + `ref` + `kind`.
+                    '';
+                    type = types.nullOr (
+                      types.submodule {
+                        options = {
+                          snapshotId = mkOption {
+                            type = types.nullOr types.str;
+                            default = null;
+                          };
+                          repo = mkOption {
+                            type = types.nullOr types.str;
+                            default = null;
+                          };
+                          ref = mkOption {
+                            type = types.nullOr types.str;
+                            default = null;
+                          };
+                          kind = mkOption {
+                            type = types.nullOr (
+                              types.enum [
+                                "clean-build"
+                                "clean-clone"
+                              ]
+                            );
+                            default = null;
+                          };
+                          maxAgeSeconds = mkOption {
+                            type = types.nullOr types.ints.positive;
+                            default = null;
+                          };
+                        };
+                      }
+                    );
                   };
                   capabilities = mkOption {
                     default = { };

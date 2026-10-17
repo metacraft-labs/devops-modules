@@ -131,6 +131,7 @@ type nixRunnerPayloadData struct {
 	OfferedVersion string
 	Path           string
 	Env            [][2]string
+	WarmCacheDir   string
 
 	PayloadFailureExit int
 }
@@ -161,6 +162,7 @@ func renderNixRunnerPayload(bootstrap commonParams.BootstrapInstance, tools comm
 		RunnerVersion:     runner.Version,
 		OfferedVersion:    provider.OfferedRunnerVersion(tools),
 		Path:              strings.Join(runner.Path, ":"),
+		WarmCacheDir:      runner.WarmCacheDir,
 
 		PayloadFailureExit: PayloadFailureExit,
 	}
@@ -276,6 +278,16 @@ export RUNNER_ROOT="$STATE_DIRECTORY"
 # user's (hidden and read-only inside the sandbox), and tools that honour
 # it (just, for one) then fail; mirror the service environment.
 unset XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+{{- if .WarmCacheDir }}
+# Warm start (AH5): a workspace branched from a starting point may carry
+# pre-populated tool caches (the Nix flake fetcher and evaluation caches).
+# The branch is this job's own copy, so writes stay in the job. In a cold
+# workspace the directory does not exist and nothing changes.
+if [ -d "$JOB_DIR/"{{ shell .WarmCacheDir }} ]; then
+	export XDG_CACHE_HOME="$JOB_DIR/"{{ shell .WarmCacheDir }}
+	status "warm start: using the starting point's caches"
+fi
+{{- end }}
 {{- range .Env }}
 export {{ index . 0 }}={{ shell (index . 1) }}
 {{- end }}

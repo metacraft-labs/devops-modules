@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	garmErrors "github.com/cloudbase/garm-provider-common/errors"
@@ -91,6 +92,38 @@ type poolExtraSpecs struct {
 	MemoryMax          string  `json:"memory_max,omitempty"`
 	CPUMax             string  `json:"cpu_max,omitempty"`
 	PidsMax            uint32  `json:"pids_max,omitempty"`
+	// StartingPoint overrides the provider's starting point for this pool;
+	// the string "none" (or {} ) disables it.
+	StartingPoint json.RawMessage `json:"starting_point,omitempty"`
+}
+
+// poolStartingPoint resolves the pool's starting point: the extra_specs
+// override when present ("none"/{} disables), else the provider default.
+func poolStartingPoint(spec poolExtraSpecs, def *StartingPoint) (*StartingPoint, error) {
+	raw := strings.TrimSpace(string(spec.StartingPoint))
+	switch raw {
+	case "":
+		return def, nil
+	case `"none"`, "null", "{}":
+		return nil, nil
+	}
+	// extra_specs keys are snake_case like the TOML config; the wire format
+	// (StartingPoint's json tags) is camelCase.
+	var in struct {
+		SnapshotID    string  `json:"snapshot_id"`
+		Repo          string  `json:"repo"`
+		Ref           string  `json:"ref"`
+		Kind          string  `json:"kind"`
+		MaxAgeSeconds *uint64 `json:"max_age_seconds"`
+	}
+	if err := json.Unmarshal(spec.StartingPoint, &in); err != nil {
+		return nil, fmt.Errorf("extra_specs.starting_point: %w", err)
+	}
+	sp := StartingPoint{SnapshotID: in.SnapshotID, Repo: in.Repo, Ref: in.Ref, Kind: in.Kind, MaxAgeSeconds: in.MaxAgeSeconds}
+	if err := sp.validate(); err != nil {
+		return nil, fmt.Errorf("extra_specs.%w", err)
+	}
+	return &sp, nil
 }
 
 func parseExtraSpecs(raw []byte) (poolExtraSpecs, error) {
@@ -236,6 +269,11 @@ func (p *Provider) buildCreateRequest(bootstrap commonParams.BootstrapInstance, 
 		sandbox.PidsMax = spec.PidsMax
 	}
 
+	startingPoint, err := poolStartingPoint(spec, p.cfg.StartingPoint)
+	if err != nil {
+		return CreateJobRequest{}, garmErrors.NewBadRequestError("%s", err)
+	}
+
 	labels := p.ownerLabels(controllerID)
 	labels[LabelPool] = bootstrap.PoolID
 
@@ -249,6 +287,7 @@ func (p *Provider) buildCreateRequest(bootstrap commonParams.BootstrapInstance, 
 		TTLSeconds:         &ttl,
 		IdleTimeoutSeconds: idle,
 		Sandbox:            sandbox,
+		StartingPoint:      startingPoint,
 	}
 	// image/flavor are VM concepts; the server rejects them (422) for
 	// local-sandbox, so they are only forwarded to VM substrates.
@@ -296,6 +335,19 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrap commonParams.Bo
 	}
 
 	job, err := p.client.CreateJob(ctx, req, idempotencyKey(controllerID, bootstrap.Name))
+	if err != nil && req.StartingPoint != nil {
+		var apiErr *APIError
+		if errors.As(err, &apiErr) && apiErr.Code == CodeStartingPointUnavailable {
+			// A missing or stale starting point costs speed, never the job:
+			// relaunch cold. The server never falls back silently, so this
+			// is the one place a cold start is chosen, and it is logged.
+			// A fresh idempotency key: the warm attempt's key may replay
+			// its 422.
+			fmt.Fprintf(os.Stderr, "agentharbor: starting point unavailable for %s (%s); launching cold\n", bootstrap.Name, apiErr.Error())
+			req.StartingPoint = nil
+			job, err = p.client.CreateJob(ctx, req, idempotencyKey(controllerID, bootstrap.Name)+"-cold")
+		}
+	}
 	if err != nil {
 		var apiErr *APIError
 		if !errors.As(err, &apiErr) || apiErr.Code != CodeNameConflict {

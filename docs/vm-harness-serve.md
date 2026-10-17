@@ -3,14 +3,20 @@
 > **Renamed (GOSTI1b).** The option path is `services.gosti-serve`; the old
 > `services.vm-harness-serve` path still works and prints a deprecation
 > warning. The default package is `packages.gosti` (`bin/gosti`, with
-> `bin/vm-harness` as a symlink; `packages.vm-harness` is an alias). The unit
-> (`vm-harness-serve.service` / launchd `org.metacraft-labs.vm-harness-serve`),
-> user, group, credential names and state directory (`/var/lib/vm-harness-serve`)
-> are deliberately UNCHANGED: they carry the enrollment keyId and the agenix
-> secret ownership. Renaming the unit (with a `vm-harness-serve.service`
-> alias) is a later step, after every consumer that names the unit has moved.
-> Units export `GOSTI_EPHEMERAL_LABEL_DIR` alongside `VMH_EPHEMERAL_LABEL_DIR`.
-> Gate: `t_gosti_serve_rename`.
+> `bin/vm-harness` as a symlink; `packages.vm-harness` is an alias). The units
+> are `gosti-serve.service` (with `vm-harness-serve.service` as an alias, so
+> `systemctl … vm-harness-serve` keeps working), `gosti-serve-healthcheck.*`
+> and `gosti-serve-inventory.*`; on darwin the launchd jobs are
+> `launchd.daemons.gosti-serve*` with label `org.metacraft-labs.gosti-serve`.
+> Setting `systemd.services.vm-harness-serve*` or
+> `launchd.daemons.vm-harness-serve*` is an evaluation error. The user, group,
+> credential names, log paths and state directory (`/var/lib/vm-harness-serve`;
+> `/var/lib/gosti-serve` is a symlink to it) are deliberately UNCHANGED: they
+> carry the enrollment keyId and the agenix secret ownership. Journal queries
+> must name the real unit: `journalctl -u gosti-serve`.
+> Units export `GOSTI_EPHEMERAL_LABEL_DIR` (the legacy `VMH_` name was dropped in
+> GOSTI1b step 6; gosti still reads it as a fallback).
+> Gates: `t_gosti_serve_rename`, `t_gosti_serve_unit_rename_switch`.
 
 Campaign: _CI Runner Fleet — vm-harness Remoting, Central GARM, Capability
 Pools_ · milestone **RA2** (Linux/incus serve deployment).
@@ -29,7 +35,7 @@ consumes these options.
 
 ## What it provides
 
-- A `vm-harness-serve.service` systemd unit running `vm-harness serve` as a
+- A `gosti-serve.service` systemd unit running `gosti serve` as a
   dedicated system user (`vm-harness-serve`), in the `incus-admin` group so it
   can reach the incus socket, under the same hardening profile as the
   `services.garm` incus-strict posture (`ProtectSystem=strict`,
@@ -71,10 +77,34 @@ consumes these options.
   registered hypervisor backend synchronously — measured 2026-09-18 at 16.7 s
   authenticated versus 5 ms unauthenticated.
 
+- **Surviving a dependency blip.** The daemon needs incus only per request (it
+  shells out to the CLI), so it depends on `incus.service` with `Wants=`, not
+  `Requires=`. A failed incus start therefore can't fail the serve start job
+  ("Dependency failed"), and an incus restart doesn't stop the daemon. The unit
+  restarts on failure with no start limit (`StartLimitIntervalSec=0`,
+  `RestartSec=5`). The GARM incus convergence oneshots
+  (`garm-incus-storage-network`, `garm-incus-image-import`) do the same: they
+  `Want` incus and retry every 10 s until it is back.
+
+  The watchdog is the second layer. When the listener does not answer and the
+  unit is inactive, the watchdog starts the unit if its latest start failed on
+  a dependency. It does NOT rely on `Result=dependency`, which systemd doesn't
+  record for a failed start job: the Result field keeps its previous value. It
+  checks the unit's journal for a `Dependency failed for` line since the unit
+  last went inactive. A deliberate `systemctl stop` is still left alone. The
+  watchdog's state-file writes are best-effort, so a write failure is logged
+  and can't abort the run.
+
+  Incidents behind this: gpu-server-002 (serve down 17 h after incus
+  core-dumped and restarted) and gpu-server-001 on 2026-10-14 (a deploy stopped
+  serve at 21:04, the restart at 21:14 hit a 3 s incus blip, and serve stayed
+  down until restarted by hand at 01:41). Gate:
+  `t_gosti_serve_survives_incus_blip`.
+
 - **Ownership records for kept GARM instances.** The remote GARM provider
   records which pool owns each instance it creates (`vm-harness
 ephemeral-label`) and lists a pool's instances with `ephemeral-list --label
-garm-pool=<id>`. The records live in `VMH_EPHEMERAL_LABEL_DIR`, which the
+garm-pool=<id>`. The records live in `GOSTI_EPHEMERAL_LABEL_DIR`, which the
   unit sets to `/var/lib/vm-harness-serve/ephemeral-labels` (inside its
   StateDirectory, the only writable state under `ProtectSystem=strict`; the
   darwin module uses `<stateDir>/ephemeral-labels`). A pool must see only its

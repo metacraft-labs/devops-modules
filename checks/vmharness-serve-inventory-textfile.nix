@@ -55,7 +55,7 @@ top@{ ... }:
       };
       cfg = eval.config;
       icfg = cfg.services.gosti-serve.inventoryExporter;
-      sc = cfg.systemd.services.vm-harness-serve-inventory.serviceConfig;
+      sc = cfg.systemd.services.gosti-serve-inventory.serviceConfig;
       str = v: builtins.unsafeDiscardStringContext (toString v);
       postExec = str (sc.ExecStartPost or "");
       rwPaths = map str (lib.toList (sc.ReadWritePaths or [ ]));
