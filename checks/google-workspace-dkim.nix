@@ -10,9 +10,13 @@
 #   google-workspace-dkim-test  scripts/google-workspace-dkim.sh against stub dig/gh and
 #                          a local bare origin; no network.
 #   google-workspace-domains-test  scripts/google-workspace-domains.sh, its API
-#                          helper and the guided scripts/google-workspace-setup.sh
-#                          against a local Google API stub, an SMTP stub, stub
-#                          dig/gh and local bare origins; no network.
+#                          helper and scripts/google-workspace-setup.sh (the
+#                          guided per-domain path and the batched two-phase one,
+#                          interrupted and resumed; the merge gate, aliases,
+#                          dkim-collect, registrar-debris, the credentials)
+#                          against a local Google API stub, a Cloudflare API
+#                          stub, an SMTP stub, stub dig/gh/gcloud and local
+#                          bare origins; no network.
 { ... }:
 {
   perSystem =
@@ -113,12 +117,17 @@
             nativeBuildInputs = [
               pkgs.bash
               pkgs.coreutils
+              # registrar-debris talks to the Cloudflare API with curl.
+              pkgs.curl
               pkgs.gawk
               pkgs.git
               pkgs.gnugrep
               pkgs.gnused
               pkgs.jq
               pkgs.openssl
+              # setsid: the test interrupts a background follower's process
+              # group. (The key-unlock offer's terminal is python's pty.)
+              pkgs.util-linux
               (pkgs.python3.withPackages (p: [
                 p.google-auth
                 p.requests

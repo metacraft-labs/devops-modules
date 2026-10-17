@@ -22,6 +22,18 @@ it between runs:
      "groups_api_disabled": false,                # 403 SERVICE_DISABLED
      "groups_external_forbidden": false}          # PATCH ANYONE_CAN_POST -> 400
 
+"deny_scopes" may name gmail.metadata and gmail.readonly too (the inbound
+test's read scopes). messages.send delivers into the stub mailbox of the user
+who owns the To address — labels INBOX and SENT — only when the To domain's MX,
+as the stub resolver serves it (DNS_DIR/<domain>.MX), names a Google host, and
+"inbound_broken" is not set; otherwise SENT only. POST /test/deliver {from,
+to, subject} (no token; the tests' stand-in for a message sent from a mailbox
+OUTSIDE the tenant) delivers by the same rule, with label INBOX. messages.list
+and messages.get (format=metadata: Subject, From, To) read that mailbox.
+
+domainAliases.insert answers 409 "Parent domain <p> is not verified." while the
+parent is not verified, as Google does.
+
 A user's nonEditableAliases are derived as Google derives them: every address
 of the user at the parent of a VERIFIED domain alias, at the alias. A user
 alias can only be added at a verified primary or secondary domain (else 400),
@@ -37,7 +49,9 @@ webResource.insert succeeds only when DNS_DIR/<domain> (the stub resolver's
 TXT answer for the apex) holds the token getToken issued; it then marks the
 domain or alias verified — at once, or, with "verify_lag": N, only on the Nth
 Directory read after it (Google's verification reaches the Directory API with a
-delay, and the tool must wait for it). Every request is appended to LOG as
+delay, and the tool must wait for it; "alias_verify_lag": N does so for
+domain aliases alone, whose verification lags most). Each insert is logged as
+"VERIFY <domain> accepted|notfound". Every request is appended to LOG as
 "<METHOD> <path> <scope the bearer token was minted for>", and every Directory
 read of a known domain or alias also as "READ <name> verified=<true|false>". No
 network beyond 127.0.0.1.
@@ -61,6 +75,7 @@ SCOPE_SENDAS = "gmail.settings.sharing"
 SCOPE_SENDAS_READ = ("gmail.settings.basic", "gmail.settings.sharing")
 SCOPE_SEND = "gmail.send"
 SCOPE_GROUPS = "apps.groups.settings"
+SCOPE_MAIL_READ = ("gmail.metadata", "gmail.readonly")
 USERS = "/admin/directory/v1/users/"
 GMAIL = "/gmail/v1/users/"
 GROUPS = "/groups/v1/groups/"
@@ -69,7 +84,7 @@ GROUPS = "/groups/v1/groups/"
 def load():
     with open(STATE) as f:
         s = json.load(f)
-    for k in ("domains", "aliases", "users", "sendas", "groups"):
+    for k in ("domains", "aliases", "users", "sendas", "groups", "mail"):
         s.setdefault(k, {})
     return s
 
@@ -146,6 +161,24 @@ class H(BaseHTTPRequestHandler):
         u = urllib.parse.urlsplit(self.path)
         raw = self.body()
         s = load()
+        if u.path == "/test/deliver":
+            b = json.loads(raw)
+            to = b["to"].lower()
+            owner = next((x for x in s["users"] if to in addresses_of(s, x)), None)
+            try:
+                with open(os.path.join(DNS, to.split("@")[1] + ".MX")) as f:
+                    mx = f.read()
+            except OSError:
+                mx = ""
+            ok = bool(owner) and "google.com" in mx and not s.get("inbound_broken")
+            with open(LOG, "a") as f:
+                f.write(f"DELIVER From={b['from']} To={to} {'delivered' if ok else 'bounced'}\n")
+            if ok:
+                box = s["mail"].setdefault(owner, [])
+                box.append({"id": f"m{len(box) + 1}", "subject": b["subject"], "from": b["from"], "to": to,
+                            "labelIds": ["INBOX"]})
+                save(s)
+            return self.reply(200 if ok else 550, {"delivered": ok})
         if u.path == "/token":
             form = urllib.parse.parse_qs(raw.decode())
             claims = b64json(form["assertion"][0].split(".")[1])
@@ -213,6 +246,27 @@ class H(BaseHTTPRequestHandler):
                 m = email.message_from_bytes(base64.urlsafe_b64decode(json.loads(raw)["raw"]))
                 with open(LOG, "a") as f:
                     f.write(f"SENT {user} From={m['From']} To={m['To']}\n")
+                to = str(m["To"]).lower()
+                owner = next((x for x in s["users"] if to in addresses_of(s, x)), None)
+                try:
+                    with open(os.path.join(DNS, to.split("@")[1] + ".MX")) as f:
+                        mx = f.read()
+                except OSError:
+                    mx = ""
+                delivered = bool(owner) and "google.com" in mx and not s.get("inbound_broken")
+
+                def put(box_user, labels):
+                    box = s["mail"].setdefault(box_user, [])
+                    box.append({"id": f"m{len(box) + 1}", "subject": m["Subject"], "from": m["From"], "to": m["To"],
+                                "labelIds": labels})
+
+                if delivered and owner == user:
+                    put(user, ["INBOX", "SENT"])
+                else:
+                    put(user, ["SENT"])
+                    if delivered:
+                        put(owner, ["INBOX"])
+                save(s)
                 return self.reply(200, {"id": "msg-1", "threadId": "t-1"})
         if u.path == DIR + "domainaliases":
             if not self.need(SCOPE_DOMAIN):
@@ -221,6 +275,10 @@ class H(BaseHTTPRequestHandler):
             name = b["domainAliasName"]
             if name in s["aliases"] or name in s["domains"]:
                 return self.reply(409, {"error": {"code": 409, "message": "Entity already exists."}})
+            if not s["domains"].get(b["parentDomainName"], {}).get("verified"):
+                return self.reply(
+                    409, {"error": {"code": 409, "message": f"Parent domain {b['parentDomainName']} is not verified."}}
+                )
             s["aliases"][name] = {"parent": b["parentDomainName"], "verified": False}
             save(s)
             return self.reply(200, {"domainAliasName": name, "parentDomainName": b["parentDomainName"], "verified": False})
@@ -255,14 +313,17 @@ class H(BaseHTTPRequestHandler):
                         served = f.read()
                 except OSError:
                     served = ""
-                if f'"{token_for(domain)}"' not in served:
+                found = f'"{token_for(domain)}"' in served
+                with open(LOG, "a") as f:
+                    f.write(f"VERIFY {domain} {'accepted' if found else 'notfound'}\n")
+                if not found:
                     return self.reply(
                         400,
                         {"error": {"code": 400, "message": "The necessary verification token could not be found on your site."}},
                     )
-                lag = s.get("verify_lag", 0)
                 for coll in ("domains", "aliases"):
-                    if domain in s[coll]:
+                    lag = s.get("alias_verify_lag", s.get("verify_lag", 0)) if coll == "aliases" else s.get("verify_lag", 0)
+                    if domain in s[coll] and not s[coll][domain].get("verified") and "reads_until_verified" not in s[coll][domain]:
                         if lag > 0:
                             s[coll][domain]["reads_until_verified"] = lag
                         else:
@@ -330,6 +391,22 @@ class H(BaseHTTPRequestHandler):
                         del hidden[a]
             save(s)
             return self.reply(200, v)
+        if u.path.startswith(GMAIL) and "/messages" in u.path:
+            user = urllib.parse.unquote(u.path[len(GMAIL) :].split("/")[0])
+            if not self.need(SCOPE_MAIL_READ) or not self.as_user(user):
+                return
+            box = list(reversed(s["mail"].get(user, [])))
+            rest = u.path.split("/messages", 1)[1]
+            if rest in ("", "/"):
+                return self.reply(200, {"messages": [{"id": m["id"]} for m in box[:25]]})
+            mid = urllib.parse.unquote(rest.lstrip("/"))
+            for m in box:
+                if m["id"] == mid:
+                    return self.reply(200, {"id": mid, "labelIds": m["labelIds"], "payload": {"headers": [
+                        {"name": "Subject", "value": m["subject"]},
+                        {"name": "From", "value": m.get("from", "")},
+                        {"name": "To", "value": m.get("to", "")}]}})
+            return self.reply(404, {"error": {"code": 404, "message": "Requested entity was not found."}})
         if u.path.startswith(GMAIL) and u.path.endswith("/settings/sendAs"):
             user = urllib.parse.unquote(u.path[len(GMAIL) : -len("/settings/sendAs")])
             if not self.need(SCOPE_SENDAS_READ) or not self.as_user(user):

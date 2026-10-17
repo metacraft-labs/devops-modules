@@ -16,7 +16,11 @@ file, the users, the report mailbox.
 > `inputs'.nixos-modules.packages.workspace-admin-tools` to its own dev shell,
 > or runs one pinned revision with `nix run <this flake>/<rev>#<tool> --`.
 
-## 1. Run the guided setup
+## 1. The setup: an interactive phase, then a background one
+
+**The procedure — registrar, zone, Terraform, the batches, DKIM, verification,
+hardening, troubleshooting — is [Onboard-A-Domain.md](./Onboard-A-Domain.md).**
+This document is the reference for the tools it runs.
 
 ```sh
 google-workspace-setup run \
@@ -24,56 +28,95 @@ google-workspace-setup run \
   --key "$KEY" --subject admin@example.com \
   --base main --dmarc-rua dmarc-reports@example.com --group dmarc-reports@example.com \
   --post-edit '<census hook>' --dkim-post-edit '<census hook>' \
-  --scopes '<every scope the delegation must carry>' --test-to someone@elsewhere.example
+  --scopes '<every scope the delegation must carry>'
+google-workspace-setup follow …         # the background phase in the foreground (--detach: detached)
+google-workspace-setup status …         # the domain table and the background phase
+google-workspace-setup inbound-test …   # the inbound test from outside, then the live-mail batch
+google-workspace-setup dkim-collect …   # every DKIM key the console can generate now, ONE PR
 ```
 
-A consumer wraps this in recipes (`just google-setup`, and one per step) that
-fill in everything. The wizard is written for a narrow terminal pane: guidance
-on stdout, wrapped at 78 columns, URLs and values to paste never broken. For
-every step that needs the Admin console it prints **the page (a deep link),
-what to click, the exact value to paste, and what success looks like**, then
-waits — `Enter` = done, verify now; `s` = skip; `q` = quit — and **verifies
-the result itself** before moving on, printing the guidance again when the
-check fails. Everything is checked live first, so a re-run skips what is done
-and resumes where the last one stopped.
+`run` does the operator's part in one sitting (the Google project's APIs, the
+scopes, the report group, the decisions, the domains on the tenant, the
+addresses, the DKIM keys, the inbound test when due) and opens ONE PR with the
+batch due now; `follow` lands it, waits for the apply and DNS, has Google
+verify, and opens the next batch, until nothing is left; it ends with what
+still needs the operator, kept for `status` and piped to
+`$GOOGLE_WORKSPACE_NOTIFY` when set (title in `$NOTIFY_TITLE`). Each batch
+carries one kind of change — verification tokens, then the mail records of
+domains with no mail elsewhere, then (after the inbound test) those that move
+live mail, then DKIM keys — see
+[Onboard-A-Domain.md §5](./Onboard-A-Domain.md#5-tokens-verification-mail-records-setup-run).
+`follow` runs as a transient systemd user unit when the user manager answers,
+else with `nohup` (`$GOOGLE_WORKSPACE_FOLLOW_DETACH=systemd|nohup|none`).
+
+**Interrupted, both resume.** Everything is re-read every time — the data file
+on `origin/<base>`, the tenant, DNS, the state file — so a re-run picks up where
+things stand: a batch PR in flight is landed rather than opened again, a batch
+already merged goes straight to its DNS wait. A domain that another open PR
+changes — a per-domain PR of §1.4, or a batch made by hand under any branch
+name: any open PR whose head changes the domain's entry in the data file — is
+left to that PR; the follower waits for it to land (up to
+`$GOOGLE_WORKSPACE_FOREIGN_PR_WAIT` seconds, default six hours) and carries on
+from what it published. Work done by hand is simply found done.
+
+### 1.1 The safety rules the batches keep
+
+- **No MX before verification.** A domain's mail records go into a batch only
+  once Google reports it verified, and an alias's only once its parent is
+  (§4, "Why two PRs"). The one exception is a **no-mail alias** whose token
+  Site Verification has accepted: its Workspace verification lags hours, and
+  with no mail today nothing can bounce that did not before.
+- **Mail that goes elsewhere today** — an MX outside Google, resolving or not
+  (the host may only be down) — moves only as the operator decided, and only
+  after a message sent from a mailbox **outside** the tenant reached a domain
+  already moved (`inbound-test`; a message from inside is delivered
+  internally and proves nothing about the MX). The domains with no MX move
+  first, so that there is one to test.
+- **One kind of change per batch**, in the order above, so that every PR is
+  reviewable at a glance and the risky one (moving live mail) is alone.
+- Domains declared `zone_pending` are listed and skipped (§6.2).
+
+### 1.2 The state file
+
+`${XDG_STATE_HOME:-~/.local/state}/google-workspace-setup/<tenant>.json`
+(`$GOOGLE_WORKSPACE_STATE_DIR` overrides the directory), never committed, with
+the background phase's log beside it (`<tenant>.log`). It holds only what is
+neither in the data file, nor on the tenant, nor in DNS: the decisions
+(`--redecide` asks them again), the DKIM keys pasted but not yet on the base
+branch (public keys), the inbound proof, which domains' tokens Site
+Verification accepted and since when the follower waits for their
+verification, the batch in flight (its kind, PR, stage, and the record
+addresses it adds and removes), the follower's pid or unit, the console steps
+the batches made due (Activate Gmail, Start authentication; shown and
+confirmed at the next `run`) and the last summary. Deleting it loses the
+decisions and the queued keys, nothing else.
+
+### 1.3 The per-domain path
+
+The steps one by one, and the original guided run that takes the domains one
+after another and waits for each PR (one PR per change, slow):
 
 | Step             | What it does                                                                                                                                                                                                                                                                                            | Verified by                                                                |
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
 | `scopes`         | Mints a token per scope; for the missing ones prints the client id, the console page and the **complete** replacement scope line (granted + missing, one comma-separated line, and one per box)                                                                                                         | a token for every scope                                                    |
 | `dmarc-group`    | Sets the report group's `whoCanPostMessage` to `ANYONE_CAN_POST`, `spamModerationLevel` to `ALLOW` and `messageModerationLevel` to `MODERATE_NONE` (no report held for a moderator); guides through enabling the Groups Settings API, or the organisation's Groups sharing setting, when Google refuses | the group's settings, read back                                            |
-| `onboard-all`    | Every declared domain, in the order of §1.1: onboard (§4), Activate Gmail (console), the users' addresses (§3)                                                                                                                                                                                          | `status` of the domain; the Directory and Gmail APIs                       |
+| `onboard-all`    | Every declared domain, in the order below: onboard (§4), Activate Gmail (console), the users' addresses (§3)                                                                                                                                                                                            | `status` of the domain; the Directory and Gmail APIs                       |
 | `user-addresses` | Every `google_users` user's aliases and send-as entries on every domain                                                                                                                                                                                                                                 | the Directory and Gmail APIs; `pending` re-checked after the user clicks   |
 | `dkim-all`       | Every domain on Google without a DKIM key: the console steps (domain, 2048 bits, selector `google`), the paste, the PR, the DNS wait, "Start authentication"                                                                                                                                            | DNS serves the key; with `--test-to`, a message sent through the Gmail API |
 | `smtp-relay`     | The SMTP relay rule for automated sending (§5), console only                                                                                                                                                                                                                                            | with `--test-to` and an app password, a message sent through the relay     |
-| `status`         | One line per domain                                                                                                                                                                                                                                                                                     | —                                                                          |
+| `guided`         | All of the above in that order, DKIM inside each domain's turn                                                                                                                                                                                                                                          | —                                                                          |
 
-`run` (the default) does all of them in that order, with DKIM inside each
-domain's turn.
+The guided path's order, from the data and live DNS: the tenant's **primary**
+domain (records only); domains whose mail is **already on Google**; domains
+with **no MX**; domains whose MX names a host elsewhere that **does not
+resolve**; then domains whose mail **goes elsewhere today** — each of the last
+two only after the operator confirms a message from outside arrived at a domain
+already moved, and that the old mailboxes are exported. An alias always comes
+after its parent.
 
-### 1.1 The order
+### 1.4 The tools underneath
 
-From the data and live DNS, per domain:
-
-1. the tenant's **primary** domain (records only);
-2. domains whose mail is **already on Google** — no routing change;
-3. domains with **no MX** — nothing to lose;
-4. domains whose MX names a host elsewhere that **does not resolve** (it may
-   only be down for now), then
-5. domains whose mail **goes elsewhere today**. Before the first domain of 4
-   or 5 is switched, the wizard asks the operator to confirm that a message
-   sent from **outside** the tenant arrived at an address on a secondary or
-   alias domain already moved to `smtp.google.com`; and before each, that the
-   old mailboxes are exported and every address in use exists on the tenant.
-   Without the confirmation — or with no such domain to send it to — the
-   domain is skipped, untouched.
-
-An alias always comes after its parent (Google needs the parent first), and
-`onboard` leaves an alias's mail records alone until its parent is verified.
-Domains declared `zone_pending` are listed and skipped (§6.2).
-
-### 1.2 The tools underneath
-
-The wizard only orchestrates; each step is a command of its own:
+Both phases only orchestrate; each step is a command of its own:
 
 ```sh
 google-workspace-domains scopes [--scopes S,S,…] [--guide]
@@ -81,37 +124,34 @@ google-workspace-domains dmarc-group --group G [--guide]
 google-workspace-domains onboard --domain D --data FILE [--kind secondary|alias --parent P] …
 google-workspace-domains user-addresses (--user U | --all) (--domain D | --all-domains) --data FILE [--local L]…
 google-workspace-domains status (--domain D | --all) --data FILE [--user U] [--table]
+google-workspace-domains edit --domain D --data FILE --phase verification --token T | --phase records … [--dry-run]
+google-workspace-domains registrar-debris --domain D [--token-file F [--unlock C --lock C] --delete] …
 google-workspace-dkim publish --domain D --data FILE …          # docs/Google-Workspace-DKIM.md
 ```
 
-`--key`/`--subject` (or `$GOOGLE_WORKSPACE_KEY`/`$GOOGLE_WORKSPACE_SUBJECT`)
-are the decrypted service-account key of
+`edit` is `onboard`'s edit of the data file for one phase alone — no Google
+call, no hook, no PR; the batches are made of it. `--key`/`--subject` (or
+`$GOOGLE_WORKSPACE_KEY`/`$GOOGLE_WORKSPACE_SUBJECT`) are the decrypted
+service-account key of
 [Google-Workspace-Admin-API-Access.md](./Google-Workspace-Admin-API-Access.md)
-and the super admin it acts as. `status` without them checks DNS only.
+and the super admin it acts as. `status` without them checks DNS only. The PR
+flow (`scripts/lib/pr-publish.sh`) is shared: open (branch, commit, push, PR)
+and land (watch the exact head, merge at it) are separate steps, so one
+process can open a PR and another land it. Its merge gate — the required
+checks, the labels, the plan check, the apply re-run — is configured in the
+environment ([Onboard-A-Domain.md §5](./Onboard-A-Domain.md#5-tokens-verification-mail-records-setup-run),
+"The merge gate"), and applies to every tool's PRs.
 
 ## 2. Secondary domain or domain alias
 
-| You want                                                                                    | Kind          |
-| ------------------------------------------------------------------------------------------- | ------------- |
-| Separate identities: some users (or groups) get addresses there, chosen one by one          | **secondary** |
-| A user whose **primary** address is in that domain                                          | **secondary** |
-| Every user of a domain reachable at the same name in another domain, with nothing to manage | **alias**     |
-| A second spelling of a domain (`example-labs.com` / `examplelabs.com`), or a new TLD        | **alias**     |
-
-- A **secondary domain** gives nobody an address by itself. Users and groups
-  are created there, or given **user aliases** there (§3). Users can be created
-  with their primary address in it.
-- A **domain alias** belongs to a parent domain — the primary or a secondary
-  domain — and every user and group of the parent automatically receives mail
-  at the same local part in the alias. Nobody can have a primary address in an
-  alias domain, and its addresses cannot be removed one by one.
-- Both cost nothing extra, and both need their own verification, MX, SPF, DKIM
-  and DMARC: each domain is its own mail domain on the internet.
-- Google cannot turn one kind into the other. The tool refuses a domain the
-  tenant has as the other kind, and says what to delete in the console first.
-
+Which to choose, and what each gives:
+[Onboard-A-Domain.md §4](./Onboard-A-Domain.md#4-workspace-secondary-domain-or-domain-alias).
 The kind is data, per domain: `"google": {"kind": "secondary"}` or
 `{"kind": "alias", "parent": "<domain>"}` (`"primary"` for the tenant's own).
+Google cannot turn one kind into the other: the tool refuses a domain the
+tenant has as the other kind, and says what to delete in the console first.
+An alias can only be added once its parent is verified (HTTP 409 before; the
+API helper's `alias` exits 4).
 
 ## 3. Users' addresses and send-as
 
@@ -293,7 +333,7 @@ MX and SPF changes cannot: they wait for the second PR of §4.
 **DMARC progression.** Start at `p=none` with `rua` (aggregate reports), as
 `onboard` does. Read the reports for a few weeks: every legitimate source must
 pass SPF or DKIM _aligned_ with the From domain. For mail through Google that
-means the domain's **own** DKIM key (§1, `dkim-all`) — before it, Google signs
+means the domain's **own** DKIM key (§1, the DKIM step of `run`) — before it, Google signs
 with a `*.gappssmtp.com` key that never aligns — and SPF only when the envelope
 sender is in the domain. Then `p=quarantine` (optionally `pct=25` → `100`), then
 `p=reject`, by hand in the data file. A domain that sends no mail at all can go
@@ -340,22 +380,25 @@ named in the error; `scopes` checks them all.
 | `sendAs.list` (as the user)                          | `gmail.settings.basic` (or `gmail.settings.sharing`)            |
 | `sendAs.create` (as the user)                        | `gmail.settings.sharing`                                        |
 | `messages.send` (as the user; tests, automation)     | `gmail.send`                                                    |
+| `messages.list`, `.get` (as the user; inbound test)  | `gmail.metadata` (or `gmail.readonly`)                          |
 | Groups Settings `groups.get` / `.patch`              | `apps.groups.settings`                                          |
 
 Edit the client id's entry at
 <https://admin.google.com/ac/owl/domainwidedelegation>. **The saved list
 replaces the old one**: paste the complete line `scopes` prints (it includes
 every scope it checked, granted or not), plus any other scope the entry carries
-for other automation. The project needs the Admin SDK, Gmail, Site Verification
-and Groups Settings APIs enabled (`google-workspace-dwd setup` enables them).
+for other automation. The project needs the Admin SDK, Gmail, Site Verification,
+Groups Settings and Org Policy APIs enabled (`google-workspace-dwd setup` and
+`google-workspace-setup run` enable them, logging gcloud in again when its
+credentials have expired).
 
-| Error                                             | Cause and remedy                                                            |
-| ------------------------------------------------- | --------------------------------------------------------------------------- |
-| `token refused (unauthorized_client) for scope X` | X is not in the delegation (or not approved yet): add it                    |
-| `the <api> API is not enabled`                    | `gcloud services enable <api> --project <project>` (printed in full)        |
-| `HTTP 403 … lacks the privilege`                  | `--subject` is not a super admin                                            |
-| `Google could not find the verification TXT`      | public DNS does not serve the token yet; re-run once `status` shows it      |
-| `Google cannot turn one into the other`           | the tenant has the domain as the other kind: delete it in the console first |
+| Error                                             | Cause and remedy                                                                                        |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `token refused (unauthorized_client) for scope X` | X is not in the delegation (or not approved yet): add it                                                |
+| `the <api> API is not enabled`                    | `run` enables it with gcloud; else `gcloud services enable <api> --project <project>` (printed in full) |
+| `HTTP 403 … lacks the privilege`                  | `--subject` is not a super admin                                                                        |
+| `Google could not find the verification TXT`      | public DNS does not serve the token yet; re-run once `status` shows it                                  |
+| `Google cannot turn one into the other`           | the tenant has the domain as the other kind: delete it in the console first                             |
 
 ## 9. Cutover consequences and rollback
 
