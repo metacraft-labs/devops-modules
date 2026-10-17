@@ -2332,16 +2332,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1777851538,
-        "narHash": "sha256-Gp8qwTEYNoy2yvmErVGlvLOQvrtEECCAKbonW7VJef8=",
+        "lastModified": 1791938526,
+        "narHash": "sha256-yNYK2pdk3bCtJrpblrNYA6hZKdybWUeyTtx74+OEJFo=",
         "owner": "nix-community",
         "repo": "home-manager",
-        "rev": "cc09c0f9b7eaa95c2d9827338a5eb03d32505ca5",
+        "rev": "32904dfe1cf86039f3c8c9f41f94e1cfd76dbb34",
         "type": "github"
       },
       "original": {
         "owner": "nix-community",
-        "ref": "release-25.11",
+        "ref": "release-26.05",
         "repo": "home-manager",
         "type": "github"
       }
@@ -3011,16 +3011,16 @@
         ]
       },
       "locked": {
-        "lastModified": 1772129556,
-        "narHash": "sha256-Utk0zd8STPsUJPyjabhzPc5BpPodLTXrwkpXBHYnpeg=",
+        "lastModified": 1783744694,
+        "narHash": "sha256-2cp6N3rrwnGYLTx9l6N+NI+kwrCWxvJUbj5WJhvB29A=",
         "owner": "nix-darwin",
         "repo": "nix-darwin",
-        "rev": "ebec37af18215214173c98cf6356d0aca24a2585",
+        "rev": "c3e90c89649b07d1a96e4b9dd6cd0d6e44b91a74",
         "type": "github"
       },
       "original": {
         "owner": "nix-darwin",
-        "ref": "nix-darwin-25.11",
+        "ref": "nix-darwin-26.05",
         "repo": "nix-darwin",
         "type": "github"
       }
@@ -3582,22 +3582,6 @@
         "type": "github"
       }
     },
-    "nixos-2511": {
-      "locked": {
-        "lastModified": 1778003029,
-        "narHash": "sha256-q/nkKLDtHIyLjZpKhWk3cSK5IYsFqtMd6UtXF3ddjgA=",
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "0c88e1f2bdb93d5999019e99cb0e61e1fe2af4c5",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NixOS",
-        "ref": "nixos-25.11",
-        "repo": "nixpkgs",
-        "type": "github"
-      }
-    },
     "nixos-2605": {
       "locked": {
         "lastModified": 1791254437,
@@ -3605,6 +3589,22 @@
         "owner": "NixOS",
         "repo": "nixpkgs",
         "rev": "b25309931cfda5f0b8805f462a29897eeae50168",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-26.05",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "nixos-2605_2": {
+      "locked": {
+        "lastModified": 1792030654,
+        "narHash": "sha256-OaQwAtPMTjQiY2sT/2/62UbSPhzP/0aDnWzMm/NCiUw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "26f4107e47e3ad0ffd0db220469ba83b6f6d96e8",
         "type": "github"
       },
       "original": {
@@ -3778,13 +3778,13 @@
         "nix2container": "nix2container_2",
         "nixd": "nixd_4",
         "nixos-2505": "nixos-2505_2",
-        "nixos-2511": "nixos-2511",
+        "nixos-2605": "nixos-2605_2",
         "nixos-anywhere": "nixos-anywhere_2",
         "nixos-images": "nixos-images_2",
         "nixpkgs": [
           "reprobuild",
           "nixos-modules",
-          "nixos-2511"
+          "nixos-2605"
         ],
         "nixpkgs-unstable": "nixpkgs-unstable_2",
         "reprobuild": [
@@ -3798,7 +3798,7 @@
       "locked": {
         "owner": "metacraft-labs",
         "repo": "devops-modules",
-        "rev": "5a0fe76d193ede95438769fb3b7bba4b2139b24c",
+        "rev": "cec5443218a74b00f24ab7702d17fb42465c7949",
         "type": "github"
       },
       "original": {
@@ -4449,17 +4449,17 @@
         "stackable-hooks-macos-tools": "stackable-hooks-macos-tools"
       },
       "locked": {
-        "lastModified": 1792182730,
-        "narHash": "sha256-TH6I2GgqSgTrPtbnIQebWfW6J/smYb9cYf7JuL7qASA=",
+        "lastModified": 1792215594,
+        "narHash": "sha256-pbLoGZ8hza9BSQdA9qxzQySNh9jEfsXl3UOKnr+fiFM=",
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "3912f3874e3038af5a2648a11a82f824762c0940",
+        "rev": "aba27698097b36a751c3c004b0864269034c8586",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "3912f3874e3038af5a2648a11a82f824762c0940",
+        "rev": "aba27698097b36a751c3c004b0864269034c8586",
         "type": "github"
       }
     },
