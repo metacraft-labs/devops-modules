@@ -180,12 +180,14 @@ one of the approved scopes; `admin.directory.user` does not imply
 `admin.directory.user.readonly`) and lists one user of the tenant. It prints
 `ok: …` on success. The usual failures:
 
-| Error                                            | Cause                                                                                                                             |
-| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| `unauthorized_client`                            | Delegation not approved yet, wrong client ID (email instead of numeric ID), or a scope requested that is not in the approved list |
-| `403 Not Authorized to access this resource/api` | The impersonated user lacks the admin privilege for the call                                                                      |
-| `invalid_grant: Invalid email or User ID`        | `sub` is not a user in the tenant                                                                                                 |
-| `accessNotConfigured`                            | The API is not enabled in the service account's project                                                                           |
+| Error                                                                    | Cause                                                                                                                                                                  |
+| ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unauthorized_client`                                                    | Delegation not approved yet, wrong client ID (email instead of numeric ID), or a scope requested that is not in the approved list                                      |
+| `403 Not Authorized to access this resource/api`                         | The impersonated user lacks the admin privilege for the call                                                                                                           |
+| `invalid_grant: Invalid email or User ID`                                | `sub` is not a user in the tenant                                                                                                                                      |
+| `accessNotConfigured`                                                    | The API is not enabled in the service account's project                                                                                                                |
+| gcloud: `Reauthentication failed`, `refreshing your current auth tokens` | The organisation's reauthentication policy expired the gcloud login: `gcloud auth login` (the setup tools run it themselves)                                           |
+| `cannot read the service-account key` after a reboot                     | The key was unlocked onto a tmpfs (`$XDG_RUNTIME_DIR`) that the restart emptied: unlock it again ([Onboard-A-Domain.md §11](./Onboard-A-Domain.md#11-troubleshooting)) |
 
 ## 7. Rotate and revoke
 

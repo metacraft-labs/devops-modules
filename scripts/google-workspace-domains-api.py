@@ -6,7 +6,10 @@
   state  DOMAIN [--write]   {"kind": "primary"|"secondary"|"alias"|"absent",
                              "verified": bool, "parent": str|null}
   alias  DOMAIN PARENT      add DOMAIN as a domain alias of PARENT (unless the
-                            tenant has it already); prints the state
+                            tenant has it already); prints the state. Exit 4
+                            when Google refuses because PARENT is not verified
+                            yet (HTTP 409 "Parent domain ... is not verified"):
+                            add the alias again once it is
   secondary DOMAIN          add DOMAIN as a secondary domain (same rules)
   token  DOMAIN             the DNS TXT value proving ownership (DNS_TXT)
   verify DOMAIN             ask Google to check that TXT record
@@ -28,6 +31,18 @@
                             message is held for a moderator
   send-test USER FROM TO    send a short test message as USER, From: FROM
                             (one of USER's send-as addresses), To: TO
+  inbound-wait USER MARKER   wait (up to $GOOGLE_INBOUND_TIMEOUT seconds,
+                            default 180) until a message whose Subject
+                            contains MARKER is in USER's mailbox — the test
+                            message the operator sends from a mailbox OUTSIDE
+                            the tenant, so that it really comes in through
+                            the domain's MX (a message sent from inside the
+                            tenant is delivered internally and proves
+                            nothing). Reads headers only, with gmail.metadata
+                            (or gmail.readonly). Prints {"result":
+                            "delivered", "from": ..., "to": ..., "labels":
+                            [...]}; exit 3 when neither read scope is granted,
+                            1 when no such message arrives (or it is in Spam)
   smtp-test USER FROM TO    send a test message through the Workspace SMTP
                             relay (smtp-relay.gmail.com:587, STARTTLS), logging
                             in as USER with the password in $SMTP_RELAY_PASSWORD
@@ -48,7 +63,9 @@ GOOGLE_SITE_VERIFICATION_API, GOOGLE_GMAIL_API and GOOGLE_GROUPS_SETTINGS_API
 (the token endpoint is the key file's token_uri); GOOGLE_SMTP_RELAY=host:port
 redirects smtp-test, and GOOGLE_SMTP_RELAY_STARTTLS=0 lets it talk to a
 plain-text test server (never use it against a real relay).
-Exit status: 0 ok, 1 failure (the message names the cause and the remedy).
+Exit status: 0 ok, 1 failure (the message names the cause and the remedy), 3
+for inbound-wait when the delegation grants neither read scope, 4 for alias
+when the parent domain is not verified yet.
 """
 
 import argparse
@@ -74,6 +91,8 @@ SCOPE_SENDAS_READ = AUTH + "gmail.settings.basic"
 SCOPE_SENDAS = AUTH + "gmail.settings.sharing"
 SCOPE_SEND = AUTH + "gmail.send"
 SCOPE_GROUPS = AUTH + "apps.groups.settings"
+SCOPE_MAIL_META = AUTH + "gmail.metadata"
+SCOPE_MAIL_READ = AUTH + "gmail.readonly"
 
 
 def api_of(scope):
@@ -108,6 +127,10 @@ class Failure(Exception):
 
 class Denied(Failure):
     """The delegation does not include the scope (unauthorized_client)."""
+
+
+class ParentUnverified(Failure):
+    """domainAliases.insert refused: the parent domain is not verified yet."""
 
 
 def key_info(key):
@@ -256,9 +279,19 @@ def add(args, kind):
     else:
         r = call(s, "POST", f"{ADMIN_API}{DIR}domains", json={"domainName": args.domain})
         what = "domains.insert"
+    if r.status_code == 409 and kind == "alias" and "not verified" in r.text.lower():
+        # Google adds an alias only to a VERIFIED parent; the alias is added
+        # (and then verified with its own token) once the parent is.
+        raise ParentUnverified(
+            f"Google refused to add {args.domain} as an alias of {args.parent}: the parent domain is not "
+            f"verified yet (HTTP 409: {r.text[:160]}). Add it again once {args.parent} is verified"
+        )
     if r.status_code != 409:  # 409: added concurrently; read it back below
         json_or_fail(r, f"{what} {args.domain}")
-    return state(args, write=True)
+    st = state(args, write=True)
+    if st["kind"] == "absent":
+        raise Failure(f"{what} {args.domain}: HTTP {r.status_code} but the tenant does not list it ({r.text[:160]})")
+    return st
 
 
 def site(domain):
@@ -409,6 +442,36 @@ def send_test(args):
     return {"id": res.get("id"), "from": args.sender, "to": args.to}
 
 
+def inbound_wait(args):
+    import time
+
+    reader = session_any(args.key, args.user, [SCOPE_MAIL_META, SCOPE_MAIL_READ])
+    timeout = int(os.environ.get("GOOGLE_INBOUND_TIMEOUT", "180"))
+    interval = float(os.environ.get("GOOGLE_INBOUND_INTERVAL", "10"))
+    start = time.time()
+    while True:
+        r = call(reader, "GET", f"{GMAIL_API}/gmail/v1/users/{q(args.user)}/messages",
+                 params={"maxResults": 25, "includeSpamTrash": "true"})
+        for ref in json_or_fail(r, f"messages.list for {args.user}").get("messages", []):
+            r = call(reader, "GET", f"{GMAIL_API}/gmail/v1/users/{q(args.user)}/messages/{q(ref['id'])}",
+                     params={"format": "metadata", "metadataHeaders": ["Subject", "From", "To"]})
+            msg = json_or_fail(r, f"messages.get {ref['id']}")
+            hdr = {h.get("name", "").lower(): h.get("value", "") for h in msg.get("payload", {}).get("headers", [])}
+            if args.marker not in hdr.get("subject", ""):
+                continue
+            labels = sorted(msg.get("labelIds", []))
+            if "SPAM" in labels:
+                raise Failure(f"the test message ({args.marker}) arrived, but in Spam ({labels})")
+            if "INBOX" in labels:
+                return {"result": "delivered", "from": hdr.get("from", ""), "to": hdr.get("to", ""), "labels": labels}
+        if time.time() - start >= timeout:
+            raise Failure(
+                f"no message with {args.marker!r} in its subject reached {args.user}'s inbox within {timeout}s: "
+                "the domain may not accept mail on the tenant yet (the MX, Activate Gmail, the address)"
+            )
+        time.sleep(interval)
+
+
 def smtp_test(args):
     import smtplib
     import socket
@@ -492,6 +555,9 @@ def main():
         p = sub.add_parser(op)
         p.add_argument("user")
         p.add_argument("address")
+    p = sub.add_parser("inbound-wait")
+    p.add_argument("user")
+    p.add_argument("marker")
     p = sub.add_parser("group")
     p.add_argument("group")
     p.add_argument("--allow-external", action="store_true")
@@ -518,9 +584,17 @@ def main():
         "group": group,
         "send-test": send_test,
         "smtp-test": smtp_test,
+        "inbound-wait": inbound_wait,
     }
     try:
         out = ops[args.op](args)
+    except Denied as e:
+        # inbound-wait without a read scope is "cannot tell", not a failure.
+        print(f"{PROG}: {e}", file=sys.stderr)
+        return 3 if args.op == "inbound-wait" else 1
+    except ParentUnverified as e:
+        print(f"{PROG}: {e}", file=sys.stderr)
+        return 4
     except Failure as e:
         msg = str(e)
         if "--project <project>" in msg:

@@ -255,6 +255,7 @@ apply_edit() {
   after="$(jq -L "$lib" -r 'include "mail-auth"; mail_auth_addresses' "$f" | sort)"
   added="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed '/^$/d')"
   removed="$(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed '/^$/d')"
+  pr_added="$added" pr_removed="$removed" pr_known=1
   say "set .domains[\"$domain\"].dkim[\"$selector\"] in $f"
   if [ -n "$post_edit" ]; then
     say "running the post-edit hook: $post_edit"
