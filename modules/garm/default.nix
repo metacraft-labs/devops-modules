@@ -366,9 +366,23 @@
           auth_token_file = "${stagedAhTokenPath name}"
         ''
         + optStr "runner_template" a.runnerTemplate
-        + optionalString (ahUsesNixRunner a) ''
-          command = ["${pkgs.bashInteractive}/bin/bash", "-s"]
-        ''
+        + (
+          let
+            cmd =
+              if a.command != null then
+                a.command
+              else if ahUsesNixRunner a then
+                [
+                  "${pkgs.bashInteractive}/bin/bash"
+                  "-s"
+                ]
+              else
+                [ ];
+          in
+          optionalString (cmd != [ ]) ''
+            command = [${lib.concatMapStringsSep ", " (c: "\"${tomlStr c}\"") cmd}]
+          ''
+        )
         + optStr "ca_cert_file" (if a.caCertFile == null then "" else toString a.caCertFile)
         + optStr "guest_metadata_url" (if p.guestMetadataURL == null then "" else p.guestMetadataURL)
         + optStr "guest_callback_url" (if p.guestCallbackURL == null then "" else p.guestCallbackURL)
@@ -427,14 +441,16 @@
             config.systemd.package
           ]
           ++ r.extraPackages;
-          binDirs = map (p: "${lib.getBin p}/bin") pathPkgs;
+          binDirs = if r.pathDirs != null then r.pathDirs else map (p: "${lib.getBin p}/bin") pathPkgs;
+          listenerPath = if r.listener != null then r.listener else "${r.package}/bin/Runner.Listener";
+          runnerVersion = if r.version != null then r.version else r.package.version;
         in
         ''
 
           [runner]
-          listener = "${r.package}/bin/Runner.Listener"
-          version = "${r.package.version}"
-          path = [${lib.concatMapStringsSep ", " (d: "\"${d}\"") binDirs}]
+          listener = "${tomlStr listenerPath}"
+          version = "${tomlStr runnerVersion}"
+          path = [${lib.concatMapStringsSep ", " (d: "\"${tomlStr d}\"") binDirs}]
           max_minor_lag = ${toString r.maxMinorLag}
         ''
         + optionalString (r.extraEnvironment != { }) (
@@ -2938,6 +2954,16 @@
                       picks the substrate default.
                     '';
                   };
+                  command = mkOption {
+                    type = types.nullOr (types.listOf types.str);
+                    default = null;
+                    description = ''
+                      Optional job command override on the agent-harbor host
+                      (e.g. `["/etc/ah-sandbox/path/bin/bash", "-s"]` for a remote
+                      Darwin host). When null, local-sandbox providers default to
+                      this controller's `[ "${pkgs.bashInteractive}/bin/bash", "-s" ]`.
+                    '';
+                  };
                   ttlSeconds = mkOption {
                     type = types.ints.positive;
                     default = 21600;
@@ -3030,6 +3056,35 @@
                           default = pkgs.github-runner;
                           defaultText = lib.literalExpression "pkgs.github-runner";
                           description = "The nixpkgs `github-runner` package (its `bin/Runner.Listener` and `version`).";
+                        };
+                        listener = mkOption {
+                          type = types.nullOr types.str;
+                          default = null;
+                          description = ''
+                            Optional target-host path to `bin/Runner.Listener` (e.g.
+                            `"/etc/ah-sandbox/runner/bin/Runner.Listener"` on a remote
+                            Darwin host). When null, defaults to
+                            `"''${runner.package}/bin/Runner.Listener"`.
+                          '';
+                        };
+                        version = mkOption {
+                          type = types.nullOr types.str;
+                          default = null;
+                          description = ''
+                            Optional explicit runner version string (`x.y.z`). When
+                            null, defaults to `runner.package.version`.
+                          '';
+                        };
+                        pathDirs = mkOption {
+                          type = types.nullOr (types.listOf types.str);
+                          default = null;
+                          description = ''
+                            Optional explicit list of absolute PATH directories on the
+                            agent-harbor host (used when the host has a different OS or
+                            architecture than the GARM controller). When null, built
+                            from the controller's standard service path packages plus
+                            `extraPackages`.
+                          '';
                         };
                         extraPackages = mkOption {
                           type = types.listOf types.package;

@@ -207,6 +207,38 @@ func TestCreateHandsRunnerInstallScriptToLaunch(t *testing.T) {
 	if _, hasImage := body["image"]; hasImage {
 		t.Fatal("image must not be sent for local-sandbox (the server answers 422)")
 	}
+
+	// macOS arm64 local-sandbox pools use the same rootless Nix runner payload
+	// (with sw_vers system-info fallback), while Windows is rejected.
+	bMac := bootstrap("runner-macos")
+	bMac.OSType = commonParams.OSType("macos")
+	bMac.OSArch = commonParams.Arm64
+	bMac.Tools = []commonParams.RunnerApplicationDownload{{
+		OS:           ptr("osx"),
+		Architecture: ptr("arm64"),
+		DownloadURL:  ptr("https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-osx-arm64-2.336.0.tar.gz"),
+		Filename:     ptr("actions-runner-osx-arm64-2.336.0.tar.gz"),
+	}}
+	if _, err := p.CreateInstance(context.Background(), bMac); err != nil {
+		t.Fatalf("macos create: %v", err)
+	}
+	_, macBody := lastCreate(t, m)
+	macStdin, _ := macBody["stdin"].(string)
+	if !strings.Contains(macStdin, "sw_vers -productName") {
+		t.Errorf("macos install script lacks sw_vers fallback")
+	}
+
+	bWin := bootstrap("runner-win")
+	bWin.OSType = commonParams.Windows
+	bWin.Tools = []commonParams.RunnerApplicationDownload{{
+		OS:           ptr("win"),
+		Architecture: ptr("x64"),
+		DownloadURL:  ptr("https://github.com/actions/runner/releases/download/v2.336.0/actions-runner-win-x64-2.336.0.zip"),
+		Filename:     ptr("actions-runner-win-x64-2.336.0.zip"),
+	}}
+	if _, err := p.CreateInstance(context.Background(), bWin); !errors.Is(err, garmErrors.ErrBadRequest) {
+		t.Fatalf("windows sandbox payload must be rejected, got: %v", err)
+	}
 }
 
 func TestCreatePassesTTLAndRequiresCleanupToken(t *testing.T) {

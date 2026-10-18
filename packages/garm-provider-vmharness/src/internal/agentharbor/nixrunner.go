@@ -142,8 +142,8 @@ const PayloadFailureExit = 78
 
 // renderNixRunnerPayload renders the sandbox payload for one runner.
 func renderNixRunnerPayload(bootstrap commonParams.BootstrapInstance, tools commonParams.RunnerApplicationDownload, runner NixRunnerConfig) ([]byte, error) {
-	if bootstrap.OSType != commonParams.Linux {
-		return nil, fmt.Errorf("the sandbox payload supports linux only, not %q", bootstrap.OSType)
+	if bootstrap.OSType != commonParams.Linux && bootstrap.OSType != commonParams.OSType("macos") {
+		return nil, fmt.Errorf("the sandbox payload supports linux and macos only, not %q", bootstrap.OSType)
 	}
 	pkg := path.Dir(path.Dir(runner.Listener))
 	data := nixRunnerPayloadData{
@@ -241,6 +241,9 @@ send_system_info() {
 	if [ -f /etc/os-release ]; then
 		os_name=$(sed -n 's/^NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release)
 		os_version=$(sed -n 's/^VERSION_ID="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release)
+	elif command -v sw_vers >/dev/null 2>&1; then
+		os_name=$(sw_vers -productName 2>/dev/null || true)
+		os_version=$(sw_vers -productVersion 2>/dev/null || true)
 	fi
 	base_url="$CALLBACK_URL"
 	case "$base_url" in

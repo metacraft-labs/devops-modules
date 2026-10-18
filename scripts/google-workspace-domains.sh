@@ -16,6 +16,13 @@
 #                                    --data FILE [--local L]… [--key KEY --subject ADMIN]
 #   google-workspace-domains dmarc-group --group GROUP [--guide] [--key KEY --subject ADMIN]
 #   google-workspace-domains scopes  [--scopes S,S,…] [--guide] [--key KEY --subject ADMIN]
+#   google-workspace-domains edit    --domain D --data FILE (--phase verification --token T |
+#                                    --phase records [--mx …] [--spf-drop H]… [--spf-replace]
+#                                    [--dmarc-rua M] [--tls-rpt-rua M]) [--dry-run]
+#   google-workspace-domains registrar-debris --domain D [--data FILE] [--zone-id Z]
+#                                    [--token-file F] [--unlock CMD] [--lock CMD]
+#                                    [--parking-ip IP]… [--debris-ns PATTERN]…
+#                                    [--allow-ns PATTERN]… [--names N,N,…] [--delete]
 #
 # --key/--subject (or $GOOGLE_WORKSPACE_KEY / $GOOGLE_WORKSPACE_SUBJECT): the
 # decrypted service-account key with domain-wide delegation and the super admin
@@ -108,6 +115,32 @@
 # MODERATE_NONE so that no report waits in a moderation queue; scope
 # apps.groups.settings.
 #
+# registrar-debris: what a domain transferred in (or a zone copied from the old
+# registrar's DNS) can carry that shadows or breaks the records we publish —
+#   - NS DELEGATIONS of names inside the zone to nameservers that are not the
+#     zone's own: a registrar that suspends a domain (unverified WHOIS
+#     contact, say) may delegate _dmarc, _domainkey, www, mail, … to its own
+#     servers, and a resolver then never sees our TXT/MX records there;
+#   - A/AAAA records pointing at a registrar's PARKING address.
+# With a Cloudflare API token (--token-file F, or $CLOUDFLARE_API_TOKEN; a
+# read-only one suffices to list) every record of the zone is examined (the
+# zone is --zone-id, the data's zone_id, or looked up by name); without one,
+# public DNS is probed for the names in --names (default: the apex, www, a
+# random name for a wildcard, and the names mail records use). Known debris is
+# marked as such: nameservers matching --debris-ns (default: the suspension
+# servers *.namecheap.com) and addresses in --parking-ip (default
+# 198.54.117.242, Namecheap's parking); --allow-ns PATTERN accepts an
+# intentional delegation. Exit 0 when nothing is found, 2 when something is.
+#
+# --delete (Cloudflare source only): shows the records, asks for "yes", and
+# deletes them through the API with a token that may edit DNS — the file
+# --token-file names, which --unlock CMD creates (run when the file is not
+# there) and --lock CMD removes again afterwards, whatever happens. Then it
+# lists again. A record the consumer's Terraform declares must instead be
+# removed there (or Terraform recreates it); the debris a registrar leaves is
+# normally in no Terraform, which is why the API is the tool here.
+# $CLOUDFLARE_API_BASE redirects the API (tests).
+#
 # scopes: mints a token for every scope in the list (default: every scope these
 # tools use) and reports which the delegation grants; for the missing ones it
 # prints the client id and the complete replacement scope line for the Admin
@@ -127,20 +160,22 @@ lib="${GOOGLE_WORKSPACE_TOOLS_LIB:-$here/lib}"
 . "$lib/guide.sh"
 read -r -a api_cmd <<<"${GOOGLE_WORKSPACE_DOMAINS_API:-python3 $here/google-workspace-domains-api.py}"
 
-usage="usage: $prog onboard|status|user-addresses|dmarc-group|scopes ... (see the header of this script, or --help)"
+usage="usage: $prog onboard|status|user-addresses|dmarc-group|scopes|edit|registrar-debris ... (see the header of this script, or --help)"
 cmd="${1:-}"
 [ -n "$cmd" ] || die "$usage"
 shift
 case "$cmd" in -h | --help) set -- --help ;; esac
 
 # Every scope these tools use, in the order the guidance lists them.
-tool_scopes="admin.directory.domain,admin.directory.domain.readonly,siteverification,admin.directory.user,gmail.settings.basic,gmail.settings.sharing,gmail.send,apps.groups.settings"
+tool_scopes="admin.directory.domain,admin.directory.domain.readonly,siteverification,admin.directory.user,gmail.settings.basic,gmail.settings.sharing,gmail.send,gmail.metadata,apps.groups.settings"
 
 domain="" parent="" kind_flag="" data="" post_edit="" base="" merge=0 no_pr=0 all=0 all_domains=0
 key="${GOOGLE_WORKSPACE_KEY:-}" subject="${GOOGLE_WORKSPACE_SUBJECT:-}"
 mx_spec="1:smtp.google.com" mx_explicit=0 spf_drop=() spf_replace=0 dmarc_rua="" tls_rpt_rua="" tls_rpt_given=0
 dns_timeout="${GOOGLE_WORKSPACE_DOMAINS_DNS_TIMEOUT:-1800}" verify_timeout="${GOOGLE_WORKSPACE_DOMAINS_VERIFY_TIMEOUT:-900}"
 user="" locals=() table=0 group="" guide=0 scope_list="$tool_scopes"
+edit_phase="" edit_token="" dry_run=0
+zone_id_flag="" token_file="" unlock_cmd="" lock_cmd="" parking_ips=() debris_ns=() allow_ns=() probe_names="" delete=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --domain) domain="${2:?--domain needs a value}"; shift 2 ;;
@@ -168,6 +203,18 @@ while [ $# -gt 0 ]; do
     --group) group="${2:?--group needs a value}"; shift 2 ;;
     --guide) guide=1; shift ;;
     --scopes) scope_list="${2:?--scopes needs a value}"; shift 2 ;;
+    --phase) edit_phase="${2:?--phase needs a value}"; shift 2 ;;
+    --token) edit_token="${2:?--token needs a value}"; shift 2 ;;
+    --dry-run) dry_run=1; shift ;;
+    --zone-id) zone_id_flag="${2:?--zone-id needs a value}"; shift 2 ;;
+    --token-file) token_file="${2:?--token-file needs a value}"; shift 2 ;;
+    --unlock) unlock_cmd="${2:?--unlock needs a value}"; shift 2 ;;
+    --lock) lock_cmd="${2:?--lock needs a value}"; shift 2 ;;
+    --parking-ip) parking_ips+=("${2:?--parking-ip needs a value}"); shift 2 ;;
+    --debris-ns) debris_ns+=("${2:?--debris-ns needs a value}"); shift 2 ;;
+    --allow-ns) allow_ns+=("${2:?--allow-ns needs a value}"); shift 2 ;;
+    --names) probe_names="${2:?--names needs a value}"; shift 2 ;;
+    --delete) delete=1; shift ;;
     -h | --help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument $1 ($usage)" ;;
   esac
@@ -363,6 +410,7 @@ phase_edit() {
   after_addr="$(jqm -r 'include "mail-auth"; mail_auth_addresses' "$f" | sort)"
   added="$(comm -13 <(printf '%s\n' "$before_addr") <(printf '%s\n' "$after_addr") | sed '/^$/d')"
   removed="$(comm -23 <(printf '%s\n' "$before_addr") <(printf '%s\n' "$after_addr") | sed '/^$/d')"
+  pr_added="$added" pr_removed="$removed" pr_known=1
   say "set the $phase records of $domain in $f"
   if [ -n "$post_edit" ]; then
     say "running the post-edit hook: $post_edit"
@@ -400,21 +448,6 @@ records_answer() {
     "$(lookup_txt "$domain" "$1" | grep '^v=spf1' | paste -sd' ' -)" \
     "$(lookup_txt "_dmarc.$domain" "$1" | grep '^v=DMARC1' | paste -sd' ' -)" \
     "$(lookup_txt "_smtp._tls.$domain" "$1" | grep '^v=TLSRPTv1' | paste -sd' ' -)"
-}
-
-# Cloudflare serves an MX whose target is a PROXIED name in the zone as
-# "_dc-mx.<hex>.<zone>" (a DNS-only name it maintains for the purpose, since a
-# proxied address cannot receive SMTP). Both sides normalised the same way, the
-# substitute and the in-zone host it stands for compare equal.
-mx_normalise() { # DOMAIN SIDE(declared|served) < "<prio> <host>" lines
-  awk -v d="$1" -v side="$2" '
-    function inzone(h) { return h == d || substr(h, length(h) - length(d)) == "." d }
-    {
-      h = $2
-      if (side == "served" && h ~ /^_dc-mx\.[0-9a-f]+\./ && inzone(h)) h = "<proxied host in " d ">"
-      else if (side == "declared" && inzone(h)) h = "<proxied host in " d ">"
-      print $1, h
-    }' | LC_ALL=C sort
 }
 
 # ── onboard ──────────────────────────────────────────────────────────────────
@@ -580,6 +613,36 @@ Then: $prog status --domain $domain --data $data
 EOF
 }
 
+# ── edit (one phase, in place, nothing else) ─────────────────────────────────
+
+cmd_edit() {
+  [ -n "$domain" ] || die "--domain is required"
+  [ -n "$data" ] || die "--data is required (the mail-auth JSON data file)"
+  [ -f "$data" ] || die "no such data file: $data"
+  require_declared "$data"
+  case "$edit_phase" in
+    verification)
+      [[ $edit_token =~ ^google-site-verification=[A-Za-z0-9_-]+$ ]] ||
+        die "--token must be a google-site-verification=… value"
+      verification_token="$edit_token" phase_prog="$verification_prog"
+      ;;
+    records)
+      mx_list="$(mx_json)"
+      phase_prog="$records_prog"
+      ;;
+    *) die "--phase must be verification or records" ;;
+  esac
+  phase="$edit_phase"
+  [ "$(phase_state "$data")" != same ] || return 3
+  [ "$dry_run" = 0 ] || return 0
+  local tmp
+  tmp="$(mktemp "$data.XXXXXX")"
+  apply_jq "$data" "$phase_prog" >"$tmp"
+  chmod --reference="$data" "$tmp" 2>/dev/null || true
+  mv "$tmp" "$data"
+  say "edited $domain's $phase in $data"
+}
+
 # ── user addresses ───────────────────────────────────────────────────────────
 
 # Local parts for USER: --local, else the data's google_users, else USER's own.
@@ -615,7 +678,7 @@ addresses_at() {
 
 ua_status=0
 ensure_user() {
-  local u="$1" d st view sendas addr r status addrs=() k
+  local u="$1" d st view sendas addr r status addrs=() made=() k missing i
   shift
   echo "== $u"
   # Secondary domains first: an alias domain mirrors addresses its parent has.
@@ -630,9 +693,26 @@ ensure_user() {
     while IFS= read -r addr; do
       r="$(api user-alias "$u" "$addr")" || exit 1
       printf '   %-36s user alias: %s\n' "$addr" "$(state_field result "$r")"
+      made+=("$addr")
     done < <(locals_for "$u" | sed "s/\$/@$d/")
   done
-  view="$(api user "$u")" || exit 1
+  # A just-created alias takes a while to appear in the user's directory
+  # entry; wait for every one, or the send-as step below would silently skip
+  # them.
+  for i in $(seq 1 "${GOOGLE_ALIAS_WAIT_TRIES:-24}"); do
+    view="$(api user "$u")" || exit 1
+    missing=0
+    for addr in "${made[@]}"; do
+      jq -e --arg a "$addr" '[(.aliases // [])[] | ascii_downcase] | index($a)' <<<"$view" >/dev/null || missing=$((missing + 1))
+    done
+    [ "$missing" = 0 ] && break
+    [ "$i" = 1 ] && echo "   (waiting for $missing new alias(es) to appear in the directory)"
+    sleep "${GOOGLE_ALIAS_WAIT_SECONDS:-5}"
+  done
+  if [ "$missing" != 0 ]; then
+    echo "   $missing alias(es) are not visible in the directory yet; re-run to add their send-as entries"
+    ua_status=2
+  fi
   for d in "$@"; do
     k="$(data_kind "$d")"
     case "$k" in
@@ -650,7 +730,7 @@ ensure_user() {
     while IFS= read -r addr; do
       [ -n "$addr" ] || continue
       # A secondary domain that was skipped above contributes nothing.
-      if [ "$k" = secondary ] && ! jq -e --arg a "$addr" '.aliases | index([$a])' <<<"$view" >/dev/null; then
+      if [ "$k" = secondary ] && ! jq -e --arg a "$addr" '[(.aliases // [])[] | ascii_downcase] | index($a)' <<<"$view" >/dev/null; then
         continue
       fi
       addrs+=("$addr")
@@ -666,7 +746,11 @@ ensure_user() {
       echo "      open it in $u's mailbox, click it, and re-run."
     fi
   done
-  [ "${#addrs[@]}" -gt 0 ] || echo "   (no addresses: no verified secondary or alias domain among the ones asked)"
+  if [ "${#addrs[@]}" = 0 ]; then
+    echo "   (no addresses: no verified secondary or alias domain among the ones asked)"
+    # Asked for addresses and got none: not done, whatever the reason.
+    ua_status=2
+  fi
 }
 
 cmd_user_addresses() {
@@ -1037,11 +1121,185 @@ cmd_status() {
   return "$status_status"
 }
 
+# ── registrar debris ─────────────────────────────────────────────────────────
+
+cf_api="${CLOUDFLARE_API_BASE:-https://api.cloudflare.com/client/v4}"
+cf_token=""
+# cf METHOD PATH: one Cloudflare API call with $cf_token; the JSON on stdout.
+# The token goes to curl through a header file, never on a command line.
+cf() {
+  local hdr out
+  hdr="$(mktemp)"
+  printf 'Authorization: Bearer %s\n' "$cf_token" >"$hdr"
+  out="$(curl -sS -X "$1" -H @"$hdr" -H 'Content-Type: application/json' "$cf_api$2")" || {
+    rm -f "$hdr"
+    return 1
+  }
+  rm -f "$hdr"
+  jq -e '.success == true' <<<"$out" >/dev/null 2>&1 || {
+    echo "$prog: Cloudflare $1 $2: $(jq -r '[.errors[]? | "\(.code) \(.message)"] | join("; ")' <<<"$out" 2>/dev/null || echo "$out" | head -c 200)" >&2
+    return 1
+  }
+  printf '%s\n' "$out"
+}
+
+load_cf_token() {
+  cf_token=""
+  if [ -n "$token_file" ] && [ -r "$token_file" ]; then
+    cf_token="$(tr -d '[:space:]' <"$token_file")"
+  elif [ -n "${CLOUDFLARE_API_TOKEN:-}" ]; then
+    cf_token="$CLOUDFLARE_API_TOKEN"
+  fi
+  [ -n "$cf_token" ]
+}
+
+matches_any() { # VALUE PATTERN… (bash patterns)
+  local v="$1" p
+  shift
+  for p in "$@"; do
+    # shellcheck disable=SC2053 # a pattern on purpose
+    [[ $v == $p ]] && return 0
+  done
+  return 1
+}
+
+# Findings, one per line: "<id>\t<type>\t<name>\t<content>\t<verdict>".
+debris=()
+classify_ns() { # NAME TARGET [ID]
+  local name="$1" target="${2%.}" id="${3:--}"
+  target="${target,,}"
+  matches_any "$target" "${zone_ns[@]}" && return 0
+  matches_any "$target" "${allow_ns[@]}" && return 0
+  if matches_any "$target" "${debris_ns[@]}"; then
+    debris+=("$id"$'\t'NS$'\t'"$name"$'\t'"$target"$'\t'"registrar debris: delegates $name away from the zone")
+  else
+    debris+=("$id"$'\t'NS$'\t'"$name"$'\t'"$target"$'\t'"delegated to a nameserver that is not the zone's (intentional? --allow-ns)")
+  fi
+}
+classify_addr() { # TYPE NAME ADDRESS [ID]
+  local ip
+  for ip in "${parking_ips[@]}"; do
+    [ "$3" = "$ip" ] && debris+=("${4:--}"$'\t'"$1"$'\t'"$2"$'\t'"$3"$'\t'"a registrar's parking address")
+  done
+  return 0
+}
+
+zone_ns=()
+cmd_registrar_debris() {
+  [ -n "$domain" ] || die "--domain is required"
+  [ "${#parking_ips[@]}" -gt 0 ] || parking_ips=(198.54.117.242)
+  [ "${#debris_ns[@]}" -gt 0 ] || debris_ns=('failed-whois-verification.namecheap.com' 'verify-contact-details.namecheap.com' '*.namecheap.com')
+  local zid="$zone_id_flag" out page pages name type content id n line rc=0 names=() ans unlocked=0
+  mapfile -t zone_ns < <(dig +short +time=5 +tries=2 NS "$domain" "@${resolvers[0]}" 2>/dev/null | sed 's/\.$//' | tr '[:upper:]' '[:lower:]' | sort -u)
+  say "the zone's nameservers (public DNS): ${zone_ns[*]:-<none>}"
+  if [ "${#zone_ns[@]}" -gt 0 ] && matches_any "${zone_ns[0]}" "${debris_ns[@]}"; then
+    say "the domain ITSELF is delegated to $(printf '%s ' "${zone_ns[@]}"): the registrar has suspended its DNS (WHOIS/registrant verification, typically). Nothing published in our zone is seen until that is resolved AT THE REGISTRAR; then set the nameservers to the zone's."
+    rc=2
+    # Those servers are the registrar's, not the zone's.
+    zone_ns=()
+  fi
+  if [ "$delete" = 1 ]; then
+    # The deletion needs a token that may edit DNS: unlock it first (the
+    # listing then uses it too), and lock it again however this ends.
+    if [ -n "$lock_cmd" ]; then
+      # shellcheck disable=SC2064 # expanded now, on purpose
+      trap "bash -c $(printf '%q' "$lock_cmd") >&2 || true" EXIT
+    fi
+    if [ -n "$unlock_cmd" ] && { [ -z "$token_file" ] || [ ! -r "$token_file" ]; }; then
+      say "unlocking a token that may edit DNS: $unlock_cmd"
+      bash -c "$unlock_cmd" || die "the unlock command failed"
+      unlocked=1
+    fi
+  fi
+  if [ -z "$zid" ] && [ -n "$data" ] && [ -f "$data" ]; then
+    zid="$(jq -r --arg d "$domain" '.domains[$d].zone_id // empty' "$data")"
+  fi
+  if load_cf_token; then
+    if [ -z "$zid" ]; then
+      out="$(cf GET "/zones?name=$domain")" || die "could not look up the zone of $domain"
+      zid="$(jq -r '.result[0].id // empty' <<<"$out")"
+      [ -n "$zid" ] || die "Cloudflare has no zone named $domain for this token"
+    fi
+    # The zone's own nameservers as Cloudflare assigned them count as "ours".
+    out="$(cf GET "/zones/$zid")" || die "could not read zone $zid"
+    mapfile -t -O "${#zone_ns[@]}" zone_ns < <(jq -r '.result.name_servers[]? | ascii_downcase' <<<"$out")
+    say "listing every record of zone $zid through the Cloudflare API"
+    page=1 pages=1
+    while [ "$page" -le "$pages" ]; do
+      out="$(cf GET "/zones/$zid/dns_records?per_page=500&page=$page")" || die "could not list the records of zone $zid"
+      pages="$(jq -r '.result_info.total_pages // 1' <<<"$out")"
+      while IFS=$'\t' read -r id type name content; do
+        case "$type" in
+          NS) [ "$name" = "$domain" ] || classify_ns "$name" "$content" "$id" ;;
+          A | AAAA) classify_addr "$type" "$name" "$content" "$id" ;;
+        esac
+      done < <(jq -r '.result[] | [.id, .type, .name, .content] | @tsv' <<<"$out")
+      page=$((page + 1))
+    done
+  else
+    [ "$delete" = 0 ] || die "--delete needs a Cloudflare API token (--token-file, or \$CLOUDFLARE_API_TOKEN)"
+    say "no Cloudflare API token: probing public DNS (pass --token-file for every record of the zone)"
+    if [ -n "$probe_names" ]; then
+      IFS=, read -r -a names <<<"$probe_names"
+    else
+      names=("" www "parking-probe-$RANDOM" mail _dmarc _domainkey google._domainkey _smtp._tls _mta-sts mta-sts autodiscover webmail ftp smtp imap pop)
+    fi
+    for n in "${names[@]}"; do
+      name="${n:+$n.}$domain"
+      if [ -n "$n" ]; then
+        while IFS= read -r content; do
+          [ -n "$content" ] && classify_ns "$name" "$content"
+        done < <(dig +short +time=5 +tries=2 NS "$name" "@${resolvers[0]}" 2>/dev/null | sed 's/\.$//' | sort -u)
+      fi
+      for type in A AAAA; do
+        while IFS= read -r content; do
+          [[ $content =~ ^[0-9a-fA-F:.]+$ ]] && classify_addr "$type" "$name" "$content"
+        done < <(dig +short +time=5 +tries=2 "$type" "$name" "@${resolvers[0]}" 2>/dev/null)
+      done
+    done
+  fi
+  if [ "${#debris[@]}" = 0 ]; then
+    say "no registrar debris found for $domain"
+    return "$rc"
+  fi
+  printf '%-34s %-5s %-36s %s\n' RECORD-ID TYPE NAME "CONTENT — WHY"
+  for line in "${debris[@]}"; do
+    IFS=$'\t' read -r id type name content n <<<"$line"
+    printf '%-34s %-5s %-36s %s — %s\n' "$id" "$type" "$name" "$content" "$n"
+  done
+  say "${#debris[@]} record(s) above shadow or break what the zone should serve"
+  [ "$delete" = 1 ] || return 2
+  [ "$unlocked" = 0 ] || say "the token was unlocked for this; it is locked again when this ends${lock_cmd:+ ($lock_cmd)}"
+  printf '\n>> Delete these %s record(s) of %s through the Cloudflare API? Type yes: ' "${#debris[@]}" "$domain" >&2
+  IFS= read -r ans || ans=""
+  [ "$ans" = yes ] || {
+    say "nothing deleted"
+    return 2
+  }
+  for line in "${debris[@]}"; do
+    IFS=$'\t' read -r id type name content n <<<"$line"
+    cf DELETE "/zones/$zid/dns_records/$id" >/dev/null || die "deleting $type $name ($id) failed"
+    say "deleted $type $name -> $content"
+  done
+  debris=()
+  out="$(cf GET "/zones/$zid/dns_records?per_page=500")" || die "could not list the records again"
+  while IFS=$'\t' read -r id type name content; do
+    case "$type" in
+      NS) [ "$name" = "$domain" ] || classify_ns "$name" "$content" "$id" ;;
+      A | AAAA) classify_addr "$type" "$name" "$content" "$id" ;;
+    esac
+  done < <(jq -r '.result[] | [.id, .type, .name, .content] | @tsv' <<<"$out")
+  [ "${#debris[@]}" = 0 ] || die "${#debris[@]} record(s) still there after the deletion"
+  say "OK: the zone has no registrar debris left. Public resolvers forget a cached delegation within its TTL."
+}
+
 case "$cmd" in
   onboard) cmd_onboard ;;
   status) cmd_status ;;
   user-addresses) cmd_user_addresses ;;
   dmarc-group) cmd_dmarc_group ;;
   scopes) cmd_scopes ;;
+  edit) cmd_edit ;;
+  registrar-debris) cmd_registrar_debris ;;
   *) die "$usage" ;;
 esac

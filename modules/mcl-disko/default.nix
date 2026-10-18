@@ -151,6 +151,37 @@
         };
       };
 
+      # EXISTING POOLS: move /home from `refreservation` to `reservation` IN
+      # PLACE (zpool.nix explains why the property changed). disko applies dataset
+      # properties only when it creates the pool, so hosts installed before the
+      # change keep `refreservation=200GiB`, and every `zfs snapshot` of /home
+      # fails with "out of space" once less than 200 GiB is free. This converges
+      # them on the next deploy and is a no-op everywhere else: a pool without
+      # `root/home`, or one already at `refreservation=none`, exits at once.
+      # The reservation is set BEFORE the refreservation is dropped, so /home is
+      # never without its 200 GiB guarantee; a failure leaves the unit failed,
+      # visibly, rather than half-applied in silence.
+      config.systemd.services.mcl-disko-home-reservation = lib.mkIf cfg.enable {
+        description = "Move /home from refreservation to reservation (mcl-disko)";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "zfs-mount.service" ];
+        path = [ config.boot.zfs.package ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
+        script = ''
+          ds=${cfg.zpool.name}/root/home
+          zfs list -H -o name "$ds" >/dev/null 2>&1 || exit 0
+          if [ "$(zfs get -H -o value refreservation "$ds")" = none ]; then
+            exit 0
+          fi
+          zfs set reservation=200GiB "$ds"
+          zfs set refreservation=none "$ds"
+          echo "mcl-disko: $ds now uses reservation=200GiB, refreservation=none"
+        '';
+      };
+
       config.disko =
         let
           makePrimaryZfsDisk = import ./primaryPartition;
