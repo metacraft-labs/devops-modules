@@ -471,14 +471,16 @@ def make_remote(path: Path, commits: int = 2) -> list[str]:
     return shas
 
 
-def lock_text(entries: list[tuple[str, str, str, str]]) -> str:
-    """entries: (name, path, url, revision); the first is the root."""
+def lock_text(entries: list[tuple[str, str, str, str]], *, schema: int = 2) -> str:
+    """entries: (name, local path, url, revision); v3 never persists paths."""
     deps = ", ".join(
-        f'{{ name = "{n}", path = "{p}", coord_kind = "vcs", url = "{u}", '
+        f'{{ name = "{n}", '
+        + (f'path = "{p}", ' if schema == 2 else ('self = "true", ' if p == "." else ""))
+        + f'coord_kind = "vcs", url = "{u}", '
         f'ref = "never-pushed", revision = "{r}", integrity = "git-sha1:{r}", '
         f'version = "", visibility = "public", participation = "", depends = "", groups = "" }}'
         for n, p, u, r in entries)
-    return ('schema = "reprobuild.solved-graph-lock.v2"\n\n[lock]\nplatform = "amd64-linux"\n'
+    return (f'schema = "reprobuild.solved-graph-lock.v{schema}"\n\n[lock]\nplatform = "amd64-linux"\n'
             'packages = [{ name = "decoy", version = "1", source = "decoy" }]\n'
             f"deps = [{deps}]\n")
 
@@ -585,7 +587,7 @@ def test_develop_set() -> None:
         h = StepHarness(Path(tmp), DEVSET_MARKER)
         auto = {"LINT_DEVELOP_SET": "auto"}
 
-        def workspace(with_siblings: bool = True):
+        def workspace(with_siblings: bool = True, *, schema: int = 2):
             base = h.case()
             a = make_remote(base / "remotes" / "sib-a")
             b = make_remote(base / "remotes" / "sib-b")
@@ -597,7 +599,7 @@ def test_develop_set() -> None:
                     ("sib-a", "../sib-a", f"file://{base}/remotes/sib-a", a[0]),
                     ("sib-b", "../sib-b", f"file://{base}/remotes/sib-b", b[0]),
                 ]
-            (work / "repro.lock").write_text(lock_text(entries))
+            (work / "repro.lock").write_text(lock_text(entries, schema=schema))
             nodes = [("sib-a", str(base / "ws" / "sib-a"), a[0], True),
                      ("sib-b", str(base / "ws" / "sib-b"), b[0], True)]
             return base, work, a, b, nodes
@@ -623,6 +625,23 @@ def test_develop_set() -> None:
             assert git("rev-parse", "HEAD", cwd=sib) == shas[0] != shas[1], name
             assert_no_persisted_credential(sib)
         assert (work / "repro.lock").exists()
+
+        # v3 pins the same identities without any checkout paths. The actual
+        # clones must still land on the locked commits rather than disappear
+        # behind the cheap root-only pre-check.
+        v3_base, v3_work, v3_a, v3_b, v3_nodes = workspace(schema=3)
+        assert 'path =' not in (v3_work / "repro.lock").read_text()
+        check("v3 path-free siblings materialized",
+              h.run(v3_work, env=auto, json_doc=develop_json(v3_nodes)), 0,
+              contains=["materialized 2 develop-set sibling(s)"], calls=[DRY_RUN])
+        for name, shas in (("sib-a", v3_a), ("sib-b", v3_b)):
+            sib = v3_base / "ws" / name
+            assert git("rev-parse", "HEAD", cwd=sib) == shas[0] != shas[1], name
+            assert_no_persisted_credential(sib)
+        _, v3_root, _, _, _ = workspace(with_siblings=False, schema=3)
+        check("v3 self-only lock installs nothing",
+              h.run(v3_root, env=auto, repro_on_path=False), 0,
+              contains=["pins no sibling"], calls=[])
 
         # Re-running over existing checkouts (a persistent runner) re-pins them.
         (base / "ws" / "sib-a" / "stray").write_text("x")
