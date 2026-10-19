@@ -81,6 +81,11 @@ enum DeploymentActivationMode
 
 enum deployApplyDeferredExitCode = 75;
 enum deployApplyManifestConflictExitCode = 76;
+// The desired generation could not be activated live, only from the next boot:
+// NixOS refused the switch because a switch inhibitor changed (e.g. the D-Bus
+// implementation), and the generation was installed as the boot default
+// instead. Not a failure: the deployment converges when the host reboots.
+enum deployApplyRebootRequiredExitCode = 77;
 
 @(Command("deploy-apply")
     .Description("Target-side signed deployment apply wrapper"))
@@ -354,6 +359,71 @@ string nixosSwitchCommand(string profile, string generation)
         ~ " --set " ~ escapeShellFileName(generation)
         ~ " && " ~ escapeShellFileName(generation ~ "/bin/switch-to-configuration")
         ~ " switch";
+}
+
+// The fallback when a live switch is refused only because it needs a reboot:
+// register the generation and make it the boot default, without activating it.
+// `switch-to-configuration boot` rebuilds the boot entries from the profile, so
+// the profile write must come first, exactly as for `switch`.
+string nixosBootCommand(string profile, string generation)
+{
+    import std.process : escapeShellFileName;
+
+    return "nix-env --profile " ~ escapeShellFileName(profile)
+        ~ " --set " ~ escapeShellFileName(generation)
+        ~ " && " ~ escapeShellFileName(generation ~ "/bin/switch-to-configuration")
+        ~ " boot";
+}
+
+// True when switch-to-configuration refused the live switch and the ONLY failed
+// pre-switch check was `switchInhibitors`.
+//
+// NixOS (switch-to-configuration-ng, NixOS >= 25.05) runs pre-switch checks
+// before activating and prints "Pre-switch check '<name>' failed" for each one
+// that fails (nixos/modules/system/activation/pre-switch-check.nix). The
+// `switchInhibitors` check fails when /run/current-system/switch-inhibitors and
+// the new generation's differ -- a change NixOS will only apply across a
+// reboot, such as `services.dbus.implementation` dbus -> broker -- and it
+// explicitly passes for the `boot` action
+// (nixos/modules/system/activation/switchable-system.nix). Any other failed
+// check is a real failure and must stay one.
+bool refusedOnlyBySwitchInhibitors(string stderr)
+{
+    import std.algorithm : canFind, filter, startsWith;
+    import std.array : array;
+    import std.range.primitives : empty;
+    import std.string : lineSplitter, strip;
+
+    auto failed = stderr.lineSplitter
+        .map!(line => line.strip)
+        .filter!(line => line.startsWith("Pre-switch check '") && line.canFind("' failed"))
+        .array;
+    return failed.length > 0
+        && failed.filter!(line => line != "Pre-switch check 'switchInhibitors' failed").empty;
+}
+
+@("deployApply.refusedOnlyBySwitchInhibitors recognises a reboot-only refusal")
+unittest
+{
+    // The exact stderr nixos-ci-bare-003 produced on 2026-10-15 (dbus -> broker).
+    auto refused = "Checking switch inhibitors...\n"
+        ~ "Switching into this system is not recommended.\n"
+        ~ "If you really want to switch into this configuration directly, then\n"
+        ~ "you can set NIXOS_NO_CHECK=1 to ignore pre-switch checks.\n"
+        ~ "WARNING: doing so might cause the switch to fail or your system to become unstable.\n"
+        ~ "Pre-switch check 'switchInhibitors' failed\n"
+        ~ "Pre-switch checks failed\n";
+    assert(refusedOnlyBySwitchInhibitors(refused));
+    // Another failed check alongside it is a real failure.
+    assert(!refusedOnlyBySwitchInhibitors(refused
+        ~ "Pre-switch check 'diskSpace' failed\n"));
+    assert(!refusedOnlyBySwitchInhibitors("Pre-switch check 'diskSpace' failed\nPre-switch checks failed\n"));
+    // A switch that failed for any other reason (activation error, timeout).
+    assert(!refusedOnlyBySwitchInhibitors("error: Failed to start some units\n"));
+    assert(!refusedOnlyBySwitchInhibitors(""));
+    assert(nixosBootCommand("/nix/var/nix/profiles/system", "/nix/store/abc-nixos-system-host")
+        == "nix-env --profile /nix/var/nix/profiles/system --set /nix/store/abc-nixos-system-host"
+        ~ " && /nix/store/abc-nixos-system-host/bin/switch-to-configuration boot");
 }
 
 @("deployApply.nixosSwitchCommand registers the generation before switching")
@@ -725,6 +795,7 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
     }
 
     bool switchOk;
+    bool stagedForReboot;
     string current;
     string outcome;
     string state;
@@ -739,16 +810,43 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
         auto currentResult = currentGeneration(args, queryRunner);
         current = currentResult.stdout.strip;
         switchOk = switched.succeeded;
+        // A refusal that only a reboot can resolve is not a failed switch.
+        auto rebootOnly = !switched.succeeded && args.switchCommand == ""
+            && refusedOnlyBySwitchInhibitors(switched.stderr);
         emit("switch", "switch-to-configuration", ["sh", "-c", switchCommand],
             switched.succeeded ? "succeeded" : "failed",
             switched.exitCode,
-            switched.succeeded ? "" : "System switch failed",
-            "switch_failed",
+            switched.succeeded ? ""
+                : rebootOnly ? "System switch refused: a switch inhibitor changed and needs a reboot"
+                : "System switch failed",
+            rebootOnly ? "switch_inhibited" : "switch_failed",
             switched.succeeded ? "" : switched.stderr.stderrSummary,
             [
                 "previousGeneration": JSONValue(previous),
                 "newGeneration": JSONValue(current),
             ]);
+
+        // Install the generation as the boot default instead, so the next
+        // reboot -- planned, or a crash recovery -- comes up on it. Without
+        // this the host keeps booting the previous generation and the
+        // deployment can never converge (2026-10-14: five office hosts stuck
+        // on dbus -> dbus-broker, two of them through a reboot).
+        if (rebootOnly)
+        {
+            auto bootCommand = nixosBootCommand(args.systemProfile, desired);
+            auto staged = detachedSwitch(runner, bootCommand, !args.noDetachSwitch);
+            stagedForReboot = staged.succeeded;
+            emit("switch", "switch-to-configuration boot", ["sh", "-c", bootCommand],
+                staged.succeeded ? "succeeded" : "failed",
+                staged.exitCode,
+                staged.succeeded ? "" : "Installing the generation as the boot default failed",
+                "boot_stage_failed",
+                staged.succeeded ? "" : staged.stderr.stderrSummary,
+                [
+                    "previousGeneration": JSONValue(previous),
+                    "bootGeneration": JSONValue(desired),
+                ]);
+        }
     }
     else
     {
@@ -828,7 +926,14 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
         }
     }
 
-    if (!switchOk)
+    if (stagedForReboot)
+    {
+        outcome = "reboot-required";
+        state = "reboot-required";
+        stateMessage = "A switch inhibitor changed; the generation is the boot default "
+            ~ "and takes effect at the next reboot.";
+    }
+    else if (!switchOk)
     {
         outcome = "switch-failed";
         state = "failed";
@@ -913,17 +1018,27 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
         stateMessage = "Post-switch lifecycle hook failed.";
     }
 
+    if (!postHook.succeeded && state == "reboot-required")
+    {
+        state = "failed";
+        stateMessage = "Post-switch lifecycle hook failed.";
+    }
+
     markDeploymentState(args.stateDir, manifest, state, stateMessage);
     auto succeeded = state == "succeeded";
+    auto rebootRequired = state == "reboot-required";
     emit("complete", "mcl-devops deploy-apply", ["mcl-devops", "deploy-apply"],
-        succeeded ? "succeeded" : "failed", succeeded ? 0 : 1,
-        succeeded ? "" : "Deployment did not converge",
-        succeeded ? "command_failed" : "deployment_failed", "", [
+        succeeded ? "succeeded" : rebootRequired ? "reboot-required" : "failed",
+        succeeded ? 0 : rebootRequired ? deployApplyRebootRequiredExitCode : 1,
+        succeeded ? "" : rebootRequired ? "Deployment takes effect at the next reboot"
+            : "Deployment did not converge",
+        succeeded ? "command_failed" : rebootRequired ? "reboot_required" : "deployment_failed",
+        "", [
             "previousGeneration": JSONValue(previous),
             "newGeneration": JSONValue(current),
             "outcome": JSONValue(outcome),
         ]);
-    return succeeded ? 0 : 1;
+    return succeeded ? 0 : rebootRequired ? deployApplyRebootRequiredExitCode : 1;
 }
 
 @("test_deploy_apply_rejects_ssh_original_command")
@@ -1760,6 +1875,98 @@ unittest
     // Never a bare switch: that is the activation a reboot silently undoes.
     assert(!commands.canFind(["/bin/sh", "-c", desired ~ "/bin/switch-to-configuration switch"]));
     assert(manifestStatePath(stateDir, "converged", "deploy-nixos-profile").exists);
+}
+
+@("test_deploy_apply_nixos_stages_boot_default_when_only_a_switch_inhibitor_refuses")
+unittest
+{
+    import std.algorithm : canFind;
+    import std.file : rmdirRecurse;
+    import std.json : JSONOptions;
+    import mcl.utils.deploy_manifest : ManifestSigningRequest, signManifest;
+    import mcl.utils.deploy_state : manifestStatePath;
+
+    auto base = uniqueDeployStateTestPath("deploy-apply-nixos-inhibited");
+    auto keyPath = base ~ ".ed25519";
+    auto manifestPath = base ~ ".manifest.json";
+    auto stateDir = base ~ ".state";
+    scope(exit)
+    {
+        foreach (path; [base, keyPath, keyPath ~ ".pub", manifestPath])
+            if (path.exists) path.remove;
+        if (stateDir.exists) stateDir.rmdirRecurse;
+    }
+
+    auto keygen = runProcessCapture([
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", keyPath,
+    ]);
+    assert(keygen.succeeded, keygen.stderr);
+    auto desired = "/nix/store/22222222222222222222222222222222-nixos-system-host";
+    auto previous = "/nix/store/11111111111111111111111111111111-nixos-system-host";
+    auto manifest = signManifest(buildManifest(ManifestBuildRequest(
+        deploymentId: "deploy-nixos-inhibited",
+        target: "host",
+        gitRevision: "0123456789abcdef0123456789abcdef01234567",
+        sequence: 1,
+        desiredSystemPath: desired,
+    )), ManifestSigningRequest(keyPath: keyPath, keyId: "mcl-deployment"));
+    manifestPath.write(manifest.toString(JSONOptions.doNotEscapeSlashes));
+
+    foreach (otherCheckFails; [false, true])
+    {
+        if (stateDir.exists) stateDir.rmdirRecurse;
+        auto switchCommand = nixosSwitchCommand(base ~ ".profile", desired);
+        auto bootCommand = nixosBootCommand(base ~ ".profile", desired);
+        string bootDefault = previous;
+        string[][] commands;
+        ProcessResult fakeRun(string[] command)
+        {
+            commands ~= command.dup;
+            // The live switch is refused, as on nixos-ci-bare-003 (dbus -> broker).
+            if (command == ["/bin/sh", "-c", switchCommand])
+                return ProcessResult(1, "", "Checking switch inhibitors...\nSwitching into this system is not recommended.\n"
+            ~ "Pre-switch check 'switchInhibitors' failed\nPre-switch checks failed\n"
+                    ~ (otherCheckFails ? "Pre-switch check 'diskSpace' failed\n" : ""));
+            if (command == ["/bin/sh", "-c", bootCommand])
+                bootDefault = desired;
+            return ProcessResult(0, "", "");
+        }
+        ProcessResult fakeQuery(string[] command)
+        {
+            if (command == ["/bin/sh", "-c", "current-generation"])
+                return ProcessResult(0, previous ~ "\n", "");
+            return ProcessResult(0, "{}", "");
+        }
+
+        DeployApplyArgs args;
+        args.manifest = manifestPath;
+        args.target = "host";
+        args.trustedManifestPublicKey = (keyPath ~ ".pub").readText.strip;
+        args.stateDir = stateDir;
+        args.systemProfile = base ~ ".profile";
+        args.generationCommand = "current-generation";
+        args.noDetachSwitch = true;
+
+        auto result = deployApplyImpl(args, DeployApplyDependencies(
+            runProcess: &fakeRun,
+            queryProcess: &fakeQuery,
+        ));
+        if (otherCheckFails)
+        {
+            // Any other failed pre-switch check stays a plain failure, with
+            // nothing installed for the next boot.
+            assert(result == 1);
+            assert(!commands.canFind(["/bin/sh", "-c", bootCommand]));
+            assert(bootDefault == previous);
+        }
+        else
+        {
+            assert(result == deployApplyRebootRequiredExitCode);
+            assert(commands.canFind(["/bin/sh", "-c", bootCommand]));
+            assert(bootDefault == desired);
+            assert(!manifestStatePath(stateDir, "converged", "deploy-nixos-inhibited").exists);
+        }
+    }
 }
 
 @("test_deploy_apply_nix_darwin_restores_previous_profile_on_activation_failure")
