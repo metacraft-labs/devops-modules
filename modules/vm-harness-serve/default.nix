@@ -83,6 +83,14 @@
       enrollCredName = "enroll-secret";
       enrollCredPath = "%d/${enrollCredName}";
       runtimeDir = "vm-harness-serve";
+      # GOSTI1b step 2 (unit half): the units are named `gosti-serve*`; the
+      # main unit keeps `vm-harness-serve.service` as an alias so
+      # `systemctl … vm-harness-serve` keeps working. The physical names that
+      # carry live identity do NOT change: the state dir (enrollment secret →
+      # keyId), runtime dir, user/group, credentials and the watchdog/inventory
+      # state dirs. `/var/lib/gosti-serve` is a symlink to the state dir.
+      unitName = "gosti-serve";
+      legacyUnitName = "vm-harness-serve";
       portFile = "/run/${runtimeDir}/port";
 
       # ----- EPHEMERAL-INSTANCE INVENTORY EXPORTER --------------------------
@@ -180,6 +188,7 @@
           pkgs.curl
           pkgs.systemd
           pkgs.gnused
+          pkgs.gnugrep
         ];
         text = ''
           set -euo pipefail
@@ -190,6 +199,15 @@
           threshold=${toString hcfg.failureThreshold}
 
           log() { echo "vm-harness-serve-healthcheck: $*"; }
+
+          # State writes are bookkeeping, never a reason to abort the watchdog.
+          # On gpu-server-001 (2026-10-14) a failed `printf > $fail_file` under
+          # `set -e` killed the run before it could act, and marked the unit
+          # failed. Recreate the dir and carry on if a write still fails.
+          put() {
+            mkdir -p "$(dirname "$1")" 2>/dev/null || true
+            printf '%s' "$2" > "$1" 2>/dev/null || log "WARN: could not write $1 (continuing)"
+          }
 
           # Probe. `-o /dev/null -w %{http_code}` so the STATUS is inspected, not
           # merely curl's exit code: a 503 means the daemon is up but has no
@@ -213,7 +231,7 @@
               if [ -f "$fail_file" ] && [ "$(cat "$fail_file" 2>/dev/null || echo 0)" != "0" ]; then
                 log "listener healthy again (HTTP $code from $url) — resetting failure counter"
               fi
-              printf '0' > "$fail_file"
+              put "$fail_file" 0
               exit 0
               ;;
             503)
@@ -230,7 +248,7 @@
           # Only act if the unit is actually meant to be up. A stopped or failed
           # daemon is systemd's job (Restart=on-failure); probing a deliberately
           # stopped one must not manufacture a "recovery".
-          if [ "$(systemctl is-active vm-harness-serve.service 2>/dev/null || true)" != "active" ]; then
+          if [ "$(systemctl is-active ${unitName}.service 2>/dev/null || true)" != "active" ]; then
             # EXCEPT a start that failed on a DEPENDENCY. Then the unit is left
             # inactive with Result=dependency — not `failed` — so Restart= never
             # fires and nothing retries it, even once the dependency recovers.
@@ -239,19 +257,40 @@
             # (Requires=incus.service) stayed down for 17 hours and its pools'
             # teardowns backed up fleet-wide. A deliberate `systemctl stop`
             # records Result=success, so it is still left alone.
-            if [ "$(systemctl show -p Result --value vm-harness-serve.service 2>/dev/null || true)" = "dependency" ]; then
-              log "vm-harness-serve.service is inactive after a DEPENDENCY failure (Result=dependency) — retrying start"
-              systemctl start --no-block vm-harness-serve.service || log "start request failed; will retry next interval"
-              printf '0' > "$fail_file"
+            #
+            # The unit's Result= property does NOT record this: a start JOB that
+            # fails on a dependency leaves Result at its previous value (e.g.
+            # `success` from an earlier deliberate stop). That is why the
+            # check below missed gpu-server-001 on 2026-10-14 (serve stopped by
+            # a deploy at 21:04, start failed on a 3 s incus blip at 21:14, down
+            # until 01:41). So also look at the journal: a "Dependency failed
+            # for" line for this unit SINCE it last went inactive means the
+            # latest start attempt failed on a dependency, not that someone
+            # stopped it on purpose.
+            dep_failed=no
+            if [ "$(systemctl show -p Result --value ${unitName}.service 2>/dev/null || true)" = "dependency" ]; then
+              dep_failed=yes
+            else
+              since=$(systemctl show -p InactiveEnterTimestamp --timestamp=unix --value ${unitName}.service 2>/dev/null || true)
+              if [ -n "$since" ] && [ "$since" != "@0" ] \
+                 && journalctl -q -o cat -u ${unitName}.service --since "$since" 2>/dev/null \
+                    | grep -q '^Dependency failed for '; then
+                dep_failed=yes
+              fi
+            fi
+            if [ "$dep_failed" = yes ]; then
+              log "${unitName}.service is inactive after a start that failed on a DEPENDENCY — retrying start"
+              systemctl start --no-block ${unitName}.service || log "start request failed; will retry next interval"
+              put "$fail_file" 0
               exit 0
             fi
-            log "probe failed but vm-harness-serve.service is not active — leaving it to systemd (no watchdog action)"
-            printf '0' > "$fail_file"
+            log "probe failed but ${unitName}.service is not active — leaving it to systemd (no watchdog action)"
+            put "$fail_file" 0
             exit 0
           fi
 
           fails=$(( $(cat "$fail_file" 2>/dev/null || echo 0) + 1 ))
-          printf '%s' "$fails" > "$fail_file"
+          put "$fail_file" "$fails"
           log "probe failed ($url); consecutive failures = $fails/$threshold"
 
           if [ "$fails" -lt "$threshold" ]; then
@@ -279,11 +318,11 @@
             fi
           fi
 
-          log "listener dead for $fails consecutive probes — restarting vm-harness-serve.service (watchdog recovery)"
-          printf '%s' "$now" > "$last_restart_file"
-          printf '0' > "$fail_file"
-          systemctl restart vm-harness-serve.service
-          log "vm-harness-serve.service restart issued"
+          log "listener dead for $fails consecutive probes — restarting ${unitName}.service (watchdog recovery)"
+          put "$last_restart_file" "$now"
+          put "$fail_file" 0
+          systemctl restart ${unitName}.service
+          log "${unitName}.service restart issued"
         '';
       };
     in
@@ -693,6 +732,22 @@
       config = mkIf cfg.enable {
         assertions = [
           {
+            # A module that still sets `systemd.services.vm-harness-serve.*`
+            # would silently define a SECOND, ExecStart-less unit that collides
+            # with the alias. Fail evaluation and name the fix instead.
+            assertion =
+              !(lib.any (n: config.systemd.services ? ${n}) [
+                legacyUnitName
+                "${legacyUnitName}-healthcheck"
+                "${legacyUnitName}-inventory"
+              ]);
+            message = ''
+              systemd.services.vm-harness-serve* is set, but the gosti serve
+              units are now named `gosti-serve*` (vm-harness-serve.service is an
+              alias). Set systemd.services.gosti-serve.* instead.
+            '';
+          }
+          {
             assertion = cfg.authTokenFile != null;
             message = ''
               services.gosti-serve.authTokenFile must be set — the daemon
@@ -728,8 +783,9 @@
           ${cfg.overlayInterface}.allowedTCPPorts = [ cfg.port ];
         };
 
-        systemd.services.vm-harness-serve = {
-          description = "vm-harness serve — VM/container remoting daemon (NetBird-only)";
+        systemd.services.${unitName} = {
+          aliases = [ "${legacyUnitName}.service" ];
+          description = "gosti serve — VM/container remoting daemon (NetBird-only)";
           wantedBy = [ "multi-user.target" ];
           after = [
             "network-online.target"
@@ -743,8 +799,21 @@
           # hosts agenix runs from an activation script (no unit), so this stays
           # inert there.
           ++ optional (config.systemd.services ? agenix-install-secrets) "agenix-install-secrets.service";
-          wants = [ "network-online.target" ];
-          requires = optional config.virtualisation.incus.enable "incus.service";
+          # Wants=, NOT Requires=, on incus (devops-modules: serve survives an
+          # incus blip). The daemon only shells out to the incus CLI per
+          # request, so it can start and serve while incusd restarts. With
+          # Requires= a single failed incus start left the unit inactive with
+          # Result=dependency, where Restart= never fires: gpu-server-002 (17 h)
+          # and gpu-server-001 (2026-10-14, about 4 h) both lost serve to an
+          # incus restart that took 3 seconds.
+          wants = [
+            "network-online.target"
+          ]
+          ++ optional config.virtualisation.incus.enable "incus.service";
+          # Never give up restarting: a crash loop while a dependency is
+          # briefly down must not exhaust the default start limit
+          # (5 starts in 10 s) and park the unit as `failed` for good.
+          startLimitIntervalSec = 0;
 
           # The backend CLI the daemon shells out to must be on PATH.
           path = [ cfg.package ] ++ cfg.extraPackages;
@@ -784,7 +853,7 @@
             SupplementaryGroups = cfg.extraGroups;
 
             Restart = "on-failure";
-            RestartSec = 2;
+            RestartSec = 5;
 
             # THE SOFT LIMIT IS THE ONE THAT BITES, AND systemd's DEFAULT IS
             # 1024 — measured, not precautionary. On high-mem-server this unit
@@ -811,21 +880,20 @@
 
             RuntimeDirectory = runtimeDir;
             RuntimeDirectoryMode = "0750";
-            StateDirectory = runtimeDir;
+            # `dir:symlink` (systemd >= 250): the physical dir keeps its name.
+            StateDirectory = "${runtimeDir}:${unitName}";
             StateDirectoryMode = "0700";
             WorkingDirectory = "/var/lib/${runtimeDir}";
             # The incus CLI writes its config under $HOME; keep it in the state dir.
-            # VMH_EPHEMERAL_LABEL_DIR: where `ephemeral-label` records which GARM
+            # GOSTI_EPHEMERAL_LABEL_DIR: where `ephemeral-label` records which GARM
             # pool owns each kept instance, so the provider's ListInstances can
             # return exactly one pool's instances. It must be writable under
             # ProtectSystem=strict, i.e. inside the StateDirectory; named
             # explicitly rather than left to vm-harness's $STATE_DIRECTORY default.
             Environment = [
               "HOME=/var/lib/${runtimeDir}"
-              "VMH_EPHEMERAL_LABEL_DIR=${labelDir}"
-              # GOSTI1b step 4: the canonical name, exported ALONGSIDE the
-              # legacy one for one deploy cycle, so a host whose gosti predates
-              # the GOSTI_* reader keeps working.
+              # GOSTI1b step 6: only the canonical name; every gosti since step 3
+              # (11008d9) reads GOSTI_* first, and the default package is newer.
               "GOSTI_EPHEMERAL_LABEL_DIR=${labelDir}"
             ];
 
@@ -877,7 +945,7 @@
 
         # ---- MA12 SERVE-LISTENER WATCHDOG: health-check service + timer ----
         # A periodic oneshot that probes the listener on the SAME address+port
-        # the daemon binds. It restarts vm-harness-serve.service ONLY after
+        # the daemon binds. It restarts gosti-serve.service ONLY after
         # `failureThreshold` consecutive unanswered/saturated probes, and never
         # more often than `minRestartInterval`.
         #
@@ -891,9 +959,9 @@
         # StateDirectory with the supervised unit is what made garm-healthcheck
         # re-chown /var/lib/garm to root on every run and break garm's DB
         # access; that lesson is inherited here rather than relearned.
-        systemd.services.vm-harness-serve-healthcheck = mkIf hcfg.enable {
+        systemd.services."${unitName}-healthcheck" = mkIf hcfg.enable {
           description = "vm-harness serve listener health-check watchdog (auto-recover a process-alive-but-request-dead daemon)";
-          after = [ "vm-harness-serve.service" ];
+          after = [ "${unitName}.service" ];
           serviceConfig = {
             Type = "oneshot";
             ExecStart = lib.getExe healthCheckScript;
@@ -912,9 +980,9 @@
         # ExecStartPost (`+`: full privileges, no sandbox) only installs the
         # rendered file into the root-owned textfile dir.
         systemd.tmpfiles.rules = mkIf icfg.enable [ "d ${icfg.textfileDir} 0755 root root -" ];
-        systemd.services.vm-harness-serve-inventory = mkIf icfg.enable {
+        systemd.services."${unitName}-inventory" = mkIf icfg.enable {
           description = "Publish vm-harness kept-instance inventory for orphan alerting";
-          after = [ "vm-harness-serve.service" ];
+          after = [ "${unitName}.service" ];
           serviceConfig = {
             Type = "oneshot";
             ExecStart = lib.getExe inventoryScript;
@@ -926,10 +994,8 @@
             SupplementaryGroups = cfg.extraGroups;
             Environment = [
               "HOME=/var/lib/${runtimeDir}"
-              "VMH_EPHEMERAL_LABEL_DIR=${labelDir}"
-              # GOSTI1b step 4: the canonical name, exported ALONGSIDE the
-              # legacy one for one deploy cycle, so a host whose gosti predates
-              # the GOSTI_* reader keeps working.
+              # GOSTI1b step 6: only the canonical name; every gosti since step 3
+              # (11008d9) reads GOSTI_* first, and the default package is newer.
               "GOSTI_EPHEMERAL_LABEL_DIR=${labelDir}"
             ];
             ProtectSystem = "strict";
@@ -938,18 +1004,18 @@
             PrivateTmp = true;
           };
         };
-        systemd.timers.vm-harness-serve-inventory = mkIf icfg.enable {
+        systemd.timers."${unitName}-inventory" = mkIf icfg.enable {
           description = "Periodic vm-harness kept-instance inventory snapshot";
           wantedBy = [ "timers.target" ];
           timerConfig = {
             OnBootSec = icfg.interval;
             OnUnitActiveSec = icfg.interval;
             AccuracySec = "10s";
-            Unit = "vm-harness-serve-inventory.service";
+            Unit = "${unitName}-inventory.service";
           };
         };
 
-        systemd.timers.vm-harness-serve-healthcheck = mkIf hcfg.enable {
+        systemd.timers."${unitName}-healthcheck" = mkIf hcfg.enable {
           description = "Periodic vm-harness serve listener health-check (MA12 watchdog)";
           wantedBy = [ "timers.target" ];
           timerConfig = {
@@ -957,7 +1023,7 @@
             OnUnitActiveSec = hcfg.interval;
             # If the machine was asleep, do not fire a burst of catch-up runs.
             AccuracySec = "10s";
-            Unit = "vm-harness-serve-healthcheck.service";
+            Unit = "${unitName}-healthcheck.service";
           };
         };
       };

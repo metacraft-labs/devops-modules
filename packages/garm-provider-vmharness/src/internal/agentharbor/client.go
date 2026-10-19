@@ -64,6 +64,47 @@ type CreateJobRequest struct {
 	Sandbox            SandboxOptions    `json:"sandbox"`
 	Image              *string           `json:"image,omitempty"`
 	Flavor             *string           `json:"flavor,omitempty"`
+	// StartingPoint starts the job's workspace as a per-job writable branch
+	// of an existing starting point (Direct-Sandbox-Launch.md § Starting a
+	// job from a starting point). Mutually exclusive with WorkingDirectory.
+	StartingPoint *StartingPoint `json:"startingPoint,omitempty"`
+}
+
+// StartingPoint names a starting point either by snapshot id or by
+// (repo, ref, kind), resolved by the server at launch.
+type StartingPoint struct {
+	SnapshotID    string  `toml:"snapshot_id" json:"snapshotId,omitempty"`
+	Repo          string  `toml:"repo" json:"repo,omitempty"`
+	Ref           string  `toml:"ref" json:"ref,omitempty"`
+	Kind          string  `toml:"kind" json:"kind,omitempty"`
+	MaxAgeSeconds *uint64 `toml:"max_age_seconds" json:"maxAgeSeconds,omitempty"`
+}
+
+// Starting-point kinds (Session-Starting-Points.md § Clean Starting Points).
+const (
+	StartingPointCleanBuild = "clean-build"
+	StartingPointCleanClone = "clean-clone"
+)
+
+func (sp *StartingPoint) validate() error {
+	if sp == nil {
+		return nil
+	}
+	if sp.SnapshotID != "" {
+		if sp.Repo != "" || sp.Ref != "" || sp.Kind != "" {
+			return fmt.Errorf("starting_point: snapshot_id excludes repo/ref/kind")
+		}
+		return nil
+	}
+	if sp.Repo == "" || sp.Ref == "" {
+		return fmt.Errorf("starting_point needs snapshot_id, or repo and ref")
+	}
+	switch sp.Kind {
+	case StartingPointCleanBuild, StartingPointCleanClone:
+	default:
+		return fmt.Errorf("starting_point.kind %q must be %s or %s", sp.Kind, StartingPointCleanBuild, StartingPointCleanClone)
+	}
+	return nil
 }
 
 // HostInfo identifies the serving host of a job.
@@ -99,6 +140,20 @@ type Job struct {
 	CleanupToken       string            `json:"cleanupToken"`
 	Host               HostInfo          `json:"host"`
 	Addresses          []string          `json:"addresses"`
+	// StartingPoint echoes the starting point the job's workspace was
+	// branched from; nil for a cold (empty-workspace) job.
+	StartingPoint *ResolvedStartingPoint `json:"startingPoint,omitempty"`
+}
+
+// ResolvedStartingPoint is the server's record of which starting point a job
+// started from.
+type ResolvedStartingPoint struct {
+	SnapshotID   string     `json:"snapshotId"`
+	Repo         string     `json:"repo,omitempty"`
+	Ref          string     `json:"ref,omitempty"`
+	Kind         string     `json:"kind,omitempty"`
+	SourceCommit string     `json:"sourceCommit,omitempty"`
+	CreatedAt    *time.Time `json:"createdAt,omitempty"`
 }
 
 type jobList struct {
@@ -116,14 +171,15 @@ type CleanupResponse struct {
 
 // Error codes of the spec's error model (§ Error model).
 const (
-	CodeInvalidRequest       = "invalid-request"
-	CodeForbidden            = "forbidden"
-	CodeNotFound             = "not-found"
-	CodeNameConflict         = "name-conflict"
-	CodeInvalidSandboxOption = "invalid-sandbox-option"
-	CodeSubstrateUnavailable = "substrate-unavailable"
-	CodeAdmissionShed        = "admission-shed"
-	CodeCapacityExhausted    = "capacity-exhausted"
+	CodeInvalidRequest           = "invalid-request"
+	CodeForbidden                = "forbidden"
+	CodeNotFound                 = "not-found"
+	CodeNameConflict             = "name-conflict"
+	CodeInvalidSandboxOption     = "invalid-sandbox-option"
+	CodeStartingPointUnavailable = "starting-point-unavailable"
+	CodeSubstrateUnavailable     = "substrate-unavailable"
+	CodeAdmissionShed            = "admission-shed"
+	CodeCapacityExhausted        = "capacity-exhausted"
 )
 
 // APIError is a Problem+JSON error answer.

@@ -34,7 +34,7 @@
 # re-execs the resolved executable, i.e. `/proc/self/exe`).
 stdenv.mkDerivation (finalAttrs: {
   pname = "gosti";
-  version = "0.1.0-unstable-2026-09-23";
+  version = "0.1.2-unstable-2026-10-14";
 
   src = fetchFromGitHub {
     owner = "metacraft-labs";
@@ -42,8 +42,8 @@ stdenv.mkDerivation (finalAttrs: {
     # unchanged by the rename. The in-repo vm-harness/vmh CLI brand rename
     # (pname, binary, share/ paths, serve service) is the GOSTI1b follow-up.
     repo = "gosti";
-    rev = "4d69242dd1bfe7b28bb7705666da34a2b318c5f0";
-    hash = "sha256-fm78BD2VATbJmHB4JoCbi7hSh/Qdw8o3fe/9wgIibJM=";
+    rev = "6d050ba03dbfc736a5a26e4459b7965398c16a68";
+    hash = "sha256-UBQvUnHTBVo60AM1xUqVM1/UbCTlq1dfbrBIidvgEkk=";
   };
 
   nativeBuildInputs = [ nim ];
