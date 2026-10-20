@@ -7,6 +7,19 @@
       terraformWorkflow = ../.github/workflows/reusable-terraform-ci.yml;
     in
     {
+      checks.reusable-flake-checks-cancellation =
+        pkgs.runCommand "reusable-flake-checks-cancellation"
+          {
+            nativeBuildInputs = [
+              pkgs.bash
+              (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
+            ];
+          }
+          ''
+            BASH_BIN=${pkgs.bash}/bin/bash python3 ${../scripts/tests/test_reusable_flake_cancellation.py} ${flakeChecksWorkflow}
+            touch "$out"
+          '';
+
       # Selector input fixtures exercise the committed workflow expressions.
       # No network client or authentication response is mocked: GitHub evaluates
       # these same expressions in the live reusable workflow.
