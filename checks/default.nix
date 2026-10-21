@@ -5,6 +5,7 @@
     ./encrypted-s3-artifact.nix
     ./desktop-vms
     ./deployment-docs.nix
+    ./dev-certificates-minting.nix
     ./deployment-cache.nix
     ./deployment-darwin-activation.nix
     ./deployment-incus-rehearsal.nix
