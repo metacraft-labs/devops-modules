@@ -52,6 +52,10 @@ mergeable into a Terranix root that also declares the `github` provider.
 - **One baseline ruleset per repository** targeting `~ALL` branches, blocking
   force pushes and deletions (`non_fast_forward` / `deletion`) — this is the
   "every branch protected from force push" universal rule.
+  A class that overrides the baseline with `allowDeletion = true` (e.g.
+  `agents-to-dev-*`, deleted once it lands) is excluded from that deletion
+  rule. Its branches get a `baseline-protect-deletable-branches` ruleset that
+  still blocks force pushes.
 - **One ruleset per applicable branch class** (matched by `repoClass`) that
   gates on CI: `required_status_checks` with the repo's contexts, plus a
   `pull_request` rule when the class is PR-only. Classes that require neither
@@ -147,6 +151,13 @@ that lands the merge commit it tested with the reviewed commits unchanged. The
 renderer rejects a queue on a class without one, on a repository that is not
 PR-only, a `mergeMethod` override (or a policy method other than `MERGE`), an
 unknown key, and out-of-range values.
+
+**Optional queues.** A class whose `mergeQueue` block says `enabled = false`
+(the Metacraft policy since 2026-09-30: strict required checks, no queue by
+default) renders no queue. A repository may still opt in by being listed in
+`mergeQueueRepos` with a documented reason (>= 20 characters) in
+`mergeQueueOptIns = { <repo> = "<reason>"; }`. Without a reason, it is
+rejected.
 
 **Allowed merge methods.** A PR-gated class's `allowedMergeMethods` (the
 Metacraft policy: `["merge"]` on `stable`, `dev` and `live`) is rendered as the
