@@ -40,6 +40,8 @@
 #         min_minutes_remaining: 300
 #         included_minutes: 3000        # Team plan monthly allowance
 #         max_billed_amount: 0          # hard $0 cap; any overage -> self-hosted
+#         dry_run: true                 # log + summarize the decision, write nothing
+#         # allow_github_hosted: true   # opt OUT of the self-hosted hold (default false)
 #         # runner: '["self-hosted","linux","x64"]'   # used when the ops repo is private
 #         # metrics_textfile: /var/lib/node_exporter/textfile/ci-runner-mode.prom
 #       secrets:
@@ -82,6 +84,16 @@
 #   * variables_token — org VARIABLES write (fine-grained: Organization
 #                       "Variables" read/write). Writes CI_RUNNER_MODE.
 #     GITHUB_TOKEN cannot do either, so both are required secrets.
+#
+# SAFETY INPUTS (both default to the safe side):
+#   * allow_github_hosted (default FALSE) — operator policy is that orgs stay
+#     self-hosted. While false, the service NEVER writes `github-hosted`: where
+#     billing says the pool is healthy, it writes (or keeps) `self-hosted` and
+#     logs that the self-hosted hold is in effect. Set true only for an org that
+#     should actually ride the included GitHub-hosted minutes.
+#   * dry_run (default false) — compute, log and job-summarize the decision
+#     (mode, remaining minutes, billed amount, reason) but never call
+#     `gh variable set`. Use it to validate a new caller before it writes.
 #
 # Prometheus signals (see the `metrics` step): a decision gauge, remaining
 # minutes, billed amount, a fail-safe flag, and a last-SUCCESS timestamp that is
@@ -133,6 +145,19 @@ on:
           Default 0 enforces the $0 policy: any minutes overage flips.
         type: number
         default: 0
+      dry_run:
+        description: >-
+          true = compute, log and job-summarize the decision but never write the
+          CI_RUNNER_MODE variable (no `gh variable set`).
+        type: boolean
+        default: false
+      allow_github_hosted:
+        description: >-
+          true = the service may write `github-hosted` when billing allows it.
+          Default false (operator policy: orgs stay self-hosted): a decision of
+          github-hosted is held at `self-hosted` and the hold is logged.
+        type: boolean
+        default: false
       metrics_textfile:
         description: >-
           Optional node-exporter textfile-collector path to write the Prometheus
@@ -157,6 +182,9 @@ on:
       failsafe:
         description: '"1" if the decision fell back to the fail-safe self-hosted default, else "0".'
         value: ${{ jobs.manage.outputs.failsafe }}
+      held:
+        description: '"1" if billing allowed github-hosted but the self-hosted hold (allow_github_hosted=false) kept self-hosted, else "0".'
+        value: ${{ jobs.manage.outputs.held }}
 
 jobs:
   manage:
@@ -169,6 +197,7 @@ jobs:
     outputs:
       mode: ${{ steps.decide.outputs.mode }}
       failsafe: ${{ steps.decide.outputs.failsafe }}
+      held: ${{ steps.decide.outputs.held }}
     steps:
       - id: decide
         env:
@@ -178,6 +207,8 @@ jobs:
           INCLUDED_MINUTES: ${{ inputs.included_minutes }}
           BILLING_ENTERPRISE: ${{ inputs.enterprise }}
           MAX_BILLED: ${{ inputs.max_billed_amount }}
+          ALLOW_GITHUB_HOSTED: ${{ inputs.allow_github_hosted }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           # No `set -e` at top level: a compute failure must NOT fail the job,
           # it must resolve fail-safe to self-hosted. billing_remaining() runs
@@ -292,14 +323,37 @@ jobs:
             reason="fail-safe: billing unreachable / unparseable / ambiguous"
           fi
 
+          # Self-hosted HOLD (operator policy: orgs stay self-hosted). Only the
+          # literal "true" lifts it; anything else (false, empty) holds.
+          held=0
+          if [ "$mode" = "github-hosted" ] && [ "${ALLOW_GITHUB_HOSTED:-false}" != "true" ]; then
+            mode="self-hosted"
+            held=1
+            reason="${reason}; self-hosted hold in effect (allow_github_hosted=false), keeping self-hosted"
+            printf 'manage-runner-mode: self-hosted hold in effect: billing allows github-hosted, writing self-hosted\n'
+          fi
+
           {
             printf 'mode=%s\n' "$mode"
             printf 'remaining=%s\n' "$remaining"
             printf 'billed=%s\n' "$billed"
             printf 'failsafe=%s\n' "$failsafe"
+            printf 'held=%s\n' "$held"
           } >> "$GITHUB_OUTPUT"
-          printf 'manage-runner-mode: org=%s -> CI_RUNNER_MODE=%s (%s)\n' \
-            "$ORG" "$mode" "$reason"
+          if [ "${DRY_RUN:-false}" = "true" ]; then dry=" [dry-run: no variable write]"; else dry=""; fi
+          printf 'manage-runner-mode: org=%s -> CI_RUNNER_MODE=%s remaining=%s billed=%s (%s)%s\n' \
+            "$ORG" "$mode" "$remaining" "$billed" "$reason" "$dry"
+          {
+            printf '### manage-runner-mode: %s%s\n\n' "$ORG" "$dry"
+            printf '| field | value |\n|---|---|\n'
+            printf '| mode | %s |\n' "$mode"
+            printf '| remaining (Linux-eq. minutes) | %s |\n' "$remaining"
+            printf '| billed (USD) | %s |\n' "$billed"
+            printf '| failsafe | %s |\n' "$failsafe"
+            printf '| self-hosted hold | %s |\n' "$held"
+            printf '| dry run | %s |\n' "${DRY_RUN:-false}"
+            printf '| reason | %s |\n' "$reason"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
       - id: metrics
         env:
@@ -364,12 +418,33 @@ jobs:
           fi
 
       - name: Write CI_RUNNER_MODE org variable
+        id: write
+        # dry_run never writes. The run block re-checks DRY_RUN and the hold
+        # (defence in depth; the hermetic gate drives this block directly).
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ secrets.variables_token }}
           ORG: ${{ inputs.org }}
           MODE: ${{ steps.decide.outputs.mode }}
+          ALLOW_GITHUB_HOSTED: ${{ inputs.allow_github_hosted }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            printf 'manage-runner-mode: dry run, NOT writing CI_RUNNER_MODE=%s for org %s\n' "$MODE" "$ORG"
+            exit 0
+          fi
+          case "$MODE" in
+            self-hosted) ;;
+            github-hosted)
+              if [ "${ALLOW_GITHUB_HOSTED:-false}" != "true" ]; then
+                printf 'manage-runner-mode: self-hosted hold in effect, writing self-hosted instead of github-hosted\n'
+                MODE="self-hosted"
+              fi ;;
+            *)
+              printf 'manage-runner-mode: unexpected mode %s, writing fail-safe self-hosted\n' "$MODE"
+              MODE="self-hosted" ;;
+          esac
           # create-or-update the org-visible variable (idempotent).
           gh variable set CI_RUNNER_MODE --org "$ORG" --visibility all --body "$MODE"
           printf 'manage-runner-mode: CI_RUNNER_MODE set to %s for org %s\n' "$MODE" "$ORG"

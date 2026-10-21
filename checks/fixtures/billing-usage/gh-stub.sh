@@ -22,7 +22,15 @@
 #   MOCK_USAGE_410      the usage endpoint answers HTTP 410
 #   MOCK_OLD_SHAPE      the usage endpoint answers 200 with the OLD classic body
 #   MOCK_FAIL_REPOS     the public-repo listing fails
+#   MOCK_GH_LOG         append every invocation's argv (one line) to this file;
+#                       `gh variable set ...` is then accepted (exit 0) so a gate
+#                       can assert exactly which variable writes were attempted
 set -uo pipefail
+
+if [ -n "${MOCK_GH_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$MOCK_GH_LOG"
+  [ "${1:-}" = "variable" ] && [ "${2:-}" = "set" ] && exit 0
+fi
 
 gone() {
   printf '{"message":"This endpoint has been moved.","documentation_url":"https://gh.io/billing-api-updates-org","status":"410"}'

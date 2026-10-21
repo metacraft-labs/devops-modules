@@ -38,6 +38,15 @@ _top@{ ... }:
   #     repo-listing error / unreachable) and that case flips.
   # The metrics assertions pin the stuck-state dead-man's-switch: a successful
   # run advances last_success; a fail-safe run does not.
+  #
+  # SAFETY INPUTS: with `allow_github_hosted` false (the default) or unset, NO
+  # billing shape produces `github-hosted` — the healthy cases are re-run and
+  # must come out self-hosted with held=1 — and the REAL write block, fed a
+  # github-hosted mode, writes self-hosted. With `dry_run` true the write block
+  # makes no `gh variable set` call at all (the stub logs every gh invocation),
+  # while the decide block still writes the decision to the job summary. Each
+  # has a positive control (allow=true writes github-hosted; dry_run=false
+  # writes), so the assertions are not vacuous.
   perSystem =
     { pkgs, ... }:
     let
@@ -103,6 +112,21 @@ _top@{ ... }:
             # The written variable is the S1-authoritative CI_RUNNER_MODE.
             writestep = next(s for s in steps if "Write CI_RUNNER_MODE" in s.get("name", ""))
             assert "gh variable set CI_RUNNER_MODE" in writestep["run"], writestep["run"]
+            # Safety inputs: both booleans, both default to the safe side.
+            inp = on0["workflow_call"]["inputs"]
+            assert inp["dry_run"]["type"] == "boolean" and inp["dry_run"]["default"] is False, inp["dry_run"]
+            assert inp["allow_github_hosted"]["type"] == "boolean" \
+                and inp["allow_github_hosted"]["default"] is False, inp["allow_github_hosted"]
+            assert env.get("ALLOW_GITHUB_HOSTED") == "${"$"}{{ inputs.allow_github_hosted }}", env
+            assert env.get("DRY_RUN") == "${"$"}{{ inputs.dry_run }}", env
+            # The write step is skipped under dry_run AND re-checks it itself.
+            assert "!inputs.dry_run" in str(writestep.get("if", "")), writestep.get("if")
+            wenv = writestep["env"]
+            assert wenv.get("DRY_RUN") == "${"$"}{{ inputs.dry_run }}", wenv
+            assert wenv.get("ALLOW_GITHUB_HOSTED") == "${"$"}{{ inputs.allow_github_hosted }}", wenv
+            # The ONLY variable write in the workflow is in the write step.
+            others = "".join(s.get("run", "") for s in steps if s is not writestep)
+            assert "gh variable" not in others, "a non-write step calls gh variable"
             # Outputs plumb decide -> job -> workflow_call.
             on = wf.get("on", wf.get(True))
             outs = on["workflow_call"]["outputs"]
@@ -111,9 +135,11 @@ _top@{ ... }:
             assert "steps.decide.outputs.mode" in job_outs["mode"], job_outs
             Path("decide.sh").write_text(decide["run"])
             Path("metrics.sh").write_text(metrics["run"])
+            Path("write.sh").write_text(writestep["run"])
             PY
             ${pkgs.bash}/bin/bash -n decide.sh  || fail "decide run block is not valid bash"
             ${pkgs.bash}/bin/bash -n metrics.sh || fail "metrics run block is not valid bash"
+            ${pkgs.bash}/bin/bash -n write.sh   || fail "write run block is not valid bash"
 
             # A stub `gh` = the ONLY network boundary (see gh-stub.sh): it serves
             # the captured usage reports and GitHub's real failure shapes.
@@ -132,6 +158,7 @@ _top@{ ... }:
                 FIXTURES="${fixtures}" \
                 MIN_REMAIN="300" \
                 MAX_BILLED="0" \
+                ALLOW_GITHUB_HOSTED="true" \
                 "$@" \
                 ${pkgs.bash}/bin/bash decide.sh >/dev/null 2>caselog \
                 || { cat caselog >&2; fail "$name: decide exited non-zero"; }
@@ -142,6 +169,10 @@ _top@{ ... }:
                 || fail "$name: mode=$got_mode, wanted $want_mode"
               [ "$got_fs" = "$want_fs" ] \
                 || fail "$name: failsafe=$got_fs, wanted $want_fs"
+              if [ -n "''${WANT_HELD:-}" ]; then
+                local got_held; got_held="$(grep '^held=' "$out" | tail -1 | cut -d= -f2-)"
+                [ "$got_held" = "$WANT_HELD" ] || fail "$name: held=$got_held, wanted $WANT_HELD"
+              fi
               echo "[t_runner_mode_manager][ok] $name -> CI_RUNNER_MODE=$got_mode (failsafe=$got_fs)"
             }
 
@@ -188,6 +219,87 @@ _top@{ ... }:
             # (d5) the public-repo listing fails -> cannot separate free usage.
             decide_case "public-repo-listing-error" "self-hosted" "1" "''${ORGCASE[@]}" \
               MOCK_UNTIL="2026-09-05" MOCK_FAIL_REPOS="1"
+
+            # ---- Self-hosted hold: allow_github_hosted false/unset ----------
+            # (The cases above run with ALLOW_GITHUB_HOSTED=true so the billing
+            # logic itself stays load-bearing; these re-run them with the hold.)
+            WANT_HELD=1 decide_case "hold/org-healthy" "self-hosted" "0" "''${ORGCASE[@]}" \
+              MOCK_UNTIL="2026-09-05" ALLOW_GITHUB_HOSTED="false"
+            WANT_HELD=1 decide_case "hold/org-above-buffer" "self-hosted" "0" "''${ORGCASE[@]}" \
+              MOCK_UNTIL="2026-09-11" ALLOW_GITHUB_HOSTED="false"
+            WANT_HELD=1 decide_case "hold/storage-overage-ignored" "self-hosted" "0" "''${ORGCASE[@]}" \
+              MOCK_UNTIL="2026-09-05" ALLOW_GITHUB_HOSTED="false" \
+              MOCK_INJECT_SKU="Actions storage" MOCK_INJECT_UNIT="GigabyteHours" MOCK_INJECT_NET="0.94"
+            WANT_HELD=1 decide_case "hold/enterprise-healthy" "self-hosted" "0" "''${ENTCASE[@]}" \
+              MOCK_UNTIL="2026-09-18" ALLOW_GITHUB_HOSTED="false"
+            # Unset / empty input also holds (only the literal "true" lifts it).
+            WANT_HELD=1 decide_case "hold/allow-empty" "self-hosted" "0" "''${ORGCASE[@]}" \
+              MOCK_UNTIL="2026-09-05" ALLOW_GITHUB_HOSTED=""
+            # A genuine self-hosted decision is not reported as a hold.
+            WANT_HELD=0 decide_case "hold/near-exhaustion-not-held" "self-hosted" "0" "''${ORGCASE[@]}" \
+              MOCK_UNTIL="2026-09-12" ALLOW_GITHUB_HOSTED="false"
+            # Positive control: the healthy case with the hold lifted.
+            WANT_HELD=0 decide_case "hold/lifted-control" "github-hosted" "0" "''${ORGCASE[@]}" \
+              MOCK_UNTIL="2026-09-05" ALLOW_GITHUB_HOSTED="true"
+
+            # ---- Write step: dry_run + hold, against a logging gh stub -------
+            # write_case NAME WANT_BODY(none|self-hosted|github-hosted) <env...>
+            write_case() {
+              local name="$1" want="$2"; shift 2
+              local log; log="$(mktemp)"
+              env -i PATH="$PATH" FIXTURES="${fixtures}" MOCK_GH_LOG="$log" ORG="example-org" "$@" \
+                ${pkgs.bash}/bin/bash write.sh >/dev/null 2>writelog \
+                || { cat writelog >&2; fail "$name: write exited non-zero"; }
+              if [ "$want" = "none" ]; then
+                [ ! -s "$log" ] || { cat "$log" >&2; fail "$name: dry run invoked gh"; }
+              else
+                local calls; calls="$(grep -c '^variable set' "$log" || true)"
+                [ "$calls" = "1" ] || { cat "$log" >&2; fail "$name: expected exactly 1 variable write, got $calls"; }
+                grep -qx "variable set CI_RUNNER_MODE --org example-org --visibility all --body $want" "$log" \
+                  || { cat "$log" >&2; fail "$name: wrong variable write, wanted body $want"; }
+              fi
+              if [ "$want" != "github-hosted" ] && grep -q 'github-hosted' "$log"; then
+                cat "$log" >&2; fail "$name: a github-hosted write was attempted"
+              fi
+              echo "[t_runner_mode_manager][ok] write/$name -> $want"
+            }
+            write_case "dry-run-hosted"       none          MODE="github-hosted" DRY_RUN="true" ALLOW_GITHUB_HOSTED="true"
+            write_case "dry-run-self"         none          MODE="self-hosted"   DRY_RUN="true" ALLOW_GITHUB_HOSTED="false"
+            write_case "hold-defence"         self-hosted   MODE="github-hosted" DRY_RUN="false" ALLOW_GITHUB_HOSTED="false"
+            write_case "hold-defence-unset"   self-hosted   MODE="github-hosted"
+            write_case "unexpected-mode"      self-hosted   MODE="bogus"         DRY_RUN="false" ALLOW_GITHUB_HOSTED="true"
+            write_case "self-hosted"          self-hosted   MODE="self-hosted"   DRY_RUN="false" ALLOW_GITHUB_HOSTED="false"
+            write_case "allowed-control"      github-hosted MODE="github-hosted" DRY_RUN="false" ALLOW_GITHUB_HOSTED="true"
+
+            # ---- End to end: decide -> write over a healthy pool -------------
+            e2e() {
+              # e2e NAME ALLOW DRY -> leaves gh log in e2e.log, summary in e2e.md
+              local out; out="$(mktemp)"; : > e2e.log; : > e2e.md
+              env -i PATH="$PATH" GITHUB_OUTPUT="$out" GITHUB_STEP_SUMMARY="$PWD/e2e.md" \
+                FIXTURES="${fixtures}" MIN_REMAIN="300" MAX_BILLED="0" \
+                "''${ORGCASE[@]}" MOCK_UNTIL="2026-09-05" \
+                ALLOW_GITHUB_HOSTED="$2" DRY_RUN="$3" \
+                ${pkgs.bash}/bin/bash decide.sh >/dev/null 2>caselog \
+                || { cat caselog >&2; fail "e2e/$1: decide failed"; }
+              local mode; mode="$(grep '^mode=' "$out" | tail -1 | cut -d= -f2-)"
+              env -i PATH="$PATH" FIXTURES="${fixtures}" MOCK_GH_LOG="$PWD/e2e.log" ORG="example-org" \
+                MODE="$mode" ALLOW_GITHUB_HOSTED="$2" DRY_RUN="$3" \
+                ${pkgs.bash}/bin/bash write.sh >/dev/null 2>writelog \
+                || { cat writelog >&2; fail "e2e/$1: write failed"; }
+            }
+            e2e "hold" "false" "false"
+            grep -q 'github-hosted' e2e.log && { cat e2e.log >&2; fail "e2e/hold: github-hosted written"; }
+            grep -qx 'variable set CI_RUNNER_MODE --org example-org --visibility all --body self-hosted' e2e.log \
+              || { cat e2e.log >&2; fail "e2e/hold: self-hosted not written"; }
+            grep -q 'self-hosted hold' e2e.md || fail "e2e/hold: summary does not report the hold"
+            echo "[t_runner_mode_manager][ok] e2e/hold: healthy pool, allow_github_hosted=false -> wrote self-hosted"
+            e2e "dry-run" "true" "true"
+            [ ! -s e2e.log ] || { cat e2e.log >&2; fail "e2e/dry-run: gh was invoked by the write step"; }
+            for f in '| mode | github-hosted |' '| remaining (Linux-eq. minutes) | 2052 |' \
+                     '| billed (USD) | 0 |' '| dry run | true |' '| reason | healthy:'; do
+              grep -qF "$f" e2e.md || { cat e2e.md >&2; fail "e2e/dry-run: summary missing '$f'"; }
+            done
+            echo "[t_runner_mode_manager][ok] e2e/dry-run: decision summarized, no variable write"
 
             # ---- Prometheus signals + stuck-state dead-man's-switch ----------
             run_metrics() {
