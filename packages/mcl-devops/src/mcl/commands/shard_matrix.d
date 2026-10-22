@@ -167,7 +167,11 @@ unittest
 unittest
 {
     import mcl.utils.path : rootDir;
-    auto flakeRef = rootDir.buildPath("packages/mcl-devops/src/src/mcl/utils/test/nix/shard-matrix-no-shards");
+    import std.file : exists, isFile;
+
+    auto flakeRef = rootDir.buildPath("packages/mcl-devops/src/mcl/utils/test/nix/shard-matrix-no-shards");
+    assert(flakeRef.buildPath("flake.nix").exists && flakeRef.buildPath("flake.nix").isFile,
+        "Missing declared no-shards flake fixture: " ~ flakeRef);
 
     auto shards = generateShardMatrix(flakeRef);
     assert(shards.include == []);

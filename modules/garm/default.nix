@@ -294,6 +294,9 @@
         + optionalString p.remote.incusNestedKvm ''
           incus_nested_kvm = true
         ''
+        + optionalString (p.remote.incusProfiles != [ ]) ''
+          incus_profiles = ${builtins.toJSON p.remote.incusProfiles}
+        ''
         # Per-job resource caps, likewise omitted at 0 so a provider that sets
         # none keeps a byte-identical config.toml and create argv.
         + optionalString (p.remote.incusLimitsCpu > 0) ''
@@ -2652,6 +2655,19 @@
                       0 (default) uses a built-in timeout. The create/delete
                       streams are bounded by the remote worker's own
                       `--timeout-sec`, not this.
+                    '';
+                  };
+                  incusProfiles = mkOption {
+                    type = types.listOf types.str;
+                    default = [ ];
+                    description = ''
+                      Existing remote-host Incus profiles in administrator order,
+                      forwarded as repeated --incus-profile arguments. Empty
+                      retains Incus's automatic default profile. An explicit list
+                      must include default to retain its root disk and NIC before
+                      overlay profiles. This is operator configuration, never
+                      workflow, pool or bootstrap/user-data input. Only accepted
+                      for backend = "remote" and remote.targetBackend = "incus".
                     '';
                   };
                   incusSecurityNesting = mkOption {
@@ -5152,6 +5168,15 @@
             # Remote Incus capability grants are deliberately narrow and
             # provider-admin controlled. Refuse configurations whose target
             # cannot honour them instead of silently ignoring a privilege grant.
+            ++ lib.mapAttrsToList (n: p: {
+              assertion =
+                p.remote.incusProfiles == [ ] || (providerIsRemote p && p.remote.targetBackend == "incus");
+              message = "services.garm.providers.${n}.remote.incusProfiles requires backend = \"remote\" and remote.targetBackend = \"incus\".";
+            }) cfg.providers
+            ++ lib.mapAttrsToList (n: p: {
+              assertion = lib.all (profile: profile != "") p.remote.incusProfiles;
+              message = "services.garm.providers.${n}.remote.incusProfiles must contain non-empty profile names.";
+            }) cfg.providers
             ++ lib.mapAttrsToList (n: p: {
               assertion =
                 !p.remote.incusSecurityNesting || (providerIsRemote p && p.remote.targetBackend == "incus");

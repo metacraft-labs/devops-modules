@@ -129,6 +129,9 @@ def _matrix_values(job: dict, key: str) -> list[str]:
     """Collect every concrete value a matrix key can take (top-level + include)."""
     matrix = (job.get("strategy") or {}).get("matrix") or {}
     values: list[str] = []
+    if not isinstance(matrix, dict):
+        # `matrix: ${{ fromJson(...) }}` — computed at run time; nothing to expand.
+        return values
     if key in matrix and isinstance(matrix[key], list):
         for v in matrix[key]:
             if isinstance(v, str):

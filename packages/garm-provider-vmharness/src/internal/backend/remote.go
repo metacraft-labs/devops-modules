@@ -79,6 +79,9 @@ type RemoteBackend struct {
 	// select arbitrary Incus configuration, device paths, or modes.
 	IncusSecurityNesting bool
 	IncusNestedKvm       bool
+	// IncusProfiles is trusted provider configuration, not CreateArgs or bootstrap.
+	// Names and their order are forwarded to the existing Incus profile mechanism.
+	IncusProfiles []string
 	// IncusLimitsCPU / IncusLimitsMemoryMB are trusted provider-admin per-job
 	// resource caps for the remote Incus recipe (0 = unset). They map only to
 	// vm-harness's generic `--cpus` / `--memory-mb` flags, which the Incus
@@ -142,19 +145,19 @@ var ephemeralRecipe = remoteRecipe{
 		}
 		// Only remote Incus consumes these provider-admin grants. The fixed
 		// flag order is part of the contract: the image pair first (base then
-		// source, above), then nesting, then nested KVM, then the pre-existing
-		// lifecycle/logging suffix.
+		// source, above), then ordered profiles, nesting, nested KVM, and the
+		// pre-existing lifecycle/logging suffix.
 		//
-		// The "with both grants off the argv is byte-for-byte identical to the
-		// RB1/RB2 path" property still holds, MODULO the deliberate
-		// `--source-image <image>` pair added above: with both grants off the
-		// emitted argv is the pre-capability argv with exactly that pair
-		// inserted immediately after `--base-image <image>`, and nothing else
-		// moved or dropped. When no image is configured neither image flag is
-		// emitted, so the grants-off argv is then literally identical to the
-		// RB1/RB2 one. The capability flags are unreachable for any target
-		// other than "incus", image or no image.
+		// With profiles empty, capability grants off and resource limits unset,
+		// the legacy argv remains unchanged apart from the deliberate
+		// `--source-image <image>` pair above. When no image is configured,
+		// neither image flag is emitted, so the default argv is literally
+		// identical to the RB1/RB2 path. Incus-only options are unreachable for
+		// every other target, with or without an image.
 		if backend.TargetBackend == "incus" {
+			for _, profile := range backend.IncusProfiles {
+				argv = append(argv, "--incus-profile", profile)
+			}
 			if backend.IncusSecurityNesting {
 				argv = append(argv, "--incus-security-nesting")
 			}

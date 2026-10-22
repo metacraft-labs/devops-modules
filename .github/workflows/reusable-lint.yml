@@ -54,7 +54,7 @@ name: 'Lint'
 #     records the pusher's local branch name — even though the pinned commit
 #     is there.
 #     `auto` installs and clones nothing when there is no `repro.lock` or it
-#     pins no sibling (every deps entry is `path = "."`, the repo itself).
+#     pins no sibling (every deps entry identifies the repo itself).
 #     Each sibling's own submodules are initialized too, as a developer's
 #     checkout has them (unless `submodules: off`).
 #   * git submodules, recursively, when `.gitmodules` is tracked (input
@@ -176,6 +176,38 @@ jobs:
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
 
+      # Warning-only (does not fail the build yet): flag restrictive runs-on
+      # labels (bare-metal, nixos, x86-64-v3, gpu, …) that carry no
+      # justification comment. Policy: metacraft-dev-guidelines
+      # policies/ci-workflow-standards.md "Choosing runs-on labels for a job".
+      - name: Check runs-on labels are justified (warning only)
+        if: ${{ hashFiles('.github/workflows/*.yml', '.github/workflows/*.yaml') != '' }}
+        continue-on-error: true
+        run: |
+          # `bash -e` is the default shell: turn -e off so a finding (checker
+          # exit 1) or a tool error can never fail this step.
+          set +e -uo pipefail
+          dir="$(mktemp -d)"
+          # Always the current checker from dev: this step only warns.
+          base="https://raw.githubusercontent.com/metacraft-labs/devops-modules/dev/scripts/ci"
+          for f in check_over_constrained_runs_on.py check_public_repo_runners.py; do
+            curl -fsSL --retry 3 -o "$dir/$f" "$base/$f" || { echo "::warning title=runs-on labels::could not fetch $f; skipping"; exit 0; }
+          done
+          if ! command -v nix >/dev/null 2>&1; then
+            echo "::warning title=runs-on labels::nix not available; skipping"; exit 0
+          fi
+          # shellcheck disable=SC2016 # a Nix expression, not a shell one
+          nix shell --impure --expr \
+            '(builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}.python3.withPackages (p: [ p.pyyaml ])' \
+            -c python3 "$dir/check_over_constrained_runs_on.py" .github/workflows 2>&1 \
+            | while IFS= read -r line; do
+                case "$line" in
+                  *" :: job "*) echo "::warning title=runs-on labels::${line#*✗ }" ;;
+                  *) echo "$line" ;;
+                esac
+              done
+          exit 0
+
       - name: Initialize submodules
         env:
           LINT_SUBMODULES: ${{ inputs.submodules }}
@@ -235,20 +267,31 @@ jobs:
             exit 0
           fi
 
-          # Static pre-check (no tool needed): does the lock pin any sibling,
-          # i.e. a deps entry whose path is not "." (the repo itself)? If not,
-          # nothing is installed and nothing is cloned.
+          # Static pre-check (no tool needed): count named dependency records,
+          # excluding v3's explicit self marker. In v2 only the legacy root
+          # marker is read from path; sibling locations are never inputs.
           deps_line=""
+          legacy_lock=0
           while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in 'deps = ['*) deps_line="$line" ;; esac
+            case "$line" in
+              'schema = "reprobuild.solved-graph-lock.v2"') legacy_lock=1 ;;
+              'deps = ['*) deps_line="$line" ;;
+            esac
           done <repro.lock
           siblings=0
-          rest="$deps_line"
+          rest="${deps_line#deps = [}"
           while :; do
             case "$rest" in
-              *'path = "'*)
-                rest="${rest#*path = \"}"
-                [ "${rest%%\"*}" = "." ] || siblings=$((siblings + 1))
+              *'{ '*' }'*)
+                entry="${rest%%" }"*}"
+                rest="${rest#*" }"}"
+                rest="${rest#", "}"
+                body=", ${entry#\{ }"
+                case "$body" in *', self = "true"'*) continue ;; esac
+                if [ "$legacy_lock" -eq 1 ]; then
+                  case "$body" in *', path = "."'*) continue ;; esac
+                fi
+                case "$body" in *', name = "'*) siblings=$((siblings + 1)) ;; esac
                 ;;
               *) break ;;
             esac

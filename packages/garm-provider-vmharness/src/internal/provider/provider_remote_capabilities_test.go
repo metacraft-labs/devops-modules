@@ -1,3 +1,6 @@
+// Mock justification: the local HTTP fixture exercises the real provider and
+// authenticated remote argv transport without creating a VM or requiring a host.
+// Constructor tests use the real config and backend objects.
 package provider
 
 import (
@@ -37,6 +40,53 @@ func TestRemoteIncusCapabilitiesReachBackend(t *testing.T) {
 	}
 	if !b.IncusSecurityNesting || !b.IncusNestedKvm {
 		t.Fatalf("remote Incus grants were not propagated: %+v", b)
+	}
+}
+
+func TestRemoteIncusProfilesReachBackendInOrder(t *testing.T) {
+	cfg := &config.Config{
+		Backend: config.BackendRemote,
+		Remote: &config.RemoteConfig{
+			Endpoint: "runner.example.test:8873", TargetBackend: "incus",
+			AuthToken: "test-token", IncusProfiles: []string{"default", "ci-store"},
+		},
+	}
+	p, err := NewWithConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := p.backend.(*backend.RemoteBackend)
+	cfg.Remote.IncusProfiles[1] = "changed-after-construction"
+	if !reflect.DeepEqual(b.IncusProfiles, []string{"default", "ci-store"}) {
+		t.Fatalf("profiles were reordered or not captured at construction: %v", b.IncusProfiles)
+	}
+}
+
+func TestRemoteIncusProfilesRejectInvalidRoutesAndNames(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		backend  config.BackendKind
+		target   string
+		profiles []string
+	}{
+		{"remote libvirt", config.BackendRemote, "libvirt", []string{"ci-store"}},
+		{"remote noop", config.BackendRemote, "noop", []string{"ci-store"}},
+		{"local provider", config.BackendLibvirt, "incus", []string{"ci-store"}},
+		{"empty name", config.BackendRemote, "incus", []string{""}},
+		{"NUL name", config.BackendRemote, "incus", []string{"bad\x00name"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Backend: tc.backend, Remote: &config.RemoteConfig{
+				Endpoint: "runner.example.test:8873", TargetBackend: tc.target,
+				AuthToken: "test-token", IncusProfiles: tc.profiles,
+			}}
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "incus_profiles") {
+				t.Fatalf("profile config was not specifically refused: %v", err)
+			}
+			if _, err := NewWithConfig(cfg); err == nil || !strings.Contains(err.Error(), "incus_profiles") {
+				t.Fatalf("profile construction was not specifically refused: %v", err)
+			}
+		})
 	}
 }
 
@@ -163,7 +213,7 @@ func TestRemoteIncusCapabilitiesCannotComeFromExtraSpecs(t *testing.T) {
 		Image:      "runner-linux",
 		OSType:     commonParams.Linux,
 		OSArch:     commonParams.Amd64,
-		ExtraSpecs: json.RawMessage(`{"incus_security_nesting":true,"incus_nested_kvm":true,"incus_device_path":"/dev/mem"}`),
+		ExtraSpecs: json.RawMessage(`{"incus_security_nesting":true,"incus_nested_kvm":true,"incus_device_path":"/dev/mem","incus_profiles":["hostile"],"remote":{"incus_profiles":["hostile"]}}`),
 	})
 	if err != nil {
 		t.Fatalf("CreateInstance with pre-existing permissive extra_specs: %v", err)
@@ -187,7 +237,7 @@ func TestRemoteIncusCapabilitiesCannotComeFromExtraSpecs(t *testing.T) {
 	if !ok {
 		t.Fatalf("backend type=%T want *backend.RemoteBackend", p.backend)
 	}
-	if b.IncusSecurityNesting || b.IncusNestedKvm {
+	if b.IncusSecurityNesting || b.IncusNestedKvm || len(b.IncusProfiles) != 0 {
 		t.Fatalf("pool extra_specs escalated remote provider grants: %+v", b)
 	}
 }
@@ -221,6 +271,7 @@ func TestConfigSchemaPinsRemoteIncusCapabilityBoundary(t *testing.T) {
 		"incus_limits_cpu",
 		"incus_limits_memory_mb",
 		"incus_nested_kvm",
+		"incus_profiles",
 		"incus_security_nesting",
 		"request_timeout_sec",
 		"target_backend",
@@ -232,6 +283,10 @@ func TestConfigSchemaPinsRemoteIncusCapabilityBoundary(t *testing.T) {
 	sort.Strings(gotKeys)
 	if !reflect.DeepEqual(gotKeys, wantKeys) {
 		t.Fatalf("remote schema keys=%v want exact closed surface %v", gotKeys, wantKeys)
+	}
+	profiles := remote.Properties["incus_profiles"]
+	if profiles.Type != "array" || string(profiles.Default) != "[]" {
+		t.Fatalf("remote profiles schema=%+v want array default []", profiles)
 	}
 	for _, key := range []string{"incus_security_nesting", "incus_nested_kvm"} {
 		prop, ok := remote.Properties[key]

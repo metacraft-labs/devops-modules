@@ -69,6 +69,12 @@ const configJSONSchema = `{
 					"default": false,
 					"description": "Remote Incus only: append the fixed vm-harness --incus-nested-kvm grant, which maps only host /dev/kvm at guest /dev/kvm, verifies exact mode 0666, and opens it read-write. Device path and mode are not configurable. Default false preserves the existing remote create argv."
 				},
+				"incus_profiles": {
+					"type": "array",
+					"items": {"type": "string", "minLength": 1},
+					"default": [],
+					"description": "Remote Incus only: existing administrator-selected profiles in order. Empty retains the automatic default; include default explicitly to retain its root disk and NIC alongside overlays. Never taken from pool or bootstrap input."
+				},
 				"incus_limits_cpu": {
 					"type": "integer",
 					"minimum": 0,

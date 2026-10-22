@@ -174,6 +174,13 @@ top@{ ... }:
     in
     {
       checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        t_garm_credentials_no_race_restart_contract =
+          pkgs.runCommand "garm-credentials-no-race-restart-contract" { }
+            ''
+              ${pkgs.python3}/bin/python3 ${./garm-credentials-no-race-test.py} ${./garm-credentials-no-race.nix}
+              touch "$out"
+            '';
+
         t_garm_credentials_no_race = pkgs.testers.nixosTest {
           name = "t_garm_credentials_no_race";
 
@@ -191,6 +198,8 @@ top@{ ... }:
           };
 
           testScript = ''
+            from test_driver.errors import RequestedAssertionFailed
+
             start_all()
 
             for m in (fixed, racy):
@@ -211,6 +220,17 @@ top@{ ... }:
                 m.succeed("systemctl reset-failed garm.service || true")
                 m.succeed("systemctl restart garm.service || true")
                 m.wait_for_open_port(9997, timeout = 120)
+
+            def restart_cycle_tolerant(m):
+                # The negative control may lose every race. Its bounded wait is
+                # an observation, never a readiness gate; the fixed node must
+                # continue using restart_cycle's asserting wait.
+                m.succeed("systemctl reset-failed garm.service || true")
+                m.succeed("systemctl restart garm.service || true")
+                try:
+                    m.wait_for_open_port(9997, timeout = 120)
+                except RequestedAssertionFailed as error:
+                    print(f"negative control did not bind within this cycle: {error}")
 
             with subtest("the unit under test really carries the dangerous triple"):
                 # If either leg were missing there would be nothing to race and
@@ -260,10 +280,12 @@ top@{ ... }:
                     "journalctl --no-pager | grep -qF ${lib.escapeShellArg "garm.service: ${raceWarning}"}"
                 )
 
-            with subtest("both nodes start and serve"):
-                for m in (fixed, racy):
-                    restart_cycle(m)
-                    m.wait_for_unit("garm.service")
+            with subtest("the fixed node starts and serves"):
+                restart_cycle(fixed)
+                fixed.wait_for_unit("garm.service")
+
+            with subtest("the control's initial readiness is reported, never asserted"):
+                restart_cycle_tolerant(racy)
 
             def credential_failures(m):
                 out = m.succeed(
@@ -293,7 +315,7 @@ top@{ ... }:
                 # control does lose this race — just not on demand — so the
                 # number is printed rather than made a pass condition.
                 for _ in range(${toString restarts}):
-                    restart_cycle(racy)
+                    restart_cycle_tolerant(racy)
                 print(
                     f"negative control: {credential_failures(racy)} credential-setup "
                     "failure line(s) across ${toString restarts} restarts under Type=simple"

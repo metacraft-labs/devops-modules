@@ -3,7 +3,7 @@ top@{ ... }:
   # Remote Incus capability-grant contract.
   #
   # This is a hermetic module render/evaluation gate. It proves the two
-  # provider-admin booleans reach only the [remote] provider TOML, are absent by
+  # provider-admin booleans and ordered profiles reach only [remote] TOML, are absent by
   # default, render in deterministic order when enabled, and fail closed for a
   # non-Incus remote target or a non-remote provider. The real /dev/kvm attach
   # and read/write-open proof lives in vm-harness; concrete host enablement and
@@ -53,6 +53,10 @@ top@{ ... }:
           incusNestedKvm = true;
           incusLimitsCpu = 6;
           incusLimitsMemoryMb = 16384;
+          incusProfiles = [
+            "default"
+            "ci-store"
+          ];
         }
       );
       badLimitsTarget = mkSystem (
@@ -60,6 +64,15 @@ top@{ ... }:
           incusLimitsCpu = 6;
         }
       );
+      badProfilesTarget = mkSystem (remoteProvider "noop" { incusProfiles = [ "ci-store" ]; });
+      badProfilesNonRemote = mkSystem {
+        backend = "libvirt";
+        remote = {
+          targetBackend = "incus";
+          incusProfiles = [ "ci-store" ];
+        };
+      };
+      badEmptyProfile = mkSystem (remoteProvider "incus" { incusProfiles = [ "" ]; });
       badSecurityTarget = mkSystem (
         remoteProvider "noop" {
           incusSecurityNesting = true;
@@ -83,6 +96,7 @@ top@{ ... }:
       securityMessage = "remote.incusSecurityNesting requires backend = \"remote\" and remote.targetBackend = \"incus\"";
       kvmMessage = "remote.incusNestedKvm requires backend = \"remote\" and remote.targetBackend = \"incus\"";
       limitsMessage = "remote.incusLimitsCpu/incusLimitsMemoryMb require backend = \"remote\" and remote.targetBackend = \"incus\"";
+      profilesMessage = "remote.incusProfiles requires backend = \"remote\" and remote.targetBackend = \"incus\"";
       isExactFailure =
         needle: config:
         let
@@ -108,7 +122,16 @@ top@{ ... }:
             "remote.incusNestedKvm did not fail exactly once for a non-remote provider: ${toString (failedMessages badNonRemote)}"
         ++
           lib.optional (!isExactFailure limitsMessage badLimitsTarget)
-            "remote.incusLimitsCpu did not fail exactly once for targetBackend=libvirt: ${toString (failedMessages badLimitsTarget)}";
+            "remote.incusLimitsCpu did not fail exactly once for targetBackend=libvirt: ${toString (failedMessages badLimitsTarget)}"
+        ++ lib.optional (
+          !isExactFailure profilesMessage badProfilesTarget
+        ) "remote profiles did not fail exactly once for targetBackend=noop"
+        ++ lib.optional (
+          !isExactFailure profilesMessage badProfilesNonRemote
+        ) "remote profiles did not fail exactly once for a local provider"
+        ++ lib.optional (
+          !isExactFailure "incusProfiles must contain non-empty" badEmptyProfile
+        ) "an empty profile name was not refused exactly once";
     in
     {
       checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
@@ -135,7 +158,7 @@ top@{ ... }:
 
               grep -Fx '[remote]' "$default_config"
               grep -Fx 'target_backend = "incus"' "$default_config"
-              if grep -Eq '^incus_(security_nesting|nested_kvm|limits_cpu|limits_memory_mb)[[:space:]]*=' "$default_config"; then
+              if grep -Eq '^incus_(security_nesting|nested_kvm|limits_cpu|limits_memory_mb|profiles)[[:space:]]*=' "$default_config"; then
                 echo "default remote provider rendered an unrequested Incus capability" >&2
                 cat "$default_config" >&2
                 exit 1
@@ -149,9 +172,10 @@ top@{ ... }:
               test "$nesting_line" -lt "$kvm_line"
               grep -Fx 'incus_limits_cpu = 6' "$enabled_config"
               grep -Fx 'incus_limits_memory_mb = 16384' "$enabled_config"
+              grep -Fx 'incus_profiles = ["default","ci-store"]' "$enabled_config"
 
-              # The module exposes only booleans that map to vm-harness's fixed
-              # flags: never a caller-selected Incus key, path, type, or mode.
+              # Fixed capabilities and existing host profiles never expose a
+              # caller-selected Incus key, path, type, or mode.
               if grep -Eq '^incus_(config|device|device_path|device_mode)[[:space:]]*=' "$enabled_config"; then
                 echo "remote provider rendered an arbitrary Incus privilege field" >&2
                 cat "$enabled_config" >&2

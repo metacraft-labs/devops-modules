@@ -487,7 +487,7 @@ jobs:
     name: Plan build matrix
     needs: [shard-matrix, merge-matrices]
     if: >-
-      always() && (
+      !cancelled() && (
         (inputs.build-max-jobs != '' && inputs.build-max-jobs != '{}') ||
         inputs.build-systems != ''
       )
@@ -713,7 +713,9 @@ jobs:
 
   build:
     needs: [compute-mcl-ref, shard-matrix, merge-matrices, plan-build-matrix]
-    if: always()
+    # Still run after failed/skipped evaluation, but release superseded runs
+    # without waiting for a runner to execute the no-op fallback.
+    if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
       matrix: >-
@@ -1173,7 +1175,9 @@ jobs:
     name: Final Results
     needs:
       [compute-mcl-ref, build, shard-matrix, merge-matrices, plan-build-matrix]
-    if: always()
+    # Report upstream failures while the run is active; cancellation must not
+    # allocate a final reporting runner and retain the caller's concurrency slot.
+    if: ${{ !cancelled() }}
     permissions:
       contents: read
       issues: write

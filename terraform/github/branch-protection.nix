@@ -71,19 +71,55 @@ in
     let
       inherit (policy) baseline branchClasses;
 
-      # Baseline ruleset: every branch, no force push / no deletion.
-      baselineRuleset = repoName: {
+      # The ref patterns of the classes (applicable to this repository) that
+      # override the baseline's `allowDeletion` with `true`: e.g. the
+      # `agents-to-dev-*` stabilisation branches, deleted once they land.
+      # `<product-name>` resolves to the repository name, as below.
+      refOf =
+        repoName: branchKey: cls:
+        if cls ? pattern then
+          (if cls.pattern == "<product-name>" then "refs/heads/${repoName}" else "refs/heads/${cls.pattern}")
+        else
+          "refs/heads/${branchKey}";
+      deletableRefs =
+        repoCfg: repoName:
+        lib.mapAttrsToList (branchKey: cls: refOf repoName branchKey cls) (
+          filterAttrs (
+            _: c: c.repoClass == repoCfg.repoClass && (c.allowDeletion or false) == true
+          ) branchClasses
+        );
+
+      # Baseline ruleset: every branch, no force push / no deletion. A class
+      # that allows deletion is carved out of the deletion rule: its branches
+      # get their own ruleset below, which keeps the force-push block but lets
+      # them be deleted. (A single `~ALL` deletion rule would block deleting
+      # them, whatever the class says.)
+      baselineRuleset = repoName: repoCfg: {
         name = "baseline-protect-all-branches";
         repository = repoName;
         target = "branch";
         enforcement = "active";
         conditions.ref_name = {
           include = [ "~ALL" ];
-          exclude = [ ];
+          exclude = if baseline.allowDeletion or false then [ ] else deletableRefs repoCfg repoName;
         };
         rules = {
           # A `true` rule blocks the operation.
           deletion = !(baseline.allowDeletion or false);
+          non_fast_forward = !(baseline.allowForcePush or false);
+        };
+      };
+      # The carved-out deletable branches: force push stays blocked.
+      deletableRuleset = repoName: repoCfg: {
+        name = "baseline-protect-deletable-branches";
+        repository = repoName;
+        target = "branch";
+        enforcement = "active";
+        conditions.ref_name = {
+          include = deletableRefs repoCfg repoName;
+          exclude = [ ];
+        };
+        rules = {
           non_fast_forward = !(baseline.allowForcePush or false);
         };
       };
@@ -152,7 +188,10 @@ in
         acc: repoName: repoCfg:
         acc
         // {
-          "ruleset_${key repoName}_baseline" = baselineRuleset repoName;
+          "ruleset_${key repoName}_baseline" = baselineRuleset repoName repoCfg;
+        }
+        // optionalAttrs (!(baseline.allowDeletion or false) && deletableRefs repoCfg repoName != [ ]) {
+          "ruleset_${key repoName}_baseline_deletable" = deletableRuleset repoName repoCfg;
         }
         // classRulesets repoName repoCfg
       ) { } repositories;
