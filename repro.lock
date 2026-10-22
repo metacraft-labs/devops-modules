@@ -6,4 +6,4 @@ optimal = false
 inputs_digest = "fnv1a64:cbf29ce484222325"
 variants = []
 packages = []
-deps = [{ name = "devops-modules", self = "true", coord_kind = "vcs", url = "https://github.com/metacraft-labs/devops-modules", ref = "", revision = "d519b349cd87c74919d184ee7b82d8f220399ff6", integrity = "git-sha1:d519b349cd87c74919d184ee7b82d8f220399ff6", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
+deps = [{ name = "devops-modules", self = "true", coord_kind = "vcs", url = "https://github.com/metacraft-labs/devops-modules", ref = "", revision = "4d39058d96e9f7c569e5f939328a358fa919bfcf", integrity = "git-sha1:4d39058d96e9f7c569e5f939328a358fa919bfcf", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
