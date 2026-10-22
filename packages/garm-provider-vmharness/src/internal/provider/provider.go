@@ -58,6 +58,11 @@ func New(configFile string) (*Provider, error) {
 // NewWithConfig builds a Provider from an already-parsed config, wiring the
 // backend the config selects. Exposed for tests.
 func NewWithConfig(cfg *config.Config) (*Provider, error) {
+	if cfg.Remote != nil {
+		if err := cfg.Remote.ValidateIncusProfiles(cfg.Backend); err != nil {
+			return nil, err
+		}
+	}
 	if cfg.Remote != nil && (cfg.Remote.IncusSecurityNesting || cfg.Remote.IncusNestedKvm) &&
 		(cfg.Backend != config.BackendRemote || cfg.Remote.TargetBackend != string(config.BackendIncus)) {
 		return nil, fmt.Errorf("remote Incus capabilities require backend %q with target backend %q", config.BackendRemote, config.BackendIncus)
@@ -154,6 +159,7 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 			GuestOS:                  cfg.Remote.GuestOS,
 			IncusSecurityNesting:     cfg.Remote.IncusSecurityNesting,
 			IncusNestedKvm:           cfg.Remote.IncusNestedKvm,
+			IncusProfiles:            append([]string(nil), cfg.Remote.IncusProfiles...),
 			IncusLimitsCPU:           cfg.Remote.IncusLimitsCPU,
 			IncusLimitsMemoryMB:      cfg.Remote.IncusLimitsMemoryMB,
 			LibvirtUEFILoader:        cfg.Remote.LibvirtUEFILoader,

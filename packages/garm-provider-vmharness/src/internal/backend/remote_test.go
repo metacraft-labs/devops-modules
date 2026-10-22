@@ -22,6 +22,8 @@
 // provider against a REAL `vm-harness serve --backend noop`, so the full wire
 // contract is also proven against the genuine daemon. This mock exists solely to
 // give a fast, dependency-free unit that pins the client/backend logic.
+// Mock justification: a local authenticated HTTP/NDJSON peer records the real
+// ServeClient requests; no guest or host lifecycle is needed to test argv.
 package backend
 
 import (
@@ -235,6 +237,28 @@ func TestRemoteCreateIncusResourceLimitsFollowCapabilities(t *testing.T) {
 				t.Fatalf("create argv=%v want exact %v", fs.execArgv[0], want)
 			}
 		})
+	}
+}
+
+func TestRemoteCreateIncusProfilesPreserveOrderAndEmptyArgv(t *testing.T) {
+	for _, tc := range []struct {
+		profiles []string
+		want     []string
+	}{
+		{nil, []string{"run", "--ephemeral", "--backend", "incus", "--baseline", "profiled", "--keep", "--log-format", "json"}},
+		{[]string{}, []string{"run", "--ephemeral", "--backend", "incus", "--baseline", "profiled", "--keep", "--log-format", "json"}},
+		{[]string{"default", "ci-store"}, []string{"run", "--ephemeral", "--backend", "incus", "--baseline", "profiled", "--incus-profile", "default", "--incus-profile", "ci-store", "--keep", "--log-format", "json"}},
+	} {
+		b, fs, closeFn := newFakeBackend(t, "incus", 0)
+		b.IncusProfiles = tc.profiles
+		_, err := b.Create(context.Background(), CreateArgs{Name: "profiled"})
+		closeFn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(fs.execArgv[0], tc.want) {
+			t.Fatalf("profiles %v: argv=%v want exact %v", tc.profiles, fs.execArgv[0], tc.want)
+		}
 	}
 }
 
