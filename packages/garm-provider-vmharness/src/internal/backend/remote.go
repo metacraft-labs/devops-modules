@@ -145,18 +145,15 @@ var ephemeralRecipe = remoteRecipe{
 		}
 		// Only remote Incus consumes these provider-admin grants. The fixed
 		// flag order is part of the contract: the image pair first (base then
-		// source, above), then ordered profiles, nesting, nested KVM, then the pre-existing
-		// lifecycle/logging suffix.
+		// source, above), then ordered profiles, nesting, nested KVM, and the
+		// pre-existing lifecycle/logging suffix.
 		//
-		// The "with both grants off the argv is byte-for-byte identical to the
-		// RB1/RB2 path" property still holds, MODULO the deliberate
-		// `--source-image <image>` pair added above: with both grants off the
-		// emitted argv is the pre-capability argv with exactly that pair
-		// inserted immediately after `--base-image <image>`, and nothing else
-		// moved or dropped. When no image is configured neither image flag is
-		// emitted, so the grants-off argv is then literally identical to the
-		// RB1/RB2 one. The capability flags are unreachable for any target
-		// other than "incus", image or no image.
+		// With profiles empty, capability grants off and resource limits unset,
+		// the legacy argv remains unchanged apart from the deliberate
+		// `--source-image <image>` pair above. When no image is configured,
+		// neither image flag is emitted, so the default argv is literally
+		// identical to the RB1/RB2 path. Incus-only options are unreachable for
+		// every other target, with or without an image.
 		if backend.TargetBackend == "incus" {
 			for _, profile := range backend.IncusProfiles {
 				argv = append(argv, "--incus-profile", profile)
