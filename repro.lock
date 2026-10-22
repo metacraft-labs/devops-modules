@@ -1,0 +1,9 @@
+schema = "reprobuild.solved-graph-lock.v3"
+
+[lock]
+platform = "amd64-linux"
+optimal = false
+inputs_digest = "fnv1a64:cbf29ce484222325"
+variants = []
+packages = []
+deps = [{ name = "devops-modules", self = "true", coord_kind = "vcs", url = "https://github.com/metacraft-labs/devops-modules", ref = "", revision = "a47b1029bb1f5989ab398dfbc1aa4ba0cc190404", integrity = "git-sha1:a47b1029bb1f5989ab398dfbc1aa4ba0cc190404", version = "", visibility = "public", participation = "", depends = "", tags = "" }]
