@@ -130,6 +130,11 @@ type RemoteConfig struct {
 	// Default false preserves the pre-capability remote create argv byte-for-byte.
 	IncusNestedKvm bool `toml:"incus_nested_kvm"`
 
+	// IncusProfiles selects existing remote-host profiles in administrator order.
+	// Empty preserves Incus's automatic default profile; an explicit list must
+	// include default when its root disk and NIC are needed. Never pool/user-data.
+	IncusProfiles []string `toml:"incus_profiles"`
+
 	// IncusLimitsCPU, when > 0, caps every remote Incus per-job container at
 	// that many CPUs. It maps only to vm-harness's generic `--cpus <n>` flag,
 	// which the Incus ephemeral path turns into `limits.cpu = <n>` before the
@@ -171,6 +176,22 @@ func (r *RemoteConfig) HasLibvirtSettings() bool {
 // HasIncusLimits reports whether any per-job Incus resource cap is set.
 func (r *RemoteConfig) HasIncusLimits() bool {
 	return r.IncusLimitsCPU != 0 || r.IncusLimitsMemoryMB != 0
+}
+
+// ValidateIncusProfiles is shared by file validation and direct construction.
+func (r *RemoteConfig) ValidateIncusProfiles(backend BackendKind) error {
+	if len(r.IncusProfiles) == 0 {
+		return nil
+	}
+	if backend != BackendRemote || r.TargetBackend != string(BackendIncus) {
+		return fmt.Errorf("remote incus_profiles require backend %q with target backend %q", BackendRemote, BackendIncus)
+	}
+	for _, profile := range r.IncusProfiles {
+		if profile == "" || strings.ContainsRune(profile, '\x00') {
+			return fmt.Errorf("remote incus_profiles entries must be non-empty and contain no NUL")
+		}
+	}
+	return nil
 }
 
 // GoldenImage maps a pool label/flavor to a concrete libvirt source.
@@ -487,6 +508,11 @@ func (c *Config) applyDefaults() {
 
 // Validate returns an error if the config is internally inconsistent.
 func (c *Config) Validate() error {
+	if c.Remote != nil {
+		if err := c.Remote.ValidateIncusProfiles(c.Backend); err != nil {
+			return err
+		}
+	}
 	if c.Remote != nil && (c.Remote.IncusSecurityNesting || c.Remote.IncusNestedKvm) &&
 		(c.Backend != BackendRemote || c.Remote.TargetBackend != string(BackendIncus)) {
 		return fmt.Errorf("remote Incus capabilities incus_security_nesting/incus_nested_kvm require backend %q with remote.target_backend %q", BackendRemote, BackendIncus)

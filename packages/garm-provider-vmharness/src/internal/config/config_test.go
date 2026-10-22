@@ -2,9 +2,42 @@ package config
 
 import (
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestRemoteIncusProfilesParseInOrderAndRejectInvalidRoutes(t *testing.T) {
+	t.Setenv(DefaultAuthTokenEnv, "")
+	for _, tc := range []struct {
+		name, backend, target, profiles string
+		want                            []string
+		invalid                         bool
+	}{
+		{"absent", "remote", "incus", "", nil, false},
+		{"empty", "remote", "incus", "incus_profiles = []", []string{}, false},
+		{"ordered", "remote", "incus", `incus_profiles = ["default", "ci-store"]`, []string{"default", "ci-store"}, false},
+		{"wrong target", "remote", "libvirt", `incus_profiles = ["ci-store"]`, nil, true},
+		{"wrong provider", "libvirt", "incus", `incus_profiles = ["ci-store"]`, nil, true},
+		{"empty name", "remote", "incus", `incus_profiles = [""]`, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := ParseBytes([]byte("backend = \"" + tc.backend + "\"\n[remote]\nendpoint = \"runner.example.test:8873\"\nauth_token = \"t\"\ntarget_backend = \"" + tc.target + "\"\n" + tc.profiles + "\n"))
+			if tc.invalid {
+				if err == nil || !strings.Contains(err.Error(), "incus_profiles") {
+					t.Fatalf("expected profile routing error, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cfg.Remote.IncusProfiles, tc.want) {
+				t.Fatalf("profiles=%v want %v", cfg.Remote.IncusProfiles, tc.want)
+			}
+		})
+	}
+}
 
 func TestValidateAcceptsQemuWindowsArm(t *testing.T) {
 	cfg, err := ParseBytes([]byte(`
