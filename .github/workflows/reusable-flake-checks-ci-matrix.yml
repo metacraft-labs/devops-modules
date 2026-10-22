@@ -25,7 +25,7 @@ on:
         required: false
         type: string
       non-nix-runner:
-        description: 'JSON-encoded runner label set for non-nix tasks (initial comment, mcl-devops reference compute)'
+        description: 'JSON-encoded helper runner labels (comments, reference compute, and matrix planning)'
         default: '["self-hosted","linux","x64"]'
         required: false
         type: string
@@ -202,7 +202,7 @@ jobs:
 
   shard-matrix:
     needs: compute-mcl-ref
-    runs-on: ${{ fromJSON(inputs.runners).x86_64-linux }}
+    runs-on: ${{ fromJSON(inputs.non-nix-runner) }}
     permissions:
       contents: read
       issues: write
@@ -270,7 +270,7 @@ jobs:
 
   eval-matrix:
     needs: [compute-mcl-ref, shard-matrix]
-    runs-on: ${{ fromJSON(inputs.runners).x86_64-linux }}
+    runs-on: ${{ fromJSON(inputs.non-nix-runner) }}
     if: needs.shard-matrix.outputs.eval_matrix
     strategy:
       matrix: ${{fromJSON(needs.shard-matrix.outputs.eval_matrix)}}
@@ -339,7 +339,7 @@ jobs:
       matrix: ${{ steps.generate-matrix.outputs.matrix }}
 
   merge-matrices:
-    runs-on: ${{ fromJSON(inputs.runners).x86_64-linux }}
+    runs-on: ${{ fromJSON(inputs.non-nix-runner) }}
     needs: [compute-mcl-ref, shard-matrix, eval-matrix]
     name: Merge matrices
     permissions:
@@ -491,7 +491,7 @@ jobs:
         (inputs.build-max-jobs != '' && inputs.build-max-jobs != '{}') ||
         inputs.build-systems != ''
       )
-    runs-on: ${{ fromJSON(inputs.runners).x86_64-linux }}
+    runs-on: ${{ fromJSON(inputs.non-nix-runner) }}
     outputs:
       build_matrix: ${{ steps.plan.outputs.build_matrix }}
     steps:
