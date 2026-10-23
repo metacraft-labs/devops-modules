@@ -301,6 +301,10 @@
         # GOSTI1b: the pre-rename attribute name, kept as an alias.
         vm-harness = self'.packages.gosti;
       }
+      // optionalAttrs (system == "x86_64-linux") {
+        # Callers targeting a remote host override nix with that host's package.
+        garm-shared-nix-client = pkgs.callPackage ./garm-shared-nix-client { };
+      }
       // optionalAttrs isLinux {
         deployment-event-metrics = pkgs.callPackage ./deployment-event-metrics { };
         folder-size-metrics = pkgs.callPackage ./folder-size-metrics { };

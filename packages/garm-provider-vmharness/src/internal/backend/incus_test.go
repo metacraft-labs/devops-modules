@@ -650,8 +650,17 @@ func TestIncusSharedStoresAttachStoreDisks(t *testing.T) {
 		t.Fatalf("expected shared Nix client setup execs: %v", err)
 	}
 	execText := string(execs)
+	nixBinDir, err := resolveHostNixBinDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Bind the actual setup invocation's data arguments, not the renderer's
+	// internal variable names. Its filesystem behavior is tested separately.
+	wantSetupArgs := "-- " + nixBinDir + " /usr/local/bin"
+	if !strings.HasSuffix(strings.TrimSpace(execText), wantSetupArgs) {
+		t.Fatalf("shared Nix setup did not bind the host client and standard destination %q: %s", wantSetupArgs, execText)
+	}
 	for _, want := range []string{
-		"/usr/local/bin/$tool",
 		"NIX_REMOTE=daemon",
 		"nix-store",
 	} {

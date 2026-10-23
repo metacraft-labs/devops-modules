@@ -298,6 +298,26 @@ get_metadata_file "credentials/runner" "$STATE_DIRECTORY/.runner" || fail "faile
 get_metadata_file "credentials/credentials" "$STATE_DIRECTORY/.credentials" || fail "failed to get credentials file"
 get_metadata_file "credentials/credentials_rsaparams" "$STATE_DIRECTORY/.credentials_rsaparams" || fail "failed to get credentials_rsaparams file"
 chmod 600 "$STATE_DIRECTORY/.credentials" "$STATE_DIRECTORY/.credentials_rsaparams"
+# The JIT .runner carries GitHub's workFolder ("_work", relative to
+# RUNNER_ROOT), so the job would run in $STATE_DIRECTORY/_work. Point it at
+# the work directory, as configure --work does on the registration path:
+# checkouts and tool state then live where HOME and the job's cwd are.
+# .runner is JSON; newlines in it are only inter-token whitespace, so it is
+# flattened to one line before the field is replaced (or added).
+case "$WORK_DIRECTORY" in
+	*[\"\\\|\&]*) fail "the work directory $WORK_DIRECTORY cannot be written into .runner" ;;
+esac
+runner_file="$STATE_DIRECTORY/.runner"
+tr -d '\r\n' < "$runner_file" > "$runner_file.flat" || fail "failed to read the runner file"
+if grep -q '"workFolder"' "$runner_file.flat"; then
+	sed 's|"workFolder"[[:space:]]*:[[:space:]]*"[^"]*"|"workFolder": "'"$WORK_DIRECTORY"'"|' "$runner_file.flat" > "$runner_file.new"
+elif grep -q '^[^{]*{[[:space:]]*}[[:space:]]*$' "$runner_file.flat"; then
+	sed 's|{[[:space:]]*}|{"workFolder": "'"$WORK_DIRECTORY"'"}|' "$runner_file.flat" > "$runner_file.new"
+else
+	sed 's|{|{"workFolder": "'"$WORK_DIRECTORY"'", |' "$runner_file.flat" > "$runner_file.new"
+fi
+grep -qF "\"workFolder\": \"$WORK_DIRECTORY\"" "$runner_file.new" || fail "failed to point the runner's work folder at $WORK_DIRECTORY"
+mv "$runner_file.new" "$runner_file" && rm -f "$runner_file.flat" || fail "failed to write the runner file"
 {{- else }}
 GITHUB_TOKEN=$(curl --retry 5 --retry-delay 5 --retry-connrefused --fail -s \
 	-X GET -H 'Accept: application/json' \

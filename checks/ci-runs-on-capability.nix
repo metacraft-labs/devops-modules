@@ -92,6 +92,28 @@
                 print("\n".join(bad), file=sys.stderr)
                 sys.exit(1)
             print("[ok] all reusable-workflow runner defaults are capability label sets")
+
+            # Planning evaluates metadata; it must not inherit VM-build labels.
+            # These are structural routing controls, not a GitHub scheduler mock.
+            flake = yaml.safe_load((wfdir / "reusable-flake-checks-ci-matrix.yml").read_text())
+            jobs = flake["jobs"]
+            helper_route = "fromJSON(inputs.non-nix-runner)"
+            for name in ("shard-matrix", "eval-matrix", "merge-matrices", "plan-build-matrix"):
+                route = jobs[name]["runs-on"].replace(" ", "")
+                assert route == "''${{" + helper_route + "}}", (name, route)
+            # The build route has a deliberate Foundry override before the
+            # ordinary matrix.ghRunner fallback. Keep both original routes.
+            build_route = re.sub(r"\s+", "", jobs["build"]["runs-on"])
+            assert build_route.endswith("||matrix.ghRunner}}")
+            assert "matrix.name=='foundry'" in build_route
+            assert "matrix.system=='aarch64-darwin'" in build_route
+            assert "fromJSON(inputs.foundry-darwin-bootstrap-runner)" in build_route
+            assert "toJSON(fromJSON(inputs.runners).x86_64-linux)" in jobs["build"]["strategy"]["matrix"]
+            on = flake.get("on", flake.get(True))
+            assert json.loads(on["workflow_call"]["inputs"]["non-nix-runner"]["default"]) == [
+                "self-hosted", "linux", "x64"
+            ]
+
             PY
 
             # ---- 2a. LINT FIRES on the over-constrained fixture ------------------
