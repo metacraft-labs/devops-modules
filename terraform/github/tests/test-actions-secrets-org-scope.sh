@@ -25,6 +25,22 @@ trap 'rm -rf "$work"' EXIT
 
 terranix "${src}/default.nix" > "${work}/config.tf.json"
 jq . "${work}/config.tf.json" >/dev/null
+
+# Package selection belongs to the owning shell, not an inherited host alias.
+# Exercise the real renderer: poisoning that alias must not change its bytes.
+poison_pkgs="${work}/missing-nixpkgs"
+NIX_PATH="nixpkgs=${poison_pkgs}" terranix "${src}/default.nix" > "${work}/poisoned-path.json"
+cmp "${work}/config.tf.json" "${work}/poisoned-path.json"
+
+# An explicit public --pkgs override still wins. Require its actual missing-path
+# error, so an unrelated provider or parsing failure cannot satisfy this arm.
+if NIX_PATH='' terranix --pkgs "$poison_pkgs" "${src}/default.nix" \
+  > "${work}/override.json" 2> "${work}/override.stderr"; then
+  echo "FAIL: explicit missing --pkgs override was ignored" >&2
+  exit 1
+fi
+grep -F -- "$poison_pkgs" "${work}/override.stderr"
+grep -Eq 'does not exist|No such file or directory' "${work}/override.stderr"
 cp "${src}"/*.tftest.hcl "${work}/"
 
 ( cd "$work" && tofu init -input=false -backend=false >/dev/null && tofu test )

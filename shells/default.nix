@@ -26,6 +26,14 @@
           podman-as-docker = pkgs.writeShellScriptBin "docker" ''
             exec podman "$@"
           '';
+
+          # Match the reusable Terraform workflow: render with this flake's
+          # declared package set, independently of the host's NIX_PATH.
+          # A caller's later --pkgs option keeps Terranix's explicit override.
+          terranix-locked = pkgs.writeShellScriptBin "terranix" ''
+            exec ${inputs'.terranix.packages.terranix}/bin/terranix \
+              --pkgs ${inputs.nixpkgs.outPath} "$@"
+          '';
         in
         pkgs.mkShell {
           packages =
@@ -55,6 +63,9 @@
 
               # Terraform/OpenTofu tooling
               opentofu
+              terranix-locked
+              # Keep the existing doc-json/doc-man commands; the locked CLI
+              # above takes precedence for the main terranix command.
               inputs'.terranix.packages.terranix
               cf-terraforming
               tflint
