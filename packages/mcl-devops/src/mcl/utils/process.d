@@ -209,13 +209,174 @@ ProcessResult runProcessWithInputCapture(string[] args, string input, bool echoO
 
     tracef("$ %s%s%s", bold, cmd, normal);
 
+    import core.sys.posix.poll : pollfd, poll, nfds_t,
+        POLLIN, POLLOUT, POLLHUP, POLLERR, POLLNVAL;
+    import core.sys.posix.fcntl : fcntl, F_GETFL, F_SETFL, O_NONBLOCK;
+    import core.sys.posix.unistd : read, write;
+    import core.sys.posix.signal : sigset_t, sigemptyset, sigaddset,
+        sigpending, sigismember, sigwait, pthread_sigmask,
+        SIGPIPE, SIG_BLOCK, SIG_SETMASK, SIGKILL, kill;
+    import core.stdc.errno : errno, EINTR, EPIPE, EAGAIN, EWOULDBLOCK, EBADF;
+    import std.exception : errnoEnforce, ErrnoException, enforce;
+    import std.array : Appender;
+    import std.stdio : File;
+
+    Appender!string[2] captured;
     auto pipes = pipeProcess(args, Redirect.stdin | Redirect.stdout | Redirect.stderr);
-    pipes.stdin.write(input);
-    pipes.stdin.close();
-    const outputs = readStdoutAndStderr(pipes);
-    string stdoutText = outputs[0];
-    string stderrText = outputs[1];
-    int status = wait(pipes.pid);
+    File[3] channels;
+    pollfd[3] watched = [pollfd(-1, 0, 0), pollfd(-1, 0, 0), pollfd(-1, 0, 0)];
+    sigset_t pipeSignal, previousMask, pending;
+    bool maskSaved, priorPending, priorBlocked, sawEpipe, cleaned;
+    Throwable failure;
+    int status;
+
+    void remember(Throwable error)
+    {
+        if (failure is null)
+            failure = error;
+    }
+    void closeChannel(size_t index)
+    {
+        scope(exit) watched[index].fd = -1;
+        channels[index].close();
+    }
+    void cleanup(bool stopChild)
+    {
+        // Only this operation owns the unreaped child PID. No callbacks or
+        // worker threads can outlive cleanup or signal a subsequently reused PID.
+        if (stopChild)
+            kill(pipes.pid.processID, SIGKILL);
+        foreach (index; 0 .. channels.length)
+            try { closeChannel(index); } catch (Throwable error) { remember(error); }
+        try { status = wait(pipes.pid); } catch (Throwable error) { remember(error); }
+
+        if (maskSaved)
+        {
+            try
+            {
+                // Preserve a caller's prior pending signal and an already
+                // blocked caller's signal policy. Otherwise consume only the
+                // write-generated EPIPE signal before restoring the old mask.
+                // sigwait is available on Linux/macOS; sigtimedwait is not
+                // available in the selected Darwin bindings. A write-generated
+                // thread-directed pending signal cannot be stolen by another
+                // thread. Arbitrary concurrent process-directed SIGPIPE
+                // provenance is not distinguishable and is not promised here.
+                if (sawEpipe && !priorPending && !priorBlocked)
+                {
+                    errnoEnforce(sigpending(&pending) == 0, "reading pending stdin signals");
+                    if (sigismember(&pending, SIGPIPE) == 1)
+                    {
+                        int received;
+                        int error;
+                        do { error = sigwait(&pipeSignal, &received); } while (error == EINTR);
+                        if (error != 0)
+                            throw new ErrnoException("consuming stdin SIGPIPE", error);
+                        enforce(received == SIGPIPE, "Unexpected stdin signal");
+                    }
+                }
+            }
+            catch (Throwable error) { remember(error); }
+            // Restore even after an I/O, close, wait or signal-consumption error.
+            const error = pthread_sigmask(SIG_SETMASK, &previousMask, null);
+            if (error != 0)
+                try { throw new ErrnoException("restoring stdin signal mask", error); }
+                catch (Throwable problem) { remember(problem); }
+            maskSaved = false;
+        }
+        cleaned = true;
+    }
+    // Register child ownership before setting descriptor flags, changing the
+    // signal mask, or allocating capture buffers. Cleanup preserves the first
+    // failure while independently closing all channels and reaping the child.
+    scope(exit) if (!cleaned) cleanup(true);
+    try
+    {
+        channels = [pipes.stdin, pipes.stdout, pipes.stderr];
+        errnoEnforce(sigemptyset(&pipeSignal) == 0, "initializing stdin signal mask");
+        errnoEnforce(sigaddset(&pipeSignal, SIGPIPE) == 0, "selecting stdin SIGPIPE");
+        const maskError = pthread_sigmask(SIG_BLOCK, &pipeSignal, &previousMask);
+        if (maskError != 0)
+            throw new ErrnoException("blocking stdin SIGPIPE", maskError);
+        maskSaved = true;
+        errnoEnforce(sigpending(&pending) == 0, "reading prior pending stdin signals");
+        priorPending = sigismember(&pending, SIGPIPE) == 1;
+        priorBlocked = sigismember(&previousMask, SIGPIPE) == 1;
+
+        foreach (index; 0 .. channels.length)
+        {
+            const fd = channels[index].fileno();
+            const flags = fcntl(fd, F_GETFL);
+            errnoEnforce(flags >= 0, "reading capture descriptor flags");
+            errnoEnforce(fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0,
+                "setting nonblocking capture descriptor");
+            watched[index] = pollfd(fd, cast(short)(index == 0 ? POLLOUT : POLLIN), 0);
+        }
+        size_t offset;
+        if (input.length == 0)
+            closeChannel(0); // Deliver EOF even when no input was supplied.
+        char[64 * 1024] buffer;
+        while (watched[0].fd >= 0 || watched[1].fd >= 0 || watched[2].fd >= 0)
+        {
+            const ready = poll(watched.ptr, cast(nfds_t)watched.length, -1);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            errnoEnforce(ready >= 0, "polling child capture descriptors");
+            foreach (index; 0 .. watched.length)
+            {
+                const events = watched[index].revents;
+                if (watched[index].fd < 0 || events == 0)
+                    continue;
+                if (events & POLLNVAL)
+                    throw new ErrnoException("invalid child capture descriptor", EBADF);
+                if (index == 0 && (events & (POLLOUT | POLLHUP | POLLERR)))
+                {
+                    import std.algorithm : min;
+                    // Raw writes leave no buffered stdio flush at close. Bound
+                    // each transfer and keep partial-write/EINTR/EAGAIN handling.
+                    const count = write(watched[0].fd, input.ptr + offset,
+                        min(input.length - offset, buffer.length));
+                    if (count > 0)
+                    {
+                        offset += cast(size_t)count;
+                        if (offset == input.length)
+                            closeChannel(0);
+                    }
+                    else if (count < 0 && errno == EPIPE)
+                    {
+                        sawEpipe = true;
+                        closeChannel(0); // Keep draining the child's actual result.
+                    }
+                    else if (count < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+                        throw new ErrnoException("writing child stdin", errno);
+                    else
+                        enforce(count != 0, "Writing child stdin made no progress");
+                }
+                else if (index > 0 && (events & (POLLIN | POLLHUP | POLLERR)))
+                {
+                    const count = read(watched[index].fd, buffer.ptr, buffer.length);
+                    if (count > 0)
+                        captured[index - 1].put(buffer[0 .. cast(size_t)count]);
+                    else if (count == 0)
+                        closeChannel(index); // HUP may still have buffered bytes.
+                    else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+                        throw new ErrnoException("reading child output", errno);
+                }
+            }
+        }
+    }
+    catch (Throwable error) { remember(error); }
+    cleanup(failure !is null);
+    if (failure !is null)
+        throw failure;
+    string stdoutText = captured[0].data;
+    string stderrText = captured[1].data;
+    // Preserve byLine().join("\n") exactly on POSIX: remove one final LF,
+    // retain interior empty lines, CR bytes and output without a final LF.
+    if (stdoutText.length && stdoutText[$ - 1] == '\n')
+        stdoutText = stdoutText[0 .. $ - 1];
+    if (stderrText.length && stderrText[$ - 1] == '\n')
+        stderrText = stderrText[0 .. $ - 1];
 
     if (echoOutput && stdoutText != "")
         stdout.writeln(stdoutText);
@@ -269,4 +430,110 @@ void spawnProcessInline(string[] args)
 
     auto pid = spawnProcess(args);
     enforce(wait(pid) == 0, "Process failed.");
+}
+
+@("runProcessWithInputCapture.earlyChildExit")
+unittest
+{
+    import std.array : replicate;
+    import std.conv : to;
+    import core.sys.posix.signal : sigaction_t, sigaction, sigset_t,
+        pthread_sigmask, sigismember, SIG_BLOCK, SIGPIPE;
+
+    sigaction_t actionBefore, actionAfter;
+    sigset_t maskBefore, maskAfter;
+    assert(sigaction(SIGPIPE, null, &actionBefore) == 0);
+    assert(pthread_sigmask(SIG_BLOCK, null, &maskBefore) == 0);
+    const input = "x".replicate(1024 * 1024);
+    const positive = runProcessWithInputCapture(["timeout", "60", "wc", "-c"], input);
+    assert(positive.exitCode == 0);
+    assert(positive.stdout.strip == input.length.to!string);
+    assert(positive.stderr == "");
+
+    const rejected = runProcessWithInputCapture([
+        "timeout", "60", "sh", "-c", "printf rejected >&2; exit 23",
+    ], input);
+    assert(rejected.exitCode == 23);
+    assert(rejected.stdout == "");
+    assert(rejected.stderr == "rejected");
+    assert(sigaction(SIGPIPE, null, &actionAfter) == 0);
+    assert(pthread_sigmask(SIG_BLOCK, null, &maskAfter) == 0);
+    assert(actionBefore.sa_handler == actionAfter.sa_handler);
+    assert(actionBefore.sa_flags == actionAfter.sa_flags);
+    assert(sigismember(&maskBefore, SIGPIPE) == sigismember(&maskAfter, SIGPIPE));
+}
+
+@("runProcessWithInputCapture.drainsOutputWhileWriting")
+unittest
+{
+    import std.array : replicate;
+    import std.conv : to;
+    import std.string : splitLines;
+
+    const line = "x".replicate(100);
+    const script = "i=0; while [ $i -lt 2000 ]; do echo " ~ line
+        ~ " >&2; i=$((i+1)); done; wc -c";
+    const input = "y".replicate(1024 * 1024);
+    const result = runProcessWithInputCapture(["timeout", "60", "sh", "-c", script], input);
+    assert(result.exitCode == 0);
+    assert(result.stdout.strip == input.length.to!string);
+    const lines = result.stderr.splitLines;
+    assert(lines.length == 2000);
+    foreach (actual; lines)
+        assert(actual == line);
+}
+
+@("runProcessWithInputCapture.preservesCallerPendingSigpipe")
+unittest
+{
+    import std.array : replicate;
+    import core.sys.posix.signal : sigset_t, sigemptyset, sigaddset,
+        sigpending, sigismember, sigwait, pthread_sigmask, pthread_kill,
+        SIGPIPE, SIG_BLOCK, SIG_SETMASK;
+    import core.sys.posix.pthread : pthread_self;
+
+    sigset_t blocked, previous, pending;
+    assert(sigemptyset(&blocked) == 0);
+    assert(sigaddset(&blocked, SIGPIPE) == 0);
+    assert(pthread_sigmask(SIG_BLOCK, &blocked, &previous) == 0);
+    bool queuedHere;
+    scope(exit)
+    {
+        assert(sigpending(&pending) == 0);
+        // Consume only this test's own signal before restoring its old mask.
+        // A pre-existing pending caller signal must remain pending.
+        if (queuedHere && sigismember(&pending, SIGPIPE) == 1)
+        {
+            int received;
+            assert(sigwait(&blocked, &received) == 0 && received == SIGPIPE);
+        }
+        assert(pthread_sigmask(SIG_SETMASK, &previous, null) == 0);
+    }
+    assert(sigpending(&pending) == 0);
+    if (sigismember(&pending, SIGPIPE) == 0)
+    {
+        assert(pthread_kill(pthread_self(), SIGPIPE) == 0);
+        queuedHere = true;
+    }
+    assert(sigpending(&pending) == 0);
+    assert(sigismember(&pending, SIGPIPE) == 1,
+        "Pending-signal control must be active; inherited SIGPIPE ignore is not a passing control");
+    const result = runProcessWithInputCapture([
+        "timeout", "60", "sh", "-c", "printf pending-rejected >&2; exit 23",
+    ], "x".replicate(1024 * 1024));
+    assert(result.exitCode == 23 && result.stderr == "pending-rejected");
+    assert(sigpending(&pending) == 0);
+    assert(sigismember(&pending, SIGPIPE) == 1);
+}
+
+@("runProcessWithInputCapture.preservesOutputLinesAndEof")
+unittest
+{
+    const result = runProcessWithInputCapture([
+        "timeout", "60", "sh", "-c",
+        `test "$(wc -c)" = 0 || exit 99; printf 'first\n\nlast\r\n\n'; printf 'err\r\n' >&2; exit 7`,
+    ], "");
+    assert(result.exitCode == 7);
+    assert(result.stdout == "first\n\nlast\r\n");
+    assert(result.stderr == "err\r");
 }
