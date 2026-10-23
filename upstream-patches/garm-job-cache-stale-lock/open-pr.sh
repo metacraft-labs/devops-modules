@@ -14,7 +14,9 @@
 # upstream's default branch, pushes it to your fork, and opens the PR against
 # cloudbase/garm with PR.md as the body. Review before running.
 #
-# fix.patch was generated against upstream main 20a0c4ba (2026-09-21). The
+# fix.patch was generated against upstream main 20a0c4ba (2026-09-21) and
+# rebased onto aa830b59 (2026-10-23; util.go context only: upstream added
+# poolShadowedByScaleSet next to the new helpers). The
 # local Nix patch (packages/garm/patches/fix-job-cache-stale-lock.patch) is the
 # same change on our older pin: it drops the tombstone calls (upstream's
 # 22e24eb6 is not in the pin) and sits on top of our other local patches.

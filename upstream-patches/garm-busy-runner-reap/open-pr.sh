@@ -14,7 +14,9 @@
 # cut from upstream's default branch, pushes it to your fork, and opens the PR
 # against cloudbase/garm with PR.md as the body. Review before running.
 #
-# fix.patch was generated against upstream main c58e7375 (2026-09-29). The
+# fix.patch was generated against upstream main c58e7375 (2026-09-29) and
+# re-cut on aa830b59 (2026-10-23; the test now passes a context to
+# InitController(), which upstream bf79e351 added). The
 # local Nix patch (packages/garm/patches/fix-busy-runner-reap.patch) is the
 # same change on our older pin, cut on top of our other local patches (it
 # differs only in context).
