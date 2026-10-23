@@ -744,16 +744,8 @@ func (b *IncusBackend) Create(ctx context.Context, args CreateArgs) (Instance, e
 			_ = b.forceDelete(ctx, args.Name)
 			return Instance{}, err
 		}
-		setup := fmt.Sprintf(
-			"set -eu; nix_bin_dir=%q; "+
-				"for tool in nix nix-build nix-channel nix-collect-garbage nix-copy-closure nix-env nix-hash nix-instantiate nix-prefetch-url nix-shell nix-store; do "+
-				"target=\"$nix_bin_dir/$tool\"; [ -x \"$target\" ] || continue; "+
-				"rm -f \"/usr/local/bin/$tool\"; "+
-				"printf '#!/bin/sh\\nexport NIX_REMOTE=daemon\\nexec \"%%s\" \"$@\"\\n' \"$target\" > \"/usr/local/bin/$tool\"; "+
-				"chmod 0755 \"/usr/local/bin/$tool\"; done",
-			nixBinDir,
-		)
-		if out, err := b.run(ctx, "", "exec", args.Name, "--", "bash", "-c", setup); err != nil {
+		setup := sharedNixClientSetupScript
+		if out, err := b.run(ctx, "", "exec", args.Name, "--", "bash", "-c", setup, "--", nixBinDir, "/usr/local/bin"); err != nil {
 			_ = b.forceDelete(ctx, args.Name)
 			return Instance{}, fmt.Errorf("shared Nix client setup on %s failed: %w: %s", args.Name, err, strings.TrimSpace(out))
 		}
