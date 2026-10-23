@@ -194,7 +194,10 @@ buildGo126Module rec {
     # runners only. Cut against the tree with every patch above applied; keep
     # it LAST. Gates: internal/capacity tests and
     # TestPoolStressTestSuite/TestStuckDeletesDoNotConsumePoolCapacity (real
-    # sqlite store), run by the package's checkPhase below.
+    # sqlite store, defined in checks/garm/deleting_capacity_test.go), both run
+    # by t_garm_deleting_capacity (checks/garm-deleting-capacity.nix) against
+    # this tree and, as a negative control, the tree without this patch. The
+    # test stays outside the patch so the control can run it too.
     ./patches/fix-deleting-instances-hold-capacity.patch
     # consumeQueuedJobs skips, without touching the store, a queued job whose
     # every matching pool already refused a runner in the same pass. Upstream locks the job, tries every

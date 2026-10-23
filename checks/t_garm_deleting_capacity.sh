@@ -48,7 +48,7 @@ run_suite() { # <tree> <log>
   cp "$GATE_TEST_FILE" "$1/runner/pool/deleting_capacity_test.go"
   # The package comes BEFORE -testify.m: go test stops parsing its own flags
   # at the first one it does not know.
-  (cd "$1" && go test -tags "$GATE_GO_TAGS" -count=1 -timeout 1200s -v \
+  (cd "$1" && go test -tags "$GATE_GO_TAGS" -count=1 -timeout 30m -v \
     ./runner/pool/ -run TestPoolStressTestSuite -testify.m "$TEST" >"$2" 2>&1)
 }
 
@@ -62,6 +62,9 @@ if [ "$rc" -ne 0 ]; then
   tail -40 "$work/patched.log"
   fail "patched tree: the test did not pass (rc=$rc)"
 fi
+# Load-bearing: a -testify.m that matches no method still prints
+# "--- PASS: TestPoolStressTestSuite" and "ok" (testify emits no "no tests to
+# run"), so only the named subtest's own PASS line proves the test ran.
 grep -q -- "--- PASS: TestPoolStressTestSuite/$TEST" "$work/patched.log" ||
   fail "patched tree: $TEST did not run or did not pass"
 
