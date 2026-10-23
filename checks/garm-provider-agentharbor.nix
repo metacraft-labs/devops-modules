@@ -26,7 +26,7 @@ top@{ ... }:
   #       credentials (a JWT signed with the JIT key), exits with its own
   #       TerminatedError, and is reported to GARM as a crash (error + reason)
   #       rather than a clean stop.
-  #   (3) NEGATIVE CONTROLS: the end-to-end gate is re-run against eight
+  #   (3) NEGATIVE CONTROLS: the end-to-end gate is re-run against nine
   #       single-line mutations of the provider source and MUST fail each time
   #       with a test failure (not a build failure), plus once against the
   #       unmutated source copy, which MUST pass — so a control cannot fail
@@ -196,7 +196,8 @@ top@{ ... }:
                 TestOtherErrorsAreNotRetriedCold \
                 TestPoolExtraSpecsOverrideOrDisableStartingPoint \
                 TestStartingPointConfigValidation \
-                TestPayloadUsesWarmCacheOnlyWhenPresent; do
+                TestPayloadUsesWarmCacheOnlyWhenPresent \
+                TestPayloadPointsRunnerWorkFolderAtWorkDir; do
                 grep -q -- "--- PASS: $t " unit.log || fail "$t did not run and pass"
               done
 
@@ -272,12 +273,16 @@ top@{ ... }:
               mutate runnerroot "$N" \
                 'export RUNNER_ROOT="$STATE_DIRECTORY"' \
                 'export RUNNER_ROOT_UNSET="$STATE_DIRECTORY"'
+              # The JIT runner keeps GitHub's RUNNER_ROOT/_work work folder.
+              mutate workfolder "$N" \
+                'mv "$runner_file.new" "$runner_file" &&' \
+                'mv "$runner_file.new" "$runner_file.unused" &&'
               # The stale-runner guard never fires.
               mutate guard "$N" \
                 'if lag >= maxMinorLag {' \
                 'if false && lag >= maxMinorLag {'
 
-              echo "[t_garm_provider_agentharbor][PASS] behaviour matrix + end-to-end runner lifecycle + real Nix runner crash path + 8/8 negative controls"
+              echo "[t_garm_provider_agentharbor][PASS] behaviour matrix + end-to-end runner lifecycle + real Nix runner crash path + 9/9 negative controls"
               touch "$out"
             '';
 

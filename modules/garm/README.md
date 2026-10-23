@@ -330,7 +330,8 @@ The default `sandbox` payload is rootless and downloads nothing. It runs the
 host's nixpkgs `github-runner` (`runner.package`) the way nixpkgs'
 `services.github-runners` unit does: the JIT credentials go into a
 `RUNNER_ROOT` in the job's per-job workspace (deleted with the job), the work
-directory is `HOME` with the credentials and `_diag` linked in, the job PATH is
+directory is `HOME` with the credentials and `_diag` linked in (the JIT
+`.runner`'s `workFolder` is rewritten to it), the job PATH is
 the unit's `path` plus `runner.extraPackages`, and the payload execs
 `Runner.Listener run --startuptype service`. So the sandbox needs no FHS
 `/bin/bash` and no `installdependencies.sh`. The store paths must be realised

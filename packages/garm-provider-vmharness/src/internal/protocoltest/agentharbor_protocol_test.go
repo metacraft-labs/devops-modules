@@ -126,6 +126,8 @@ done
 [ "$HOME" = "$PWD" ] || { echo "HOME ($HOME) is not the work directory ($PWD)" >&2; exit 67; }
 [ -z "${XDG_RUNTIME_DIR:-}" ] || { echo "XDG_RUNTIME_DIR leaked into the runner: $XDG_RUNTIME_DIR" >&2; exit 69; }
 [ "$(readlink "$PWD/_diag")" != "" ] || { echo "_diag is not linked" >&2; exit 68; }
+wf=$(sed -n 's/.*"workFolder": *"\([^"]*\)".*/\1/p' "$RUNNER_ROOT/.runner")
+[ "$wf" = "$PWD" ] || { echo "the runner's workFolder ($wf) is not the work directory ($PWD)" >&2; exit 70; }
 server=$(sed -n 's/.*"serverUrl": *"\([^"]*\)".*/\1/p' "$RUNNER_ROOT/.runner")
 name=$(sed -n 's/.*"agentName": *"\([^"]*\)".*/\1/p' "$RUNNER_ROOT/.runner")
 echo "listening for jobs as $name"
@@ -221,7 +223,7 @@ func (g *fakeGARM) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		switch file {
 		case "credentials/runner":
-			_ = json.NewEncoder(w).Encode(map[string]string{"agentName": name, "serverUrl": g.srv.URL + "/github"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"agentName": name, "serverUrl": g.srv.URL + "/github", "workFolder": "_work"})
 		case "credentials/credentials", "credentials/credentials_rsaparams":
 			_, _ = io.WriteString(w, `{"scheme":"OAuth","data":{"clientId":"fake"}}`)
 		default:

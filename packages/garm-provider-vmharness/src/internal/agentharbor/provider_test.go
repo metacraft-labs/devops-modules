@@ -1051,3 +1051,101 @@ func TestPayloadUsesWarmCacheOnlyWhenPresent(t *testing.T) {
 		t.Fatal("the job wrote through to the starting point")
 	}
 }
+
+// The JIT .runner GARM serves carries GitHub's workFolder ("_work", relative
+// to RUNNER_ROOT). The payload, run for real by the mock, rewrites it to the
+// job's work directory (the runner's cwd and HOME) before the runner starts,
+// keeping every other field and the file valid JSON. It also covers a .runner
+// with no workFolder and an empty one. The runner is a probe script that
+// records the .runner it would load and its cwd.
+func TestPayloadPointsRunnerWorkFolderAtWorkDir(t *testing.T) {
+	var runnerPath []string
+	for _, d := range filepath.SplitList(os.Getenv("PATH")) {
+		if filepath.IsAbs(d) {
+			runnerPath = append(runnerPath, strconv.Quote(d))
+		}
+	}
+	for _, tool := range []string{"bash", "sh", "sed", "grep", "tr", "head", "curl", "cp"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("needs %s on PATH", tool)
+		}
+	}
+	pkg := t.TempDir()
+	out := t.TempDir()
+	listener := filepath.Join(pkg, "bin", "Runner.Listener")
+	deps := filepath.Join(pkg, "lib", "github-runner", "Runner.Listener.deps.json")
+	for _, d := range []string{filepath.Dir(listener), filepath.Dir(deps)} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(deps, []byte(`{"targets":{"x":{"Runner.Listener/2.336.0.0":{}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shPath, _ := exec.LookPath("sh")
+	probe := "#!" + shPath + "\n[ \"$1\" = run ] || exit 0\ncp \"$RUNNER_ROOT/.runner\" " +
+		provider.ShellQuote(filepath.Join(out, "runner")) + "\nprintf '%s' \"$PWD\" > " +
+		provider.ShellQuote(filepath.Join(out, "cwd")) + "\nexit 0\n"
+	if err := os.WriteFile(listener, []byte(probe), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := map[string]string{
+		// The shape GitHub's generate-jitconfig emits (pretty-printed, BOM-free).
+		"github": "{\n  \"agentId\": 42,\n  \"agentName\": \"runner-wf\",\n  \"poolId\": 1,\n  \"serverUrl\": \"https://pipelines.example.test/x\",\n  \"workFolder\": \"_work\",\n  \"ephemeral\": true\n}\n",
+		"absent": `{"agentId": 42, "agentName": "runner-wf", "ephemeral": true}`,
+		"empty":  "{}",
+	}
+	for name, runnerJSON := range cases {
+		for _, f := range []string{"runner", "cwd"} {
+			_ = os.Remove(filepath.Join(out, f))
+		}
+		m := startMock(t, func(s *ahmock.Server) {
+			s.Exec = true
+			s.WorkRoot = t.TempDir()
+		})
+		cfgTOML := "[runner]\nlistener = " + strconv.Quote(listener) + "\nversion = \"2.336.0\"\npath = [" + strings.Join(runnerPath, ", ") + "]\n"
+		p := newProvider(t, m, cfgTOML)
+		b := bootstrap("runner-wf-" + name)
+		body := runnerJSON
+		garm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/credentials/runner") {
+				_, _ = w.Write([]byte(body))
+				return
+			}
+			_, _ = w.Write([]byte("{}"))
+		}))
+		t.Cleanup(garm.Close)
+		b.CallbackURL = garm.URL + "/callbacks"
+		b.MetadataURL = garm.URL + "/metadata"
+		inst, err := p.CreateInstance(context.Background(), b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !m.WaitExited(inst.ProviderID, 30*time.Second) {
+			t.Fatalf("%s: payload did not finish; log:\n%s", name, m.JobLog(inst.ProviderID))
+		}
+		raw, err := os.ReadFile(filepath.Join(out, "runner"))
+		if err != nil {
+			t.Fatalf("%s: runner never ran; log:\n%s", name, m.JobLog(inst.ProviderID))
+		}
+		cwd, _ := os.ReadFile(filepath.Join(out, "cwd"))
+		var got map[string]any
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("%s: rewritten .runner is not JSON (%v): %s", name, err, raw)
+		}
+		if got["workFolder"] != string(cwd) || !strings.HasSuffix(string(cwd), "/work") {
+			t.Fatalf("%s: workFolder = %v, want the runner's work directory %q", name, got["workFolder"], cwd)
+		}
+		var want map[string]any
+		_ = json.Unmarshal([]byte(runnerJSON), &want)
+		for k, v := range want {
+			if k != "workFolder" && got[k] != v {
+				t.Fatalf("%s: field %s = %v, want %v (only workFolder may change)", name, k, got[k], v)
+			}
+		}
+		if len(got) != len(want)+map[bool]int{true: 0, false: 1}[want["workFolder"] != nil] {
+			t.Fatalf("%s: rewritten .runner has fields %v, want %v plus workFolder", name, got, want)
+		}
+	}
+}

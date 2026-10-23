@@ -1,4 +1,4 @@
-From 204d1b534d01fb9d6a7ff2b3f62e06780437290d Mon Sep 17 00:00:00 2001
+From 9889aab1e11181c605d12f930caa53823a413eaf Mon Sep 17 00:00:00 2001
 From: Metacraft Labs <info@metacraft-labs.com>
 Date: Mon, 28 Sep 2026 19:53:42 +0300
 Subject: [PATCH] Don't strand queued jobs when the job cache goes stale
@@ -30,10 +30,10 @@ Signed-off-by: Metacraft Labs <info@metacraft-labs.com>
  3 files changed, 191 insertions(+)
 
 diff --git a/runner/pool/pool.go b/runner/pool/pool.go
-index c02d17b9..48f95f9a 100644
+index 507e050b..a3a82b7f 100644
 --- a/runner/pool/pool.go
 +++ b/runner/pool/pool.go
-@@ -2224,6 +2224,13 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+@@ -2251,6 +2251,13 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  			// was spawned. Unlock it and try again. A different job may have picked up
  			// the runner.
  			if err := r.store.UnlockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
@@ -47,7 +47,7 @@ index c02d17b9..48f95f9a 100644
  				// nolint:golangci-lint,godox
  				// TODO: Implament a cache? Should we return here?
  				slog.With(slog.Any("error", err)).ErrorContext(
-@@ -2231,6 +2238,16 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+@@ -2258,6 +2265,16 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  					"job_id", job.WorkflowJobID)
  				continue
  			}
@@ -64,7 +64,7 @@ index c02d17b9..48f95f9a 100644
  		}
  
  		if job.LockedBy.String() == r.ID() {
-@@ -2263,11 +2280,19 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+@@ -2303,11 +2320,19 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  
  		runnerCreated := false
  		if err := r.store.LockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
@@ -84,7 +84,7 @@ index c02d17b9..48f95f9a 100644
  
  		jobLabels := []string{
  			fmt.Sprintf("%s=%d", jobLabelPrefix, job.WorkflowJobID),
-@@ -2309,11 +2334,24 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+@@ -2350,11 +2375,24 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  				r.ctx, "could not create a runner for job; unlocking",
  				"job_id", job.WorkflowJobID)
  			if err := r.store.UnlockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
@@ -108,9 +108,9 @@ index c02d17b9..48f95f9a 100644
 +			r.refreshCachedJob(job)
  		}
  	}
- 	return nil
+ 	if addedRunners > 0 {
 diff --git a/runner/pool/pool_test.go b/runner/pool/pool_test.go
-index c28636af..5865d23e 100644
+index cb90b285..2fe1c81a 100644
 --- a/runner/pool/pool_test.go
 +++ b/runner/pool/pool_test.go
 @@ -791,6 +791,111 @@ func (s *PoolStressTestSuite) TestPersistJobToDB_AllowsForwardTransitions() {
@@ -226,7 +226,7 @@ index c28636af..5865d23e 100644
  	u, err := uuid.Parse(s)
  	if err != nil {
 diff --git a/runner/pool/util.go b/runner/pool/util.go
-index eef79a6c..94849b17 100644
+index 6ed5d0ac..aaa0541e 100644
 --- a/runner/pool/util.go
 +++ b/runner/pool/util.go
 @@ -16,6 +16,7 @@ package pool
@@ -237,8 +237,8 @@ index eef79a6c..94849b17 100644
  	"fmt"
  	"log/slog"
  	"net/http"
-@@ -109,6 +110,53 @@ func (r *basePoolManager) getQueuedJobs() []params.Job {
- 	return ret
+@@ -147,6 +148,53 @@ func (r *basePoolManager) poolShadowedByScaleSet(pool params.Pool, labels []stri
+ 	return false
  }
  
 +// refreshCachedJob re-reads a job this manager has just written to (locked or
