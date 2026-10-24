@@ -14,6 +14,19 @@
       ...
     }:
     {
+      # Host-only execution belongs to the native gate, not a pure builder.
+      # The imported shared module already sets pre-commit.check.enable=false;
+      # this own-repository hook is not exported to consuming repositories.
+      pre-commit.settings.hooks.git-hooks-explicit-integration = {
+        enable = true;
+        name = "real Git native/managed hook composition";
+        entry = "${config.packages.git-hooks-explicit-integration}/bin/test-git-hooks-explicit-integration";
+        language = "system";
+        pass_filenames = false;
+        always_run = true;
+        stages = [ "pre-commit" ];
+      };
+
       devShells.default =
         let
           repl = pkgs.writeShellApplication {

@@ -180,3 +180,38 @@ The `mcl-devops` tool is a Swiss-knife CLI for managing NixOS deployments. For d
 | `secret`            | Manage age-encrypted secrets for NixOS machines                                                                          |
 
 Run `mcl-devops --help` or `mcl-devops <command> --help` for usage details, subcommands, and environment variables.
+
+## Explicit hook installation
+
+A development shell may intentionally leave Git hooks untouched. In that case,
+expose the shared `lib/git-hooks-explicit-install.nix` function as an explicit
+app instead of copying installation or ownership logic into the consumer. Pass
+`pkgs`, the native `preCommit` configuration and the evaluated SHA256 of the
+consumer's `flake.nix`. The function derives intended Git stages from the native
+configuration and composes the same-repository guard with the native/Repro
+handoff. Importing it does not change a shell hook.
+
+Installation refuses unknown active hooks, unresolved legacy chains, foreign
+hook paths and unknown configuration before native installation. Existing
+managed hooks require the matching `REPROBUILD_REPRO` CLI. Its real constructor
+runs in an owned Git fixture only to obtain canonical dispatcher bytes; the
+exact checked-out `repro.lock`, when present, supplies its existing certificate
+policy selector. Synthetic managed bodies are never used as authority. Existing
+dispatcher and managed bytes must remain unchanged across installation.
+
+Disabled `.sample` files are preserved unchanged, rather than compared with one
+Git package's template catalogue. Their packaged interpreter paths can differ
+from the Git version that created the checkout. The explicit app fails if its
+post-installation native/managed inventory is incomplete or unexpected; it does
+not turn a preservation conflict into a successful hook installation.
+
+The owner regression has two enrolled layers. The pure
+`checks.<system>.git-hooks-explicit-install` verifies construction, protocol,
+refusal, preservation and native-only Git firing. The own-repository native
+pre-commit gate also runs `test-git-hooks-explicit-integration`, exercising real
+Git, unchanged managed hooks and native checks on the host. The existing
+`pre-commit.check.enable = false` keeps that host gate out of pure Nix checks;
+the independent pure regression does not inherit the host hook configuration.
+The normal reusable lint workflow reaches the same native gate through the
+pre-commit development shell. No missing-tool skip or canonical-byte rewriting
+is used to make a builder impersonate that host environment.
