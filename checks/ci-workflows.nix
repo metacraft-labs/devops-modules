@@ -711,6 +711,18 @@
             touch "$out"
           '';
 
+      # Static contract over the committed workflows: a setup-nix step that is
+      # given the private substituter must also be given the token to read it.
+      checks.setup-nix-callers-pass-attic-token =
+        pkgs.runCommand "setup-nix-callers-pass-attic-token"
+          {
+            nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
+          }
+          ''
+            python3 ${../scripts/tests/test_setup_nix_attic_token.py} ${../.github/workflows}
+            touch "$out"
+          '';
+
       checks.reusable-terraform-source-identity =
         pkgs.runCommand "reusable-terraform-source-identity"
           {

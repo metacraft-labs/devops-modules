@@ -51,6 +51,10 @@ jobs:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # vars.SUBSTITUTERS is the PRIVATE Attic cache: without a token Nix
+          # reads it anonymously, gets 401, and builds from source on any
+          # runner whose host netrc does not already carry the credential.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           devshell: default
 
       - name: Build and test the `mcl-devops` command
@@ -83,6 +87,10 @@ jobs:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # vars.SUBSTITUTERS is the PRIVATE Attic cache: without a token Nix
+          # reads it anonymously, gets 401, and builds from source on any
+          # runner whose host netrc does not already carry the credential.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           # The fixture resolves github:NixOS/nixpkgs/nixos-unstable through the
           # GitHub API. Unauthenticated that is 60 requests/hour per egress IP,
           # shared by the whole runner fleet, and it failed this job with HTTP
@@ -105,6 +113,10 @@ jobs:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # vars.SUBSTITUTERS is the PRIVATE Attic cache: without a token Nix
+          # reads it anonymously, gets 401, and builds from source on any
+          # runner whose host netrc does not already carry the credential.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           # The fixture resolves github:NixOS/nixpkgs/nixos-unstable through the
           # GitHub API. Unauthenticated that is 60 requests/hour per egress IP,
           # shared by the whole runner fleet, and it failed this job with HTTP
@@ -159,6 +171,10 @@ jobs:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # vars.SUBSTITUTERS is the PRIVATE Attic cache: without a token Nix
+          # reads it anonymously, gets 401, and builds from source on any
+          # runner whose host netrc does not already carry the credential.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
 
       - name: Confirm the requested features are usable without extra flags
         shell: bash
@@ -198,6 +214,10 @@ jobs:
           push-to-cache: false
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # vars.SUBSTITUTERS is the PRIVATE Attic cache: without a token Nix
+          # reads it anonymously, gets 401, and builds from source on any
+          # runner whose host netrc does not already carry the credential.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
 
       - name: Run mcl-devops secret integration tests
         run: nix run .#checks.x86_64-linux.secret-integration
@@ -267,6 +287,10 @@ jobs:
           push-to-cache: true
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           substituters: ${{ vars.SUBSTITUTERS }}
+          # vars.SUBSTITUTERS is the PRIVATE Attic cache: without a token Nix
+          # reads it anonymously, gets 401, and builds from source on any
+          # runner whose host netrc does not already carry the credential.
+          attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           devshell: default
 
       - name: Create `.gh-vars.env` and `.gh-secrets.env` files
