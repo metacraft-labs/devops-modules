@@ -242,6 +242,11 @@ top@{ config, ... }:
           testScript = ''
             start_all()
             target.wait_for_unit("sshd.service")
+            # sshd on the target says nothing about the controller's own
+            # interface: without this the first ssh can hit "Network is
+            # unreachable", which also makes a must-fail subtest pass vacuously.
+            controller.wait_for_unit("multi-user.target")
+            controller.wait_until_succeeds("ping -c 1 -W 1 target")
 
             with subtest("create signed desired-state manifest"):
                 controller.succeed("install -m 0600 ${deployPrivateKey} /tmp/deploy-key")
@@ -359,6 +364,11 @@ top@{ config, ... }:
           testScript = ''
             start_all()
             target.wait_for_unit("sshd.service")
+            # sshd on the target says nothing about the controller's own
+            # interface: without this the first ssh can hit "Network is
+            # unreachable", which also makes a must-fail subtest pass vacuously.
+            controller.wait_for_unit("multi-user.target")
+            controller.wait_until_succeeds("ping -c 1 -W 1 target")
 
             with subtest("create signed rollback manifest"):
                 controller.succeed("install -m 0600 ${deployPrivateKey} /tmp/deploy-key")
@@ -465,6 +475,11 @@ top@{ config, ... }:
           testScript = ''
             start_all()
             target.wait_for_unit("sshd.service")
+            # sshd on the target says nothing about the controller's own
+            # interface: without this the first ssh can hit "Network is
+            # unreachable", which also makes a must-fail subtest pass vacuously.
+            controller.wait_for_unit("multi-user.target")
+            controller.wait_until_succeeds("ping -c 1 -W 1 target")
 
             with subtest("create old and new signed manifests"):
                 controller.succeed("install -m 0600 ${deployPrivateKey} /tmp/deploy-key")
