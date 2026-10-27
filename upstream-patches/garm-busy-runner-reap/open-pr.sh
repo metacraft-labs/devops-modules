@@ -1,55 +1,27 @@
 #!/usr/bin/env bash
 #
-# Open the upstream PR for the garm busy-runner reap fix.
+# Prepared upstream PR for the garm busy-runner reap fix (fix + tests in
+# runner/pool/busy_runner_reap_test.go, one commit), described by bundle.toml.
 #
-# Prerequisites:
-#   - `gh` authenticated (`gh auth status`)
-#   - A fork of cloudbase/garm on your GitHub account
+# This is a thin wrapper around metacraft-dev-guidelines
+# scripts/submit-prepared-pr; see policies/preparing-prs-for-internal-review.md
+# there. It DRY-RUNS by default: nothing is pushed and gh is not called.
 #
-# Usage:
-#   FORK=<your-gh-user>/garm ./open-pr.sh
+#   ./open-pr.sh                              # dry run: build, scan, show the plan
+#   ./open-pr.sh --verify --against-head      # does fix.patch apply on base / upstream head?
+#   ./open-pr.sh --approve --reviewer NAME    # reviewer: approve the current content
+#   ./open-pr.sh --submit --fork <you>/garm   # after approval: push + gh pr create
 #
-# Clones your fork into a scratch dir, applies fix.patch (fix + tests in
-# runner/pool/busy_runner_reap_test.go, one commit) with `git am` on a branch
-# cut from upstream's default branch, pushes it to your fork, and opens the PR
-# against cloudbase/garm with PR.md as the body. Review before running.
-#
-# fix.patch was generated against upstream main c58e7375 (2026-09-29) and
-# re-cut on aa830b59 (2026-10-23; the test now passes a context to
-# InitController(), which upstream bf79e351 added). The
-# local Nix patch (packages/garm/patches/fix-busy-runner-reap.patch) is the
-# same change on our older pin, cut on top of our other local patches (it
-# differs only in context).
+# MDG points at a metacraft-dev-guidelines checkout; the default is the
+# workspace sibling.
 
 set -euo pipefail
 
-UPSTREAM="cloudbase/garm"
-FORK="${FORK:?set FORK to your fork, e.g. FORK=yourname/garm}"
-BRANCH="${BRANCH:-fix-busy-runner-reap}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-BASE="$(gh repo view "$UPSTREAM" --json defaultBranchRef -q .defaultBranchRef.name)"
-
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-
-git clone "https://github.com/${FORK}.git" "$work"
-cd "$work"
-git remote add upstream "https://github.com/${UPSTREAM}.git"
-git fetch upstream "$BASE"
-git checkout -b "$BRANCH" "upstream/${BASE}"
-
-git am --3way "${HERE}/fix.patch"
-
-# Build + test sanity (needs a Go toolchain with cgo):
-#   go build ./...
-#   go test -tags testing ./runner/pool/ -run TestBusyRunnerReapSuite
-
-git push -u origin "$BRANCH"
-
-gh pr create \
-  --repo "$UPSTREAM" \
-  --base "$BASE" \
-  --head "${FORK%%/*}:${BRANCH}" \
-  --title "Never reap a runner the forge reports busy" \
-  --body-file "${HERE}/PR.md"
+MDG="${MDG:-${HERE}/../../../metacraft-dev-guidelines}"
+TOOL="${MDG}/scripts/submit-prepared-pr"
+[ -x "$TOOL" ] || {
+  echo "submit-prepared-pr not found at $TOOL; set MDG to a metacraft-dev-guidelines checkout" >&2
+  exit 1
+}
+exec "$TOOL" "$@" "$HERE"
