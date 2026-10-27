@@ -1,0 +1,46 @@
+# Prepared upstream PR bundle, driven by metacraft-dev-guidelines
+# scripts/submit-prepared-pr; the process is described in
+# metacraft-dev-guidelines policies/preparing-prs-for-internal-review.md.
+#
+# STATUS: RETIRED, do not submit (2026-10-27). Upstream fixed the bug
+# independently in 488cf98b ("Improve metrics", 2026-09-11): execWithTimeout()
+# now returns on `err != nil`, and ListInstances() checks `if err != nil`.
+# Our pin 0a9a939c (2026-07-08) does NOT contain 488cf98b
+# (`git merge-base --is-ancestor 488cf98b 0a9a939c` fails), so the local Nix
+# patch (packages/garm/patches/fix-listinstances-inverted-error-check.patch)
+# stays until the pin moves past 488cf98b; drop it then. The bundle is kept,
+# pinned on 0a9a939c, as the record of what was prepared; the wrapper refuses
+# --submit and --approve. See ../AGENTS.md.
+
+[upstream]
+repo = "cloudbase/garm"
+base_branch = "main"
+base_sha = "0a9a939c10f1e253947b63b0708acaa0c9d5e0bc"
+
+[fork]
+repo = "<your-gh-user>/garm" # pass --fork or FORK=
+
+[status]
+retired = "fixed upstream by cloudbase/garm 488cf98b (2026-09-11)"
+
+[pr]
+branch = "fix-listinstances-inverted-error-check"
+title = "Fix inverted error check in external provider ListInstances"
+body = "PR.md"
+patches = ["fix.patch"]
+
+[review]
+# Private identifiers that must never reach the upstream PR. The lookaheads
+# let our contributor identity in Signed-off-by: through.
+forbid = [
+  'high-mem-server',
+  'gpu-server',
+  'codetracer-ci',
+  'metacraft(?!-labs\.com)(?! labs <)',
+  'hms-',
+  '100\.83\.',
+  '/var/lib/garm',
+  'zroot',
+  'checks/t_garm',
+  'reprobuild-specs',
+]

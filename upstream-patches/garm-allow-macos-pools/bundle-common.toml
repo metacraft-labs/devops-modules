@@ -1,0 +1,46 @@
+# Prepared upstream PR bundle (step 1 of 2), driven by metacraft-dev-guidelines
+# scripts/submit-prepared-pr; the process is described in
+# metacraft-dev-guidelines policies/preparing-prs-for-internal-review.md.
+#
+# THIS IS TWO PRs, IN ORDER, AND THE ORDER IS NOT OPTIONAL. The `OSType`
+# constants live in cloudbase/garm-provider-common, which has Windows, Linux
+# and Unknown only. The garm half (bundle.toml) references `params.MacOS`, so
+# it does not compile until this one has been merged, tagged, and vendored
+# into garm.
+#
+#   step 1  bundle-common.toml: provider-common-fix.patch -> cloudbase/garm-provider-common
+#   step 2  (upstream merges + tags it, and bumps garm's go.mod + vendor/)
+#   step 3  bundle.toml: fix.patch + the test -> cloudbase/garm
+#
+#   ./open-pr.sh --manifest bundle-common.toml                 # dry run
+#   ./open-pr.sh --manifest bundle-common.toml --verify --against-head
+
+[upstream]
+repo = "cloudbase/garm-provider-common"
+base_branch = "main"
+base_sha = "ec82f622d2d4201076f6df4c425d78113a38f121"
+
+[fork]
+repo = "<your-gh-user>/garm-provider-common" # pass --fork or FORK=
+
+[pr]
+branch = "add-macos-ostype-constant"
+title = "Add a MacOS OSType constant"
+body = "PR-common.md"
+patches = ["provider-common-fix.patch"]
+
+[review]
+# Private identifiers that must never reach the upstream PR. The lookaheads
+# let our contributor identity in Signed-off-by: through.
+forbid = [
+  'high-mem-server',
+  'gpu-server',
+  'codetracer-ci',
+  'metacraft(?!-labs\.com)(?! labs <)',
+  'hms-',
+  '100\.83\.',
+  'infra/checks',
+  'checks/t_garm',
+  'reprobuild-specs',
+  'm3-tart',
+]

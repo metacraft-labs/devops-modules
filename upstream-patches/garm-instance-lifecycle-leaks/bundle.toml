@@ -1,0 +1,61 @@
+# Prepared upstream PR bundle, driven by metacraft-dev-guidelines
+# scripts/submit-prepared-pr; the process is described in
+# metacraft-dev-guidelines policies/preparing-prs-for-internal-review.md.
+#
+# fix.patch was generated against our pin 0a9a939c and re-cut on upstream main
+# 33ec0921 (2026-10-27). Re-cut changes: upstream 488cf98b ("Improve metrics")
+# widened the labels of garm_runner_errors_total, which conflicted with the new
+# counter's context; the counter is kept as-is (label `provider`) and is now
+# also documented in doc/monitoring.md next to the other runner metrics. The
+# pool.go hunks merged without conflict. prepare.sh adapts the test's
+# db.InitController() call to the context parameter upstream bf79e351 added.
+# The local Nix patch (packages/garm/patches/fix-instance-lifecycle-leaks.patch)
+# is the same change on our pin, cut on top of our other local patches
+# (without the doc/monitoring.md row, which our pin does not have).
+#
+# Tests on the re-cut tree (2026-10-27, go 1.26.8): TestInstanceLifecycleSuite
+# 6/6 PASS with the fix and 6/6 FAIL on unpatched 33ec0921; the whole
+# ./runner/pool/ package passes; go vet and gofmt are clean.
+#
+# The test is NOT carried inside fix.patch: ../../checks/garm/instance_lifecycle_test.go
+# is the single source of truth, compiled by the gate t_garm_instance_lifecycle
+# into both a patched and an unpatched tree. prepare.sh copies it in as a
+# second commit, scrubbed of private identifiers; [review] forbid is the
+# backstop that fails loudly if the scrub stops matching.
+#
+# Build + test sanity on the PR tree (needs a Go toolchain with cgo):
+#   go build ./...
+#   go test -tags testing ./runner/pool/ -run TestInstanceLifecycleSuite
+
+[upstream]
+repo = "cloudbase/garm"
+base_branch = "main"
+base_sha = "33ec0921418a470ca7e00dfb20ae111595da24e1"
+
+[fork]
+repo = "<your-gh-user>/garm" # pass --fork or FORK=
+
+[pr]
+branch = "fix-instance-lifecycle-leaks"
+title = "Never forget an instance the provider may still hold; stop delete storms"
+body = "PR.md"
+patches = ["fix.patch"]
+prepare = "prepare.sh"
+inputs = ["../../checks/garm/instance_lifecycle_test.go"]
+
+[review]
+# Private identifiers that must never reach the upstream PR. The lookaheads
+# let our contributor identity in Signed-off-by: through.
+forbid = [
+  'high-mem-server',
+  'gpu-server',
+  'codetracer-ci',
+  'metacraft(?!-labs\.com)(?! labs <)',
+  'hms-',
+  '100\.83\.',
+  '/var/lib/garm',
+  'zroot',
+  'checks/t_garm',
+  'reprobuild-specs',
+  'qglasrc9bvey',
+]

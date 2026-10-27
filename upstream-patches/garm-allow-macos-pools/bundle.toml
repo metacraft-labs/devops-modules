@@ -1,0 +1,57 @@
+# Prepared upstream PR bundle (step 3 of 3, after bundle-common.toml), driven
+# by metacraft-dev-guidelines scripts/submit-prepared-pr; the process is
+# described in metacraft-dev-guidelines
+# policies/preparing-prs-for-internal-review.md.
+#
+# fix.patch references `params.MacOS`, which garm-provider-common does not
+# have yet: the PR tree does not compile until the bundle-common.toml PR has
+# been merged, tagged and vendored into garm (see depends_on below).
+#
+# fix.patch was generated against our pin 0a9a939c (it applies unchanged on
+# upstream main 33ec0921). The local Nix patch
+# (packages/garm/patches/allow-macos-pools.patch) is the same change on our pin.
+#
+# NOTE ON THE TEST FILE. The test is NOT carried inside fix.patch. It lives at
+# ../../checks/garm/macos_pool_ostype_test.go, which is the single source of
+# truth: the gate t_garm_macos_pools_supported compiles that same file into
+# BOTH a patched and an unpatched GARM tree, so the negative control runs the
+# identical assertions. prepare.sh copies it in as a second commit, stripping
+# the gate preamble; [review] forbid is the backstop.
+#
+# Build + test sanity on the PR tree (needs a Go toolchain with cgo, and the
+# provider-common bump):
+#   go build ./...
+#   go test -tags testing ./runner/ -run 'TestMacOS|TestLinuxAndWindows|TestUnknown|TestUnsupported'
+
+[upstream]
+repo = "cloudbase/garm"
+base_branch = "main"
+base_sha = "0a9a939c10f1e253947b63b0708acaa0c9d5e0bc"
+
+[fork]
+repo = "<your-gh-user>/garm" # pass --fork or FORK=
+
+[pr]
+branch = "allow-macos-pools"
+title = "Allow macOS pools, matching what scale sets already accept"
+body = "PR.md"
+patches = ["fix.patch"]
+prepare = "prepare.sh"
+inputs = ["../../checks/garm/macos_pool_ostype_test.go"]
+depends_on = ["cloudbase/garm-provider-common: MacOS OSType constant (bundle-common.toml) merged, tagged and vendored into garm"]
+
+[review]
+# Private identifiers that must never reach the upstream PR. The lookaheads
+# let our contributor identity in Signed-off-by: through.
+forbid = [
+  'high-mem-server',
+  'gpu-server',
+  'codetracer-ci',
+  'metacraft(?!-labs\.com)(?! labs <)',
+  'hms-',
+  '100\.83\.',
+  'infra/checks',
+  'checks/t_garm',
+  'reprobuild-specs',
+  'm3-tart',
+]

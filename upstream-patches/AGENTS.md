@@ -5,47 +5,66 @@ local patch in this repo and intend to contribute back upstream. It is the
 patch analog of `codetracer-native-backend/upstream-bugs/` (which collects
 _bug reports_); here each entry is a ready-to-submit _fix_.
 
-Each subdirectory is named `<project>-<short-description>` and contains:
+Each subdirectory is named `<project>-<short-description>` and is a
+_prepared PR bundle_ (metacraft-dev-guidelines
+`policies/preparing-prs-for-internal-review.md`). It contains:
 
+- `bundle.toml` — the manifest: upstream repo, pinned `base_sha`, fork
+  placeholder, branch, title, body, patches, optional `prepare` hook and
+  `inputs`, and the `[review] forbid` list of private identifiers.
 - `fix.patch` — a `git format-patch`/`git am`-able patch against the
   **upstream** repository (not this Nix build tree). It carries a real
   commit message (subject + body + `Signed-off-by:`).
 - `PR.md` — the prepared pull-request title and body, written for a public
   upstream audience (no private infra details).
-- `open-pr.sh` — a documented, ready-to-run script that forks the upstream
-  repo (or reuses your fork), creates a branch, applies `fix.patch` with
-  `git am`, pushes to your fork, and opens the PR with `gh`.
+- `prepare.sh` (optional) — run in the PR tree after the patches. The bundles
+  whose test is a gate file in `../checks/garm/` (the single source of truth
+  for the patched and unpatched gate runs) use it to copy that file in as a
+  second commit, scrubbed.
+- `open-pr.sh` — a thin wrapper around `scripts/submit-prepared-pr`. It
+  **dry-runs by default**; `--verify --against-head` checks the patches on the
+  pinned base and the current upstream head; `--submit` refuses until a
+  reviewer's `--approve` (a content digest in `REVIEW-APPROVED`) matches.
+  Set `MDG` to a metacraft-dev-guidelines checkout if it is not the workspace
+  sibling.
 
 ## Workflow
 
 1. We hit a bug in an upstream dependency and land a local patch for it
    (for garm, that lives in `packages/<project>/patches/`).
 2. Create a subdirectory here named `<project>-<short-description>`.
-3. Regenerate `fix.patch` against a clean upstream checkout at the pinned
-   revision so it applies to upstream `HEAD`, with a proper commit message
-   and `Signed-off-by:` (use this repo's git identity —
-   `git config user.name` / `git config user.email`).
-4. Draft `PR.md` (Summary / The bug / Impact / The fix / How it was found).
-5. Verify: `git apply --check fix.patch` (and `git am fix.patch`) against a
-   fresh upstream clone, and that it still compiles.
-6. Write `open-pr.sh`; set your fork slug at the top.
-7. After review, run `open-pr.sh` to open the PR, then note the PR URL in
-   `PR.md`.
+3. Cut `fix.patch` on a clean upstream checkout at the current upstream head,
+   record that commit as `base_sha`, with a proper commit message and
+   `Signed-off-by:`. Put the tests in the series (or, for a gate test file,
+   in a `prepare.sh` hook declared with `inputs`).
+4. Draft `PR.md` (Summary / The bug / Impact / The fix / Tests).
+5. Write `bundle.toml` and copy the thin `open-pr.sh` from a sibling.
+6. Check: `./open-pr.sh --verify --against-head` and `./open-pr.sh` (dry run).
+7. Commit, ask for review; the reviewer runs `./open-pr.sh --approve
+--reviewer NAME`. Submit with `./open-pr.sh --submit --fork <you>/<repo>`,
+   then note the PR URL in `PR.md` and as `submitted` under `[pr]`.
 
-## Shared tooling
+## Status
 
-The process is documented for all Metacraft repositories in
-metacraft-dev-guidelines `policies/preparing-prs-for-internal-review.md`. Its
-tool is `scripts/submit-prepared-pr`. A bundle describes itself in a
-`bundle.toml` manifest (upstream repo, pinned `base_sha`, fork, branch,
-title, body, patches, forbidden identifiers). The tool dry-runs by default,
-`--verify --against-head` checks the patches against the pinned base and the
-current upstream head, and `--submit` refuses until a reviewer's
-`--approve` (a content digest in `REVIEW-APPROVED`) matches the bundle.
+`--verify --against-head` against cloudbase/garm `main` 33ec0921 and
+cloudbase/garm-provider-common `main` ec82f622 (2026-10-27). None has been
+submitted or approved.
 
-`garm-busy-runner-reap/` is converted: its `open-pr.sh` is a thin wrapper
-around the shared tool. The other bundles still carry their own `open-pr.sh`.
-Those scripts submit as soon as they run, so run them only after the review.
+| Bundle                                          | Base     | On base | On head | Status                                                             |
+| ----------------------------------------------- | -------- | ------- | ------- | ------------------------------------------------------------------ |
+| `garm-busy-runner-reap`                         | aa830b59 | ✓       | ✓       | ready for review                                                   |
+| `garm-job-cache-stale-lock`                     | aa830b59 | ✓       | ✓       | ready for review                                                   |
+| `garm-deleting-instances-hold-capacity`         | aa830b59 | ✓       | ✓       | ready for review                                                   |
+| `garm-instance-lifecycle-leaks`                 | 33ec0921 | ✓       | ✓       | re-cut 2026-10-27; ready for review                                |
+| `garm-allow-macos-pools` (`bundle-common.toml`) | ec82f622 | ✓       | ✓       | ready for review; submit first                                     |
+| `garm-allow-macos-pools` (`bundle.toml`)        | 0a9a939c | ✓       | ✓       | ready for review; needs the provider-common PR merged and vendored |
+| `garm-listinstances-inverted-error-check`       | 0a9a939c | ✓       | ❌      | **retired**: fixed upstream in 488cf98b                            |
+| `garm-stale-scaleset-job-reaper`                | 0a9a939c | ✓       | ❌      | **retired**: superseded upstream by 8c64910f                       |
+
+A retired bundle is kept as the record of what was prepared; its wrapper
+refuses `--submit` and `--approve`, and `bundle.toml` carries a `[status]`
+table. Its local Nix patch stays while our pin (`0a9a939c`) predates the
+upstream fix; drop it when the pin moves past that commit.
 
 ## Relationship to the local patch
 

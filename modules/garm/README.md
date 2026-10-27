@@ -706,8 +706,10 @@ The GARM package in this repo carries the one-line fix:
 `packages/garm/default.nix` applies
 `packages/garm/patches/fix-listinstances-inverted-error-check.patch`, and the
 upstream submission material lives in
-`upstream-patches/garm-listinstances-inverted-error-check/`. Operators who still
-see the message are running an unpatched GARM.
+`upstream-patches/garm-listinstances-inverted-error-check/`. Upstream fixed the
+bug independently in cloudbase/garm 488cf98b (2026-09-11), so that bundle is
+retired; the local patch stays until our pin moves past 488cf98b. Operators who
+still see the message are running an unpatched GARM.
 
 ---
 

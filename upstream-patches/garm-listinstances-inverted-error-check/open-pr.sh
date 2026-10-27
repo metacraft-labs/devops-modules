@@ -1,48 +1,37 @@
 #!/usr/bin/env bash
 #
-# Open the upstream PR for the garm ListInstances inverted-error-check fix.
+# Prepared upstream PR for the garm ListInstances inverted-error-check fix,
+# described by bundle.toml.
 #
-# Prerequisites:
-#   - `gh` authenticated (`gh auth status`)
-#   - A fork of cloudbase/garm on your GitHub account
+# This is a thin wrapper around metacraft-dev-guidelines
+# scripts/submit-prepared-pr; see policies/preparing-prs-for-internal-review.md
+# there. It DRY-RUNS by default: nothing is pushed and gh is not called.
 #
-# Usage:
-#   FORK=<your-gh-user>/garm ./open-pr.sh
+# RETIRED: fixed upstream in cloudbase/garm 488cf98b. The wrapper refuses
+# --submit and --approve; dry run and --verify still work, as a record of what
+# was prepared.
 #
-# It clones your fork into a scratch dir, applies fix.patch with `git am` on a
-# branch cut from upstream's default branch, pushes to your fork, and opens the
-# PR against cloudbase/garm with PR.md as the body. Review before running.
+#   ./open-pr.sh                              # dry run: build, scan, show the plan
+#   ./open-pr.sh --verify --against-head      # does fix.patch apply on base / upstream head?
+#
+# MDG points at a metacraft-dev-guidelines checkout; the default is the
+# workspace sibling.
 
 set -euo pipefail
 
-UPSTREAM="cloudbase/garm"
-FORK="${FORK:?set FORK to your fork, e.g. FORK=yourname/garm}"
-BRANCH="${BRANCH:-fix-listinstances-inverted-error-check}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Determine upstream's default branch (main/master) without guessing.
-BASE="$(gh repo view "$UPSTREAM" --json defaultBranchRef -q .defaultBranchRef.name)"
-
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-
-git clone "https://github.com/${FORK}.git" "$work"
-cd "$work"
-git remote add upstream "https://github.com/${UPSTREAM}.git"
-git fetch upstream "$BASE"
-git checkout -b "$BRANCH" "upstream/${BASE}"
-
-# Apply the prepared patch (3-way in case upstream context drifted).
-git am --3way "${HERE}/fix.patch"
-
-# Build sanity (optional; needs a Go toolchain):
-# go build ./... >/dev/null
-
-git push -u origin "$BRANCH"
-
-gh pr create \
-  --repo "$UPSTREAM" \
-  --base "$BASE" \
-  --head "${FORK%%/*}:${BRANCH}" \
-  --title "Fix inverted error check in external provider ListInstances" \
-  --body-file "${HERE}/PR.md"
+for a in "$@"; do
+  case "$a" in
+  --submit | --approve)
+    echo "refusing $a: this bundle is retired (fixed upstream in cloudbase/garm 488cf98b); see bundle.toml" >&2
+    exit 1
+    ;;
+  esac
+done
+MDG="${MDG:-${HERE}/../../../metacraft-dev-guidelines}"
+TOOL="${MDG}/scripts/submit-prepared-pr"
+[ -x "$TOOL" ] || {
+  echo "submit-prepared-pr not found at $TOOL; set MDG to a metacraft-dev-guidelines checkout" >&2
+  exit 1
+}
+exec "$TOOL" "$@" "$HERE"

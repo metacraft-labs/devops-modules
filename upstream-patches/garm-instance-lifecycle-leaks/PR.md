@@ -41,7 +41,8 @@ manager or turning into a retry storm against every other host.
    then calls the provider's `DeleteInstance` (which providers implement
    idempotently) before removing the record. Each event is counted in a new
    `garm_runner_absent_from_provider_total{provider}` counter, so a provider
-   that has lost sight of its instances is alertable.
+   that has lost sight of its instances is alertable. The counter is
+   documented in `doc/monitoring.md`.
 2. Use a plain `errgroup.Group`, never return a per-instance failure from the
    goroutine, and back off a failing instance with the existing instance
    backoff.
@@ -58,3 +59,14 @@ manager or turning into a retry storm against every other host.
 real SQLite store with a mocked provider and forge. The five defect tests fail
 on the current tree and pass with the fix; a sixth pins that the backoff
 entries introduced here are released.
+
+Run them with:
+
+```sh
+go test -tags testing ./runner/pool/ -run TestInstanceLifecycleSuite
+```
+
+The rest of `./runner/pool/` passes unchanged.
+
+<!-- After opening, record the PR URL here: -->
+<!-- PR: https://github.com/cloudbase/garm/pull/XXXX -->

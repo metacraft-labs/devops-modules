@@ -1,0 +1,68 @@
+# Prepared upstream PR bundle, driven by metacraft-dev-guidelines
+# scripts/submit-prepared-pr; the process is described in
+# metacraft-dev-guidelines policies/preparing-prs-for-internal-review.md.
+#
+# STATUS: RETIRED, do not submit (2026-10-27). Upstream fixed the root cause
+# independently in 8c64910f ("Split scaleset jobs in their own table",
+# 2026-10-09): scale set jobs no longer live in workflow_jobs (migration
+# 0010_scaleset_jobs moves them to scale_set_jobs and drops the
+# scale_set_job_id column), ListEntityJobsByStatus() no longer filters on
+# workflow_job_id > 0 because every remaining row has one, and the new
+# workers/jobs retention worker prunes scale set jobs not updated for 24h
+# whatever their status, which clears a phantom `queued` row. The series no
+# longer applies on upstream main and a re-cut would target code that no
+# longer exists. Our pin 0a9a939c predates 8c64910f, so the local Nix patch
+# stays until the pin moves past it; drop it then. The bundle is kept, pinned
+# on 0a9a939c, as the record of what was prepared; the wrapper refuses
+# --submit and --approve. See ../AGENTS.md.
+#
+# fix.patch was generated against our pin 0a9a939c. The local Nix patch
+# (packages/garm/patches/fix-stale-scaleset-job-reaper.patch) is the same
+# change on that pin, cut on top of our other local patches.
+#
+# NOTE ON THE TEST FILE. The test is NOT carried inside fix.patch. It lives at
+# ../../checks/garm/stale_scaleset_job_test.go, which is the single source of
+# truth: the gate t_garm_stale_scaleset_job_reaped injects that same file into
+# BOTH a patched and an unpatched GARM tree, so the negative control runs the
+# identical assertions. prepare.sh copies it in as a second commit, stripping
+# the gate preamble and scrubbing private identifiers; [review] forbid is the
+# backstop that fails loudly if the scrub stops matching.
+#
+# Build + test sanity on the PR tree (needs a Go toolchain with cgo):
+#   go build ./...
+#   go test -tags testing ./runner/pool/ -run TestStaleScaleSetJobSuite
+
+[upstream]
+repo = "cloudbase/garm"
+base_branch = "main"
+base_sha = "0a9a939c10f1e253947b63b0708acaa0c9d5e0bc"
+
+[fork]
+repo = "<your-gh-user>/garm" # pass --fork or FORK=
+
+[status]
+retired = "superseded upstream by cloudbase/garm 8c64910f (2026-10-09)"
+
+[pr]
+branch = "fix-stale-scaleset-job-reaper"
+title = "Make reconcileStaleJobs able to see and reap scale set jobs"
+body = "PR.md"
+patches = ["fix.patch"]
+prepare = "prepare.sh"
+inputs = ["../../checks/garm/stale_scaleset_job_test.go"]
+
+[review]
+# Private identifiers that must never reach the upstream PR. The lookaheads
+# let our contributor identity in Signed-off-by: through.
+forbid = [
+  'high-mem-server',
+  'gpu-server',
+  'codetracer-ci',
+  'metacraft(?!-labs\.com)(?! labs <)',
+  'hms-',
+  '100\.83\.',
+  '/var/lib/garm',
+  'zroot',
+  'checks/t_garm',
+  'reprobuild-specs',
+]

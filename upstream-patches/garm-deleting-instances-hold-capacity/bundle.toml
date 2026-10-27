@@ -1,0 +1,47 @@
+# Prepared upstream PR bundle, driven by metacraft-dev-guidelines
+# scripts/submit-prepared-pr; the process is described in
+# metacraft-dev-guidelines policies/preparing-prs-for-internal-review.md.
+#
+# fix.patch (fix + tests, one commit) was generated against upstream main
+# aa830b59 (2026-10-23). The local Nix patch
+# (packages/garm/patches/fix-deleting-instances-hold-capacity.patch) is the
+# same change on our older pin, cut on top of our other local patches.
+# Differences: upstream already excludes `deleted` scale set runners from
+# runnerCount() and counts deleting runners against the scale-down delta
+# before its loop; this version keeps `deleted` out of every count and
+# computes the delta from live runners only. It also adds the runner/pool test.
+#
+# Build + test sanity on the PR tree (needs a Go toolchain with cgo):
+#   go build ./...
+#   go test ./internal/capacity/ ./database/sql/ ./workers/scaleset/
+#   go test -tags testing ./runner/pool/ -run 'TestPoolStressTestSuite/TestStuckDeletesDoNotConsumePoolCapacity'
+
+[upstream]
+repo = "cloudbase/garm"
+base_branch = "main"
+base_sha = "aa830b59c762fb02671d41cd478704fa01ca0e9c"
+
+[fork]
+repo = "<your-gh-user>/garm" # pass --fork or FORK=
+
+[pr]
+branch = "fix-deleting-instances-hold-capacity"
+title = "Don't let instances stuck in deletion fill a pool"
+body = "PR.md"
+patches = ["fix.patch"]
+
+[review]
+# Private identifiers that must never reach the upstream PR. The lookaheads
+# let our contributor identity in Signed-off-by: through.
+forbid = [
+  'high-mem-server',
+  'gpu-server',
+  'codetracer-ci',
+  'metacraft(?!-labs\.com)(?! labs <)',
+  'hms-',
+  '100\.83\.',
+  '/var/lib/garm',
+  'zroot',
+  'checks/t_garm',
+  'reprobuild-specs',
+]
