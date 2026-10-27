@@ -68,26 +68,43 @@
 # included pool is exhausted (the $0 budget blocks it), which would freeze
 # CI_RUNNER_MODE at `github-hosted` exactly when it must flip — so a private
 # wrapper runs on the self-hosted `runner` label array instead.
-# Tokens (operator prerequisite):
+# SCOPE OF THE VARIABLE: CI_RUNNER_MODE governs PRIVATE/INTERNAL repos only.
+# reusable-choose-runner.yml routes a PUBLIC repo to free GitHub-hosted runners
+# whatever the variable says (S2-D1, 2026-10-27), so writing `self-hosted` here
+# never moves public CI.
+#
+# Tokens (no personal token needed for an org-scope caller):
 #   * billing_token   — billing READ for the scope that owns the pool.
-#                       Org scope: a GOVERNANCE-APP installation token (org
-#                       billing:read — verified 2026-09-15 that an App install
-#                       token drives `GET /organizations/{org}/settings/billing/usage`
-#                       -> 200) or a classic PAT (admin:org). Enterprise scope
-#                       (`enterprise:` set): a classic PAT of an enterprise
-#                       owner / billing manager with `manage_billing:enterprise`
-#                       (an org App installation cannot read enterprise billing).
+#                       Org scope: a GitHub App INSTALLATION token whose App has
+#                       the organization "Administration" (read) permission —
+#                       GitHub lists GET /organizations/{org}/settings/billing/usage
+#                       under it (docs: "Permissions required for GitHub Apps",
+#                       Administration); verified 2026-09-15 (HTTP 200). The
+#                       governance App qualifies.
+#                       Enterprise scope (`enterprise:` set): an installation
+#                       token of an App installed ON THE ENTERPRISE with the
+#                       "Enterprise billing" (read) permission (enterprise
+#                       installations GA 2026-10-23), or a classic PAT /
+#                       OAuth token with `manage_billing:enterprise`. An ORG
+#                       installation cannot read enterprise billing; without one
+#                       of these the read fails safe to self-hosted (which, with
+#                       the hold on, is the same value — only the metrics lose
+#                       their numbers).
 #                       Both dimensions (included-pool draw AND billed overage)
 #                       come from the enhanced usage report; the classic
 #                       `/orgs/{org}/settings/billing/actions` endpoint returns
 #                       HTTP 410 since GitHub's billing-platform migration.
-#   * variables_token — org VARIABLES write (fine-grained: Organization
-#                       "Variables" read/write). Writes CI_RUNNER_MODE.
-#     GITHUB_TOKEN cannot do either, so both are required secrets.
+#   * variables_token — org VARIABLES write: an App installation token with
+#                       "Organization variables" (actions_variables) write — the
+#                       governance App again — or a fine-grained token with
+#                       Organization "Variables" read/write. Writes CI_RUNNER_MODE.
+#     GITHUB_TOKEN cannot do either, so both are required secrets. One App
+#     installation token may serve as both.
 #
 # SAFETY INPUTS (both default to the safe side):
-#   * allow_github_hosted (default FALSE) — operator policy is that orgs stay
-#     self-hosted. While false, the service NEVER writes `github-hosted`: where
+#   * allow_github_hosted (default FALSE) — operator policy (S2-D1, 2026-10-27)
+#     is that private repos stay self-hosted, INCLUDING after the monthly
+#     included-minutes reset. While false, the service NEVER writes `github-hosted`: where
 #     billing says the pool is healthy, it writes (or keeps) `self-hosted` and
 #     logs that the self-hosted hold is in effect. Set true only for an org that
 #     should actually ride the included GitHub-hosted minutes.

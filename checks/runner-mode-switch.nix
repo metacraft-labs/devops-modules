@@ -5,6 +5,8 @@ _top@{ ... }:
   # Proves the org/repo Actions variable `CI_RUNNER_MODE` + repo visibility
   # deterministically resolve the `runs-on` value that a downstream job uses,
   # so flipping ONE variable reroutes CI across the fleet with no per-repo edit.
+  # Public repos are always hosted (S2-D1): the variable governs only
+  # private/internal repos.
   #
   # HERMETIC: the test extracts the REAL resolution shell block from
   # `.github/workflows/reusable-choose-runner.yml` (not a copy) and drives it
@@ -88,6 +90,7 @@ _top@{ ... }:
             HOSTED, SELF = ["ubuntu-latest"], json.loads(PRE)
             table = [
                 ("public, no vars",                 where("public"), HOSTED),
+                ("public, mode=self-hosted",        where("public", CI_RUNNER_MODE="self-hosted"), HOSTED),
                 ("private, no vars",                where("private"), SELF),
                 ("internal, no vars",               where("internal"), SELF),
                 ("no repository payload",           where(None), SELF),
@@ -144,10 +147,22 @@ _top@{ ... }:
             run_case "public/github-hosted" "$HOSTED" "true" \
               IS_PRIVATE="false" CI_RUNNER_MODE="github-hosted"
 
-            # public + self-hosted -> operator forced the fleet even for a
-            # public repo (routes to the RC4 capability-label array).
-            run_case "public/self-hosted" "$SELF" "false" \
+            # public + self-hosted -> STILL free hosted (S2-D1, 2026-10-27):
+            # public minutes are free and unlimited, so CI_RUNNER_MODE governs
+            # private/internal repos only. This is the case that pins the
+            # policy; reordering the pick step (mode before visibility) fails it.
+            run_case "public/self-hosted" "$HOSTED" "true" \
               IS_PRIVATE="false" CI_RUNNER_MODE="self-hosted"
+
+            # ...and public stays hosted even when the cron signal says the
+            # private pool is exhausted.
+            run_case "public/self-hosted+GH_HOSTED_OK=false" "$HOSTED" "true" \
+              IS_PRIVATE="false" CI_RUNNER_MODE="self-hosted" GH_HOSTED_OK="false"
+
+            # A missing visibility payload is NOT public: it takes the private
+            # (billable) path, so CI_RUNNER_MODE=self-hosted applies.
+            run_case "no-visibility/self-hosted" "$SELF" "false" \
+              CI_RUNNER_MODE="self-hosted"
 
             # internal/private + github-hosted -> rides included minutes (the S2
             # managing service flips this to self-hosted before overage).
@@ -165,9 +180,9 @@ _top@{ ... }:
             run_case "private/invalid-mode" "$SELF" "false" \
               IS_PRIVATE="true" CI_RUNNER_MODE="hoste-github"
 
-            # ...and on a public repo too: an unrecognized mode still resolves
-            # deterministically to self-hosted rather than guessing hosted.
-            run_case "public/invalid-mode" "$SELF" "false" \
+            # On a public repo the mode is not consulted at all, so even an
+            # unrecognized value resolves to the free hosted runner.
+            run_case "public/invalid-mode" "$HOSTED" "true" \
               IS_PRIVATE="false" CI_RUNNER_MODE="on"
 
             # ---- Unset mode falls through to the RD3 visibility default ------

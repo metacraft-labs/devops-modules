@@ -238,6 +238,13 @@ _top@{ ... }:
             # A genuine self-hosted decision is not reported as a hold.
             WANT_HELD=0 decide_case "hold/near-exhaustion-not-held" "self-hosted" "0" "''${ORGCASE[@]}" \
               MOCK_UNTIL="2026-09-12" ALLOW_GITHUB_HOSTED="false"
+            # The monthly RESET (S2-D1 policy, 2026-10-27): on day 1 the usage
+            # report is empty, the whole pool is back, and the hold must still
+            # keep self-hosted (the manager never flips back to hosted at reset).
+            WANT_HELD=1 decide_case "hold/after-monthly-reset" "self-hosted" "0" "''${ORGCASE[@]}" \
+              MOCK_UNTIL="2026-08-31" ALLOW_GITHUB_HOSTED="false"
+            WANT_HELD=1 decide_case "hold/after-monthly-reset-enterprise" "self-hosted" "0" "''${ENTCASE[@]}" \
+              MOCK_UNTIL="2026-08-31" ALLOW_GITHUB_HOSTED=""
             # Positive control: the healthy case with the hold lifted.
             WANT_HELD=0 decide_case "hold/lifted-control" "github-hosted" "0" "''${ORGCASE[@]}" \
               MOCK_UNTIL="2026-09-05" ALLOW_GITHUB_HOSTED="true"

@@ -62,7 +62,9 @@ and fails **closed** (assumes public) if that is ever unset.
 GitHub has **no** native hosted↔self-hosted fallback, so
 `reusable-choose-runner.yml` runs a cheap **preflight** that emits `runs_on`:
 
-1. **Public repo** → always the preferred hosted runner (free).
+1. **Public repo** → always the preferred hosted runner (free), whatever
+   `CI_RUNNER_MODE` says: the S1 switch governs private/internal repos only
+   (operator decision S2-D1, 2026-10-27).
 2. **Private repo, `vars.GH_HOSTED_OK`** (written by the cron below):
    `true` → hosted, `false` → self-hosted. _This is the production default_
    — no per-run billing API call, no admin token in every workflow.
@@ -136,8 +138,8 @@ jobs:
 
 | Item                        | What                                                                                                                                                                                                                                                                                                          | Scope   |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `ORG_BILLING_READ_TOKEN`    | Reads the enhanced usage report (`/organizations/{org}/settings/billing/usage`) + the org's public-repo list. Classic PAT `admin:org`, or a GitHub App install token with org **billing: read**. Enterprise-plan orgs need the **enterprise** report instead: a classic PAT with `manage_billing:enterprise`. | per org |
-| `ORG_VARIABLES_WRITE_TOKEN` | Writes the `GH_HOSTED_OK` org variable. Fine-grained token with org **Variables: read/write** (may equal the billing token if it has both).                                                                                                                                                                   | per org |
+| `ORG_BILLING_READ_TOKEN`    | Reads the enhanced usage report (`/organizations/{org}/settings/billing/usage`) + the org's public-repo list. Preferred: a GitHub App installation token with organization **Administration: read** (the governance App). Classic PAT `admin:org` also works. Enterprise-plan orgs need the **enterprise** report instead: an App installed on the enterprise with **Enterprise billing: read**, or a classic PAT with `manage_billing:enterprise`. | per org |
+| `ORG_VARIABLES_WRITE_TOKEN` | Writes the `GH_HOSTED_OK` org variable. GitHub App installation token with **Organization variables: write** (the governance App), or a fine-grained token with org **Variables: read/write** (may equal the billing token if it has both).                                                                                                                                                                   | per org |
 | Cron wrapper                | One `sync-hosted-minutes.yml` per org (`metacraft-labs`, `blocksense-network`, `agent-harbor`) in an ops repo, on a ~30-min schedule.                                                                                                                                                                         | per org |
 | `GH_HOSTED_OK` seed         | Optional: set it to `true` initially so private repos start on hosted before the first cron run.                                                                                                                                                                                                              | per org |
 | Verify allowance            | Pass the pool size as `included_minutes`: Team org 3,000; Enterprise 50,000 (pooled — set `enterprise` too); Free 2,000.                                                                                                                                                                                      | per org |

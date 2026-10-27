@@ -194,9 +194,37 @@ mkroot terraform/github/partial <<'JSON'
 }
 JSON
 
+# github-app: the minted installation token is exported as GITHUB_TOKEN; a root
+# may ALSO name a Terraform-variable env for a non-github provider (budgets).
+mkroot terraform/github/app-plain <<'JSON'
+{
+  "state_key": "terraform/github/app-plain.tfstate",
+  "state_sensitivity": "standard",
+  "backend_config_file": "backends/app-plain.hcl",
+  "credential_mode": "github-app",
+  "github_app_owner": "example-org",
+  "backend_uses_aws_oidc": true,
+  "enable_checkov": false,
+  "provider_allowlist": ["integrations/github"]
+}
+JSON
+mkroot terraform/github-budgets/app-var <<'JSON'
+{
+  "state_key": "terraform/github-budgets/app-var.tfstate",
+  "state_sensitivity": "standard",
+  "backend_config_file": "backends/app-var.hcl",
+  "credential_mode": "github-app",
+  "github_app_owner": "example-org",
+  "credentials_env_name": "TF_VAR_github_billing_token",
+  "backend_uses_aws_oidc": true,
+  "enable_checkov": false,
+  "provider_allowlist": ["magodo/restful"]
+}
+JSON
+
 out="$(run_matrix --root-dir "$tmp")"
-if [[ "$(jq '.include | length' <<<"$out")" != 7 ]]; then
-  fail "expected seven credential-axis roots"
+if [[ "$(jq '.include | length' <<<"$out")" != 9 ]]; then
+  fail "expected nine credential-axis roots"
 fi
 
 expect_row terraform/github/governance '
@@ -228,6 +256,19 @@ expect_row terraform/archive/local '
   and .backend_uses_aws_oidc == false
   and .uses_aws_oidc == false
   and .credentials_env_name == ""'
+expect_row terraform/github/app-plain '
+  .credential_mode == "github-app"
+  and .github_app_owner == "example-org"
+  and .uses_aws_oidc == true
+  and .credentials_env_name == ""
+  and .agenix_plan_secret_path == ""'
+expect_row terraform/github-budgets/app-var '
+  .credential_mode == "github-app"
+  and .github_app_owner == "example-org"
+  and .uses_aws_oidc == true
+  and .credentials_env_name == "TF_VAR_github_billing_token"
+  and .agenix_plan_secret_path == ""
+  and .agenix_apply_secret_path == ""'
 for pending_root in terraform/github/pending terraform/github/partial; do
   expect_row "$pending_root" '
     .credential_mode == "agenix-token"
@@ -253,6 +294,29 @@ fi
 # silently inheriting the default.
 for invalid_backend_flag in '"true"' null 0 '[]' '{}'; do
   expect_invalid_backend_flag "$invalid_backend_flag"
+done
+
+# A github-app root's extra env name must be a shell identifier, and it cannot
+# also carry agenix secret paths.
+for bad in '{"credentials_env_name": "TF_VAR_x; rm -rf /"}' \
+           '{"credentials_env_name": ""}' \
+           '{"credentials_env_name": "TF_VAR_x", "agenix_plan_secret_path": "a.age", "agenix_apply_secret_path": "b.age"}'; do
+  badtmp="$(mktemp -d)"
+  mkdir -p "$badtmp/terraform/x/y"
+  jq -n --argjson extra "$bad" '{
+    state_key: "terraform/x/y.tfstate",
+    state_sensitivity: "standard",
+    backend_config_file: "b.hcl",
+    credential_mode: "github-app",
+    github_app_owner: "example-org",
+    enable_checkov: false,
+    provider_allowlist: ["magodo/restful"]
+  } + $extra' > "$badtmp/terraform/x/y/metadata.json"
+  if run_matrix --root-dir "$badtmp" >/dev/null 2>&1; then
+    fail "invalid github-app metadata was accepted: ${bad}"
+  fi
+  rm -rf "$badtmp"
+  badtmp=""
 done
 
 # Existing fail-closed validation remains part of the contract.
