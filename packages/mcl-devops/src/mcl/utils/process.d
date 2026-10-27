@@ -258,10 +258,13 @@ ProcessResult runProcessWithInputCapture(string[] args, string input, bool echoO
                 // blocked caller's signal policy. Otherwise consume only the
                 // write-generated EPIPE signal before restoring the old mask.
                 // sigwait is available on Linux/macOS; sigtimedwait is not
-                // available in the selected Darwin bindings. A write-generated
-                // thread-directed pending signal cannot be stolen by another
-                // thread. Arbitrary concurrent process-directed SIGPIPE
-                // provenance is not distinguishable and is not promised here.
+                // available in the selected Darwin bindings. On Linux a
+                // write-generated SIGPIPE is thread-directed, so it cannot be
+                // stolen by another thread. Darwin raises it process-wide,
+                // which is why the stdin descriptor carries F_SETNOSIGPIPE
+                // there and no signal is generated at all. Arbitrary
+                // concurrent process-directed SIGPIPE provenance is not
+                // distinguishable and is not promised here.
                 if (sawEpipe && !priorPending && !priorBlocked)
                 {
                     errnoEnforce(sigpending(&pending) == 0, "reading pending stdin signals");
@@ -311,6 +314,17 @@ ProcessResult runProcessWithInputCapture(string[] args, string input, bool echoO
             errnoEnforce(fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0,
                 "setting nonblocking capture descriptor");
             watched[index] = pollfd(fd, cast(short)(index == 0 ? POLLOUT : POLLIN), 0);
+        }
+        version (OSX)
+        {
+            // XNU delivers a write-generated SIGPIPE to the whole process, not
+            // to the writing thread, so blocking it here does not stop another
+            // thread (e.g. a parallel unittest worker) from taking the default
+            // action. Suppress generation on this descriptor; write() still
+            // returns EPIPE. F_SETNOSIGPIPE is <sys/fcntl.h> value 73.
+            enum F_SETNOSIGPIPE = 73;
+            errnoEnforce(fcntl(channels[0].fileno(), F_SETNOSIGPIPE, 1) == 0,
+                "suppressing stdin SIGPIPE");
         }
         size_t offset;
         if (input.length == 0)
