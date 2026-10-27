@@ -83,8 +83,7 @@ _top@{ ... }:
             decide = next(s for s in steps if s.get("id") == "decide")
             metrics = next(s for s in steps if s.get("id") == "metrics")
             env = decide["env"]
-            # Billing read must come from the secret, org/thresholds from inputs.
-            assert env.get("GH_TOKEN") == "${"$"}{{ secrets.billing_token }}", env.get("GH_TOKEN")
+            # Billing read comes from the secret or the minted App token (asserted below); org/thresholds from inputs.
             assert env.get("MIN_REMAIN") == "${"$"}{{ inputs.min_minutes_remaining }}", env.get("MIN_REMAIN")
             assert env.get("MAX_BILLED") == "${"$"}{{ inputs.max_billed_amount }}", env.get("MAX_BILLED")
             assert env.get("INCLUDED_MINUTES") == "${"$"}{{ inputs.included_minutes }}", env.get("INCLUDED_MINUTES")
@@ -124,6 +123,16 @@ _top@{ ... }:
             wenv = writestep["env"]
             assert wenv.get("DRY_RUN") == "${"$"}{{ inputs.dry_run }}", wenv
             assert wenv.get("ALLOW_GITHUB_HOSTED") == "${"$"}{{ inputs.allow_github_hosted }}", wenv
+            # Credentials: an explicit token wins, else the App installation
+            # token the job mints itself (no personal token required).
+            assert env.get("GH_TOKEN") == "${"$"}{{ secrets.billing_token || steps.app.outputs.token }}", env
+            assert wenv.get("GH_TOKEN") == "${"$"}{{ secrets.variables_token || steps.app.outputs.token }}", wenv
+            mint = next(s for s in steps if s.get("id") == "app")
+            assert mint["uses"].startswith("actions/create-github-app-token@"), mint
+            assert mint["with"]["owner"] == "${"$"}{{ inputs.org }}", mint
+            assert mint["if"] == "env.MINT_APP_TOKEN == 'true'", mint
+            sec = on0["workflow_call"]["secrets"]
+            assert all(not sec[k].get("required", False) for k in ("billing_token", "variables_token", "app_id", "app_private_key")), sec
             # The ONLY variable write in the workflow is in the write step.
             others = "".join(s.get("run", "") for s in steps if s is not writestep)
             assert "gh variable" not in others, "a non-write step calls gh variable"
