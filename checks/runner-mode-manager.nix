@@ -169,7 +169,7 @@ _top@{ ... }:
                 MAX_BILLED="0" \
                 ALLOW_GITHUB_HOSTED="true" \
                 "$@" \
-                ${pkgs.bash}/bin/bash decide.sh >/dev/null 2>caselog \
+                ${pkgs.bash}/bin/bash -e decide.sh >/dev/null 2>caselog \
                 || { cat caselog >&2; fail "$name: decide exited non-zero"; }
               local got_mode got_fs
               got_mode="$(grep '^mode=' "$out" | tail -1 | cut -d= -f2-)"
@@ -295,7 +295,7 @@ _top@{ ... }:
                 FIXTURES="${fixtures}" MIN_REMAIN="300" MAX_BILLED="0" \
                 "''${ORGCASE[@]}" MOCK_UNTIL="2026-09-05" \
                 ALLOW_GITHUB_HOSTED="$2" DRY_RUN="$3" \
-                ${pkgs.bash}/bin/bash decide.sh >/dev/null 2>caselog \
+                ${pkgs.bash}/bin/bash -e decide.sh >/dev/null 2>caselog \
                 || { cat caselog >&2; fail "e2e/$1: decide failed"; }
               local mode; mode="$(grep '^mode=' "$out" | tail -1 | cut -d= -f2-)"
               env -i PATH="$PATH" FIXTURES="${fixtures}" MOCK_GH_LOG="$PWD/e2e.log" ORG="example-org" \
@@ -324,7 +324,7 @@ _top@{ ... }:
                 ORG="metacraft-labs" \
                 MODE="$1" REMAINING="$2" BILLED="$3" FAILSAFE="$4" \
                 TEXTFILE="$5" PUSHGATEWAY_URL="" \
-                ${pkgs.bash}/bin/bash metrics.sh >/dev/null 2>metricslog \
+                ${pkgs.bash}/bin/bash -e metrics.sh >/dev/null 2>metricslog \
                 || { cat metricslog >&2; fail "metrics exited non-zero"; }
             }
             tf="$PWD/ci-runner-mode.prom"
