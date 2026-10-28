@@ -10,12 +10,22 @@ inputs:
     description: Path to a file whose contents become the comment body (mutually exclusive with `message`)
     required: false
     default: ''
+  key:
+    description: >-
+      Optional discriminator for callers that keep MORE THAN ONE sticky comment
+      on a PR, e.g. one per Nix system when a flake's CI is split into a Linux
+      and a Darwin call. Empty (the default) is the single, unkeyed comment
+      every existing caller already owns.
+    required: false
+    default: ''
 
 runs:
   using: composite
   steps:
     - name: Post sticky comment
       uses: actions/github-script@v7
+      env:
+        STICKY_COMMENT_KEY: ${{ inputs.key }}
       with:
         script: |
           if (!context.issue.number) {
@@ -31,7 +41,11 @@ runs:
           } else {
             content = message;
           }
-          const marker = '<!-- sticky-comment -->';
+          const key = process.env.STICKY_COMMENT_KEY || '';
+          // `--` cannot appear inside an HTML comment; the key is caller data.
+          const marker = key
+            ? `<!-- sticky-comment:${key.replace(/--+/g, '-')} -->`
+            : '<!-- sticky-comment -->';
           const body = marker + '\n' + content;
           const { data: comments } = await github.rest.issues.listComments({
             owner: context.repo.owner,

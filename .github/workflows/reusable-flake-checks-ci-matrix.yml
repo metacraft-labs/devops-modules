@@ -59,14 +59,23 @@ on:
         type: string
       build-systems:
         # Restrict the BUILD jobs to these Nix systems; empty = every system.
-        # Eval still covers every system. A caller can split one flake's CI
-        # into independent calls, e.g. a Linux call that gates a deployment and
-        # a Darwin call that only reports, so a starved macOS pool cannot hold
-        # a Linux deployment (infra, 2026-10-08: 27 queued aarch64-darwin legs
-        # behind other repositories' jobs blocked fleet publication). A filter
-        # that leaves nothing builds a single no-op instead of falling back to
-        # the unfiltered matrix.
-        description: 'JSON array of Nix systems whose outputs this call builds (empty = all)'
+        # A caller can split one flake's CI into independent calls, e.g. a
+        # Linux call that gates a deployment and a Darwin call that only
+        # reports, so a starved macOS pool cannot hold a Linux deployment
+        # (infra, 2026-10-08: 27 queued aarch64-darwin legs behind other
+        # repositories' jobs blocked fleet publication). A filter that leaves
+        # nothing builds a single no-op instead of falling back to the
+        # unfiltered matrix.
+        #
+        # EVAL FOLLOWS THE SAME SYSTEMS. Until 2026-10-28 eval still covered
+        # every system, so infra's `ci` + `ci-darwin` pair evaluated all 26
+        # shards twice per run (52 eval jobs, ~78 runner-minutes, infra run
+        # 40628261206). A sharded flake now gets `shardsPerSystem.<system>`
+        # shards for just these systems (output names are unchanged), and an
+        # unsharded one evaluates just these systems. The union of a split
+        # caller's calls still evaluates every system, each exactly once.
+        # Empty keeps evaluating every system.
+        description: 'JSON array of Nix systems whose outputs this call builds and evaluates (empty = all)'
         default: ''
         required: false
         type: string
@@ -212,6 +221,8 @@ jobs:
       - name: 'Post initial package status comment'
         uses: metacraft-labs/devops-modules/.github/sticky-comment@dev
         with:
+          # One comment per call: a split caller's calls each report their own systems.
+          key: ${{ inputs.build-systems }}
           message: |
             Thanks for your Pull Request!
 
@@ -268,6 +279,8 @@ jobs:
         env:
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
           SYSTEM_TO_GITHUB_RUNNER_LABELS: ${{ inputs.runners }}
+          # Evaluate only the systems this call builds (see `build-systems`).
+          MCL_EVAL_SYSTEMS: ${{ inputs.build-systems }}
           # Authenticate mcl-devops's cache-status (narinfo) probe to the private
           # Attic cache; scoped to the Attic host inside mcl-devops.
           ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
@@ -278,10 +291,13 @@ jobs:
         if: steps.generate-matrix.outputs.full_matrix
         uses: metacraft-labs/devops-modules/.github/sticky-comment@dev
         with:
+          # One comment per call: a split caller's calls each report their own systems.
+          key: ${{ inputs.build-systems }}
           path: comment.md
 
     outputs:
       eval_matrix: ${{ steps.generate-matrix.outputs.eval_matrix }}
+      eval_artifact_pattern: ${{ steps.generate-matrix.outputs.eval_artifact_pattern }}
       build_matrix: ${{ steps.generate-matrix.outputs.build_matrix }}
       full_matrix: ${{ steps.generate-matrix.outputs.full_matrix }}
 
@@ -336,6 +352,7 @@ jobs:
         env:
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
           SYSTEM_TO_GITHUB_RUNNER_LABELS: ${{ inputs.runners }}
+          MCL_EVAL_SYSTEMS: ${{ inputs.build-systems }}
           # See the `Merge matrices` step.
           MCL_REBUILD_CACHED_DEPLOYMENT_TARGETS: ${{ inputs.push-deployment-caches }}
           # Authenticate mcl-devops's cache-status (narinfo) probe to the private
@@ -413,6 +430,13 @@ jobs:
         uses: actions/download-artifact@v8
         if: needs.eval-matrix.result == 'success'
         continue-on-error: true
+        with:
+          # Only THIS call's shards. A split caller's other call (infra's
+          # `ci-darwin` next to `ci`) uploads its own per-system shards into
+          # the same run; merging those would put the other system's outputs
+          # into this call's matrix. Empty (an mcl-devops that predates the
+          # output) keeps downloading everything, as before.
+          pattern: ${{ needs.shard-matrix.outputs.eval_artifact_pattern }}
 
       - name: Regenerate CI matrix shards when artifacts are unavailable
         if: needs.eval-matrix.result == 'success'
@@ -422,6 +446,7 @@ jobs:
           MCL_FLAKE_CMD: ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }}
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
           SYSTEM_TO_GITHUB_RUNNER_LABELS: ${{ inputs.runners }}
+          MCL_EVAL_SYSTEMS: ${{ inputs.build-systems }}
           # Authenticate mcl-devops's cache-status (narinfo) probe (same reason as the
           # Merge matrices step below).
           ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
@@ -505,6 +530,8 @@ jobs:
       - name: Post CI matrix comment
         uses: metacraft-labs/devops-modules/.github/sticky-comment@dev
         with:
+          # One comment per call: a split caller's calls each report their own systems.
+          key: ${{ inputs.build-systems }}
           path: comment.md
 
   # Collapse the one-job-per-flake-output build matrix into at most
@@ -1371,6 +1398,8 @@ jobs:
       - name: Update GitHub Comment
         uses: metacraft-labs/devops-modules/.github/sticky-comment@dev
         with:
+          # One comment per call: a split caller's calls each report their own systems.
+          key: ${{ inputs.build-systems }}
           path: comment.md
 
       - run: exit 1
