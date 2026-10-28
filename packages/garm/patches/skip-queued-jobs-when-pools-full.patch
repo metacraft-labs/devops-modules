@@ -1,5 +1,5 @@
 diff --git a/runner/pool/cache.go b/runner/pool/cache.go
-index 5a3a3c8..d6ab51f 100644
+index 5a3a3c8c..d6ab51f2 100644
 --- a/runner/pool/cache.go
 +++ b/runner/pool/cache.go
 @@ -14,6 +14,7 @@ type poolCacheStore interface {
@@ -23,11 +23,11 @@ index 5a3a3c8..d6ab51f 100644
  	atomic.StoreUint32(&p.next, 0)
  }
 diff --git a/runner/pool/pool.go b/runner/pool/pool.go
-index 4068c9f..ba1ed17 100644
+index 1375be82..7de1f7e0 100644
 --- a/runner/pool/pool.go
 +++ b/runner/pool/pool.go
-@@ -2303,6 +2303,8 @@ func (r *basePoolManager) consumeQueuedJobs() error {
- 	}()
+@@ -2369,6 +2369,8 @@ func (r *basePoolManager) reconcileStaleJobs() error {
+ func (r *basePoolManager) consumeQueuedJobs() error {
  	queued := r.getQueuedJobs()
  
 +	fullThisPass := fullPools{}
@@ -35,7 +35,7 @@ index 4068c9f..ba1ed17 100644
  	poolsCache := poolsForTags{
  		poolCacheType: r.entity.GetPoolBalancerType(),
  	}
-@@ -2395,6 +2397,20 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+@@ -2467,6 +2469,20 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  			continue
  		}
  
@@ -56,7 +56,7 @@ index 4068c9f..ba1ed17 100644
  		runnerCreated := false
  		if err := r.store.LockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
  			if errors.Is(err, runnerErrors.ErrNotFound) {
-@@ -2429,6 +2445,7 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+@@ -2501,6 +2517,7 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  				"job_id", job.WorkflowJobID)
  			if err := r.addRunnerToPool(pool, jobLabels); err != nil {
  				if errors.Is(err, runnerErrors.ErrNoCapacity) {
@@ -64,7 +64,7 @@ index 4068c9f..ba1ed17 100644
  					slog.With(slog.Any("error", err)).InfoContext(
  						r.ctx, "could not add runner to pool",
  						"pool_id", pool.ID)
-@@ -2640,3 +2657,22 @@ func (r *basePoolManager) GetWebhookInfo(ctx context.Context) (params.HookInfo,
+@@ -2718,3 +2735,22 @@ func (r *basePoolManager) GetWebhookInfo(ctx context.Context) (params.HookInfo,
  func (r *basePoolManager) RootCABundle() (params.CertificateBundle, error) {
  	return r.entity.Credentials.RootCertificateBundle()
  }
@@ -88,10 +88,10 @@ index 4068c9f..ba1ed17 100644
 +	return true
 +}
 diff --git a/runner/pool/pool_test.go b/runner/pool/pool_test.go
-index 138483d..b576e19 100644
+index 2fe1c81a..0edc929b 100644
 --- a/runner/pool/pool_test.go
 +++ b/runner/pool/pool_test.go
-@@ -906,3 +906,96 @@ func mustParseUUID(s string) uuid.UUID {
+@@ -907,3 +907,96 @@ func mustParseUUID(s string) uuid.UUID {
  func TestPoolStressTestSuite(t *testing.T) {
  	suite.Run(t, new(PoolStressTestSuite))
  }

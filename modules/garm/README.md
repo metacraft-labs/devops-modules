@@ -702,14 +702,13 @@ The `garm-provider-vmharness` provider is correct: `ListInstances`/`List` return
 `listFiltered` and `internal/provider/provider.go` `ListInstances`), and
 `DeleteInstance` treats absence as success (idempotent).
 
-The GARM package in this repo carries the one-line fix:
-`packages/garm/default.nix` applies
-`packages/garm/patches/fix-listinstances-inverted-error-check.patch`, and the
-upstream submission material lives in
-`upstream-patches/garm-listinstances-inverted-error-check/`. Upstream fixed the
-bug independently in cloudbase/garm 488cf98b (2026-09-11), so that bundle is
-retired; the local patch stays until our pin moves past 488cf98b. Operators who
-still see the message are running an unpatched GARM.
+Upstream fixed the bug independently in cloudbase/garm 488cf98b (2026-09-11).
+The GARM package in this repo carried a one-line local patch for it until its
+pin moved to 33ec0921, which includes 488cf98b; the patch is gone and the
+upstream submission material in
+`upstream-patches/garm-listinstances-inverted-error-check/` is kept, retired,
+as the record. Operators who still see the message are running a GARM older
+than 488cf98b.
 
 ---
 

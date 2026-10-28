@@ -79,7 +79,7 @@ func (s *JobCacheSelfHealSuite) SetupTest() {
 	cache.SetEntity(s.entity)
 	cache.SetEntityPool(s.entity.ID, s.pool)
 
-	controllerInfo, err := db.InitController()
+	controllerInfo, err := db.InitController(context.Background())
 	s.Require().NoError(err)
 	controllerInfo.MinimumJobAgeBackoff = 0
 
@@ -100,6 +100,7 @@ func (s *JobCacheSelfHealSuite) SetupTest() {
 		controllerInfo:   controllerInfo,
 		providers:        map[string]common.Provider{"test-provider": provider},
 		jobs:             make(map[int64]params.Job),
+		jobTombstones:    make(map[int64]time.Time),
 		checkedJobs:      make(map[int64]time.Time),
 		quit:             make(chan struct{}),
 		consumer:         &garmTesting.MockConsumer{},

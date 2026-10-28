@@ -13,10 +13,10 @@ index a41e034d..98760778 100644
 +	Busy bool `json:"busy,omitempty"`
  }
 diff --git a/runner/pool/pool.go b/runner/pool/pool.go
-index 5e1b2654..e2988f8d 100644
+index a7e56c6c..3d71cc4f 100644
 --- a/runner/pool/pool.go
 +++ b/runner/pool/pool.go
-@@ -640,7 +640,23 @@ func (r *basePoolManager) cleanupOrphanedProviderRunners(runners []forgeRunner)
+@@ -751,7 +751,23 @@ func (r *basePoolManager) cleanupOrphanedProviderRunners(runners []forgeRunner)
  			}
  		}
  
@@ -41,7 +41,7 @@ index 5e1b2654..e2988f8d 100644
  			// Set pending_delete on DB field. Allow consolidate() to remove it.
  			// We set force to true here. If we're recovering after a restart, the instance lock
  			// we attempt to acquire above, will succed. If it does and we get here, we need to
-@@ -676,6 +692,7 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+@@ -787,6 +803,7 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
  		runnersByName[run.Name] = run
  	}
  
@@ -49,7 +49,7 @@ index 5e1b2654..e2988f8d 100644
  	for _, instance := range dbInstances {
  		if instance.ScaleSetID != 0 {
  			// ignore scale set instances.
-@@ -707,18 +724,42 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+@@ -818,19 +835,43 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
  		//   * The runner managed to join github, but the setup process failed later and the runner
  		//     never started on the instance.
  		//   * A JIT config was created, but the runner never joined github.
@@ -86,6 +86,7 @@ index 5e1b2654..e2988f8d 100644
 +				reapErrs = append(reapErrs, fmt.Errorf("runner %s: %w", instance.Name, err))
 +				continue
  			}
+ 			r.recordLifecycleEvent(pool, metrics.OutcomeBootstrapTimeout)
  		}
  	}
 +	if len(reapErrs) > 0 {
@@ -94,7 +95,7 @@ index 5e1b2654..e2988f8d 100644
  	return nil
  }
  
-@@ -748,6 +789,15 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
+@@ -860,6 +901,15 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
  			// Runner is online. Ignore it.
  			continue
  		}
@@ -110,7 +111,7 @@ index 5e1b2654..e2988f8d 100644
  
  		dbInstance, err := r.store.GetInstance(r.ctx, runner.Name)
  		if err != nil {
-@@ -1911,15 +1961,18 @@ func (r *basePoolManager) runnerCleanup() (err error) {
+@@ -2025,15 +2075,18 @@ func (r *basePoolManager) runnerCleanup() (err error) {
  		return fmt.Errorf("failed to fetch github runners: %w", err)
  	}
  
@@ -133,10 +134,10 @@ index 5e1b2654..e2988f8d 100644
  
  func (r *basePoolManager) cleanupOrphanedRunners(runners []forgeRunner) error {
 diff --git a/runner/pool/util.go b/runner/pool/util.go
-index 1942933e..5aaa41d5 100644
+index aaa0541e..6caeccb9 100644
 --- a/runner/pool/util.go
 +++ b/runner/pool/util.go
-@@ -267,6 +267,7 @@ func (r *basePoolManager) listRunnersWithPagination() ([]forgeRunner, error) {
+@@ -309,6 +309,7 @@ func (r *basePoolManager) listRunnersWithPagination() ([]forgeRunner, error) {
  			ID:     val.GetID(),
  			Name:   val.GetName(),
  			Status: val.GetStatus(),
@@ -144,7 +145,7 @@ index 1942933e..5aaa41d5 100644
  			Labels: make([]RunnerLabels, len(val.Labels)),
  		}
  		for labelIdx, label := range val.Labels {
-@@ -301,6 +302,7 @@ func (r *basePoolManager) listRunnersWithScaleSetAPI() ([]forgeRunner, error) {
+@@ -343,6 +344,7 @@ func (r *basePoolManager) listRunnersWithScaleSetAPI() ([]forgeRunner, error) {
  			Name:   runner.Name,
  			ID:     runner.ID,
  			Status: string(runner.GetStatus()),

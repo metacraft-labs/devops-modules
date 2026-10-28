@@ -18,6 +18,7 @@ let
             "http://garm.example.test/api/v1/metadata",
             "http://garm.example.test/api/v1/callbacks/status",
             "instance-token",
+            commonParams.ProxyConfig{},
         )
         if err != nil {
             t.Fatalf("RenderRunnerInstallWrapper(macos) returned error: %v", err)

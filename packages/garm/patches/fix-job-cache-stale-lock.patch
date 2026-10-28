@@ -1,8 +1,8 @@
 diff --git a/runner/pool/pool.go b/runner/pool/pool.go
-index 556aee5..5e1b265 100644
+index dbb6138d..a7e56c6c 100644
 --- a/runner/pool/pool.go
 +++ b/runner/pool/pool.go
-@@ -2278,6 +2278,13 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+@@ -2337,6 +2337,13 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  			// was spawned. Unlock it and try again. A different job may have picked up
  			// the runner.
  			if err := r.store.UnlockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
@@ -16,7 +16,7 @@ index 556aee5..5e1b265 100644
  				// nolint:golangci-lint,godox
  				// TODO: Implament a cache? Should we return here?
  				slog.With(slog.Any("error", err)).ErrorContext(
-@@ -2285,6 +2292,16 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+@@ -2344,6 +2351,16 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  					"job_id", job.WorkflowJobID)
  				continue
  			}
@@ -33,7 +33,7 @@ index 556aee5..5e1b265 100644
  		}
  
  		if job.LockedBy.String() == r.ID() {
-@@ -2317,11 +2334,19 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+@@ -2389,11 +2406,19 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  
  		runnerCreated := false
  		if err := r.store.LockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
@@ -53,7 +53,7 @@ index 556aee5..5e1b265 100644
  
  		jobLabels := []string{
  			fmt.Sprintf("%s=%d", jobLabelPrefix, job.WorkflowJobID),
-@@ -2363,11 +2388,24 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+@@ -2436,11 +2461,24 @@ func (r *basePoolManager) consumeQueuedJobs() error {
  				r.ctx, "could not create a runner for job; unlocking",
  				"job_id", job.WorkflowJobID)
  			if err := r.store.UnlockJob(r.ctx, job.WorkflowJobID, r.ID()); err != nil {
@@ -77,12 +77,12 @@ index 556aee5..5e1b265 100644
 +			r.refreshCachedJob(job)
  		}
  	}
- 	return nil
+ 	if addedRunners > 0 {
 diff --git a/runner/pool/pool_test.go b/runner/pool/pool_test.go
-index 08a1365..138483d 100644
+index cb90b285..2fe1c81a 100644
 --- a/runner/pool/pool_test.go
 +++ b/runner/pool/pool_test.go
-@@ -790,6 +790,111 @@ func (s *PoolStressTestSuite) TestPersistJobToDB_AllowsForwardTransitions() {
+@@ -791,6 +791,111 @@ func (s *PoolStressTestSuite) TestPersistJobToDB_AllowsForwardTransitions() {
  	}
  }
  
@@ -195,7 +195,7 @@ index 08a1365..138483d 100644
  	u, err := uuid.Parse(s)
  	if err != nil {
 diff --git a/runner/pool/util.go b/runner/pool/util.go
-index eef79a6..1942933 100644
+index 6ed5d0ac..aaa0541e 100644
 --- a/runner/pool/util.go
 +++ b/runner/pool/util.go
 @@ -16,6 +16,7 @@ package pool
@@ -206,8 +206,8 @@ index eef79a6..1942933 100644
  	"fmt"
  	"log/slog"
  	"net/http"
-@@ -109,6 +110,49 @@ func (r *basePoolManager) getQueuedJobs() []params.Job {
- 	return ret
+@@ -147,6 +148,53 @@ func (r *basePoolManager) poolShadowedByScaleSet(pool params.Pool, labels []stri
+ 	return false
  }
  
 +// refreshCachedJob re-reads a job this manager has just written to (locked or
@@ -237,8 +237,11 @@ index eef79a6..1942933 100644
 +	if _, ok := r.jobs[fresh.ID]; !ok {
 +		return
 +	}
++	if r.jobUpdateIsStale(fresh) {
++		return
++	}
 +	if params.JobStatus(fresh.Status) == params.JobStatusCompleted {
-+		delete(r.jobs, fresh.ID)
++		r.retireJob(fresh)
 +		return
 +	}
 +	r.jobs[fresh.ID] = fresh
@@ -251,6 +254,7 @@ index eef79a6..1942933 100644
 +	defer r.mux.Unlock()
 +
 +	delete(r.jobs, id)
++	r.jobTombstones[id] = time.Now()
 +}
 +
  func (r *basePoolManager) waitForToolsOrCancel() (hasTools, stopped bool) {
