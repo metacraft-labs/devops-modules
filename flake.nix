@@ -46,11 +46,12 @@
     # built against.
     #
     # `codetracer` is a documented exception — it consumes the prebuilt package
-    # and overrides six of reprobuild's inputs to get a `repro` built with
-    # `ct_interpose`, which a bare `follows` cannot express, so it mirrors this
-    # SHA by hand. Bumping is therefore a two-file edit: here first, then
-    # codetracer's `flake.nix`. Do not "tidy" that input into a `follows`.
-    # See metacraft-specs/how-to-distribute-new-reprobuild-versions-internally.md.
+    # and overrides reprobuild's inputs to get a `repro` built with
+    # `ct_interpose`, which a bare `follows` cannot express. It independently
+    # tracks published `agents`; when rolling out a fix here, verify that its
+    # locked revision already carries the fix. Do not "tidy" that input into a
+    # `follows`.
+    # See metacraft-pm/how-to-distribute-new-reprobuild-versions-internally.md.
     # Before bumping, check the candidate against a real workspace — it must
     # still parse the current manifests (`repro workspace status`) and still
     # satisfy the installed managed-hook contract
@@ -66,7 +67,7 @@
     # name a revision that carries reprobuild's `nix/modules/` directory — a pin
     # older than that makes `modules/` fail to evaluate, not merely ship a stale
     # `repro`.
-    reprobuild.url = "github:metacraft-labs/reprobuild/97075c5aa4faf559f240c5bbfe34a68391b89d53";
+    reprobuild.url = "github:metacraft-labs/reprobuild/bc474ec2976a220049a6f22c7211105ea24d093a";
 
     nixpkgs.follows = "nixos-2605";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
