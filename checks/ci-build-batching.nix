@@ -402,7 +402,7 @@
             # ---------------------------------------------------------------
             # Build-loop fixtures. This is the aggregate-failure proof.
             # ---------------------------------------------------------------
-            def run_batch(rows, failing, fallback_name="batch", fallback_attr=""):
+            def run_batch(rows, failing, fallback_name="batch", fallback_attr="", fallback_output=""):
                 temp = tempfile.mkdtemp()
                 temp_path = Path(temp)
                 attempts = temp_path / "attempts"
@@ -429,6 +429,8 @@
                     "BATCH_TSV": rows,
                     "BATCH_FALLBACK_NAME": fallback_name,
                     "BATCH_FALLBACK_ATTR": fallback_attr,
+                    "BATCH_FALLBACK_OUTPUT": fallback_output,
+                    "RUNNER_TEMP": str(temp_path),
                     "CI_MATRIX_BUILD_COMMAND": str(fake),
                     "GITHUB_STEP_SUMMARY": str(summary),
                 })
@@ -436,6 +438,11 @@
                     [bash_bin, str(script)], env=env, capture_output=True, text=True
                 )
                 attempted = [a for a in attempts.read_text().splitlines() if a]
+                built_file = temp_path / "ci-built-outputs.txt"
+                run_batch.built = (
+                    [b for b in built_file.read_text().splitlines() if b]
+                    if built_file.exists() else []
+                )
                 return proc, attempted, summary.read_text()
 
             def tsv(*names):
@@ -535,6 +542,43 @@
             check(
                 proc.returncode != 0 and "Empty build batch" in proc.stdout,
                 "a job that resolved no outputs must fail rather than report success",
+            )
+
+            # J. The check-cache push uploads exactly the outputs that built.
+            #    The planner carries each output path as a third TSV column.
+            rows3 = "\n".join(
+                n + "\t" + n + "\t/nix/store/" + n + "-out" for n in ("a", "b", "c")
+            )
+            proc, attempted, _ = run_batch(rows3, ["b"])
+            check(attempted == [".#a", ".#b", ".#c"], "the output column must not change what builds")
+            check(
+                run_batch.built == ["/nix/store/a-out", "/nix/store/c-out"],
+                "only passing outputs may be recorded for the cache push; got %r" % run_batch.built,
+            )
+            proc, attempted, _ = run_batch(
+                "", [], fallback_name="solo", fallback_attr="solo",
+                fallback_output="/nix/store/solo-out",
+            )
+            check(
+                run_batch.built == ["/nix/store/solo-out"],
+                "the unbatched path must record matrix.output for the cache push",
+            )
+            proc, attempted, _ = run_batch(tsv("a"), [])
+            check(
+                run_batch.built == [],
+                "two-column rows (no output path) must record nothing, not a bogus path",
+            )
+            planned = plan([package("p-%d" % n) for n in range(4)], {"aarch64-darwin": 2})
+            for entry in planned["include"]:
+                for row, member in zip(entry["batchTsv"].split("\n"), entry["batch"]):
+                    check(
+                        row.split("\t")[2] == member["output"] == "/nix/store/" + member["name"],
+                        "batch rows must carry each member's output path",
+                    )
+            check(
+                "push-check-caches:" in workflow
+                and "name: Push check outputs to the Attic cache" in workflow,
+                "the reusable workflow must expose the check-cache push",
             )
 
             if failures:

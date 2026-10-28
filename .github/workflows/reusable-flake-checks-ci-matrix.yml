@@ -92,6 +92,23 @@ on:
         default: false
         required: false
         type: 'boolean'
+      push-check-caches:
+        # Push the output of every SUCCESSFUL non-deployment build (checks,
+        # packages) to the Attic cache, so the next run finds it cached and
+        # does not build it again. Before this, only deployment closures were
+        # ever pushed, so an unchanged check such as infra's `rescue-netboot`
+        # (15 derivations, a VM test) was rebuilt from source on every PR.
+        #
+        # '' (the default) follows `push-deployment-caches`: a caller that
+        # publishes from its trusted branch publishes check results from it
+        # too, and a PR run pushes nothing, exactly as before. 'true' or
+        # 'false' overrides that. The push uses the same `ATTIC_TOKEN` push
+        # credential and Attic variables as the deployment push, and it never
+        # fails the job: a cache hiccup only costs a rebuild next time.
+        description: "Push successful non-deployment build outputs to Attic: '' = follow push-deployment-caches, 'true', or 'false'"
+        default: ''
+        required: false
+        type: string
       deployment-cache-push-backends:
         description: 'Comma-separated cache push backends for deployment closures: attic, none'
         default: 'attic'
@@ -319,6 +336,8 @@ jobs:
         env:
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
           SYSTEM_TO_GITHUB_RUNNER_LABELS: ${{ inputs.runners }}
+          # See the `Merge matrices` step.
+          MCL_REBUILD_CACHED_DEPLOYMENT_TARGETS: ${{ inputs.push-deployment-caches }}
           # Authenticate mcl-devops's cache-status (narinfo) probe to the private
           # Attic cache; scoped to the Attic host inside mcl-devops.
           ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
@@ -453,6 +472,18 @@ jobs:
       - name: Merge matrices
         if: needs.eval-matrix.result == 'success'
         id: merge
+        env:
+          # A deployment target that is ALREADY CACHED gets a build job only in
+          # a run that publishes deployment closures: that job pushes it and
+          # proves the closure substitutes. Anywhere else (PR checks) the job
+          # was pure download — every infra PR paid one KVM-runner job per
+          # machine to fetch closures it had just found in the cache. Dropping
+          # them keeps the PR gate's guarantee: every machine still EVALUATED
+          # in this run (eval-matrix), the cached ones are in the cache by the
+          # narinfo probe that marked them cached, and a CHANGED machine is
+          # uncached and so is built exactly as before. The full matrix (PR
+          # comment, Final Results) still lists every target.
+          MCL_REBUILD_CACHED_DEPLOYMENT_TARGETS: ${{ inputs.push-deployment-caches }}
         run: ${{ needs.compute-mcl-ref.outputs.mcl_flake_cmd }} merge-ci-matrices
 
       - name: Generate CI matrix comment
@@ -593,10 +624,18 @@ jobs:
               raise SystemExit("build-max-jobs must be a JSON object mapping system -> integer")
 
           def member(pkg):
-              return {"name": pkg.get("name", ""), "attrPath": pkg.get("attrPath", "")}
+              return {
+                  "name": pkg.get("name", ""),
+                  "attrPath": pkg.get("attrPath", ""),
+                  "output": pkg.get("output", ""),
+              }
 
+          # name, attribute, evaluated output path (third column: what the
+          # check-cache push uploads once that output has built).
           def row(pkg):
-              return "{}\t{}".format(pkg.get("name", ""), pkg.get("attrPath", ""))
+              return "{}\t{}\t{}".format(
+                  pkg.get("name", ""), pkg.get("attrPath", ""), pkg.get("output", "")
+              )
 
           def singleton(pkg):
               # Preserve the original entry verbatim and only ADD batch fields,
@@ -815,6 +854,7 @@ jobs:
           BATCH_TSV: ${{ matrix.batchTsv }}
           BATCH_FALLBACK_NAME: ${{ matrix.name }}
           BATCH_FALLBACK_ATTR: ${{ matrix.attrPath }}
+          BATCH_FALLBACK_OUTPUT: ${{ matrix.output }}
         run: |
           # DELIBERATELY NOT `set -e`. A batch must attempt EVERY output even
           # after one fails; stopping at the first failure would report a
@@ -827,8 +867,12 @@ jobs:
 
           rows="$BATCH_TSV"
           if [[ -z "${rows//[[:space:]]/}" ]]; then
-            printf -v rows '%s\t%s' "$BATCH_FALLBACK_NAME" "$BATCH_FALLBACK_ATTR"
+            printf -v rows '%s\t%s\t%s' "$BATCH_FALLBACK_NAME" "$BATCH_FALLBACK_ATTR" "$BATCH_FALLBACK_OUTPUT"
           fi
+
+          # Output paths that built successfully, for the check-cache push.
+          built_outputs="${RUNNER_TEMP:-/tmp}/ci-built-outputs.txt"
+          : > "$built_outputs"
 
           summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
           {
@@ -841,13 +885,16 @@ jobs:
           passed=0
           failed_names=()
 
-          while IFS=$'\t' read -r out_name out_attr || [[ -n "${out_name:-}" ]]; do
+          while IFS=$'\t' read -r out_name out_attr out_path || [[ -n "${out_name:-}" ]]; do
             [[ -n "${out_attr:-}" ]] || continue
             total=$((total + 1))
             echo "::group::Build $out_name (.#$out_attr)"
             if "${build_cmd[@]}" ".#$out_attr"; then
               result='✅ pass'
               passed=$((passed + 1))
+              if [[ "${out_path:-}" == /nix/store/* ]]; then
+                printf '%s\n' "$out_path" >> "$built_outputs"
+              fi
             else
               result='❌ FAIL'
               failed_names+=("$out_name")
@@ -873,6 +920,82 @@ jobs:
               echo "::error title=Flake output build failed::$out_name"
             done
             exit 1
+          fi
+
+      # Check results: see the `push-check-caches` input. Deployment targets
+      # are excluded here because their own push step below uploads them with
+      # a closure-substitutability proof. Runs after a partly failed batch too,
+      # so the outputs that did build are not rebuilt next time; only outputs
+      # the Build step recorded as passing are pushed. Never fails the job.
+      - name: Push check outputs to the Attic cache
+        if: >-
+          ${{
+            !cancelled() && !matrix.noop && !matrix.deploymentTarget &&
+            (inputs.push-check-caches == 'true' ||
+              (inputs.push-check-caches != 'false' && inputs.push-deployment-caches))
+          }}
+        continue-on-error: true
+        shell: bash
+        env:
+          ATTIC_CACHE: ${{ vars.ATTIC_CACHE }}
+          ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
+          ATTIC_ENDPOINT: ${{ vars.ATTIC_ENDPOINT }}
+          # The push credential, as for the deployment push. Never the pull
+          # token: a pull-scoped token cannot upload.
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          built_outputs="${RUNNER_TEMP:-/tmp}/ci-built-outputs.txt"
+          mapfile -t paths < <(sort -u "$built_outputs" 2>/dev/null | grep '^/nix/store/' || true)
+          if [[ "${#paths[@]}" -eq 0 ]]; then
+            echo "No successfully built outputs to push."
+            exit 0
+          fi
+
+          missing=()
+          for name in ATTIC_TOKEN ATTIC_CACHE ATTIC_SUBSTITUTER; do
+            [[ -n "${!name:-}" ]] || missing+=("$name")
+          done
+          if [[ "${#missing[@]}" -gt 0 ]]; then
+            echo "::warning title=Check cache push skipped::${missing[*]} not set; ${#paths[@]} output(s) will be rebuilt next run"
+            exit 0
+          fi
+
+          # `nix build --no-link` keeps no GC root; drop any path the store no
+          # longer holds rather than failing the whole push on it.
+          present=()
+          for path in "${paths[@]}"; do
+            [[ -e "$path" ]] && present+=("$path")
+          done
+          if [[ "${#present[@]}" -eq 0 ]]; then
+            echo "::warning title=Check cache push skipped::none of the ${#paths[@]} built output(s) is still in the store"
+            exit 0
+          fi
+
+          endpoint="${ATTIC_ENDPOINT:-}"
+          if [[ -z "$endpoint" ]]; then
+            endpoint="${ATTIC_SUBSTITUTER%"/$ATTIC_CACHE"}"
+          fi
+          endpoint="${endpoint%/}/"
+
+          attic=(nix shell --accept-flake-config nixpkgs#attic-client -c attic)
+          if ! "${attic[@]}" login --set-default ci-checks "$endpoint" "$ATTIC_TOKEN" >/dev/null; then
+            echo "::warning title=Check cache push failed::attic login failed; continuing"
+            exit 0
+          fi
+
+          printf 'Pushing %d check output(s) to %s:\n' "${#present[@]}" "$ATTIC_CACHE"
+          printf '  %s\n' "${present[@]}"
+          if timeout --kill-after=30s 900s "${attic[@]}" push "ci-checks:$ATTIC_CACHE" "${present[@]}"; then
+            # The backticks are literal markdown code spans.
+            # shellcheck disable=SC2016
+            {
+              printf '### Check cache push\n\n'
+              printf 'Pushed %d output(s) to `%s`.\n' "${#present[@]}" "$ATTIC_CACHE"
+            } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          else
+            echo "::warning title=Check cache push failed::attic push exited $?; the outputs will be rebuilt next run"
           fi
 
       # Cache push runs only when the caller requests deployment cache

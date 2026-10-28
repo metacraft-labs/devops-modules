@@ -176,9 +176,18 @@ version (unittest)
     }
 }
 
-bool shouldIncludeInBuildMatrix(in Package pkg)
+/// Whether a flake output gets a build job.
+///
+/// Uncached outputs always do. A deployment target that is already cached is
+/// rebuilt only when `rebuildCachedDeploymentTargets` is set: the run that
+/// publishes deployment closures needs a job per target to push it and prove
+/// the closure substitutes. A run that publishes nothing (PR checks) gains
+/// nothing from it: the target already evaluated in this run, and its
+/// toplevel is in the cache, so the job would only download the closure.
+/// The default keeps the previous behaviour for callers that do not say.
+bool shouldIncludeInBuildMatrix(in Package pkg, bool rebuildCachedDeploymentTargets = true)
 {
-    return pkg.cachedAt.empty || pkg.deploymentTarget;
+    return pkg.cachedAt.empty || (rebuildCachedDeploymentTargets && pkg.deploymentTarget);
 }
 
 bool isCachedPackageJson(JSONValue pkg)
@@ -203,9 +212,74 @@ bool isDeploymentTargetPackageJson(JSONValue pkg)
     return false;
 }
 
-bool shouldIncludeInBuildMatrix(JSONValue pkg)
+bool shouldIncludeInBuildMatrix(JSONValue pkg, bool rebuildCachedDeploymentTargets = true)
 {
-    return !isCachedPackageJson(pkg) || isDeploymentTargetPackageJson(pkg);
+    return !isCachedPackageJson(pkg)
+        || (rebuildCachedDeploymentTargets && isDeploymentTargetPackageJson(pkg));
+}
+
+/// Environment switch for `shouldIncludeInBuildMatrix`. The reusable
+/// flake-checks workflow sets it to its `push-deployment-caches` input. Only
+/// an explicit `false` drops cached deployment targets; unset or anything
+/// else keeps them.
+enum rebuildCachedDeploymentTargetsEnv = "MCL_REBUILD_CACHED_DEPLOYMENT_TARGETS";
+
+bool parseRebuildCachedDeploymentTargets(string value)
+{
+    import std.uni : toLower;
+
+    return value.strip.toLower != "false";
+}
+
+bool rebuildCachedDeploymentTargetsFromEnv()
+{
+    import std.process : environment;
+
+    return environment.get(rebuildCachedDeploymentTargetsEnv, "true")
+        .parseRebuildCachedDeploymentTargets;
+}
+
+@("cached deployment targets are dropped only when not publishing")
+unittest
+{
+    auto cachedDeploymentTarget = Package(
+        name: "cached-deployment-target",
+        cachedAt: ["https://cache.example/cached-deployment-target.narinfo"],
+        deploymentTarget: true,
+    );
+    auto uncachedDeploymentTarget = Package(
+        name: "uncached-deployment-target",
+        deploymentTarget: true,
+    );
+    auto cachedPackage = Package(
+        name: "cached-package",
+        cachedAt: ["https://cache.example/cached-package.narinfo"],
+    );
+
+    assert(cachedDeploymentTarget.shouldIncludeInBuildMatrix(true));
+    assert(!cachedDeploymentTarget.shouldIncludeInBuildMatrix(false));
+    // A changed (uncached) machine is always built, publishing or not.
+    assert(uncachedDeploymentTarget.shouldIncludeInBuildMatrix(false));
+    assert(!cachedPackage.shouldIncludeInBuildMatrix(false));
+
+    auto json = JSONValue([
+        "cachedAt": JSONValue([JSONValue("https://cache.example/x.narinfo")]),
+        "deploymentTarget": JSONValue(true),
+    ]);
+    assert(json.shouldIncludeInBuildMatrix(true));
+    assert(!json.shouldIncludeInBuildMatrix(false));
+}
+
+@("parseRebuildCachedDeploymentTargets")
+unittest
+{
+    // Only an explicit false drops cached targets; the workflow passes the
+    // boolean input as `true` / `false`.
+    assert(parseRebuildCachedDeploymentTargets("true"));
+    assert(parseRebuildCachedDeploymentTargets(""));
+    assert(parseRebuildCachedDeploymentTargets("yes"));
+    assert(!parseRebuildCachedDeploymentTargets("false"));
+    assert(!parseRebuildCachedDeploymentTargets(" False "));
 }
 
 @("build matrix includes cached deployment targets")
@@ -372,6 +446,55 @@ unittest
     assert(output.githubOutputValue("full_matrix").matrixPackageNames == [
         "cached-package",
         "cached-deployment-target",
+        "uncached-package",
+    ]);
+}
+
+@("merge ci matrices drops cached deployment targets when not publishing")
+unittest
+{
+    import std.file : deleteme, exists, mkdirRecurse, readText, rmdirRecurse, write;
+
+    auto testDir = deleteme ~ ".merge-ci-matrices-no-publish";
+    if (testDir.exists)
+        testDir.rmdirRecurse;
+    scope(exit)
+        if (testDir.exists)
+            testDir.rmdirRecurse;
+
+    testDir.buildPath("shard-a").mkdirRecurse;
+    testDir.buildPath("shard-a", "matrix-pre.json").write(JSONValue([
+        "include": JSONValue([
+            JSONValue([
+                "name": JSONValue("cached-deployment-target"),
+                "cachedAt": JSONValue([JSONValue("https://cache.example/cached-deployment-target.narinfo")]),
+                "deploymentTarget": JSONValue(true),
+            ]),
+            JSONValue([
+                "name": JSONValue("changed-deployment-target"),
+                "cachedAt": JSONValue(cast(JSONValue[]) []),
+                "deploymentTarget": JSONValue(true),
+            ]),
+            JSONValue([
+                "name": JSONValue("uncached-package"),
+                "cachedAt": JSONValue(cast(JSONValue[]) []),
+                "deploymentTarget": JSONValue(false),
+            ]),
+        ]),
+    ]).toString(JSONOptions.doNotEscapeSlashes));
+
+    auto outputPath = testDir.buildPath("gh-output.env");
+    assert(mergeCiMatrices(MergeMatricesArgs(githubOutput: outputPath), testDir, false) == 0);
+
+    const output = outputPath.readText;
+    assert(output.githubOutputValue("build_matrix").matrixPackageNames == [
+        "changed-deployment-target",
+        "uncached-package",
+    ]);
+    // The cached target is still reported (comment table, Final Results).
+    assert(output.githubOutputValue("full_matrix").matrixPackageNames == [
+        "cached-deployment-target",
+        "changed-deployment-target",
         "uncached-package",
     ]);
 }
@@ -1387,10 +1510,13 @@ void printTableForCacheStatus(T)(Package[] packages, auto ref T args)
     appendGHCIBuildOutput(packages, outputPath);
 }
 
-void appendGHCIBuildOutput(Package[] packages, string outputPath)
+void appendGHCIBuildOutput(Package[] packages, string outputPath,
+    bool rebuildCachedDeploymentTargets = rebuildCachedDeploymentTargetsFromEnv)
 {
     const buildMatrixLine = "build_matrix=" ~ JSONValue([
-        "include": JSONValue(packages.filter!shouldIncludeInBuildMatrix.map!toJSON.array)
+        "include": JSONValue(packages
+            .filter!(pkg => pkg.shouldIncludeInBuildMatrix(rebuildCachedDeploymentTargets))
+            .map!toJSON.array)
     ]).toString(JSONOptions.doNotEscapeSlashes) ~ "\n";
 
     const fullMatrixLine = "full_matrix=" ~ JSONValue([
@@ -1589,7 +1715,8 @@ export int merge_ci_matrices(MergeMatricesArgs args)
     return mergeCiMatrices(args);
 }
 
-int mergeCiMatrices(MergeMatricesArgs args, string searchRoot = ".")
+int mergeCiMatrices(MergeMatricesArgs args, string searchRoot = ".",
+    bool rebuildCachedDeploymentTargets = rebuildCachedDeploymentTargetsFromEnv)
 {
     import std.algorithm : sort;
     import std.file : isFile;
@@ -1607,6 +1734,7 @@ int mergeCiMatrices(MergeMatricesArgs args, string searchRoot = ".")
 
     JSONValue[] filteredInclude;
     JSONValue[] fullInclude;
+    infof("%s=%s", rebuildCachedDeploymentTargetsEnv, rebuildCachedDeploymentTargets);
 
     foreach (entry; matrixFiles)
     {
@@ -1622,7 +1750,8 @@ int mergeCiMatrices(MergeMatricesArgs args, string searchRoot = ".")
         foreach (pkg; json["include"].array)
         {
             fullInclude ~= pkg;
-            if (pkg.type == JSONType.object && pkg.shouldIncludeInBuildMatrix)
+            if (pkg.type == JSONType.object
+                && pkg.shouldIncludeInBuildMatrix(rebuildCachedDeploymentTargets))
                 filteredInclude ~= pkg;
         }
     }
