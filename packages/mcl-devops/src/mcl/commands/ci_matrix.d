@@ -22,7 +22,7 @@ import argparse : Command, Description, NamedArgument, Placeholder, EnvFallback;
 import mcl.utils.string : enumToString, enumFromString, StringRepresentation, MaxWidth, writeRecordAsTable;
 import mcl.utils.json : toJSON, fromJSON;
 import mcl.utils.path : rootDir, resultDir, gcRootsDir, createResultDirs;
-import mcl.utils.process : execute;
+import mcl.utils.process : execute, forEachStdoutLineDrainingStderr;
 import mcl.utils.nix : nix;
 
 import mcl.commands.ci: CiArgs;
@@ -974,13 +974,16 @@ Package[] nixEvalJobs(T)(string flakeAttrPath, auto ref T args)
         errorf("Command `%s` failed with error:\n---\n%s\n---", commandString, msg);
     }
 
-    const errorsReported = pipes.stdout.byLine.fold!((errorsReported, line) {
+    // Drain stderr while streaming stdout: see forEachStdoutLineDrainingStderr.
+    bool errorsReported = false;
+    const stderrLines = forEachStdoutLineDrainingStderr(pipes, (line) {
         auto json = parseJSON(line);
 
         if (auto err = "error" in json)
         {
             logError((*err).str);
-            return true;
+            errorsReported = true;
+            return;
         }
 
         Package pkg = json.packageFromNixEvalJobsJson(
@@ -992,11 +995,9 @@ Package[] nixEvalJobs(T)(string flakeAttrPath, auto ref T args)
         pkg = checkCacheStatus([pkg], args)[0];
 
         result ~= pkg;
+    });
 
-        return errorsReported;
-    })(false);
-
-    const stderrLogs = pipes.stderr.byLine
+    const stderrLogs = stderrLines
         .filter!(line => !uselessWarnings.any!(w => line.canFind(w)))
         .join("\n");
 

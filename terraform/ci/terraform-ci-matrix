@@ -68,6 +68,18 @@ while IFS= read -r root; do
     and (.state_sensitivity | IN("standard", "sensitive"))
     and (.credential_mode | IN("aws-oidc", "agenix-token", "github-app", "none"))
     and (.credential_mode != "github-app" or (.github_app_owner | nonempty_string))
+    # A github-app root may name an extra env var for the minted token; it must
+    # be a plain shell identifier (it is written to GITHUB_ENV) and cannot be
+    # combined with agenix secret paths (one credential source per root).
+    and (
+      .credential_mode != "github-app"
+      or (
+        ((has("credentials_env_name") | not)
+          or (.credentials_env_name | type == "string" and test("^[A-Za-z_][A-Za-z0-9_]*$")))
+        and (has("agenix_plan_secret_path") | not)
+        and (has("agenix_apply_secret_path") | not)
+      )
+    )
     and (
       (has("backend_uses_aws_oidc") | not)
       or (.backend_uses_aws_oidc | type == "boolean")
@@ -123,6 +135,12 @@ while IFS= read -r root; do
         credentials_env_name=""; agenix_plan_secret_path=""; agenix_apply_secret_path=""
         provider_credentials_ready=false
       fi ;;
+    github-app)
+      # Optional: ALSO export the minted installation token under this name, for
+      # a provider that takes its token from a Terraform variable rather than
+      # GITHUB_TOKEN (e.g. TF_VAR_github_billing_token for the magodo/restful
+      # budgets engine). Empty = GITHUB_TOKEN only.
+      credentials_env_name="$(jq -r '.credentials_env_name // ""' "$metadata_file")" ;;
     none) : ;;
   esac
 

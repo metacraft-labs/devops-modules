@@ -32,6 +32,21 @@ Each subdirectory is named `<project>-<short-description>` and contains:
 7. After review, run `open-pr.sh` to open the PR, then note the PR URL in
    `PR.md`.
 
+## Shared tooling
+
+The process is documented for all Metacraft repositories in
+metacraft-dev-guidelines `policies/preparing-prs-for-internal-review.md`. Its
+tool is `scripts/submit-prepared-pr`. A bundle describes itself in a
+`bundle.toml` manifest (upstream repo, pinned `base_sha`, fork, branch,
+title, body, patches, forbidden identifiers). The tool dry-runs by default,
+`--verify --against-head` checks the patches against the pinned base and the
+current upstream head, and `--submit` refuses until a reviewer's
+`--approve` (a content digest in `REVIEW-APPROVED`) matches the bundle.
+
+`garm-busy-runner-reap/` is converted: its `open-pr.sh` is a thin wrapper
+around the shared tool. The other bundles still carry their own `open-pr.sh`.
+Those scripts submit as soon as they run, so run them only after the review.
+
 ## Relationship to the local patch
 
 The local Nix patch and the upstream `fix.patch` should be the same change.

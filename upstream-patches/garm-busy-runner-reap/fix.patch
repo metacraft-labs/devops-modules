@@ -1,4 +1,4 @@
-From aea09525db15e8f2edfb02e82830dd26f8937613 Mon Sep 17 00:00:00 2001
+From 30afae193e5b4e3d3f2f5a28e6e3baac77d14dd8 Mon Sep 17 00:00:00 2001
 From: Zahary Karadjov <zaharyk@gmail.com>
 Date: Tue, 29 Sep 2026 15:02:41 +0300
 Subject: [PATCH] Never reap a runner the forge reports busy
@@ -57,7 +57,7 @@ Signed-off-by: Zahary Karadjov <zaharyk@gmail.com>
 
 diff --git a/runner/pool/busy_runner_reap_test.go b/runner/pool/busy_runner_reap_test.go
 new file mode 100644
-index 00000000..069439c5
+index 00000000..911754b2
 --- /dev/null
 +++ b/runner/pool/busy_runner_reap_test.go
 @@ -0,0 +1,288 @@
@@ -169,7 +169,7 @@ index 00000000..069439c5
 +	cache.SetEntity(entity)
 +	cache.SetEntityPool(entity.ID, s.pool)
 +
-+	controllerInfo, err := db.InitController()
++	controllerInfo, err := db.InitController(context.Background())
 +	s.Require().NoError(err)
 +	backoff, err := locking.NewInstanceDeleteBackoff(context.Background())
 +	s.Require().NoError(err)
@@ -364,10 +364,10 @@ index a41e034d..98760778 100644
 +	Busy bool `json:"busy,omitempty"`
  }
 diff --git a/runner/pool/pool.go b/runner/pool/pool.go
-index c02d17b9..4f430e7f 100644
+index 507e050b..86c8d05b 100644
 --- a/runner/pool/pool.go
 +++ b/runner/pool/pool.go
-@@ -716,7 +716,23 @@ func (r *basePoolManager) cleanupOrphanedProviderRunners(runners []forgeRunner)
+@@ -751,7 +751,23 @@ func (r *basePoolManager) cleanupOrphanedProviderRunners(runners []forgeRunner)
  			}
  		}
  
@@ -392,7 +392,7 @@ index c02d17b9..4f430e7f 100644
  			// Set pending_delete on DB field. Allow consolidate() to remove it.
  			// We set force to true here. If we're recovering after a restart, the instance lock
  			// we attempt to acquire above, will succed. If it does and we get here, we need to
-@@ -752,6 +768,7 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+@@ -787,6 +803,7 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
  		runnersByName[run.Name] = run
  	}
  
@@ -400,7 +400,7 @@ index c02d17b9..4f430e7f 100644
  	for _, instance := range dbInstances {
  		if instance.ScaleSetID != 0 {
  			// ignore scale set instances.
-@@ -783,19 +800,43 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+@@ -818,19 +835,43 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
  		//   * The runner managed to join github, but the setup process failed later and the runner
  		//     never started on the instance.
  		//   * A JIT config was created, but the runner never joined github.
@@ -446,7 +446,7 @@ index c02d17b9..4f430e7f 100644
  	return nil
  }
  
-@@ -820,6 +861,15 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
+@@ -855,6 +896,15 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
  			// Runner is online. Ignore it.
  			continue
  		}
@@ -462,7 +462,7 @@ index c02d17b9..4f430e7f 100644
  
  		dbInstance, err := r.store.GetInstance(r.ctx, runner.Name)
  		if err != nil {
-@@ -1904,15 +1954,18 @@ func (r *basePoolManager) runnerCleanup() (err error) {
+@@ -1939,15 +1989,18 @@ func (r *basePoolManager) runnerCleanup() (err error) {
  		return fmt.Errorf("failed to fetch github runners: %w", err)
  	}
  
@@ -485,10 +485,10 @@ index c02d17b9..4f430e7f 100644
  
  func (r *basePoolManager) cleanupOrphanedRunners(runners []forgeRunner) error {
 diff --git a/runner/pool/util.go b/runner/pool/util.go
-index eef79a6c..6fe5e7bd 100644
+index 6ed5d0ac..9be65a70 100644
 --- a/runner/pool/util.go
 +++ b/runner/pool/util.go
-@@ -223,6 +223,7 @@ func (r *basePoolManager) listRunnersWithPagination() ([]forgeRunner, error) {
+@@ -261,6 +261,7 @@ func (r *basePoolManager) listRunnersWithPagination() ([]forgeRunner, error) {
  			ID:     val.GetID(),
  			Name:   val.GetName(),
  			Status: val.GetStatus(),
@@ -496,7 +496,7 @@ index eef79a6c..6fe5e7bd 100644
  			Labels: make([]RunnerLabels, len(val.Labels)),
  		}
  		for labelIdx, label := range val.Labels {
-@@ -257,6 +258,7 @@ func (r *basePoolManager) listRunnersWithScaleSetAPI() ([]forgeRunner, error) {
+@@ -295,6 +296,7 @@ func (r *basePoolManager) listRunnersWithScaleSetAPI() ([]forgeRunner, error) {
  			Name:   runner.Name,
  			ID:     runner.ID,
  			Status: string(runner.GetStatus()),

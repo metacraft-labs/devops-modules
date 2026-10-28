@@ -2,9 +2,9 @@
 #
 # Resolve `runs-on` for a downstream job from the org/repo Actions variable
 # `CI_RUNNER_MODE` and repo visibility, so flipping ONE variable reroutes CI
-# across the fleet with NO per-repo edit. Public repos default to free
-# GitHub-hosted; internal/private repos ride included minutes then flip to the
-# self-hosted RC4 capability-label array. See
+# across the fleet with NO per-repo edit. Public repos always use free
+# GitHub-hosted runners; CI_RUNNER_MODE routes internal/private repos (today:
+# the self-hosted RC4 capability-label array). See
 # metacraft-dev-guidelines/policies/ci-workflow-standards.md ("The CI_RUNNER_MODE
 # runner-mode switch") and reprobuild-specs/Sovereign-CI-Fleet.md
 # ("The runner-mode switch") for the normative design.
@@ -17,17 +17,25 @@
 # job must decide `runs-on` before any downstream job dispatches. The decision
 # is driven, highest-priority first, by:
 #
-#   0. the org/repo variable `CI_RUNNER_MODE ∈ {github-hosted, self-hosted}` —
-#      the S1 runner-mode switch. When set it is AUTHORITATIVE:
-#        * `github-hosted` -> the `preferred` hosted runner (public: free;
-#          internal/private: rides included minutes until the S2 managing service
-#          flips this to `self-hosted` near exhaustion).
+#   0. repo visibility — a PUBLIC repo ALWAYS gets the free hosted runner,
+#      whatever CI_RUNNER_MODE says. Standard GitHub-hosted runners are free and
+#      unlimited for public repositories, so there is nothing to save by moving
+#      them, and the switch only ever governs billable (private/internal)
+#      minutes. Operator decision S2-D1 (2026-10-27): public repos stay on
+#      GitHub-hosted. A public job that needs a self-hosted capability names its
+#      RC4 label array directly instead of calling this workflow.
+#   1. the org/repo variable `CI_RUNNER_MODE ∈ {github-hosted, self-hosted}` —
+#      the S1 runner-mode switch, for PRIVATE/INTERNAL repos. When set it is
+#      AUTHORITATIVE for them:
+#        * `github-hosted` -> the `preferred` hosted runner (rides included
+#          minutes). The S2 managing service never writes this value while its
+#          self-hosted hold is on (the default), so it appears only when an
+#          operator lifts the hold or sets it by hand.
 #        * `self-hosted`   -> the `fallback` RC4 capability-label array.
 #        * any other non-empty value is treated as an ERROR and FAILS SAFE to
 #          self-hosted (never a billable mode under the $0 budget cap).
 #      An UNSET `CI_RUNNER_MODE` falls through to the RD3 signals below, which
 #      themselves fail safe to self-hosted.
-#   1. repo visibility  — a PUBLIC repo always gets free hosted runners.
 #   2. the org variable `GH_HOSTED_OK` — written every ~30-60 min by the
 #      companion cron (`reusable-sync-hosted-minutes.yml`) from the org's
 #      remaining included minutes. "true" -> hosted, "false" -> self-hosted.
@@ -139,34 +147,36 @@ jobs:
             printf 'choose-runner: %s -> %s\n' "$3" "$1"
           }
 
-          # 0. CI_RUNNER_MODE — the S1 runner-mode switch. When set it is
-          #    authoritative and reroutes CI with no per-repo edit. An unset
-          #    value falls through to the RD3 signals below; a set-but-invalid
-          #    value fails safe to self-hosted (never a billable mode under $0).
+          # 0. Public repo: standard hosted runners are free + unlimited, so a
+          #    public repo is hosted whatever CI_RUNNER_MODE says (S2-D1). Only
+          #    the literal "false" counts as public; anything else (true, empty,
+          #    a missing payload) is treated as private, the billable side.
+          if [ "${IS_PRIVATE:-}" = "false" ]; then
+            emit "$hosted" "true" "public repo (free hosted; CI_RUNNER_MODE governs private repos only)"
+            exit 0
+          fi
+          # 1. CI_RUNNER_MODE — the S1 runner-mode switch, for private/internal
+          #    repos. When set it is authoritative and reroutes CI with no
+          #    per-repo edit. An unset value falls through to the RD3 signals
+          #    below; a set-but-invalid value fails safe to self-hosted (never a
+          #    billable mode under $0).
           case "${CI_RUNNER_MODE:-}" in
             "")
-              : # unset -> defer to visibility / GH_HOSTED_OK / billing below.
+              : # unset -> defer to GH_HOSTED_OK / billing below.
               ;;
             github-hosted)
-              emit "$hosted" "true" "CI_RUNNER_MODE=github-hosted"
+              emit "$hosted" "true" "private repo, CI_RUNNER_MODE=github-hosted"
               exit 0
               ;;
             self-hosted)
-              emit "$FALLBACK" "false" "CI_RUNNER_MODE=self-hosted"
+              emit "$FALLBACK" "false" "private repo, CI_RUNNER_MODE=self-hosted"
               exit 0
               ;;
             *)
-              emit "$FALLBACK" "false" "CI_RUNNER_MODE='${CI_RUNNER_MODE}' unrecognized (fail-safe self-hosted)"
+              emit "$FALLBACK" "false" "private repo, CI_RUNNER_MODE='${CI_RUNNER_MODE}' unrecognized (fail-safe self-hosted)"
               exit 0
               ;;
           esac
-
-          # 1. Public repo: standard hosted runners are free + unlimited.
-          if [ "${IS_PRIVATE:-}" = "false" ]; then
-            emit "$hosted" "true" "public repo (free hosted)"
-            exit 0
-          fi
-
           # 2. Private repo: the cron-written org variable is the cheap signal.
           case "${GH_HOSTED_OK:-}" in
             true)

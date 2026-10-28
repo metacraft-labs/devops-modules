@@ -61,4 +61,13 @@ expect_rejected \
   'backend_uses_aws_oidc: $backend_uses_aws_oidc,' \
   'backend_uses_aws_oidc: false,'
 
+expect_rejected \
+  drop-github-app-env-name \
+  "credentials_env_name=\"\$(jq -r '.credentials_env_name // \"\"' \"\$metadata_file\")\" ;;" \
+  'credentials_env_name="" ;;'
+expect_rejected \
+  weaken-github-app-env-name-validation \
+  'test("^[A-Za-z_][A-Za-z0-9_]*$")' \
+  'true'
+
 echo "OK: terraform-ci-matrix semantic mutations were rejected"

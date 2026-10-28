@@ -83,8 +83,7 @@ _top@{ ... }:
             decide = next(s for s in steps if s.get("id") == "decide")
             metrics = next(s for s in steps if s.get("id") == "metrics")
             env = decide["env"]
-            # Billing read must come from the secret, org/thresholds from inputs.
-            assert env.get("GH_TOKEN") == "${"$"}{{ secrets.billing_token }}", env.get("GH_TOKEN")
+            # Billing read comes from the secret or the minted App token (asserted below); org/thresholds from inputs.
             assert env.get("MIN_REMAIN") == "${"$"}{{ inputs.min_minutes_remaining }}", env.get("MIN_REMAIN")
             assert env.get("MAX_BILLED") == "${"$"}{{ inputs.max_billed_amount }}", env.get("MAX_BILLED")
             assert env.get("INCLUDED_MINUTES") == "${"$"}{{ inputs.included_minutes }}", env.get("INCLUDED_MINUTES")
@@ -124,6 +123,16 @@ _top@{ ... }:
             wenv = writestep["env"]
             assert wenv.get("DRY_RUN") == "${"$"}{{ inputs.dry_run }}", wenv
             assert wenv.get("ALLOW_GITHUB_HOSTED") == "${"$"}{{ inputs.allow_github_hosted }}", wenv
+            # Credentials: an explicit token wins, else the App installation
+            # token the job mints itself (no personal token required).
+            assert env.get("GH_TOKEN") == "${"$"}{{ secrets.billing_token || steps.app.outputs.token }}", env
+            assert wenv.get("GH_TOKEN") == "${"$"}{{ secrets.variables_token || steps.app.outputs.token }}", wenv
+            mint = next(s for s in steps if s.get("id") == "app")
+            assert mint["uses"].startswith("actions/create-github-app-token@"), mint
+            assert mint["with"]["owner"] == "${"$"}{{ inputs.org }}", mint
+            assert mint["if"] == "env.MINT_APP_TOKEN == 'true'", mint
+            sec = on0["workflow_call"]["secrets"]
+            assert all(not sec[k].get("required", False) for k in ("billing_token", "variables_token", "app_id", "app_private_key")), sec
             # The ONLY variable write in the workflow is in the write step.
             others = "".join(s.get("run", "") for s in steps if s is not writestep)
             assert "gh variable" not in others, "a non-write step calls gh variable"
@@ -238,6 +247,13 @@ _top@{ ... }:
             # A genuine self-hosted decision is not reported as a hold.
             WANT_HELD=0 decide_case "hold/near-exhaustion-not-held" "self-hosted" "0" "''${ORGCASE[@]}" \
               MOCK_UNTIL="2026-09-12" ALLOW_GITHUB_HOSTED="false"
+            # The monthly RESET (S2-D1 policy, 2026-10-27): on day 1 the usage
+            # report is empty, the whole pool is back, and the hold must still
+            # keep self-hosted (the manager never flips back to hosted at reset).
+            WANT_HELD=1 decide_case "hold/after-monthly-reset" "self-hosted" "0" "''${ORGCASE[@]}" \
+              MOCK_UNTIL="2026-08-31" ALLOW_GITHUB_HOSTED="false"
+            WANT_HELD=1 decide_case "hold/after-monthly-reset-enterprise" "self-hosted" "0" "''${ENTCASE[@]}" \
+              MOCK_UNTIL="2026-08-31" ALLOW_GITHUB_HOSTED=""
             # Positive control: the healthy case with the hold lifted.
             WANT_HELD=0 decide_case "hold/lifted-control" "github-hosted" "0" "''${ORGCASE[@]}" \
               MOCK_UNTIL="2026-09-05" ALLOW_GITHUB_HOSTED="true"

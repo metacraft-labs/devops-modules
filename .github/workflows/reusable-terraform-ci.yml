@@ -699,9 +699,23 @@ jobs:
 
       - name: Export GITHUB_TOKEN for the github provider
         if: inputs.github_app_owner != ''
+        env:
+          APP_TOKEN: ${{ steps.gh_app_token.outputs.token }}
+          # github-app roots may ALSO want the token under a provider-specific
+          # name (e.g. TF_VAR_github_billing_token for the restful budgets
+          # engine). Never when the root decrypts an agenix token itself.
+          CREDENTIALS_ENV_NAME: ${{ inputs.agenix_plan_secret_path == '' && inputs.credentials_env_name || '' }}
         run: |
-          echo "::add-mask::${{ steps.gh_app_token.outputs.token }}"
-          echo "GITHUB_TOKEN=${{ steps.gh_app_token.outputs.token }}" >> "$GITHUB_ENV"
+          set -euo pipefail
+          echo "::add-mask::$APP_TOKEN"
+          echo "GITHUB_TOKEN=$APP_TOKEN" >> "$GITHUB_ENV"
+          if [ -n "$CREDENTIALS_ENV_NAME" ] && [ "$CREDENTIALS_ENV_NAME" != GITHUB_TOKEN ]; then
+            if ! [[ "$CREDENTIALS_ENV_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "::error::credentials_env_name '$CREDENTIALS_ENV_NAME' is not a valid environment variable name."
+              exit 1
+            fi
+            echo "$CREDENTIALS_ENV_NAME=$APP_TOKEN" >> "$GITHUB_ENV"
+          fi
 
       # The App installation's ONE hourly REST bucket is shared by every job
       # minting from it; reading it before and after tofu measures what this
@@ -1329,9 +1343,23 @@ jobs:
 
       - name: Export GITHUB_TOKEN for the github provider
         if: inputs.github_app_owner != ''
+        env:
+          APP_TOKEN: ${{ steps.gh_app_token.outputs.token }}
+          # github-app roots may ALSO want the token under a provider-specific
+          # name (e.g. TF_VAR_github_billing_token for the restful budgets
+          # engine). Never when the root decrypts an agenix token itself.
+          CREDENTIALS_ENV_NAME: ${{ inputs.agenix_apply_secret_path == '' && inputs.credentials_env_name || '' }}
         run: |
-          echo "::add-mask::${{ steps.gh_app_token.outputs.token }}"
-          echo "GITHUB_TOKEN=${{ steps.gh_app_token.outputs.token }}" >> "$GITHUB_ENV"
+          set -euo pipefail
+          echo "::add-mask::$APP_TOKEN"
+          echo "GITHUB_TOKEN=$APP_TOKEN" >> "$GITHUB_ENV"
+          if [ -n "$CREDENTIALS_ENV_NAME" ] && [ "$CREDENTIALS_ENV_NAME" != GITHUB_TOKEN ]; then
+            if ! [[ "$CREDENTIALS_ENV_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "::error::credentials_env_name '$CREDENTIALS_ENV_NAME' is not a valid environment variable name."
+              exit 1
+            fi
+            echo "$CREDENTIALS_ENV_NAME=$APP_TOKEN" >> "$GITHUB_ENV"
+          fi
 
       # The App installation's ONE hourly REST bucket is shared by every job
       # minting from it; reading it before and after tofu measures what this
@@ -1523,9 +1551,23 @@ jobs:
 
       - name: Export the re-minted GITHUB_TOKEN
         if: steps.apply_plan.outputs.changes == 'true' && inputs.github_app_owner != ''
+        env:
+          APP_TOKEN: ${{ steps.gh_app_token_apply.outputs.token }}
+          # github-app roots may ALSO want the token under a provider-specific
+          # name (e.g. TF_VAR_github_billing_token for the restful budgets
+          # engine). Never when the root decrypts an agenix token itself.
+          CREDENTIALS_ENV_NAME: ${{ inputs.agenix_apply_secret_path == '' && inputs.credentials_env_name || '' }}
         run: |
-          echo "::add-mask::${{ steps.gh_app_token_apply.outputs.token }}"
-          echo "GITHUB_TOKEN=${{ steps.gh_app_token_apply.outputs.token }}" >> "$GITHUB_ENV"
+          set -euo pipefail
+          echo "::add-mask::$APP_TOKEN"
+          echo "GITHUB_TOKEN=$APP_TOKEN" >> "$GITHUB_ENV"
+          if [ -n "$CREDENTIALS_ENV_NAME" ] && [ "$CREDENTIALS_ENV_NAME" != GITHUB_TOKEN ]; then
+            if ! [[ "$CREDENTIALS_ENV_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "::error::credentials_env_name '$CREDENTIALS_ENV_NAME' is not a valid environment variable name."
+              exit 1
+            fi
+            echo "$CREDENTIALS_ENV_NAME=$APP_TOKEN" >> "$GITHUB_ENV"
+          fi
 
       - name: Refresh AWS credentials for apply
         if: steps.apply_plan.outputs.changes == 'true' && inputs.aws_apply_role_arn != ''
@@ -1796,9 +1838,23 @@ jobs:
 
       - name: Export GITHUB_TOKEN for the github provider
         if: inputs.github_app_owner != ''
+        env:
+          APP_TOKEN: ${{ steps.gh_app_token.outputs.token }}
+          # github-app roots may ALSO want the token under a provider-specific
+          # name (e.g. TF_VAR_github_billing_token for the restful budgets
+          # engine). Never when the root decrypts an agenix token itself.
+          CREDENTIALS_ENV_NAME: ${{ inputs.agenix_plan_secret_path == '' && inputs.credentials_env_name || '' }}
         run: |
-          echo "::add-mask::${{ steps.gh_app_token.outputs.token }}"
-          echo "GITHUB_TOKEN=${{ steps.gh_app_token.outputs.token }}" >> "$GITHUB_ENV"
+          set -euo pipefail
+          echo "::add-mask::$APP_TOKEN"
+          echo "GITHUB_TOKEN=$APP_TOKEN" >> "$GITHUB_ENV"
+          if [ -n "$CREDENTIALS_ENV_NAME" ] && [ "$CREDENTIALS_ENV_NAME" != GITHUB_TOKEN ]; then
+            if ! [[ "$CREDENTIALS_ENV_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "::error::credentials_env_name '$CREDENTIALS_ENV_NAME' is not a valid environment variable name."
+              exit 1
+            fi
+            echo "$CREDENTIALS_ENV_NAME=$APP_TOKEN" >> "$GITHUB_ENV"
+          fi
 
       - name: Configure AWS credentials for drift
         if: inputs.aws_plan_role_arn != '' || inputs.aws_drift_role_arn != ''

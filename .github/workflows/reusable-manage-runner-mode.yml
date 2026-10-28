@@ -45,8 +45,12 @@
 #         # runner: '["self-hosted","linux","x64"]'   # used when the ops repo is private
 #         # metrics_textfile: /var/lib/node_exporter/textfile/ci-runner-mode.prom
 #       secrets:
-#         billing_token: ${{ secrets.ORG_BILLING_READ_TOKEN }}
-#         variables_token: ${{ secrets.ORG_VARIABLES_WRITE_TOKEN }}
+#         # Preferred: the org's governance App; the job mints its own token.
+#         app_id: ${{ secrets.GH_GOVERNANCE_APP_ID }}
+#         app_private_key: ${{ secrets.GH_GOVERNANCE_APP_PRIVATE_KEY }}
+#         # Or explicit tokens (each overrides the App token for its use):
+#         # billing_token: ${{ secrets.ORG_BILLING_READ_TOKEN }}
+#         # variables_token: ${{ secrets.ORG_VARIABLES_WRITE_TOKEN }}
 #
 # An org on an ENTERPRISE plan shares ONE included pool with every other org of
 # its enterprise (e.g. agent-harbor + blocksense-network in schelling-point-labs:
@@ -68,26 +72,43 @@
 # included pool is exhausted (the $0 budget blocks it), which would freeze
 # CI_RUNNER_MODE at `github-hosted` exactly when it must flip — so a private
 # wrapper runs on the self-hosted `runner` label array instead.
-# Tokens (operator prerequisite):
+# SCOPE OF THE VARIABLE: CI_RUNNER_MODE governs PRIVATE/INTERNAL repos only.
+# reusable-choose-runner.yml routes a PUBLIC repo to free GitHub-hosted runners
+# whatever the variable says (S2-D1, 2026-10-27), so writing `self-hosted` here
+# never moves public CI.
+#
+# Tokens (no personal token needed for an org-scope caller):
 #   * billing_token   — billing READ for the scope that owns the pool.
-#                       Org scope: a GOVERNANCE-APP installation token (org
-#                       billing:read — verified 2026-09-15 that an App install
-#                       token drives `GET /organizations/{org}/settings/billing/usage`
-#                       -> 200) or a classic PAT (admin:org). Enterprise scope
-#                       (`enterprise:` set): a classic PAT of an enterprise
-#                       owner / billing manager with `manage_billing:enterprise`
-#                       (an org App installation cannot read enterprise billing).
+#                       Org scope: a GitHub App INSTALLATION token whose App has
+#                       the organization "Administration" (read) permission —
+#                       GitHub lists GET /organizations/{org}/settings/billing/usage
+#                       under it (docs: "Permissions required for GitHub Apps",
+#                       Administration); verified 2026-09-15 (HTTP 200). The
+#                       governance App qualifies.
+#                       Enterprise scope (`enterprise:` set): an installation
+#                       token of an App installed ON THE ENTERPRISE with the
+#                       "Enterprise billing" (read) permission (enterprise
+#                       installations GA 2026-10-23), or a classic PAT /
+#                       OAuth token with `manage_billing:enterprise`. An ORG
+#                       installation cannot read enterprise billing; without one
+#                       of these the read fails safe to self-hosted (which, with
+#                       the hold on, is the same value — only the metrics lose
+#                       their numbers).
 #                       Both dimensions (included-pool draw AND billed overage)
 #                       come from the enhanced usage report; the classic
 #                       `/orgs/{org}/settings/billing/actions` endpoint returns
 #                       HTTP 410 since GitHub's billing-platform migration.
-#   * variables_token — org VARIABLES write (fine-grained: Organization
-#                       "Variables" read/write). Writes CI_RUNNER_MODE.
-#     GITHUB_TOKEN cannot do either, so both are required secrets.
+#   * variables_token — org VARIABLES write: an App installation token with
+#                       "Organization variables" (actions_variables) write — the
+#                       governance App again — or a fine-grained token with
+#                       Organization "Variables" read/write. Writes CI_RUNNER_MODE.
+#     GITHUB_TOKEN cannot do either, so both are required secrets. One App
+#     installation token may serve as both.
 #
 # SAFETY INPUTS (both default to the safe side):
-#   * allow_github_hosted (default FALSE) — operator policy is that orgs stay
-#     self-hosted. While false, the service NEVER writes `github-hosted`: where
+#   * allow_github_hosted (default FALSE) — operator policy (S2-D1, 2026-10-27)
+#     is that private repos stay self-hosted, INCLUDING after the monthly
+#     included-minutes reset. While false, the service NEVER writes `github-hosted`: where
 #     billing says the pool is healthy, it writes (or keeps) `self-hosted` and
 #     logs that the self-hosted hold is in effect. Set true only for an org that
 #     should actually ride the included GitHub-hosted minutes.
@@ -170,11 +191,21 @@ on:
         default: ''
     secrets:
       billing_token:
-        description: 'Org billing-READ token (governance-App install token or classic PAT).'
-        required: true
+        description: 'Org billing-READ token (classic PAT or App token). Optional when app_id/app_private_key are given.'
+        required: false
       variables_token:
-        description: 'Org variables-WRITE token (may equal billing_token if it has both scopes).'
-        required: true
+        description: 'Org variables-WRITE token. Optional when app_id/app_private_key are given (may equal billing_token).'
+        required: false
+      app_id:
+        description: >-
+          GitHub App id (e.g. the org's governance App). With app_private_key,
+          the job mints an installation token for `org` and uses it for each of
+          billing_token / variables_token that is not given, so no personal
+          token is needed.
+        required: false
+      app_private_key:
+        description: 'PEM private key paired with app_id.'
+        required: false
     outputs:
       mode:
         description: 'The CI_RUNNER_MODE written this run: github-hosted or self-hosted.'
@@ -198,10 +229,27 @@ jobs:
       mode: ${{ steps.decide.outputs.mode }}
       failsafe: ${{ steps.decide.outputs.failsafe }}
       held: ${{ steps.decide.outputs.held }}
+    env:
+      # `secrets` cannot appear in a step `if`, so expose only presence.
+      MINT_APP_TOKEN: ${{ secrets.app_id != '' && secrets.app_private_key != '' }}
     steps:
+      # App path: one short-lived installation token for `org` (org
+      # Administration read covers the org billing usage report; Organization
+      # variables write covers CI_RUNNER_MODE). It cannot read ENTERPRISE
+      # billing — an org installation has no enterprise permissions — so an
+      # enterprise-scope read with it fails safe (see the header).
+      - name: Mint GitHub App installation token
+        id: app
+        if: env.MINT_APP_TOKEN == 'true'
+        uses: actions/create-github-app-token@29824e69f54612133e76f7eaac726eef6c875baf # v2
+        with:
+          app-id: ${{ secrets.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+          owner: ${{ inputs.org }}
+
       - id: decide
         env:
-          GH_TOKEN: ${{ secrets.billing_token }}
+          GH_TOKEN: ${{ secrets.billing_token || steps.app.outputs.token }}
           ORG: ${{ inputs.org }}
           MIN_REMAIN: ${{ inputs.min_minutes_remaining }}
           INCLUDED_MINUTES: ${{ inputs.included_minutes }}
@@ -423,7 +471,7 @@ jobs:
         # (defence in depth; the hermetic gate drives this block directly).
         if: ${{ !inputs.dry_run }}
         env:
-          GH_TOKEN: ${{ secrets.variables_token }}
+          GH_TOKEN: ${{ secrets.variables_token || steps.app.outputs.token }}
           ORG: ${{ inputs.org }}
           MODE: ${{ steps.decide.outputs.mode }}
           ALLOW_GITHUB_HOSTED: ${{ inputs.allow_github_hosted }}
