@@ -29,6 +29,9 @@
             # >= max-substitution-jobs (16) so NAR downloads alone never queue.
             assert "http-connections = 16" in action
             assert "download-attempts = 5" in action
+            # A cached "not found" must not outlive the job that saw it on a
+            # persistent runner HOME; see the comment in action.yml.
+            assert "narinfo-cache-negative-ttl = 0\n" in action
 
             # fallback stays true by default: with false, Nix rethrows ANY
             # substituter error (5xx/timeout), even for a derivation in no
@@ -75,6 +78,21 @@
             cp -r ${../.github/setup-nix} setup-nix
             chmod -R u+w setup-nix
             bash setup-nix/tests/probe-substituters-test.sh
+            touch "$out"
+          '';
+
+      # The two setup-nix actions (this repo's and metacraft-github-actions')
+      # must write the same transfer settings and run the same preflight.
+      # Offline half: this repo's action against a fixture of the other's.
+      # The live cross-repository half is .github/workflows/setup-nix-alignment.yml.
+      checks.setup-nix-alignment =
+        pkgs.runCommand "setup-nix-alignment"
+          {
+            nativeBuildInputs = [ pkgs.python3 ];
+          }
+          ''
+            cd ${../.}
+            python3 scripts/tests/test_setup_nix_alignment.py
             touch "$out"
           '';
 

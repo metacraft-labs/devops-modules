@@ -451,7 +451,16 @@ runs:
           stalled-download-timeout = 30
           http2 = false
           http-connections = 16
-          narinfo-cache-negative-ttl = 120
+          # 0, not 120 (nor the 3600 default): on runners whose HOME persists
+          # between jobs, a cached "not found" outlives the job that saw it, so
+          # a path a producer job pushed minutes later is rebuilt from source
+          # downstream. mcl deploy-apply overrides it to 0 for the same reason.
+          # Each nix process still deduplicates its own lookups.
+          #
+          # Keep these transfer settings identical to
+          # metacraft-labs/metacraft-github-actions setup-nix; the
+          # setup-nix-alignment check compares the two.
+          narinfo-cache-negative-ttl = 0
           allow-import-from-derivation = true
           experimental-features = ${{ inputs.experimental-features }}
 

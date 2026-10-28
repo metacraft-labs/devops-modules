@@ -47,7 +47,7 @@ rec {
       fallback = true
       download-attempts = 5
       connect-timeout = 20
-      narinfo-cache-negative-ttl = 120
+      narinfo-cache-negative-ttl = 0
       allow-import-from-derivation = true
       EOF
 

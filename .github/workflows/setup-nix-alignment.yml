@@ -1,0 +1,73 @@
+# =============================================================================
+# The two setup-nix actions must write the same nix.conf transfer settings and
+# run the same binary-cache preflight:
+#
+#   * this repository's .github/setup-nix
+#   * metacraft-labs/metacraft-github-actions setup-nix (setup-dev-env uses it)
+#
+# When one was tuned and the other was not, half the org kept the failure the
+# tuning fixed. scripts/check-setup-nix-alignment.py compares the two; its
+# offline contract suite (checks.setup-nix-alignment) compares this repo
+# against a fixture of the other. This workflow compares against the other
+# repository's LIVE mainline, so a change made over there is caught too: on a
+# schedule, and on every change here.
+#
+# Same reasoning as setup-nix-netrc.yml for the runner: both repositories are
+# public, the job needs only git and python3, and nothing here touches Nix, a
+# cache, or a secret.
+# =============================================================================
+
+name: setup-nix alignment
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 5 * * *'
+  pull_request:
+    branches:
+      - dev
+    paths:
+      - '.github/setup-nix/**'
+      - '.github/workflows/setup-nix-alignment.yml'
+      - 'scripts/check-setup-nix-alignment.py'
+  push:
+    branches:
+      - dev
+    paths:
+      - '.github/setup-nix/**'
+      - '.github/workflows/setup-nix-alignment.yml'
+      - 'scripts/check-setup-nix-alignment.py'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  alignment:
+    name: setup-nix matches metacraft-github-actions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Checkout metacraft-github-actions (mainline)
+        uses: actions/checkout@v6.0.2
+        with:
+          repository: metacraft-labs/metacraft-github-actions
+          ref: dev
+          path: .alignment/metacraft-github-actions
+          persist-credentials: false
+
+      - name: Compare the two setup-nix actions
+        shell: bash
+        run: |
+          git -C .alignment/metacraft-github-actions log -1 --format='metacraft-github-actions dev at %H'
+          python3 scripts/check-setup-nix-alignment.py \
+            --devops-root . \
+            --mga-root .alignment/metacraft-github-actions
