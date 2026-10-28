@@ -48,6 +48,54 @@ private string[2] readStdoutAndStderr(ProcessPipes pipes)
     return [stdoutText, stderrText];
 }
 
+/// Streams a child's stdout line by line to `onLine` while a second thread
+/// drains its stderr, and returns the stderr lines once both reach EOF.
+///
+/// For callers that must process stdout incrementally (`readStdoutAndStderr`
+/// buffers it whole). Reading stdout to EOF before touching stderr deadlocks
+/// in the same way: `nix-eval-jobs` forwards the `git fetch --progress`
+/// output of every eval-time Git fetch to stderr, so a cold fetch of a large
+/// repository fills the 64 KiB stderr pipe, git blocks in write(2), the
+/// worker holding the fetch lock never finishes, and stdout never reaches
+/// EOF. `ci-matrix` hung this way until the job hit its 6 h limit.
+string[] forEachStdoutLineDrainingStderr(ProcessPipes pipes, scope void delegate(const(char)[] line) onLine)
+{
+    import core.thread : Thread;
+
+    string[] stderrLines;
+    auto stderrFile = pipes.stderr;
+    auto stderrReader = new Thread({
+        foreach (line; stderrFile.byLine())
+            stderrLines ~= line.idup;
+    });
+    // Daemon: if `onLine` throws, nothing joins the reader, and it must not
+    // keep the process alive.
+    stderrReader.isDaemon = true;
+    stderrReader.start();
+    foreach (line; pipes.stdout.byLine())
+        onLine(line);
+    stderrReader.join();
+    return stderrLines;
+}
+
+@("forEachStdoutLineDrainingStderr.drainsLargeStderr")
+unittest
+{
+    import std.process : pipeProcess, wait;
+
+    // ~200 KiB on stderr (well past a 64 KiB pipe buffer) *before* anything
+    // reaches stdout; `timeout` turns a regression into a quick failure.
+    const script = `i=0; while [ $i -lt 2000 ]; do `
+        ~ `echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx >&2; `
+        ~ `i=$((i+1)); done; echo one; echo two`;
+    auto pipes = pipeProcess(["timeout", "60", "sh", "-c", script], Redirect.stdout | Redirect.stderr);
+    string[] seen;
+    const errLines = forEachStdoutLineDrainingStderr(pipes, (line) { seen ~= line.idup; });
+    assert(wait(pipes.pid) == 0);
+    assert(seen == ["one", "two"]);
+    assert(errLines.length == 2000);
+}
+
 T execute(T = string)(string args, bool printCommand = true, bool returnErr = false, Redirect redirect = Redirect.all) if (is(T == string) || is(T == ProcessPipes) || is(T == JSONValue))
 {
     return execute!T(args.strip.split(" "), printCommand, returnErr, redirect);
