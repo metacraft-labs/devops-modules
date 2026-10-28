@@ -1068,6 +1068,8 @@
           pkgs.jq
           pkgs.curl
           pkgs.openssl
+          # toml2json / json2toml: update garm-cli's profile config in place.
+          pkgs.remarshal
         ];
         text = ''
           set -euo pipefail
@@ -1089,16 +1091,31 @@
           # adminPasswordFile is set (via LoadCredential), so the -f test below
           # already covers the null case — no Nix-level guard needed (a
           # `[ -n "1" ]` literal here trips shellcheck SC2157).
+          #
+          # The password is held as a FILE PATH, never as a value on a command
+          # line: argv is world-readable through /proc/<pid>/cmdline and `ps`,
+          # so `--password "$pw"` or `curl -d '{"password":…}'` hands it to every
+          # local user for the lifetime of the process. jq reads it with
+          # --rawfile and request bodies reach curl on stdin (--data-binary @-);
+          # only the path ever appears in argv. It is never exported either.
+          # The first line, newline-stripped, is the password (as before).
           if [ -n "$cred_dir" ] && [ -f "$cred_dir/reconcile-admin-password" ]; then
-            admin_pw="$(head -n1 "$cred_dir/reconcile-admin-password" | tr -d '\n')"
+            admin_pw_file="$cred_dir/reconcile-admin-password"
           else
             if [ ! -f "$pw_persist" ]; then
               umask 077
               # zxcvbn score 4: long, mixed. Persisted 0600 under stateDir.
               openssl rand -base64 24 | tr -d '\n' | sed 's/$/-Grm9!/' > "$pw_persist"
             fi
-            admin_pw="$(head -n1 "$pw_persist" | tr -d '\n')"
+            admin_pw_file="$pw_persist"
           fi
+
+          # JSON request body carrying the admin credentials, password read from
+          # the file. Extra `--arg`s become fields alongside username/password.
+          admin_body() {
+            jq -cn --rawfile pw "$admin_pw_file" --arg u "$admin_user" "$@" \
+              '$ARGS.named + {username: $u, password: ($pw | split("\n")[0])} | del(.pw, .u)'
+          }
 
           gcli() { garm-cli --format json "$@"; }
 
@@ -1124,11 +1141,11 @@
           fi
 
           # first-run is idempotent enough: 200 on fresh, 409 if already done.
-          fr_code="$(curl -s -o /tmp/garm-fr.json -w '%{http_code}' \
-            -X POST "$api_url/api/v1/first-run" \
-            -H 'Content-Type: application/json' \
-            -d "$(jq -cn --arg u "$admin_user" --arg e "$admin_email" --arg p "$admin_pw" \
-                  '{username:$u,email:$e,password:$p}')" || true)"
+          fr_code="$(admin_body --arg email "$admin_email" \
+            | curl -s -o /tmp/garm-fr.json -w '%{http_code}' \
+                -X POST "$api_url/api/v1/first-run" \
+                -H 'Content-Type: application/json' \
+                --data-binary @- || true)"
           case "$fr_code" in
             200) log "controller first-run complete (admin '$admin_user' created)";;
             409) log "controller already initialised";;
@@ -1136,26 +1153,49 @@
           esac
 
           # Log the local garm-cli profile in (needed for every garm-cli call).
-          # `init` writes the profile + logs in; if a profile already exists we
-          # refresh the token via `profile login`.
-          if ! garm-cli profile list --format json 2>/dev/null | jq -e '.[]?|select(.name=="reconcile")' >/dev/null 2>&1; then
-            garm-cli init --name reconcile --url "$api_url" \
-              --username "$admin_user" --email "$admin_email" --password "$admin_pw" \
-              >/dev/null 2>&1 || \
-              garm-cli profile add --name reconcile --url "$api_url" \
-                --username "$admin_user" --password "$admin_pw" >/dev/null 2>&1 || true
-          fi
-          garm-cli profile switch reconcile >/dev/null 2>&1 || true
-          # `profile login` MUST be given --username: without it garm-cli drops
-          # into an interactive Username: prompt, which under systemd (no TTY)
-          # reads EOF and fails. The failure is swallowed by `|| true`, so the
-          # stale profile token is left in place — every subsequent garm-cli
-          # call then 401s (existence checks silently return empty, and the
-          # first un-guarded write, `credentials add`, aborts the reconcile).
-          # This only surfaced after a garm restart invalidated the token that
-          # the initial `init` (which does pass --username) had minted.
-          garm-cli profile login reconcile --username "$admin_user" \
-            --password "$admin_pw" >/dev/null 2>&1 || true
+          #
+          # garm-cli's `init` / `profile add` / `profile login` take the
+          # password only as --password (argv) or from an interactive TTY
+          # prompt, so the reconcile does not let garm-cli log in. It calls the
+          # same endpoint those commands call (POST /api/v1/auth/login), with
+          # the body on stdin, and records the returned token in the
+          # "reconcile" profile of garm-cli's config — exactly what
+          # `profile login` saves. Other profiles in that file are preserved.
+          #
+          # A failed login is a WARNING, as it always was: the existing profile
+          # token (if any) is left in place and the first garm-cli call that
+          # needs it reports the 401. `--username` is part of the body, so no
+          # code path can fall into garm-cli's Username: prompt, which under
+          # systemd (no TTY) reads EOF.
+          cli_cfg_dir="$HOME/.local/share/garm-cli"
+          cli_cfg="$cli_cfg_dir/config.toml"
+          login_token="$(admin_body \
+            | curl -sS --fail --connect-timeout 5 --max-time 30 \
+                -X POST "$api_url/api/v1/auth/login" \
+                -H 'Content-Type: application/json' \
+                --data-binary @- 2>/dev/null \
+            | jq -r '.token // empty' 2>/dev/null || true)"
+          case "$login_token" in
+            "" | *[!A-Za-z0-9._-]*)
+              log "WARNING: admin login to the local controller failed; keeping the existing garm-cli profile token"
+              ;;
+            *)
+              mkdir -p "$cli_cfg_dir"
+              cfg_tmp="$(mktemp "$cli_cfg_dir/.config.toml.XXXXXX")"
+              # The token rides in through a /dev/fd path (printf is a bash
+              # builtin, so it never reaches an argv either).
+              { if [ -s "$cli_cfg" ]; then toml2json "$cli_cfg"; else echo '{}'; fi; } \
+                | jq --rawfile tok <(printf '%s' "$login_token") --arg url "$api_url" '
+                    .manager = ([(.manager // [])[] | select(.name != "reconcile")]
+                                + [{name: "reconcile", base_url: $url, bearer_token: $tok}])
+                    | .active_manager = "reconcile"' \
+                | json2toml > "$cfg_tmp"
+              chmod 0600 "$cfg_tmp"
+              mv -f "$cfg_tmp" "$cli_cfg"
+              log "garm-cli profile 'reconcile' logged in as '$admin_user'"
+              ;;
+          esac
+          unset login_token
 
           # ---- (0.5) Controller URLs — REQUIRED before any /api/v1 op --------
           # GARM's apiRouter is guarded by `urlsRequired` (409 until metadata +
