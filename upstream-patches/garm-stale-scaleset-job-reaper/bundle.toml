@@ -18,10 +18,13 @@
 #
 # fix.patch was generated against our pin 0a9a939c. The local Nix patch
 # (packages/garm/patches/fix-stale-scaleset-job-reaper.patch) is the same
-# change on that pin, cut on top of our other local patches.
+# change on that pin, cut on top of our other local patches. Both were
+# dropped when packages/garm moved to 33ec0921, which carries 8c64910f; the
+# gate t_garm_stale_scaleset_job_reaped was retired with them, and its test
+# file is kept here, beside the bundle, as the record.
 #
 # NOTE ON THE TEST FILE. The test is NOT carried inside fix.patch. It lives at
-# ../../checks/garm/stale_scaleset_job_test.go, which is the single source of
+# stale_scaleset_job_test.go, which is the single source of
 # truth: the gate t_garm_stale_scaleset_job_reaped injects that same file into
 # BOTH a patched and an unpatched GARM tree, so the negative control runs the
 # identical assertions. prepare.sh copies it in as a second commit, stripping
@@ -49,7 +52,7 @@ title = "Make reconcileStaleJobs able to see and reap scale set jobs"
 body = "PR.md"
 patches = ["fix.patch"]
 prepare = "prepare.sh"
-inputs = ["../../checks/garm/stale_scaleset_job_test.go"]
+inputs = ["stale_scaleset_job_test.go"]
 
 [review]
 # Private identifiers that must never reach the upstream PR. The lookaheads

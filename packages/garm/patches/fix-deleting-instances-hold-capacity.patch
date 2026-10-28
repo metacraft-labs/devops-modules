@@ -1,5 +1,5 @@
 diff --git a/database/sql/instances.go b/database/sql/instances.go
-index 06d5b31d..3294c5c6 100644
+index ec68b140..cb4e3d3a 100644
 --- a/database/sql/instances.go
 +++ b/database/sql/instances.go
 @@ -31,6 +31,7 @@ import (
@@ -30,7 +30,7 @@ index 06d5b31d..3294c5c6 100644
  		if pool.MaxRunners > math.MaxInt64 {
  			maxRunners = math.MaxInt64
 diff --git a/database/sql/instances_test.go b/database/sql/instances_test.go
-index 75d585a5..1349bd7a 100644
+index a0b60ec0..6adc510a 100644
 --- a/database/sql/instances_test.go
 +++ b/database/sql/instances_test.go
 @@ -388,9 +388,9 @@ func (s *InstancesTestSuite) TestCreateInstanceDBCreateErr() {
@@ -42,15 +42,15 @@ index 75d585a5..1349bd7a 100644
  		WithArgs(pool.ID).
 -		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 +		WillReturnRows(sqlmock.NewRows([]string{"status"}))
- 	s.Fixtures.SQLMock.
- 		ExpectExec("INSERT INTO `pools`").
- 		WillReturnResult(sqlmock.NewResult(1, 1))
+ 	// No INSERT INTO `pools` here. Creating a runner sets the pool foreign
+ 	// key directly and omits the association, so the parent row is not
+ 	// upserted as a side effect.
 diff --git a/internal/capacity/capacity.go b/internal/capacity/capacity.go
 new file mode 100644
-index 00000000..0cc8e2c8
+index 00000000..dac1993e
 --- /dev/null
 +++ b/internal/capacity/capacity.go
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,100 @@
 +// Copyright 2026 Cloudbase Solutions SRL
 +//
 +//	Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -78,8 +78,11 @@ index 00000000..0cc8e2c8
 +
 +// Occupied returns how many of instances count against maxRunners.
 +//
++// An instance whose provider resource is confirmed gone (deleted) never
++// counts: its row only awaits database cleanup.
++//
 +// An instance on the deletion lane (pending_delete, pending_force_delete,
-+// deleting, deleted) has already been removed from the forge. It can never
++// deleting) has already been removed from the forge. It can never
 +// take a job again. It stays in the table only until the provider confirms
 +// the teardown. If that teardown keeps failing, counting the row would
 +// quietly shrink the pool: a provider whose deletes stall for hours (a busy
@@ -101,6 +104,9 @@ index 00000000..0cc8e2c8
 +func OccupiedStatuses(statuses []commonParams.InstanceStatus, maxRunners uint) int {
 +	live, deleting := 0, 0
 +	for _, s := range statuses {
++		if s == commonParams.InstanceDeleted {
++			continue
++		}
 +		if IsBeingDeleted(s) {
 +			deleting++
 +		} else {
@@ -117,9 +123,13 @@ index 00000000..0cc8e2c8
 +}
 +
 +// Split returns how many instances are not on the deletion lane (live) and
-+// how many are (deleting).
++// how many are still on it (deleting). Instances already deleted are in
++// neither.
 +func Split(instances []params.Instance) (live, deleting int) {
 +	for _, inst := range instances {
++		if inst.Status == commonParams.InstanceDeleted {
++			continue
++		}
 +		if IsBeingDeleted(inst.Status) {
 +			deleting++
 +		} else {
@@ -143,10 +153,10 @@ index 00000000..0cc8e2c8
 +}
 diff --git a/internal/capacity/capacity_test.go b/internal/capacity/capacity_test.go
 new file mode 100644
-index 00000000..2699f8cb
+index 00000000..5a4148a5
 --- /dev/null
 +++ b/internal/capacity/capacity_test.go
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,117 @@
 +// Copyright 2026 Cloudbase Solutions SRL
 +//
 +//	Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -219,6 +229,13 @@ index 00000000..2699f8cb
 +			repeat(deleting, 6),
 +			4, 2, 0,
 +		},
++		{
++			// Deleted rows only await cleanup: they never count, even
++			// beyond the allowance.
++			"deleted never counts",
++			[]commonParams.InstanceStatus{commonParams.InstanceDeleted, commonParams.InstanceDeleted, commonParams.InstanceDeleted, running},
++			1, 1, 1,
++		},
 +		{"zero max exempts nothing", []commonParams.InstanceStatus{deleting, running}, 0, 2, 1},
 +	}
 +	for _, tc := range cases {
@@ -258,7 +275,7 @@ index 00000000..2699f8cb
 +	}
 +}
 diff --git a/runner/pool/pool.go b/runner/pool/pool.go
-index e2988f8d..4068c9f5 100644
+index 3d71cc4f..1375be82 100644
 --- a/runner/pool/pool.go
 +++ b/runner/pool/pool.go
 @@ -39,6 +39,7 @@ import (
@@ -269,7 +286,7 @@ index e2988f8d..4068c9f5 100644
  	garmErrors "github.com/cloudbase/garm/internal/errors"
  	"github.com/cloudbase/garm/locking"
  	"github.com/cloudbase/garm/metrics"
-@@ -1440,12 +1441,15 @@ func (r *basePoolManager) addRunnerToPool(pool params.Pool, aditionalLabels []st
+@@ -1554,12 +1555,15 @@ func (r *basePoolManager) addRunnerToPool(pool params.Pool, aditionalLabels []st
  		return fmt.Errorf("pool %s is disabled", pool.ID)
  	}
  
@@ -287,7 +304,7 @@ index e2988f8d..4068c9f5 100644
  		return runnerErrors.NewNoCapacityError("max workers (%d) reached for pool %s", pool.MaxRunners, pool.ID)
  	}
  
-@@ -1465,7 +1469,8 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
+@@ -1579,7 +1583,8 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
  		return fmt.Errorf("failed to ensure minimum idle workers for pool %s: %w", pool.ID, err)
  	}
  
@@ -297,7 +314,7 @@ index e2988f8d..4068c9f5 100644
  		slog.DebugContext(
  			r.ctx, "max workers reached for pool, skipping idle worker creation",
  			"max_runners", pool.MaxRunners,
-@@ -1475,6 +1480,11 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
+@@ -1589,6 +1594,11 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
  
  	idleOrPendingWorkers := []params.Instance{}
  	for _, inst := range existingInstances {
@@ -309,7 +326,7 @@ index e2988f8d..4068c9f5 100644
  		if inst.RunnerStatus != params.RunnerActive && inst.RunnerStatus != params.RunnerTerminated {
  			idleOrPendingWorkers = append(idleOrPendingWorkers, inst)
  		}
-@@ -1485,7 +1495,7 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
+@@ -1599,7 +1609,7 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
  		// get the needed delta.
  		required = pool.MinIdleRunnersAsInt() - len(idleOrPendingWorkers)
  
@@ -319,18 +336,18 @@ index e2988f8d..4068c9f5 100644
  		var projected uint
  		if projectedInstanceCount > 0 {
 diff --git a/workers/scaleset/scaleset.go b/workers/scaleset/scaleset.go
-index 418756c0..602b1aa9 100644
+index 87319d52..7cc634ca 100644
 --- a/workers/scaleset/scaleset.go
 +++ b/workers/scaleset/scaleset.go
-@@ -28,6 +28,7 @@ import (
+@@ -29,6 +29,7 @@ import (
  	"github.com/cloudbase/garm/cache"
  	dbCommon "github.com/cloudbase/garm/database/common"
  	"github.com/cloudbase/garm/database/watcher"
 +	"github.com/cloudbase/garm/internal/capacity"
  	garmErrors "github.com/cloudbase/garm/internal/errors"
  	"github.com/cloudbase/garm/locking"
- 	"github.com/cloudbase/garm/params"
-@@ -931,7 +932,9 @@ func (w *Worker) waitForToolsOrCancel() (hasTools, stopped bool) {
+ 	"github.com/cloudbase/garm/metrics"
+@@ -1178,7 +1179,9 @@ func (w *Worker) waitForToolsOrCancel() (hasTools, stopped bool) {
  }
  
  func (w *Worker) handleScaleDown() {
@@ -341,25 +358,63 @@ index 418756c0..602b1aa9 100644
  	if delta <= 0 {
  		return
  	}
-@@ -1005,7 +1008,7 @@ func (w *Worker) handleScaleDown() {
+@@ -1187,19 +1190,10 @@ func (w *Worker) handleScaleDown() {
+ 		slog.ErrorContext(w.ctx, "error getting scale set client", "error", err)
+ 		return
+ 	}
+-	// Runners already on their way out satisfy part of the delta before any
+-	// new victim is picked. Counting them during the removal loop instead
+-	// would make the outcome depend on map iteration order: an idle runner
+-	// could be removed while a runner already being deleted would have
+-	// covered the delta.
++	// Runners already on the deletion lane are excluded from
++	// liveRunnerCount(), so they are not part of the delta and are not
++	// counted again here.
+ 	removed := 0
+-	for _, runner := range w.runners {
+-		switch runner.Status {
+-		case commonParams.InstancePendingDelete, commonParams.InstancePendingForceDelete,
+-			commonParams.InstanceDeleting:
+-			removed++
+-		}
+-	}
+ 
+ 	for _, runner := range w.runners {
+ 		slog.InfoContext(w.ctx, "considering runners for removal", "delta", delta, "removed", removed)
+@@ -1271,11 +1265,11 @@ func (w *Worker) handleScaleDown() {
  			removed++
  		case commonParams.InstancePendingDelete, commonParams.InstancePendingForceDelete,
- 			commonParams.InstanceDeleting, commonParams.InstanceDeleted:
--			removed++
-+			// Already excluded from liveRunnerCount(), so not part of delta.
+ 			commonParams.InstanceDeleting:
+-			// Already counted against the delta before the loop.
++			// Excluded from liveRunnerCount(), so not part of the delta.
+ 			continue
+ 		case commonParams.InstanceDeleted:
+ 			// Provider resource is gone and the record is excluded from
+-			// runnerCount(); it is not part of the delta.
++			// liveRunnerCount(); it is not part of the delta.
  			continue
  		default:
  			slog.WarnContext(w.ctx, "runner is not in a valid state; skipping", "runner_name", runner.Name, "runner_status", runner.Status)
-@@ -1024,8 +1027,26 @@ func (w *Worker) targetRunners() int {
+@@ -1294,20 +1288,26 @@ func (w *Worker) targetRunners() int {
  	return int(targetRunners)
  }
  
+-// runnerCount returns the number of runners that still occupy capacity in
+-// the provider. Runners on their way out (pending_delete, deleting) are
+-// still physically present in the IaaS, so they count; only runners whose
+-// provider resource is confirmed gone (deleted) are excluded — those records
+-// merely await database cleanup.
 +// runnerCount is how many runners hold a slot against MaxRunners. Runners on
 +// the deletion lane are already gone from GitHub and cannot take a job, so
 +// they do not, up to MaxRunners of them (capacity.Occupied): a provider whose
 +// deletes stall for hours must not leave the scale set with no usable runner.
  func (w *Worker) runnerCount() int {
--	return len(w.runners)
+-	count := 0
+-	for _, runner := range w.runners {
+-		if runner.Status == commonParams.InstanceDeleted {
+-			continue
+-		}
+-		count++
 +	return capacity.Occupied(w.runnerList(), w.scaleSet.MaxRunners)
 +}
 +
@@ -373,7 +428,8 @@ index 418756c0..602b1aa9 100644
 +	out := make([]params.Instance, 0, len(w.runners))
 +	for _, r := range w.runners {
 +		out = append(out, r)
-+	}
+ 	}
+-	return count
 +	return out
  }
  

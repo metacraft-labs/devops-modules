@@ -16,19 +16,28 @@
 # vendors. The daemon (`garm`) and admin CLI (`garm-cli`) are both produced.
 buildGo126Module rec {
   pname = "garm";
-  version = "0.2.1-unstable-2026-07-08";
+  version = "0.2.1-unstable-2026-10-23";
 
-  # v0.2.1 can wedge a scale-set listener forever when a delayed job message
-  # races an already-terminal runner transition. Pin the upstream fix merged
-  # by cloudbase/garm#817 until the next tagged release includes it. Do not
+  # cloudbase/garm main at 33ec0921 (2026-10-23). It carries the upstream
+  # fixes that replaced three local patches: 488cf98b (ListInstances inverted
+  # error check), 8c64910f (scale set jobs in their own table, pruned after
+  # 24h, superseding the stale scale-set job reaper) and f5d98947/3e398635/
+  # 0d6acdea (lossless watcher delivery). It also still carries the
+  # cloudbase/garm#817 fix the previous pin (0a9a939c) was chosen for. Do not
   # depend on the local references/garm overlay: CI builds this flake alone.
-  rev = "0a9a939c10f1e253947b63b0708acaa0c9d5e0bc";
+  #
+  # Restarting garm.service on this pin runs upstream's database migrations
+  # between 0a9a939c and 33ec0921 (pseudo pool IDs, constraint parity, the
+  # scale set jobs table, tags.name widening). Restart it in a quiet window
+  # and only after garm-provider-vmharness `serve` has rolled out to every
+  # runner host.
+  rev = "33ec0921418a470ca7e00dfb20ae111595da24e1";
 
   src = fetchFromGitHub {
     owner = "cloudbase";
     repo = "garm";
     inherit rev;
-    hash = "sha256-lv15Q8gzg+SeRxlBXA70W26W+chIOqtgvuMahsMHb6s=";
+    hash = "sha256-8BMEcFuTntcYDVoI+6VxSOyIT3m4t7ZVbbLb+YEd/uk=";
   };
 
   # Deps are vendored in-tree → build offline against `vendor/`.
@@ -71,41 +80,6 @@ buildGo126Module rec {
     # See upstream-patches/garm-allow-macos-pools/ and the gate
     # t_garm_macos_pools_supported.
     ./patches/allow-macos-pools.patch
-    # Upstream cloudbase/garm bug: the v0.1.1 external-provider ListInstances
-    # path guards garmExec.Exec with an INVERTED `if err == nil` (every other
-    # command path uses `if err != nil`). On a SUCCESSFUL provider run it took
-    # the failure branch and formatted the nil error with %s — the recurring
-    #   provider binary <path> returned error: %!s(<nil>)
-    # ERROR — AND discarded the real instance list (returned an empty slice),
-    # so scale-set runner-state consolidation never saw the provider's runners.
-    # The provider (garm-provider-vmharness) is correct: it exits 0 with a valid
-    # JSON list per the external-provider contract. One-char fix inverts the
-    # check so the error branch fires only on genuine provider failure.
-    # Fixed upstream in 488cf98b (2026-09-11), which our pin predates: drop
-    # this patch when the pin moves past 488cf98b. The upstream bundle in
-    # upstream-patches/garm-listinstances-inverted-error-check/ is retired.
-    ./patches/fix-listinstances-inverted-error-check.patch
-    # Upstream cloudbase/garm bug: reconcileStaleJobs() — the loop whose whole
-    # purpose is to clear jobs that are stuck in `queued` for ever — can never
-    # see a SCALE SET job, so on a scale-set-only controller it is a no-op.
-    # It selects candidates via ListEntityJobsByStatus(), which hard-filters
-    # `workflow_job_id > 0`, and scale set jobs never populate WorkflowJobID
-    # (only ScaleSetJobID). It then addresses jobs by WorkflowJobID
-    # throughout — dedupe map, lock key, GitHub lookup and store.DeleteJob(),
-    # which resolves rows with `WHERE workflow_job_id = ?` — so merely
-    # relaxing the filter would make DeleteJob(ctx, 0) delete an ARBITRARY
-    # scale set row. Observed on high-mem-server as a permanently `queued`
-    # phantom in `garm_job_status` (job_id=16820, workflow_job_id=0), minted
-    # when a watchdog reset lost the terminal update for a job whose forge
-    # messages had already been consumed. Every reset can mint another and
-    # they never clear, which corrupts the CI queue dashboards.
-    # See upstream-patches/garm-stale-scaleset-job-reaper/ and the gate
-    # t_garm_stale_scaleset_job_reaped.
-    # Superseded upstream by 8c64910f (2026-10-09, scale set jobs moved to
-    # their own table and pruned after 24h), which our pin predates: drop this
-    # patch, and retarget or retire the gate, when the pin moves past
-    # 8c64910f. The upstream bundle is retired.
-    ./patches/fix-stale-scaleset-job-reaper.patch
     # Instance-lifecycle leaks (three pool-manager defects, observed on central
     # GARM, high-mem-server, 2026-09-22/23):
     #  1. cleanupOrphanedGithubRunners DELETED the DB row of a runner that was
@@ -133,7 +107,7 @@ buildGo126Module rec {
     # log), and the row stayed queued and unlocked in the DB.
     #
     # Cause: each pool manager keeps an in-memory copy of its queued jobs,
-    # fed by database-watcher notifications. At this pin the watcher
+    # fed by database-watcher notifications. At the previous pin (0a9a939c) the watcher
     # delivered each notification from its own goroutine with a 1 s timeout
     # into a 1-slot channel, so notifications could be DROPPED or arrive OUT
     # OF ORDER. consumeQueuedJobs() locks a job, fails to place it, and
@@ -145,19 +119,17 @@ buildGo126Module rec {
     # restarts. Pools depend on this cache; scale sets do not (GitHub
     # re-offers their jobs), which is why only pools strand.
     #
-    # Two patches:
-    #  1. backport-watcher-lossless-delivery: upstream's own fix for the
-    #     dropped/reordered notifications (cloudbase/garm f5d98947, 3e398635,
-    #     0d6acdea, 2026-09-01..08; ordered, unbounded per-consumer queue).
-    #     Drop it when the pin moves past 0d6acdea.
-    #  2. fix-job-cache-stale-lock: consumeQueuedJobs() writes its own
-    #     unlocks through to the cache, heals a cached "locked by us" once
-    #     the 10-minute retry has unlocked the row, and drops cached jobs the
-    #     DB no longer has (instead of erroring on them every pass). Upstream
-    #     HEAD still trusts the cache here, so this is proposed upstream.
+    # The dropped/reordered notifications are fixed upstream (f5d98947,
+    # 3e398635, 0d6acdea, 2026-09-01..08; ordered, unbounded per-consumer
+    # queue), which this pin carries, so the backport is gone. The cache can
+    # still go stale on its own, so fix-job-cache-stale-lock remains:
+    # consumeQueuedJobs() writes its own unlocks through to the cache, heals a
+    # cached "locked by us" once the 10-minute retry has unlocked the row, and
+    # drops cached jobs the DB no longer has (instead of erroring on them every
+    # pass). Upstream HEAD still trusts the cache here, so this is proposed
+    # upstream.
     # See upstream-patches/garm-job-cache-stale-lock/ and the gate
     # t_garm_job_cache_self_heal.
-    ./patches/backport-watcher-lossless-delivery.patch
     ./patches/fix-job-cache-stale-lock.patch
     # Busy runners and the runner cleanup loop (central GARM, high-mem-server,
     # 2026-09-27..29). 63 pool runners were "reaped" in 2.5 days; 17 of them

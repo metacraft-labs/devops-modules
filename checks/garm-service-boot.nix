@@ -103,9 +103,9 @@ top@{ ... }:
                 ).strip()
                 assert active == "active", f"garm.service ActiveState={active!r}"
 
-            with subtest("the packaged garm --version matches the post-v0.2.1 race-fix pin"):
+            with subtest("the packaged garm --version matches the pin"):
                 version = server.succeed("garm --version").strip()
-                assert version == "v0.2.1-unstable-2026-07-08", f"garm --version={version!r}"
+                assert version == "v0.2.1-unstable-2026-10-23", f"garm --version={version!r}"
 
             with subtest("the daemon binds the apiserver port"):
                 server.wait_for_open_port(9997)

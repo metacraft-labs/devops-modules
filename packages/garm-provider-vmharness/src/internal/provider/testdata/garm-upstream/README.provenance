@@ -1,5 +1,5 @@
 Verbatim copies of GARM's runner-install templates, from
-github.com/cloudbase/garm at 0a9a939c10f1e253947b63b0708acaa0c9d5e0bc (the rev
+github.com/cloudbase/garm at 33ec0921418a470ca7e00dfb20ae111595da24e1 (the rev
 packages/garm pins), internal/templates/userdata/:
 
   linux_wrapper.tmpl, windows_wrapper.tmpl

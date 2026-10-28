@@ -58,13 +58,16 @@ submitted or approved.
 | `garm-instance-lifecycle-leaks`                 | 33ec0921 | ✓       | ✓       | re-cut 2026-10-27; ready for review                                |
 | `garm-allow-macos-pools` (`bundle-common.toml`) | ec82f622 | ✓       | ✓       | ready for review; submit first                                     |
 | `garm-allow-macos-pools` (`bundle.toml`)        | 0a9a939c | ✓       | ✓       | ready for review; needs the provider-common PR merged and vendored |
-| `garm-listinstances-inverted-error-check`       | 0a9a939c | ✓       | ❌      | **retired**: fixed upstream in 488cf98b                            |
-| `garm-stale-scaleset-job-reaper`                | 0a9a939c | ✓       | ❌      | **retired**: superseded upstream by 8c64910f                       |
+| `garm-listinstances-inverted-error-check`       | 0a9a939c | ✓       | ❌      | **landed**: fixed upstream in 488cf98b; local patch dropped        |
+| `garm-stale-scaleset-job-reaper`                | 0a9a939c | ✓       | ❌      | **landed**: superseded by 8c64910f; local patch + gate dropped     |
 
 A retired bundle is kept as the record of what was prepared; its wrapper
 refuses `--submit` and `--approve`, and `bundle.toml` carries a `[status]`
-table. Its local Nix patch stays while our pin (`0a9a939c`) predates the
-upstream fix; drop it when the pin moves past that commit.
+table. `packages/garm` now pins `33ec0921`, past both upstream fixes, so the
+two retired bundles' local Nix patches are gone (as is the
+`backport-watcher-lossless-delivery` backport, which 0d6acdea made redundant).
+The remaining local patches in `packages/garm/patches/` were re-cut on
+`33ec0921` from these bundles, minus the gate-owned test files.
 
 ## Relationship to the local patch
 

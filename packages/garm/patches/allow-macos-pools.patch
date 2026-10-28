@@ -1,5 +1,5 @@
 diff --git a/runner/types.go b/runner/types.go
-index ee41188..73644ef 100644
+index ee41188a..73644ef3 100644
 --- a/runner/types.go
 +++ b/runner/types.go
 @@ -29,6 +29,7 @@ var (
