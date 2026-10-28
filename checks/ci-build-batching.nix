@@ -355,6 +355,31 @@
                 "batching deployment targets must still preserve the output set",
             )
 
+            # -- F2. Cached deployment targets are skipped unless pushed. ----
+            cached_mix = [package("plain-%d" % n, system="x86_64-linux") for n in range(3)]
+            cached_mix += [
+                package("cached-target", system="x86_64-linux", deploymentTarget=True,
+                        deploymentKind="server", cachedAt=["https://cache.example/x.narinfo"]),
+                package("changed-target", system="x86_64-linux", deploymentTarget=True,
+                        deploymentKind="server"),
+            ]
+            pr_plan = plan(cached_mix, {}, push="false", systems='["x86_64-linux"]')
+            check(
+                sorted(m["name"] for e in pr_plan["include"] for m in e["batch"])
+                == ["changed-target", "plain-0", "plain-1", "plain-2"],
+                "a PR plan must drop the cached deployment target and keep the changed one",
+            )
+            live_plan = plan(cached_mix, {}, push="true", systems='["x86_64-linux"]')
+            check(
+                outputs_of(live_plan) == population(cached_mix),
+                "a publishing plan must keep every deployment target",
+            )
+            only_cached = plan([cached_mix[3]], {}, push="false", systems='["x86_64-linux"]')
+            check(
+                len(only_cached["include"]) == 1 and only_cached["include"][0].get("noop") is True,
+                "dropping every output must plan one no-op, never an empty plan",
+            )
+
             # -- G. Foundry keeps its own job when the bootstrap override is on.
             foundry_pkgs = [package("pkg-%d" % n) for n in range(8)]
             foundry_pkgs.append(package("foundry"))

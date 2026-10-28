@@ -598,6 +598,36 @@ jobs:
               sys.exit(0)
 
           packages = json.loads(raw).get("include", [])
+
+          def noop_plan():
+              # Never return an empty plan: `build` would fall back to the
+              # UNFILTERED matrix. One no-op keeps the call's shape.
+              return {"include": [{
+                  "name": "no-builds-required",
+                  "system": "x86_64-linux",
+                  "ghRunner": json.loads(os.environ["NOOP_RUNNER"]),
+                  "allowedToFail": False,
+                  "noop": True,
+              }]}
+
+          # A cached deployment target only needs a job in a run that pushes
+          # it (see `Merge matrices`). mcl-devops drops them already; this
+          # repeats the rule here because `compute-mcl-ref` falls back to the
+          # `dev` mcl-devops for cross-repo callers, so the planner is the
+          # place a workflow revision's rule is guaranteed to apply.
+          if not push_deployment_caches and packages:
+              kept = [
+                  pkg for pkg in packages
+                  if not (pkg.get("deploymentTarget") and pkg.get("cachedAt"))
+              ]
+              if len(kept) != len(packages):
+                  note("push-deployment-caches is false: skipping {} cached deployment target(s).".format(
+                      len(packages) - len(kept)))
+              if not kept:
+                  emit(noop_plan())
+                  sys.exit(0)
+              packages = kept
+
           raw_systems = os.environ.get("BUILD_SYSTEMS", "").strip()
           if raw_systems:
               systems = json.loads(raw_systems)
@@ -608,15 +638,7 @@ jobs:
               note("build-systems {}: building {} of {} flake output(s).".format(
                   systems, len(kept), len(packages)))
               if not kept:
-                  # Never return an empty plan here: `build` would fall back to
-                  # the UNFILTERED matrix. One no-op keeps the call's shape.
-                  emit({"include": [{
-                      "name": "no-builds-required",
-                      "system": "x86_64-linux",
-                      "ghRunner": json.loads(os.environ["NOOP_RUNNER"]),
-                      "allowedToFail": False,
-                      "noop": True,
-                  }]})
+                  emit(noop_plan())
                   sys.exit(0)
               packages = kept
           max_jobs = json.loads(raw_max_jobs) if raw_max_jobs else {}
