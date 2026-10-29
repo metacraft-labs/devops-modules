@@ -1062,9 +1062,18 @@ Package[] nixEvalForAllSystems(T)(auto ref T args)
         .array;
 }
 
-/// Memory one nix-eval-jobs worker is planned for: a full NixOS system
-/// evaluation peaks at roughly 2-3 GiB.
-enum evalWorkerMemoryMB = 3072;
+/// How far ONE attribute can grow a nix-eval-jobs worker past its
+/// `--max-memory-size`. That limit is only checked after an attribute
+/// finishes, so a worker's peak is the limit plus the growth of the attribute
+/// it is on. Measured on infra's `live` eval-matrix shard-03 in a 24 GiB
+/// runner container (gpu-server-001, 2026-10-29): under a 3 GiB limit the
+/// workers sat at 3.9, 5.3, 6.7 and 7.3 GiB when the cgroup OOM killer fired,
+/// three attempts in a row.
+enum evalAttrGrowthMB = 6144;
+
+/// Lowest `--max-memory-size` handed to a worker. Below this a worker would
+/// restart (and re-load the flake) after nearly every attribute.
+enum evalWorkerMinLimitMB = 1024;
 
 struct EvalWorkerBudget
 {
@@ -1073,36 +1082,39 @@ struct EvalWorkerBudget
 }
 
 /// Split the memory available to this job across nix-eval-jobs workers.
-/// Plans for 3/4 of `availableMB` (the per-worker limit only restarts a worker
-/// after the attribute it is evaluating, so peaks overshoot it). Unless the
-/// worker count was pinned, reduces the count so each worker gets at least
-/// `evalWorkerMemoryMB`.
+/// Plans for 3/4 of `availableMB` and sizes each worker for its restart limit
+/// plus `evalAttrGrowthMB`, the overshoot of the attribute it is on. Unless
+/// the worker count was pinned, reduces the count so that every worker fits
+/// with at least `evalWorkerMinLimitMB` of limit.
 EvalWorkerBudget evalWorkerBudget(int availableMB, int workers, bool workersPinned)
 {
     import std.algorithm.comparison : clamp, max;
 
-    const planMB = max(availableMB * 3 / 4, evalWorkerMemoryMB);
+    enum minFootprintMB = evalWorkerMinLimitMB + evalAttrGrowthMB;
+    const planMB = max(availableMB * 3 / 4, minFootprintMB);
     int n = workers < 1 ? 1 : workers;
     if (!workersPinned)
-        n = clamp(planMB / evalWorkerMemoryMB, 1, n);
-    return EvalWorkerBudget(n, max(planMB / n, 1024));
+        n = clamp(planMB / minFootprintMB, 1, n);
+    return EvalWorkerBudget(n, max(planMB / n - evalAttrGrowthMB, evalWorkerMinLimitMB));
 }
 
 @("evalWorkerBudget")
 unittest
 {
-    // 12 GiB container, 6 CPUs: 3 workers of 3 GiB each.
-    assert(evalWorkerBudget(12_288, 6, false) == EvalWorkerBudget(3, 3072));
-    // 10 GiB container: 2 workers.
-    assert(evalWorkerBudget(10_240, 6, false) == EvalWorkerBudget(2, 3840));
-    // 24 GiB container keeps all 6 workers.
-    assert(evalWorkerBudget(24_576, 6, false) == EvalWorkerBudget(6, 3072));
+    // 24 GiB runner container (the GPU hosts' and hms's generic and
+    // deploy-pipeline slots), 6 CPUs: 2 workers that restart past 3 GiB, so
+    // each peaks near 9 GiB and both together stay inside the 18 GiB plan.
+    assert(evalWorkerBudget(24_576, 6, false) == EvalWorkerBudget(2, 3072));
+    // 12 GiB container: 1 worker.
+    assert(evalWorkerBudget(12_288, 6, false) == EvalWorkerBudget(1, 3072));
+    // 10 GiB container: 1 worker with a lower restart limit.
+    assert(evalWorkerBudget(10_240, 6, false) == EvalWorkerBudget(1, 1536));
     // A large host keeps the CPU-derived count and splits memory across it.
-    assert(evalWorkerBudget(300_000, 8, false) == EvalWorkerBudget(8, 28_125));
-    // A pinned worker count is kept; memory is still split per worker.
-    assert(evalWorkerBudget(12_288, 6, true) == EvalWorkerBudget(6, 1536));
+    assert(evalWorkerBudget(300_000, 8, false) == EvalWorkerBudget(8, 21_981));
+    // A pinned worker count is kept; the limit falls to the floor.
+    assert(evalWorkerBudget(12_288, 6, true) == EvalWorkerBudget(6, 1024));
     // Tiny or unknown memory still yields one worker with a floor.
-    assert(evalWorkerBudget(0, 8, false) == EvalWorkerBudget(1, 3072));
+    assert(evalWorkerBudget(0, 8, false) == EvalWorkerBudget(1, 1024));
 }
 
 int getNixEvalWorkerCount(T)(auto ref T args)
