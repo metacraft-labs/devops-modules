@@ -398,7 +398,7 @@ version (unittest)
 {
     static immutable SummaryTableEntry[] testSummaryTableEntryArray = [
         SummaryTableEntry("testPackage", SummaryTableEntry_x86_64("✅ cached", "✅ cached"), SummaryTableEntry_aarch64("🚫 not supported")),
-        SummaryTableEntry("testPackage2", SummaryTableEntry_x86_64("⏳ building...", "❌ build failed"), SummaryTableEntry_aarch64(
+        SummaryTableEntry("testPackage2", SummaryTableEntry_x86_64("⏳ building...", "❌ not in cache"), SummaryTableEntry_aarch64(
                 "⏳ building..."))
     ];
 }
@@ -1257,7 +1257,8 @@ void saveGHCIComment(SummaryTableEntry[] tableSummaryJSON)
     import std.path : buildNormalizedPath, absolutePath;
 
     string comment = "Thanks for your Pull Request!";
-    comment ~= "\n\nBelow you will find a summary of the cachix status of each package, for each supported platform.";
+    comment ~= "\n\nBelow you will find whether each package is already in the Attic binary cache, for each supported platform.";
+    comment ~= " A row that is not cached was absent from the cache. That is a cache miss, not a build result.";
     comment ~= "\n\n| package | `x86_64-linux` | `x86_64-darwin` | `aarch64-darwin` |";
     comment ~= "\n| ------- | -------------- | --------------- | ---------------- |";
     comment ~= tableSummaryJSON.map!(
@@ -1277,6 +1278,9 @@ unittest
     createResultDirs();
     saveGHCIComment(cast(SummaryTableEntry[]) testSummaryTableEntryArray);
     string comment = rootDir.buildPath("comment.md").readText;
+    assert(comment.indexOf("Attic binary cache") != -1);
+    assert(comment.indexOf("cachix") == -1);
+    assert(comment.indexOf("Cachix") == -1);
     foreach (pkg; testSummaryTableEntryArray)
     {
         assert(comment.indexOf(pkg.name) != -1);
@@ -1311,7 +1315,9 @@ string getStatus(JSONValue pkg, string key, bool isInitial)
         if (isInitial)
             return "⏳ building...";
 
-        return "❌ build failed";
+        // The narinfo probe did not find this output. The build job can
+        // still have succeeded; a miss often means the closure was not pushed.
+        return "❌ not in cache";
     }
     else
     {
@@ -1364,7 +1370,7 @@ unittest
     assert(tableSummary[1].name == testPackageArray[1].name);
     assert(tableSummary[1].x86_64.linux == "🚫 not supported");
     assert(tableSummary[1].x86_64.darwin == "🚫 not supported");
-    assert(tableSummary[1].aarch64.darwin == "❌ build failed");
+    assert(tableSummary[1].aarch64.darwin == "❌ not in cache");
 
     tableSummary = convertNixEvalToTableSummary(
         testPackageArray,
