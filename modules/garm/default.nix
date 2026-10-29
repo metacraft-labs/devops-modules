@@ -13,7 +13,7 @@
   # M0 scope is DELIBERATELY forge-less and provider-less: GARM boots fine with
   # empty `[[provider]]`/`[[github]]` sections (see cmd/garm/main.go — providers
   # and forges are loaded lazily and an empty set is valid). The provider is
-  # wired in M1 (`garm-provider-vmharness`) and the forge/pool in M4.
+  # wired in M1 (`garm-provider-gosti`) and the forge/pool in M4.
   #
   # EXP-MP (Production-Runners-And-Shared-Store): the module now supports
   # MULTIPLE named providers (`services.garm.providers.<name>`, each with its own
@@ -67,10 +67,10 @@
         { config, ... }: config.packages.runner-label-tool
       );
 
-      # Default to this flake's `garm-provider-vmharness` package (M1). Consumers
+      # Default to this flake's `garm-provider-gosti` package (M1). Consumers
       # may override `providers.<name>.package`.
-      defaultVmharnessPackage = withSystem pkgs.stdenv.hostPlatform.system (
-        { config, ... }: config.packages.garm-provider-vmharness
+      defaultGostiPackage = withSystem pkgs.stdenv.hostPlatform.system (
+        { config, ... }: config.packages.garm-provider-gosti
       );
 
       # Sovereign-CI-Fleet AH3: the agent-harbor provider's default package.
@@ -105,7 +105,7 @@
       stagedPemPath = name: "${stateDir}/app-key-${sanitizeName name}.pem";
 
       # RB2: systemd LoadCredential id + on-disk staged path for a REMOTE
-      # provider's `vm-harness serve` bearer token. Mirrors the App-PEM staging
+      # provider's `gosti serve` bearer token. Mirrors the App-PEM staging
       # exactly (LoadCredential source -> stable 0600 path under stateDir the
       # provider reads), so the central GARM's per-host serve token never enters
       # the store and is read from a path that is stable across the render ->
@@ -121,18 +121,18 @@
       ) enabledProviders;
 
       # ----- Per-provider config.toml (a DIFFERENT file from garm's config) ---
-      # It holds NO secrets — only the virsh/qemu-img/vm-harness binary paths,
+      # It holds NO secrets — only the virsh/qemu-img/gosti binary paths,
       # the libvirt URI/network OR the incus bridge + static-IPv4 params, the
       # OVMF firmware paths, the per-VM sizing, and the golden-image map — so it
       # is safe in the Nix store. Passed to the provider verbatim via
       # GARM_PROVIDER_CONFIG_FILE. Keys match
-      # garm-provider-vmharness/internal/config.Config.
+      # garm-provider-gosti/internal/config.Config.
       # (Build the STRING first, then wrap with writeText — otherwise the
       # [images.*] blocks would be appended to the derivation's store PATH.)
       providerIsIncus = p: p.backend == "incus";
       providerIsLibvirt = p: p.backend == "libvirt";
       # RB1: remote-target mode — the provider is an RPC client to a remote
-      # `vm-harness serve` daemon instead of a local-exec backend. It needs no
+      # `gosti serve` daemon instead of a local-exec backend. It needs no
       # local hypervisor tools (no virsh/incus/kvm), only network reach to the
       # endpoint + the bearer token; the strict M0 sandbox posture already
       # permits outbound TCP, so a remote provider relaxes nothing.
@@ -157,7 +157,7 @@
       enabledAgentharborTokenProviders = lib.filterAttrs (
         _: p: providerIsAgentharbor p && p.agentharbor.authTokenFile != null
       ) enabledProviders;
-      providerIsVMHarnessRun =
+      providerIsGostiRun =
         p:
         builtins.elem p.backend [
           "tart-linux-arm"
@@ -193,22 +193,22 @@
             p.agentharbor.authTokenFile == null && p.agentharbor.authScheme != "none"
           ) p.agentharbor.authTokenEnv
         )
-        ++ lib.optionals (providerIsVMHarnessRun p) [
+        ++ lib.optionals (providerIsGostiRun p) [
           "MCL_RUNNER_SHARED_NIX_STORE"
           "MCL_RUNNER_SHARED_REPRO_STORE"
-          "VM_HARNESS_TART_STATE_DIR"
+          "GOSTI_TART_STATE_DIR"
           "TART_HOME"
-          "VM_HARNESS_UTM_STATE_DIR"
-          "VM_HARNESS_QEMU_WINDOWS_ARM_STATE_DIR"
-          "VMH_QEMU_WINDOWS_ARM_SWTPM_CMD"
-          "VM_HARNESS_DARWIN_ASUSER_UID"
+          "GOSTI_UTM_STATE_DIR"
+          "GOSTI_QEMU_WINDOWS_ARM_STATE_DIR"
+          "GOSTI_QEMU_WINDOWS_ARM_SWTPM_CMD"
+          "GOSTI_DARWIN_ASUSER_UID"
         ];
       mkLibvirtKeys =
         p:
         ''
           virsh_path = "${p.virshPath}"
           qemu_img_path = "${p.qemuImgPath}"
-          vm_harness_path = "${p.vmHarnessPath}"
+          gosti_path = "${p.gostiPath}"
           libvirt_uri = "${p.libvirtURI}"
           network = "${p.network}"
           pool_dir = "${p.poolDir}"
@@ -247,10 +247,10 @@
         + optionalString (p.incusLimitsCpu != "") ''
           incus_limits_cpu = "${p.incusLimitsCpu}"
         '';
-      mkVMHarnessRunKeys =
+      mkGostiRunKeys =
         p:
         ''
-          vm_harness_path = "${p.vmHarnessPath}"
+          gosti_path = "${p.gostiPath}"
           state_dir = "${p.stateDir}"
         ''
         + optionalString (p.guestMetadataURL != null) ''
@@ -265,7 +265,7 @@
       # (agenix / LoadCredential-staged) resolved at runtime, or the provider
       # reads `auth_token_env` from the environment (value supplied by infra).
       # The two optional Incus capability grants are likewise operator-owned:
-      # they map to fixed, audited vm-harness flags and expose no raw config key,
+      # they map to fixed, audited gosti flags and expose no raw config key,
       # device path, or mode to workflows, bootstrap/user-data, or guests.
       mkRemoteKeys =
         name: p:
@@ -325,7 +325,7 @@
       # here (that would leak them into the store); infra must instead supply
       # them through the same env chain (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
       # / AWS_SESSION_TOKEN) or a mounted shared-credentials file. NOTE: unlike
-      # the vm-harness backends, this config carries NO golden-image map — the
+      # the gosti backends, this config carries NO golden-image map — the
       # AMI is a per-pool value (`burstPools.<name>.image`), not a provider one.
       mkAwsKeys =
         p:
@@ -347,7 +347,7 @@
           credential_type = "${p.aws.credentialType}"
         '';
       # AH3: the `garm-provider-agentharbor` config.toml
-      # (garm-provider-vmharness/src/internal/agentharbor/config.go). NO secret:
+      # (garm-provider-gosti/src/internal/agentharbor/config.go). NO secret:
       # the API credential is read from the staged file or a forwarded env var.
       mkAgentharborKeys =
         name: p:
@@ -487,12 +487,12 @@
             mkAgentharborKeys name p
           else if providerIsIncus p then
             mkIncusKeys p
-          else if providerIsVMHarnessRun p then
-            mkVMHarnessRunKeys p
+          else if providerIsGostiRun p then
+            mkGostiRunKeys p
           else
             mkLibvirtKeys p
         )
-        # The golden-image map is a vm-harness concept; the agent-harbor
+        # The golden-image map is a gosti concept; the agent-harbor
         # provider has none (and rejects unknown keys), so it is not rendered.
         + lib.concatStrings (
           lib.mapAttrsToList (image: spec: ''
@@ -515,15 +515,15 @@
         provider_type = "external"
         description = "${
           if providerIsRemote p then
-            "remote ephemeral runners via a vm-harness serve daemon (${p.remote.targetBackend})"
+            "remote ephemeral runners via a gosti serve daemon (${p.remote.targetBackend})"
           else if providerIsAws p then
             "AWS EC2 burst ephemeral runners (garm-provider-aws, region ${p.aws.region})"
           else if providerIsAgentharbor p then
             "agent-harbor sandbox-job ephemeral runners (garm-provider-agentharbor, substrate ${p.agentharbor.substrate})"
           else if providerIsIncus p then
-            "incus Linux container ephemeral runners via vm-harness"
+            "incus Linux container ephemeral runners via gosti"
           else
-            "libvirt/KVM Windows ephemeral runners via vm-harness"
+            "libvirt/KVM Windows ephemeral runners via gosti"
         }"
 
           [provider.external]
@@ -645,7 +645,7 @@
         '') enabledGithub
       );
 
-      # RB2: stage each remote provider's `vm-harness serve` bearer token from
+      # RB2: stage each remote provider's `gosti serve` bearer token from
       # its LoadCredential-mounted secret to a STABLE 0600 path under stateDir
       # (owned by the service user, outside the store), mirroring stageGithubPems
       # above. The provider config's `auth_token_file` points at this stable path
@@ -689,6 +689,28 @@
       #     (first line, whitespace-trimmed).
       #   * Otherwise a strong random secret is generated once and persisted at
       #     $STATE_DIR/<name>.secret (mode 0600) and reused thereafter.
+      # Applies `providerRenames` to the stopped database (ExecStartPre, after
+      # the config render). A database that does not exist yet is left for
+      # GARM to create.
+      providerRenameScript = pkgs.writeShellApplication {
+        name = "garm-rename-providers";
+        runtimeInputs = [ pkgs.sqlite ];
+        text = ''
+          db=${lib.escapeShellArg dbFile}
+          [ -f "$db" ] || exit 0
+          sqlite3 -bail "$db" <<'SQL'
+          BEGIN IMMEDIATE;
+          ${lib.concatStrings (
+            lib.mapAttrsToList (old: new: ''
+              UPDATE pools SET provider_name = '${new}' WHERE provider_name = '${old}';
+              UPDATE scale_sets SET provider_name = '${new}' WHERE provider_name = '${old}';
+            '') cfg.providerRenames
+          )}
+          COMMIT;
+          SQL
+        '';
+      };
+
       renderScript = pkgs.writeShellApplication {
         name = "garm-render-config";
         runtimeInputs = [
@@ -1054,8 +1076,8 @@
         #!/bin/sh
         set -eu
 
-        echo "This GARM macOS install template is a compatibility stub for the external vm-harness provider." >&2
-        echo "garm-provider-vmharness renders and executes the real macOS runner bootstrap inside the Tart guest." >&2
+        echo "This GARM macOS install template is a compatibility stub for the external gosti provider." >&2
+        echo "garm-provider-gosti renders and executes the real macOS runner bootstrap inside the Tart guest." >&2
         exit 1
       '';
 
@@ -1480,7 +1502,7 @@
           # name. Its BODY is a deliberate stub, and the same stub the m3
           # per-host GARM has served its macOS Tart scale sets with in
           # production (infra services/ephemeral-runner-host/darwin.nix):
-          # garm-provider-vmharness renders the real macOS bootstrap INSIDE the
+          # garm-provider-gosti renders the real macOS bootstrap INSIDE the
           # Tart guest (its own renderMacOSRunnerInstallScript + `osx` tool
           # mapping) and never reads this template, so anything else here would
           # be fiction. If some future macOS provider DOES consult it, exiting 1
@@ -2108,9 +2130,9 @@
             package = mkOption {
               type = types.package;
               default =
-                if config.backend == "agentharbor" then defaultAgentharborPackage else defaultVmharnessPackage;
-              defaultText = lib.literalMD "this flake's `garm-provider-agentharbor` package for `backend = \"agentharbor\"`, else `garm-provider-vmharness`";
-              description = "Package providing the provider binary (`garm-provider-vmharness`, or `garm-provider-agentharbor` for the agentharbor backend).";
+                if config.backend == "agentharbor" then defaultAgentharborPackage else defaultGostiPackage;
+              defaultText = lib.literalMD "this flake's `garm-provider-agentharbor` package for `backend = \"agentharbor\"`, else `garm-provider-gosti`";
+              description = "Package providing the provider binary (`garm-provider-gosti`, or `garm-provider-agentharbor` for the agentharbor backend).";
             };
 
             backend = mkOption {
@@ -2127,8 +2149,8 @@
               ];
               default = "libvirt";
               description = ''
-                vm-harness backend the provider drives. `remote` (RB1) makes the
-                provider an RPC CLIENT to a remote `vm-harness serve` daemon
+                gosti backend the provider drives. `remote` (RB1) makes the
+                provider an RPC CLIENT to a remote `gosti serve` daemon
                 (configured under `remote.*`) instead of a local-exec backend —
                 the foundation for the central-GARM topology where one controller
                 drives every host's VMs/containers over the network. All other
@@ -2137,7 +2159,7 @@
                 path); `incus` launches per-job Linux SYSTEM CONTAINERS from a
                 runner image (the Ephemeral-Linux-Runners path);
                 `tart-linux-arm`, `tart-macos`, `utm-windows-arm`, and
-                `qemu-windows-arm` shell to vm-harness's Apple-silicon backends
+                `qemu-windows-arm` shell to gosti's Apple-silicon backends
                 for m3. The backend also
                 contributes to the systemd sandbox posture UNION: `incus` needs
                 only `incus-admin` socket-group access and no /dev/kvm (keeps the
@@ -2162,7 +2184,7 @@
                 `provider does not implement <v> ExternalProvider`, before any
                 cloud API is reached.
 
-                `garm-provider-vmharness` and `garm-provider-agentharbor`
+                `garm-provider-gosti` and `garm-provider-agentharbor`
                 implement v0.1.1. Upstream `cloudbase/garm-provider-aws`
                 implements ONLY v0.1.0 (provider/provider.go imports
                 `execution/v0.1.0`, true of `main` as of 2026-10-05), so the aws
@@ -2268,17 +2290,17 @@
               '';
             };
 
-            vmHarnessPath = mkOption {
+            gostiPath = mkOption {
               type = types.str;
-              default = "vm-harness";
-              description = "Path to the `vm-harness` binary used for per-job clone + config-drive injection.";
+              default = "gosti";
+              description = "Path to the `gosti` binary used for per-job clone + config-drive injection.";
             };
 
             stateDir = mkOption {
               type = types.str;
-              default = "/var/lib/garm-provider-vmharness";
+              default = "/var/lib/garm-provider-gosti";
               description = ''
-                State directory used by vm-harness-run providers
+                State directory used by gosti-run providers
                 (`tart-linux-arm`, `tart-macos`, `utm-windows-arm`,
                 `qemu-windows-arm`) for pid and instance metadata files.
                 Contains no secrets.
@@ -2291,7 +2313,7 @@
               example = "http://10.0.2.2:9997/api/v1/metadata";
               description = ''
                 Optional provider-local override for the GARM metadata URL
-                rendered into guest bootstrap scripts for vm-harness-run,
+                rendered into guest bootstrap scripts for gosti-run,
                 `agentharbor` and `aws` backends. Leave null to use
                 `services.garm.metadataURL`. For `aws` it is how a controller whose
                 own URL is on a private network (a VPN address) gives cloud
@@ -2305,7 +2327,7 @@
               example = "http://10.0.2.2:9997/api/v1/callbacks";
               description = ''
                 Optional provider-local override for the GARM callback URL
-                rendered into guest bootstrap scripts for vm-harness-run,
+                rendered into guest bootstrap scripts for gosti-run,
                 `agentharbor` and `aws` backends. Leave null to use
                 `services.garm.callbackURL`. For `aws` it is how a controller whose
                 own URL is on a private network (a VPN address) gives cloud
@@ -2608,7 +2630,7 @@
 
             # ----- RB1 remote-target mode -------------------------------------
             # Consulted only when `backend = "remote"`. COMPANY-AGNOSTIC: an
-            # endpoint + how to obtain the bearer token + the vm-harness backend
+            # endpoint + how to obtain the bearer token + the gosti backend
             # the REMOTE host drives — no Metacraft host or secret is baked in.
             # The concrete endpoint/token wiring (NetBird IPs, agenix secrets)
             # is an infra-layer concern that CONSUMES these options.
@@ -2617,7 +2639,7 @@
               description = ''
                 Remote-target mode configuration (RB1). Only used when
                 `backend = "remote"`, in which case the provider is an RPC client
-                to a remote `vm-harness serve` daemon instead of a local backend.
+                to a remote `gosti serve` daemon instead of a local backend.
               '';
               type = types.submodule {
                 options = {
@@ -2626,7 +2648,7 @@
                     default = "";
                     example = "100.72.0.5:8873";
                     description = ''
-                      Remote `vm-harness serve` address as host:port — typically a
+                      Remote `gosti serve` address as host:port — typically a
                       NetBird overlay IP (the control channel is NEVER exposed on
                       the public internet). Required when `backend = "remote"`.
                     '';
@@ -2643,13 +2665,13 @@
                     ];
                     default = "incus";
                     description = ''
-                      vm-harness backend id the REMOTE host drives (forwarded as
+                      gosti backend id the REMOTE host drives (forwarded as
                       the remote `--backend`). `noop` is the sanctioned test
                       backend used by the `t_garm_provider_remote` gate.
 
                       This is a SUBSET of the local `backend` enum above, and
                       deliberately so: a backend belongs here only once a remote
-                      `vm-harness serve` is known to drive it. `qemu-windows-arm`
+                      `gosti serve` is known to drive it. `qemu-windows-arm`
                       qualified when m3 began serving Windows-ARM guests to the
                       central controller; `utm-windows-arm` has not, and stays
                       local-only until something serves it.
@@ -2668,14 +2690,14 @@
                   };
                   authTokenEnv = mkOption {
                     type = types.str;
-                    default = "VMH_SERVE_TOKEN";
+                    default = "GOSTI_SERVE_TOKEN";
                     description = ''
                       Environment variable the bearer token is read from when
                       `authTokenFile` is null (`auth_token_env`). Its value is
                       supplied by the infra layer (systemd `EnvironmentFile` /
                       `LoadCredential`); this module only forwards the variable
                       name to the provider process. Matches the variable
-                      `vm-harness serve` itself documents, so one per-host secret
+                      `gosti serve` itself documents, so one per-host secret
                       serves both ends.
                     '';
                   };
@@ -2715,7 +2737,7 @@
                     default = false;
                     description = ''
                       Trusted operator grant for a remote Incus provider. When
-                      true, the provider appends only vm-harness's fixed
+                      true, the provider appends only gosti's fixed
                       `--incus-security-nesting` flag before guest start. It
                       does not expose arbitrary Incus configuration to pools,
                       workflows, bootstrap/user-data, or guests. Rejected for
@@ -2727,8 +2749,8 @@
                     default = false;
                     description = ''
                       Trusted operator grant for a remote Incus provider. When
-                      true, the provider appends only vm-harness's fixed
-                      `--incus-nested-kvm` flag; vm-harness maps the fixed host
+                      true, the provider appends only gosti's fixed
+                      `--incus-nested-kvm` flag; gosti maps the fixed host
                       `/dev/kvm` to guest `/dev/kvm`, verifies exact mode 0666,
                       and opens it read-write. No path or mode is configurable.
                       Rejected for non-remote providers and non-Incus targets.
@@ -2741,13 +2763,13 @@
                     description = ''
                       Per-job CPU cap for a remote Incus provider. When > 0, the
                       provider appends `--cpus <n>` to the remote
-                      `vm-harness run --ephemeral --backend incus`, which sets
+                      `gosti run --ephemeral --backend incus`, which sets
                       `limits.cpu = <n>` on the per-job container before its
                       first start. A count is a dynamic cpuset pin, so the
                       guest's `nproc` reports `<n>` and `make -j$(nproc)` /
                       `nix build --cores 0` size themselves to the slot instead
                       of to the whole host. 0 (default) sets nothing and keeps
-                      the create argv byte-identical. Older vm-harness daemons
+                      the create argv byte-identical. Older gosti daemons
                       parse `--cpus` and ignore it on this path, so the flag is
                       safe to roll out before the serve hosts are upgraded.
                       Rejected for non-remote providers and non-Incus targets.
@@ -2773,10 +2795,10 @@
                       OVMF code firmware, as a path ON THE REMOTE HOST, for a
                       remote libvirt provider. Emitted as `--uefi-loader` (with
                       `libvirtUefiNvramTemplate` as `--uefi-nvram-template`) on
-                      the remote `vm-harness run --ephemeral --backend libvirt`.
+                      the remote `gosti run --ephemeral --backend libvirt`.
                       Required for a UEFI golden such as Windows 11: without it
                       the per-job domain boots SeaBIOS with the `qemu64` CPU and
-                      never reaches the OS. vm-harness also switches a UEFI
+                      never reaches the OS. gosti also switches a UEFI
                       domain to `host-passthrough`. null (default) emits nothing.
                       Rejected for non-remote providers and non-libvirt targets.
                     '';
@@ -2797,7 +2819,7 @@
                     example = 4;
                     description = ''
                       Per-job vCPUs for a remote libvirt provider, emitted as
-                      `--cpus <n>`. 0 (default) leaves vm-harness's ephemeral
+                      `--cpus <n>`. 0 (default) leaves gosti's ephemeral
                       default (2). Rejected for non-libvirt targets.
                     '';
                   };
@@ -2807,7 +2829,7 @@
                     example = 16384;
                     description = ''
                       Per-job RAM (MiB) for a remote libvirt provider, emitted as
-                      `--memory-mb <n>`. 0 (default) leaves vm-harness's
+                      `--memory-mb <n>`. 0 (default) leaves gosti's
                       ephemeral default (1024 MiB, far too small for Windows).
                       Rejected for non-libvirt targets.
                     '';
@@ -4016,7 +4038,27 @@
           description = "LoadCredential name for the DB passphrase file.";
         };
 
-        # EXP-MP — the vm-harness external providers, an attrset of named
+        providerRenames = mkOption {
+          type = types.attrsOf types.str;
+          default = { };
+          example = {
+            old-provider = "new-provider";
+          };
+          description = ''
+            Provider renames applied to GARM's database before it starts, as
+            `{ <old name> = "<new name>"; }`. GARM stores each pool's and scale
+            set's provider by NAME, so renaming a key of
+            {option}`providers` alone would leave every existing pool and scale
+            set pointing at a provider GARM no longer has. This rewrites
+            `provider_name` in place, in one transaction, keeping pool ids,
+            scale-set ids and running runners. Each new name must be a declared
+            provider and no old name may still be one. Idempotent: once no row
+            carries an old name it changes nothing, so an entry can stay for a
+            deploy cycle and be removed afterwards.
+          '';
+        };
+
+        # EXP-MP — the gosti external providers, an attrset of named
         # instances (each a `[[provider]]` block). OPT-IN (default {}) so M0's
         # forge-less/provider-less boot is unaffected. Multiple entries let a
         # single GARM drive Windows (libvirt) + Linux (incus) — and, on m3, macOS
@@ -4024,7 +4066,7 @@
         providers = mkOption {
           default = { };
           description = ''
-            Named vm-harness external provider instances, keyed by provider name
+            Named gosti external provider instances, keyed by provider name
             (the `[[provider]].name` referenced by scale sets). Each has its own
             backend (libvirt|incus), image map, network, and per-VM sizing, and
             is rendered as a distinct GARM `[[provider]]` block. The systemd
@@ -4055,7 +4097,7 @@
                 options = {
                   provider = mkOption {
                     type = types.str;
-                    default = "vmharness";
+                    default = "gosti";
                     description = "The named `services.garm.providers.<provider>` that backs this scale set.";
                   };
                   org = mkOption {
@@ -4539,8 +4581,8 @@
                 options = {
                   provider = mkOption {
                     type = types.str;
-                    default = "vmharness";
-                    description = "The named `services.garm.providers.<provider>` that backs this pool (typically a `backend = \"remote\"` provider targeting a host's `vm-harness serve`).";
+                    default = "gosti";
+                    description = "The named `services.garm.providers.<provider>` that backs this pool (typically a `backend = \"remote\"` provider targeting a host's `gosti serve`).";
                   };
                   poolName = mkOption {
                     type = types.str;
@@ -4574,7 +4616,7 @@
                   flavor = mkOption {
                     type = types.str;
                     default = "default";
-                    description = "Provider flavor passed as `--flavor` (the vm-harness backends ignore it; kept for parity with the GARM CLI).";
+                    description = "Provider flavor passed as `--flavor` (the gosti backends ignore it; kept for parity with the GARM CLI).";
                   };
                   osType = mkOption {
                     type = types.enum [
@@ -5125,6 +5167,16 @@
               assertion = cfg.providers ? ${ss.provider};
               message = "services.garm.scaleSets.${n}.provider = \"${ss.provider}\" does not name a declared services.garm.providers.<name> (have: ${lib.concatStringsSep ", " (lib.attrNames cfg.providers)}).";
             }) cfg.scaleSets
+            # A provider rename must land on a declared provider and retire the
+            # old name; the names are interpolated into SQL, so keep them plain.
+            ++ lib.mapAttrsToList (old: new: {
+              assertion =
+                cfg.providers ? ${new}
+                && !(cfg.providers ? ${old})
+                && builtins.match "[A-Za-z0-9_.-]+" old != null
+                && builtins.match "[A-Za-z0-9_.-]+" new != null;
+              message = "services.garm.providerRenames.${old} = \"${new}\": the new name must be a declared provider, the old one must not, and both must match [A-Za-z0-9_.-]+.";
+            }) cfg.providerRenames
             # RC2: a pool's warm floor can never exceed its concurrency cap.
             ++ lib.mapAttrsToList (n: pl: {
               assertion = pl.minIdleRunners <= pl.maxRunners;
@@ -5180,13 +5232,13 @@
             }) cfg.providers
             ++ lib.mapAttrsToList (n: p: {
               assertion = p.currentMemoryMb == 0 || providerIsLibvirt p;
-              message = "services.garm.providers.${n}: currentMemoryMb is only honoured by the libvirt backend (this provider's backend = \"${p.backend}\"); it has no effect on incus containers or vm-harness-run VMs.";
+              message = "services.garm.providers.${n}: currentMemoryMb is only honoured by the libvirt backend (this provider's backend = \"${p.backend}\"); it has no effect on incus containers or gosti-run VMs.";
             }) cfg.providers
             # RB1: a remote-target provider needs an endpoint. (The token is
             # resolved at runtime — file or env — so it cannot be asserted here.)
             ++ lib.mapAttrsToList (n: p: {
               assertion = !(providerIsRemote p) || p.remote.endpoint != "";
-              message = "services.garm.providers.${n}: backend = \"remote\" requires remote.endpoint (host:port of the vm-harness serve daemon).";
+              message = "services.garm.providers.${n}: backend = \"remote\" requires remote.endpoint (host:port of the gosti serve daemon).";
             }) cfg.providers
             # AH3: an agent-harbor provider needs an endpoint, may pin a key id
             # only together with its key, and has no golden-image map.
@@ -5220,17 +5272,17 @@
             ++ lib.mapAttrsToList (n: p: {
               assertion =
                 !p.remote.incusSecurityNesting || (providerIsRemote p && p.remote.targetBackend == "incus");
-              message = "services.garm.providers.${n}.remote.incusSecurityNesting requires backend = \"remote\" and remote.targetBackend = \"incus\"; it maps only to vm-harness --incus-security-nesting.";
+              message = "services.garm.providers.${n}.remote.incusSecurityNesting requires backend = \"remote\" and remote.targetBackend = \"incus\"; it maps only to gosti --incus-security-nesting.";
             }) cfg.providers
             ++ lib.mapAttrsToList (n: p: {
               assertion = !p.remote.incusNestedKvm || (providerIsRemote p && p.remote.targetBackend == "incus");
-              message = "services.garm.providers.${n}.remote.incusNestedKvm requires backend = \"remote\" and remote.targetBackend = \"incus\"; it maps only to vm-harness --incus-nested-kvm with the fixed /dev/kvm device contract.";
+              message = "services.garm.providers.${n}.remote.incusNestedKvm requires backend = \"remote\" and remote.targetBackend = \"incus\"; it maps only to gosti --incus-nested-kvm with the fixed /dev/kvm device contract.";
             }) cfg.providers
             ++ lib.mapAttrsToList (n: p: {
               assertion =
                 (p.remote.incusLimitsCpu == 0 && p.remote.incusLimitsMemoryMb == 0)
                 || (providerIsRemote p && p.remote.targetBackend == "incus");
-              message = "services.garm.providers.${n}.remote.incusLimitsCpu/incusLimitsMemoryMb require backend = \"remote\" and remote.targetBackend = \"incus\"; they map only to vm-harness --cpus/--memory-mb on the Incus ephemeral path.";
+              message = "services.garm.providers.${n}.remote.incusLimitsCpu/incusLimitsMemoryMb require backend = \"remote\" and remote.targetBackend = \"incus\"; they map only to gosti --cpus/--memory-mb on the Incus ephemeral path.";
             }) cfg.providers
             ++ lib.mapAttrsToList (n: p: {
               assertion =
@@ -5241,7 +5293,7 @@
                   && p.remote.libvirtMemoryMb == 0
                 )
                 || (providerIsRemote p && p.remote.targetBackend == "libvirt");
-              message = "services.garm.providers.${n}.remote.libvirt* require backend = \"remote\" and remote.targetBackend = \"libvirt\"; they map only to vm-harness --uefi-loader/--uefi-nvram-template/--cpus/--memory-mb on the libvirt ephemeral path.";
+              message = "services.garm.providers.${n}.remote.libvirt* require backend = \"remote\" and remote.targetBackend = \"libvirt\"; they map only to gosti --uefi-loader/--uefi-nvram-template/--cpus/--memory-mb on the libvirt ephemeral path.";
             }) cfg.providers
             ++ lib.mapAttrsToList (n: p: {
               assertion = (p.remote.libvirtUefiLoader == null) == (p.remote.libvirtUefiNvramTemplate == null);
@@ -5503,7 +5555,10 @@
               # (`healthcheck.startupBindTimeout`, 30 s by default) lives.
               Type = "exec";
 
-              ExecStartPre = lib.getExe renderScript;
+              ExecStartPre = [
+                (lib.getExe renderScript)
+              ]
+              ++ lib.optional (cfg.providerRenames != { }) (lib.getExe providerRenameScript);
               ExecStart = lib.escapeShellArgs [
                 (lib.getExe cfg.package)
                 "--config"

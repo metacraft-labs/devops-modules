@@ -42,7 +42,7 @@
   #        adopted hosts (managePreseed = false) stay byte-unchanged.
   #
   #   (3) an idempotent `garm-incus-image-import.service` oneshot that imports
-  #       the runner image (default alias `vmh-linux-runner`) if — and ONLY if —
+  #       the runner image (default alias `gosti-linux-runner`) if — and ONLY if —
   #       it is absent from the host's incus image store, from a nix-built or
   #       operator-provided tarball. Replaces the manual `incus image import` /
   #       `incus image alias create`. A re-run with the image already present is
@@ -231,7 +231,7 @@
 
           alias = mkOption {
             type = types.str;
-            default = "vmh-linux-runner";
+            default = "gosti-linux-runner";
             description = ''
               The incus image alias GARM's provider references
               (`services.garm.providers.<name>.images.<k>.sourceImage`). The
@@ -242,7 +242,7 @@
           source = mkOption {
             type = types.nullOr types.path;
             default = null;
-            example = "/var/lib/garm/images/vmh-linux-runner.tar.gz";
+            example = "/var/lib/garm/images/gosti-linux-runner.tar.gz";
             description = ''
               Path to a unified incus image tarball (`incus image export`
               format) imported under `alias` when the alias is absent. Null
@@ -440,6 +440,15 @@
               set -euo pipefail
               alias="${cfg.image.alias}"
               src="${if cfg.image.source == null then "" else toString cfg.image.source}"
+              aliases="$(${incusBin} image alias list --format csv 2>/dev/null | cut -d, -f1)"
+
+              # MIGRATION: the image's alias before the product rename. A host
+              # that still carries it keeps the same image under the new alias.
+              legacy="vmh-linux-runner"
+              if ! grep -qxF "$alias" <<<"$aliases" && grep -qxF "$legacy" <<<"$aliases"; then
+                ${incusBin} image alias rename "$legacy" "$alias"
+                echo "garm-incus-image-import: renamed alias '$legacy' to '$alias'"
+              fi
 
               # Idempotent: if the alias already resolves to an image, do nothing.
               if ${incusBin} image alias list --format csv 2>/dev/null \
@@ -551,7 +560,7 @@
           # is guest-side: the image must ship a SETUID `fusermount3`
           # (Debian's `fuse3` package), because libfuse spawns that helper to
           # obtain the `/dev/fuse` descriptor and nothing in a Nix store can be
-          # setuid. That half lives in the vm-harness runner-image recipe.
+          # setuid. That half lives in the gosti runner-image recipe.
           boot.kernelModules = [ "fuse" ];
 
           # (2) The full host triple — managed incusbr0 bridge + the declared

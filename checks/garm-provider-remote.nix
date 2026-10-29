@@ -2,15 +2,15 @@
 {
   # Runner-Fleet-Capability-Pools-And-Remote-Driving RB1 gate: t_garm_provider_remote.
   #
-  # Proves the `garm-provider-vmharness` REMOTE-TARGET mode (backend = "remote"):
-  # instead of exec-ing a LOCAL vm-harness/virsh/incus, the provider is an RPC
-  # CLIENT to a remote `vm-harness serve` daemon (the RA1 protocol v1 — bearer
+  # Proves the `garm-provider-gosti` REMOTE-TARGET mode (backend = "remote"):
+  # instead of exec-ing a LOCAL gosti/virsh/incus, the provider is an RPC
+  # CLIENT to a remote `gosti serve` daemon (the RA1 protocol v1 — bearer
   # auth, GET /v1/info, chunked NDJSON POST /v1/exec). A CreateInstance ->
   # DeleteInstance cycle is driven through GARM's REAL external-provider protocol
   # (the same env + stdin/stdout contract runner/providers/v0.1.1/external.go
   # uses) against a REAL daemon, and a wrong bearer token is rejected.
   #
-  # HERMETIC + REAL WIRE. The daemon is a genuine `vm-harness serve` bound to
+  # HERMETIC + REAL WIRE. The daemon is a genuine `gosti serve` bound to
   # loopback with the SANCTIONED noop backend (design doc §9.1): no hypervisor,
   # no network, but the whole wire path — TCP, HTTP framing, bearer auth, the
   # NDJSON exec stream, the exit-code round-trip — is exercised for real end to
@@ -22,13 +22,13 @@
   # client is validated against the ACTUAL Nim daemon, catching any drift in the
   # shared /v1 contract. The fast, dependency-free unit coverage of the client +
   # backend logic lives in internal/backend/remote_test.go (run by the
-  # t_garm_provider_vmharness_backend gate); this gate adds the real-daemon,
+  # t_garm_provider_gosti_backend gate); this gate adds the real-daemon,
   # real-protocol end-to-end proof.
   #
   # Statelessness: the provider keeps NO local state in remote mode — the
   # provider_id is GARM's instance name and host liveness is recovered from the
   # remote daemon's /v1/info. The M1 local-exec protocol gate
-  # (t_garm_provider_vmharness_protocol) stays green unchanged, proving
+  # (t_garm_provider_gosti_protocol) stays green unchanged, proving
   # back-compat: local-exec mode is untouched and config-selected.
   perSystem =
     { pkgs, self', ... }:
@@ -42,8 +42,8 @@
                 pkgs.coreutils
                 pkgs.bash
               ];
-              provider = "${self'.packages.garm-provider-vmharness}/bin/garm-provider-vmharness";
-              vmHarness = "${self'.packages.vm-harness}/bin/vm-harness";
+              provider = "${self'.packages.garm-provider-gosti}/bin/garm-provider-gosti";
+              gosti = "${self'.packages.gosti}/bin/gosti";
             }
             ''
               set -euo pipefail
@@ -57,13 +57,13 @@
               NAME="garm-remote-0001"
               TOKEN="serve-bearer-$(date +%s)-3f9a2c"
 
-              # ---- 1. Stand up a REAL `vm-harness serve` (noop backend) --------
+              # ---- 1. Stand up a REAL `gosti serve` (noop backend) --------
               printf '%s' "$TOKEN" > "$work/token"
               # Ownership records written by `ephemeral-label` (the provider
               # labels every instance it creates). The sandbox HOME is not
               # writable, so point it at the scratch dir as the serve units do.
-              export VMH_EPHEMERAL_LABEL_DIR="$work/ephemeral-labels"
-              "$vmHarness" serve \
+              export GOSTI_EPHEMERAL_LABEL_DIR="$work/ephemeral-labels"
+              "$gosti" serve \
                 --listen 127.0.0.1:0 \
                 --auth-token-file "$work/token" \
                 --port-file "$work/port" \
@@ -79,7 +79,7 @@
                 sleep 0.1
               done
               if [ -z "$PORT" ]; then
-                echo "vm-harness serve did not report a port" >&2
+                echo "gosti serve did not report a port" >&2
                 exit 1
               fi
               echo "serve listening on 127.0.0.1:$PORT (pid $SERVE_PID)"
@@ -126,7 +126,7 @@
                   "metadata-url":"https://garm.example.com/api/v1/metadata",
                   "instance-token":"jwt-token",
                   os_type:"linux", arch:"amd64", flavor:"linux-large",
-                  image:"runner-linux", labels:["linux","vmharness"],
+                  image:"runner-linux", labels:["linux","gosti"],
                   pool_id:$pool, jit_config_enabled:true
                 }'
               }

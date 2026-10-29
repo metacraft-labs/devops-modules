@@ -7,8 +7,8 @@
 # jobs through ah's REST direct-sandbox-launch endpoints (agent-harbor
 # specs/REST-Service/Direct-Sandbox-Launch.md).
 #
-# It is a second command in the SAME Go module as garm-provider-vmharness
-# (../garm-provider-vmharness/src), not a copy: it reuses that module's JIT
+# It is a second command in the SAME Go module as garm-provider-gosti
+# (../garm-provider-gosti/src), not a copy: it reuses that module's JIT
 # runner-install templates, cached-runner version guard and guest-URL rewrite
 # directly, and its vendored garm-provider-common. Offline build against the
 # in-tree vendor/ (`vendorHash = null`), pure Go, no cgo.
@@ -16,7 +16,7 @@ buildGoModule {
   pname = "garm-provider-agentharbor";
   version = "0.1.0";
 
-  src = ../garm-provider-vmharness/src;
+  src = ../garm-provider-gosti/src;
   vendorHash = null;
   env.CGO_ENABLED = "0";
 
@@ -25,7 +25,7 @@ buildGoModule {
   ldflags = [
     "-s"
     "-w"
-    "-X github.com/metacraft-labs/garm-provider-vmharness/internal/version.Version=v0.1.0"
+    "-X github.com/metacraft-labs/garm-provider-gosti/internal/version.Version=v0.1.0"
   ];
 
   # The Go tests (behavioural matrix + the end-to-end protocol gate that

@@ -101,7 +101,7 @@ top@{ ... }:
 
       manifestHms = mkManifest {
         host = "high-mem-server";
-        keyId = "vmh1-hms";
+        keyId = "gosti1-hms";
         gpu = false;
         hypervisors = [
           {
@@ -121,7 +121,7 @@ top@{ ... }:
       };
       manifestGpu001 = mkManifest {
         host = "gpu-server-001";
-        keyId = "vmh1-gpu001";
+        keyId = "gosti1-gpu001";
         gpu = true;
         hypervisors = [
           {
@@ -134,8 +134,8 @@ top@{ ... }:
 
       dummyProvider = manifest: {
         backend = "qemu-windows-arm";
-        vmHarnessPath = "/nonexistent/vm-harness";
-        stateDir = "/var/lib/garm-provider-vmharness";
+        gostiPath = "/nonexistent/gosti";
+        stateDir = "/var/lib/garm-provider-gosti";
         images.golden.sourceImage = "/nonexistent/golden";
         manifestFile = manifest;
       };

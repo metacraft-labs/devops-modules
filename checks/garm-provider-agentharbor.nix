@@ -153,7 +153,7 @@ top@{ ... }:
                 pkgs.gnugrep
                 pkgs.perl
               ];
-              src = ../packages/garm-provider-vmharness/src;
+              src = ../packages/garm-provider-gosti/src;
               providerBin = lib.getExe provider;
               # The real Nix runner the sandbox payload execs (the module's
               # default `runner.package`).

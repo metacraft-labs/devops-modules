@@ -5,7 +5,7 @@ Runner-Fleet-Capability-Pools-And-Remote-Driving **RC1**, gate
 
 This module is the **company-agnostic MECHANISM** that turns an RA6 signed
 capability manifest (`GET /v1/manifest`, see
-[`vm-harness/docs/serve-enrollment.md`](../../../vm-harness/docs/serve-enrollment.md))
+[`gosti/docs/contributors/serve-enrollment.md`](../../../gosti/docs/contributors/serve-enrollment.md))
 into the GitHub runner label set a host may advertise, and **lints** that every
 label a host advertises is a subset of what its manifest proves
 (`advertised ⊆ derived`).

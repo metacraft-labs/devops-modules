@@ -17,7 +17,7 @@ runCommand "garm-shared-nix-client"
   }
   ''
     mkdir -p "$out/bin"
-    bash ${../garm-provider-vmharness/src/internal/backend/shared_nix_client.sh} \
+    bash ${../garm-provider-gosti/src/internal/backend/shared_nix_client.sh} \
       ${lib.escapeShellArg "${lib.getBin nix}/bin"} "$out/bin"
     test -x "$out/bin/nix"
   ''

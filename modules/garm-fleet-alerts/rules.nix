@@ -413,8 +413,8 @@ let
           "# GarmProviderDeleteFailures), ~210 Windows VMs leaked on high-mem-server"
           "# because the provider's ListInstances omitted them, and ~100 STOPPED"
           "# containers filled gpu-server-001/002's storage pool."
-          "# vmh_* series come from the vm-harness-serve inventory exporter"
-          "# (services.vm-harness-serve.inventoryExporter) on each provider host."
+          "# gosti_* series come from the gosti-serve inventory exporter"
+          "# (services.gosti-serve.inventoryExporter) on each provider host."
         ];
         rules = [
           {
@@ -434,28 +434,28 @@ let
             description = "At least ${s absentFromProviderCount} instances GARM believes are running were absent from provider {{ $labels.provider }}'s ListInstances in 30m. They are routed to deletion, but repeated absences mean the provider cannot see its own instances (enumeration/attribution broken) — before the fix this is exactly how ~210 VMs leaked.";
           }
           {
-            name = "VmhEphemeralStoppedOrphans";
-            expr = "sum by (instance, backend) (min_over_time(vmh_ephemeral_instances{state=\"stopped\"}[30m])) >= ${s orphanStoppedCount}";
+            name = "GostiEphemeralStoppedOrphans";
+            expr = "sum by (instance, backend) (min_over_time(gosti_ephemeral_instances{state=\"stopped\"}[30m])) >= ${s orphanStoppedCount}";
             for = orphanStoppedFor;
             severity = "warning";
             summary = "Stopped runner instances are piling up on {{ $labels.instance }} ({{ $labels.backend }})";
             description = "{{ $labels.instance }} has held at least ${s orphanStoppedCount} STOPPED per-job {{ $labels.backend }} instances continuously for 30m. A finished ephemeral runner is deleted within minutes, so these are orphans whose teardown failed or was never issued; they consume storage until the pool is full (gpu-server-001/002, 2026-09-23).";
           }
           {
-            name = "VmhEphemeralUnattributedInstances";
-            expr = "sum by (instance, backend) (min_over_time(vmh_ephemeral_instances{attributed=\"false\"}[1h])) > 0";
+            name = "GostiEphemeralUnattributedInstances";
+            expr = "sum by (instance, backend) (min_over_time(gosti_ephemeral_instances{attributed=\"false\"}[1h])) > 0";
             for = orphanUnattributedFor;
             severity = "warning";
             summary = "Runner instances with no owning GARM pool on {{ $labels.instance }} ({{ $labels.backend }})";
             description = "{{ $labels.instance }} has carried {{ $value }} runner-named {{ $labels.backend }} instances with no GARM ownership record for over an hour. No pool lists them, so GARM will never delete them: they are orphans (typically created before attribution existed, or by a create whose labelling failed).";
           }
           {
-            name = "VmhEphemeralInventoryFailing";
-            expr = "vmh_ephemeral_list_success == 0";
+            name = "GostiEphemeralInventoryFailing";
+            expr = "gosti_ephemeral_list_success == 0";
             for = inventoryFailingFor;
             severity = "warning";
             summary = "{{ $labels.instance }} cannot enumerate its {{ $labels.backend }} instances";
-            description = "`vm-harness ephemeral-list --backend {{ $labels.backend }}` has failed on {{ $labels.instance }} for ${inventoryFailingFor}. GARM's ListInstances for this host fails closed while this persists, so runners there are neither confirmed nor reconciled — fix the hypervisor/daemon access.";
+            description = "`gosti ephemeral-list --backend {{ $labels.backend }}` has failed on {{ $labels.instance }} for ${inventoryFailingFor}. GARM's ListInstances for this host fails closed while this persists, so runners there are neither confirmed nor reconciled — fix the hypervisor/daemon access.";
           }
         ];
       }

@@ -177,11 +177,11 @@ in
         # This repo's own exclusions, declared through the option like any
         # other consumer's would be, rather than baked into the shared set.
         mcl.gitHooks.editorconfigExcludes = [
-          "^checks/garm-provider-vmharness-protocol\\.nix$"
+          "^checks/garm-provider-gosti-protocol\\.nix$"
           "^checks/garm-provider-remote\\.nix$"
           "^checks/t_ephemeral_runner_security_and_metrics\\.sh$"
           "^checks/t_incus_linux_autoscale_and_harden\\.sh$"
-          "^packages/garm-provider-vmharness/src/"
+          "^packages/garm-provider-gosti/src/"
         ];
 
         perSystem =

@@ -4,7 +4,7 @@
 # campaign. Proves ONE queued GitHub job drives the full ephemeral lifecycle:
 #
 #   GARM (scale-set message queue) sees the queued job
-#     -> CreateInstance -> garm-provider-vmharness CoW-clones the Windows golden
+#     -> CreateInstance -> garm-provider-gosti CoW-clones the Windows golden
 #        into a thin overlay + builds a cloudbase-init config-drive carrying
 #        GARM's JIT bootstrap + boots a fresh UEFI/OVMF Windows VM
 #     -> the guest's cloudbase-init consumes the config-drive, pulls the JIT
@@ -26,21 +26,21 @@
 #     "default" NAT network up (virbr0 = 192.168.122.1). The host firewall
 #     must let guests reach the host on GARM_PORT (virbr0 trusted iface).
 #   * The M3 Windows golden with cloudbase-init + the actions runner staged
-#     (set VMH_WIN_GOLDEN to the golden qcow2 path).
+#     (set GOSTI_WIN_GOLDEN to the golden qcow2 path).
 #     NOTE: the golden's Windows timezone must be UTC (the provider boots the
 #     domain with <clock offset='utc'>; a non-UTC golden needs
 #     RealTimeIsUniversal=1 instead, else the runner's JIT/OAuth token is
 #     stamped in a skewed clock and GitHub deletes the registration).
-#   * OVMF firmware (VMH_OVMF_CODE=/run/libvirt/nix-ovmf/edk2-x86_64-code.fd,
-#     VMH_OVMF_VARS=/run/libvirt/nix-ovmf/edk2-i386-vars.fd).
+#   * OVMF firmware (GOSTI_OVMF_CODE=/run/libvirt/nix-ovmf/edk2-x86_64-code.fd,
+#     GOSTI_OVMF_VARS=/run/libvirt/nix-ovmf/edk2-i386-vars.fd).
 #   * qemu-img, virsh, genisoimage on PATH (genisoimage via nixpkgs#cdrkit).
 #   * The GitHub App PEM readable (APP_PEM = the App private-key PEM path), with
 #     the App ID / installation / org supplied via env (APP_ID, INSTALLATION_ID,
 #     ORG) and the org `Self-hosted runners: Read & write` permission (no webhook
 #     needed for scale sets).
 #   * `gh` CLI authenticated with repo+admin:org (to create/delete the test repo).
-#   * The GARM + garm-provider-vmharness binaries (built from this repo:
-#     `nix build .#packages.x86_64-linux.garm .#packages.x86_64-linux.garm-provider-vmharness`)
+#   * The GARM + garm-provider-gosti binaries (built from this repo:
+#     `nix build .#packages.x86_64-linux.garm .#packages.x86_64-linux.garm-provider-gosti`)
 #     passed via GARM_BIN / GARM_CLI_BIN / PROVIDER_BIN, or on PATH.
 #
 # ============================ CONFIG (env) ============================
@@ -52,9 +52,9 @@ APP_PEM="${APP_PEM:?set APP_PEM (path to the GitHub App private-key PEM)}"
 ORG="${ORG:?set ORG (the GitHub org)}"
 SCALESET_NAME="${SCALESET_NAME:-windows-ephemeral-e2e}"
 
-VMH_WIN_GOLDEN="${VMH_WIN_GOLDEN:?set VMH_WIN_GOLDEN (path to the Windows golden qcow2)}"
-VMH_OVMF_CODE="${VMH_OVMF_CODE:-/run/libvirt/nix-ovmf/edk2-x86_64-code.fd}"
-VMH_OVMF_VARS="${VMH_OVMF_VARS:-/run/libvirt/nix-ovmf/edk2-i386-vars.fd}"
+GOSTI_WIN_GOLDEN="${GOSTI_WIN_GOLDEN:?set GOSTI_WIN_GOLDEN (path to the Windows golden qcow2)}"
+GOSTI_OVMF_CODE="${GOSTI_OVMF_CODE:-/run/libvirt/nix-ovmf/edk2-x86_64-code.fd}"
+GOSTI_OVMF_VARS="${GOSTI_OVMF_VARS:-/run/libvirt/nix-ovmf/edk2-i386-vars.fd}"
 POOL_DIR="${POOL_DIR:-/var/lib/libvirt/images}"
 LIBVIRT_URI="${LIBVIRT_URI:-qemu:///system}"
 GARM_PORT="${GARM_PORT:-9997}"
@@ -62,7 +62,7 @@ BRIDGE_IP="${BRIDGE_IP:-192.168.122.1}"
 
 GARM_BIN="${GARM_BIN:-$(command -v garm || true)}"
 GARM_CLI_BIN="${GARM_CLI_BIN:-$(command -v garm-cli || true)}"
-PROVIDER_BIN="${PROVIDER_BIN:-$(command -v garm-provider-vmharness || true)}"
+PROVIDER_BIN="${PROVIDER_BIN:-$(command -v garm-provider-gosti || true)}"
 VIRSH="${VIRSH:-$(command -v virsh)}"
 QEMU_IMG="${QEMU_IMG:-$(command -v qemu-img)}"
 
@@ -77,7 +77,7 @@ for b in "$GARM_BIN" "$GARM_CLI_BIN" "$PROVIDER_BIN"; do
   [ -n "$b" ] && [ -x "$b" ] || fail "missing binary (set GARM_BIN/GARM_CLI_BIN/PROVIDER_BIN): $b"
 done
 [ -r "$APP_PEM" ] || fail "cannot read App PEM: $APP_PEM (run as root)"
-[ -f "$VMH_WIN_GOLDEN" ] || fail "missing golden: $VMH_WIN_GOLDEN"
+[ -f "$GOSTI_WIN_GOLDEN" ] || fail "missing golden: $GOSTI_WIN_GOLDEN"
 command -v genisoimage >/dev/null || fail "genisoimage not on PATH (nix shell nixpkgs#cdrkit)"
 
 # ---- App installation token (for GitHub-side assertions) -------------------
@@ -129,12 +129,12 @@ qemu_img_path = "$QEMU_IMG"
 libvirt_uri = "$LIBVIRT_URI"
 network = "default"
 pool_dir = "$POOL_DIR"
-uefi_loader = "$VMH_OVMF_CODE"
-uefi_nvram_template = "$VMH_OVMF_VARS"
+uefi_loader = "$GOSTI_OVMF_CODE"
+uefi_nvram_template = "$GOSTI_OVMF_VARS"
 memory_mb = 4096
 vcpus = 4
 [images.golden]
-source_image = "$VMH_WIN_GOLDEN"
+source_image = "$GOSTI_WIN_GOLDEN"
 os_name = "windows"
 os_version = "11"
 EOF
@@ -160,9 +160,9 @@ passphrase = "$DBP"
   [database.sqlite3]
   db_file = "$WORKDIR/garm.sqlite"
 [[provider]]
-name = "vmharness"
+name = "gosti"
 provider_type = "external"
-description = "libvirt/KVM Windows ephemeral runners via vm-harness"
+description = "libvirt/KVM Windows ephemeral runners via gosti"
   [provider.external]
   provider_executable = "$PROVIDER_BIN"
   config_file = "$WORKDIR/provider.toml"
@@ -194,7 +194,7 @@ for _ in $(seq 1 24); do
   [ "$r" = "True" ] && break; sleep 5
 done
 [ "$r" = "True" ] || fail "GARM org pool manager did not start (App auth failed)"
-SCALESET_ID=$(sudo "$GARM_CLI_BIN" scaleset add --org "$ORG_ID" --provider-name vmharness \
+SCALESET_ID=$(sudo "$GARM_CLI_BIN" scaleset add --org "$ORG_ID" --provider-name gosti \
   --image golden --name "$SCALESET_NAME" --flavor default --enabled \
   --min-idle-runners 0 --max-runners 1 --os-type windows --os-arch amd64 \
   --runner-bootstrap-timeout 30 --format json | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')

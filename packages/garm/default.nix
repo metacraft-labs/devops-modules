@@ -29,7 +29,7 @@ buildGo126Module rec {
   # Restarting garm.service on this pin runs upstream's database migrations
   # between 0a9a939c and 33ec0921 (pseudo pool IDs, constraint parity, the
   # scale set jobs table, tags.name widening). Restart it in a quiet window
-  # and only after garm-provider-vmharness `serve` has rolled out to every
+  # and only after garm-provider-gosti `serve` has rolled out to every
   # runner host.
   rev = "33ec0921418a470ca7e00dfb20ae111595da24e1";
 
@@ -70,7 +70,7 @@ buildGo126Module rec {
     # label, forwarded to the provider as GARM_POOL_OS_TYPE/the bootstrap
     # params, and used to pick the runner-install template, which the sibling
     # patch above already taught about macOS (and which m3's macOS template is
-    # deliberately a stub of — garm-provider-vmharness renders the real
+    # deliberately a stub of — garm-provider-gosti renders the real
     # bootstrap inside the Tart guest).
     #
     # DEPENDS ON the sibling patch above for `params.MacOS`: the OSType
@@ -85,7 +85,7 @@ buildGo126Module rec {
     #  1. cleanupOrphanedGithubRunners DELETED the DB row of a runner that was
     #     offline in GitHub and absent from ListInstances, never calling the
     #     provider's DeleteInstance. With a provider that could not enumerate
-    #     (the remote vmharness backend answered every list with []) every
+    #     (the remote gosti backend answered every list with []) every
     #     Windows runner still booting at 5 minutes was forgotten while its VM
     #     ran on: ~210 leaked libvirt domains / 55 GiB. Now: pending_delete, so
     #     the provider's (idempotent) delete runs first.
