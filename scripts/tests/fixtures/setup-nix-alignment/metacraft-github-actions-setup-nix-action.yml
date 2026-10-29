@@ -160,7 +160,7 @@ runs:
         cat << EOF > "$HOME/.config/nix/nix.conf"
           # Enable flakes + nix-command additively, so this holds even when the
           # DeterminateSystems installer is skipped because Nix is pre-installed
-          # (e.g. the Debian vmh-linux-runner ephemeral image, whose system
+          # (e.g. the Debian gosti-linux-runner ephemeral image, whose system
           # nix.conf does not enable flakes). extra-experimental-features
           # appends rather than replaces, so NixOS runners keep pipe-operators.
           extra-experimental-features = nix-command flakes

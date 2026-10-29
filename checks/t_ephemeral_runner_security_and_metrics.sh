@@ -29,7 +29,7 @@
 #   * /dev/kvm + qemu:///system libvirtd with the "default" NAT net up
 #     (virbr0 = 192.168.122.1, a trusted iface so guests reach the host).
 #   * The Windows golden (PREFER a sysprepped golden — fresh SID per clone — if
-#     present, else the base golden), UTC RTC. Path(s) via env (VMH_WIN_GOLDEN).
+#     present, else the base golden), UTC RTC. Path(s) via env (GOSTI_WIN_GOLDEN).
 #   * OVMF firmware under /run/libvirt/nix-ovmf.
 #   * The GitHub App PEM readable (APP_PEM = the App private-key PEM path), with
 #     the App ID / installation / org supplied via env (APP_ID, INSTALLATION_ID,
@@ -51,7 +51,7 @@ ORG="${ORG:?set ORG (the GitHub org)}"
 SCALESET_NAME="${SCALESET_NAME:-windows-ephemeral-m6}"
 
 # The Windows golden path (prefer a sysprepped golden — fresh SID per clone).
-VMH_WIN_GOLDEN="${VMH_WIN_GOLDEN:?set VMH_WIN_GOLDEN (path to the Windows golden qcow2)}"
+GOSTI_WIN_GOLDEN="${GOSTI_WIN_GOLDEN:?set GOSTI_WIN_GOLDEN (path to the Windows golden qcow2)}"
 
 # A garm-owned pool dir (the module default) — the non-root garm user cannot
 # write the shared root-only /var/lib/libvirt/images. Provisioned below.
@@ -74,7 +74,7 @@ info() { echo "[m6] $*"; }
 
 [ "$(id -u)" = 0 ] || fail "must run as root (installs the module garm.service unit + drives libvirt)"
 [ -r "$APP_PEM" ] || fail "cannot read App PEM: $APP_PEM"
-[ -f "$VMH_WIN_GOLDEN" ] || fail "missing golden: $VMH_WIN_GOLDEN"
+[ -f "$GOSTI_WIN_GOLDEN" ] || fail "missing golden: $GOSTI_WIN_GOLDEN"
 command -v nix >/dev/null || fail "nix not on PATH (needed to build the module toplevel)"
 command -v gh  >/dev/null || fail "gh not on PATH"
 
@@ -155,8 +155,8 @@ cleanup() {
   [ -n "${TEST_REPO:-}" ] && gh repo delete "${ORG}/${TEST_REPO}" --yes >/dev/null 2>&1
   # Remove the golden-path ACL we granted (leave the host as we found it).
   if [ -n "${ACL_GRANTED:-}" ]; then
-    setfacl -x u:garm "$VMH_WIN_GOLDEN" 2>/dev/null || true
-    p=$(dirname "$VMH_WIN_GOLDEN")
+    setfacl -x u:garm "$GOSTI_WIN_GOLDEN" 2>/dev/null || true
+    p=$(dirname "$GOSTI_WIN_GOLDEN")
     while [ "$p" != "/" ] && [ -n "$p" ]; do setfacl -x u:garm "$p" 2>/dev/null || true; p=$(dirname "$p"); done
   fi
   info "evidence retained under $EVIDENCE"
@@ -172,7 +172,7 @@ let flake = builtins.getFlake (toString $FLAKE); system = \"x86_64-linux\"; nixp
  sys = nixpkgs.lib.nixosSystem { inherit system; modules = [ flake.modules.nixos.garm
   ({ ... }: { boot.loader.grub.enable = false; fileSystems.\"/\" = { device = \"/dev/vda\"; fsType = \"ext4\"; }; system.stateVersion = \"24.11\";
     services.garm = { enable = true;
-      providers.vmharness = { enable = true; memoryMb = 8192; images.golden.sourceImage = \"/g.qcow2\"; };
+      providers.gosti = { enable = true; memoryMb = 8192; images.golden.sourceImage = \"/g.qcow2\"; };
       hostBudget = { memoryMb = 16384; vcpus = 8; };
       scaleSets.big = { maxRunners = 10; minIdleRunners = 0; }; }; }) ]; };
  in sys.config.system.build.toplevel.drvPath" 2>&1 || true)
@@ -198,14 +198,14 @@ let flake = builtins.getFlake (toString $FLAKE); system = \"x86_64-linux\"; nixp
       callbackURL = \"$STATE_URL/api/v1/callbacks\";
       metrics = { enable = true; disableAuth = true; };
       github.mcl-app = { appId = $APP_ID; installationId = $INSTALLATION_ID; appKeyFile = \"$APP_PEM\"; };
-      providers.vmharness = {
+      providers.gosti = {
         enable = true;
-        package = flake.packages.\${system}.garm-provider-vmharness;
+        package = flake.packages.\${system}.garm-provider-gosti;
         poolDir = \"$POOL_DIR\";
         memoryMb = $MEMORY_MB; vcpus = $VCPUS;
-        images.golden = { sourceImage = \"$VMH_WIN_GOLDEN\"; osName = \"windows\"; osVersion = \"11\"; };
+        images.golden = { sourceImage = \"$GOSTI_WIN_GOLDEN\"; osName = \"windows\"; osVersion = \"11\"; };
       };
-      scaleSets.$SCALESET_NAME = { provider = \"vmharness\"; image = \"golden\"; osType = \"windows\"; maxRunners = 1; minIdleRunners = 0; };
+      scaleSets.$SCALESET_NAME = { provider = \"gosti\"; image = \"golden\"; osType = \"windows\"; maxRunners = 1; minIdleRunners = 0; };
       hostBudget = { memoryMb = 65536; vcpus = 32; };
     };
   }) ]; };
@@ -235,10 +235,10 @@ chmod 0771 "$POOL_DIR"
 # parents. The golden often lives under a group-gated path (e.g. /storage owned
 # root:metacraft 0770). Grant a minimal POSIX ACL for the garm user along the
 # path (idempotent; removed in cleanup). This is the documented integration step
-# (modules/garm/README §2 / providers.vmharness.images.sourceImage) — the M4/M5
+# (modules/garm/README §2 / providers.gosti.images.sourceImage) — the M4/M5
 # harnesses masked it by running qemu-img as root.
-GOLDEN_DIR=$(dirname "$VMH_WIN_GOLDEN")
-if ! sudo -u garm test -r "$VMH_WIN_GOLDEN" 2>/dev/null; then
+GOLDEN_DIR=$(dirname "$GOSTI_WIN_GOLDEN")
+if ! sudo -u garm test -r "$GOSTI_WIN_GOLDEN" 2>/dev/null; then
   info "granting garm read+traverse ACL along the golden path (host integration)"
   # walk up granting --x traverse on each ancestor, r-x on the immediate dir, r on the file
   p="$GOLDEN_DIR"
@@ -246,10 +246,10 @@ if ! sudo -u garm test -r "$VMH_WIN_GOLDEN" 2>/dev/null; then
   while [ "$p" != "/" ] && [ -n "$p" ]; do ACL_DIRS+=("$p"); p=$(dirname "$p"); done
   for d in "${ACL_DIRS[@]}"; do setfacl -m u:garm:--x "$d" 2>/dev/null || true; done
   setfacl -m u:garm:r-x "$GOLDEN_DIR" 2>/dev/null || true
-  setfacl -m u:garm:r-- "$VMH_WIN_GOLDEN" 2>/dev/null || true
+  setfacl -m u:garm:r-- "$GOSTI_WIN_GOLDEN" 2>/dev/null || true
   ACL_GRANTED=1
 fi
-sudo -u garm test -r "$VMH_WIN_GOLDEN" || fail "garm user still cannot read the golden $VMH_WIN_GOLDEN after ACL grant"
+sudo -u garm test -r "$GOSTI_WIN_GOLDEN" || fail "garm user still cannot read the golden $GOSTI_WIN_GOLDEN after ACL grant"
 info "garm user can read the golden + write $POOL_DIR"
 
 # Start from a CLEAN GARM DB (a persisted DB already has an admin → first-run 409).
@@ -348,7 +348,7 @@ for _ in $(seq 1 24); do
 done
 [ "$r" = "True" ] || fail "GARM org pool manager did not start (App auth via declarative creds failed)"
 garm-cli controller update --minimum-job-age-backoff 0 >/dev/null 2>&1 || true
-SCALESET_ID=$(garm-cli scaleset add --org "$ORG_ID" --provider-name vmharness \
+SCALESET_ID=$(garm-cli scaleset add --org "$ORG_ID" --provider-name gosti \
   --image golden --name "$SCALESET_NAME" --flavor default --enabled \
   --min-idle-runners 0 --max-runners 1 --os-type windows --os-arch amd64 \
   --runner-bootstrap-timeout 30 --format json | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')

@@ -41,6 +41,8 @@ top@{ ... }:
   #      derived) — no pool is created for it.
   #  (6) COEXISTENCE: a scale set declared alongside the pools is ALSO reconciled
   #      — scale sets and pools run in parallel for the RC5 cutover.
+  #  (7) PROVIDER RENAME: renaming a provider with `providerRenames` keeps the
+  #      existing pool and scale set (same ids) under the new provider name.
   perSystem =
     {
       pkgs,
@@ -97,7 +99,7 @@ top@{ ... }:
 
       manifestHms = mkManifest {
         host = "high-mem-server";
-        keyId = "vmh1-hms";
+        keyId = "gosti1-hms";
         gpu = false;
         hypervisors = [
           {
@@ -117,7 +119,7 @@ top@{ ... }:
       };
       manifestGpu001 = mkManifest {
         host = "gpu-server-001";
-        keyId = "vmh1-gpu001";
+        keyId = "gosti1-gpu001";
         gpu = true;
         hypervisors = [
           {
@@ -129,7 +131,7 @@ top@{ ... }:
       };
       manifestGpu002 = mkManifest {
         host = "gpu-server-002";
-        keyId = "vmh1-gpu002";
+        keyId = "gosti1-gpu002";
         gpu = true;
         hypervisors = [
           {
@@ -176,8 +178,8 @@ top@{ ... }:
       # drives label derivation.
       dummyProvider = manifest: {
         backend = "qemu-windows-arm";
-        vmHarnessPath = "/nonexistent/vm-harness";
-        stateDir = "/var/lib/garm-provider-vmharness";
+        gostiPath = "/nonexistent/gosti";
+        stateDir = "/var/lib/garm-provider-gosti";
         images.golden.sourceImage = "/nonexistent/golden";
         manifestFile = manifest;
       };
@@ -192,6 +194,26 @@ top@{ ... }:
             {
               imports = [ flake.modules.nixos.garm ];
               specialisation.valid-pools.configuration.services.garm.pools = lib.mkForce validPools;
+              # (7) PROVIDER RENAME: the same host after its provider is renamed
+              # (`hms` -> `hms-renamed`), with `providerRenames` carrying the
+              # existing pool and scale set across instead of recreating them.
+              specialisation.renamed-provider.configuration.services.garm = {
+                pools = lib.mkForce (
+                  validPools
+                  // {
+                    hms-linux = validPools.hms-linux // {
+                      provider = "hms-renamed";
+                    };
+                  }
+                );
+                providers = lib.mkForce {
+                  hms-renamed = dummyProvider manifestHms;
+                  gpu001 = dummyProvider manifestGpu001;
+                  gpu002 = dummyProvider manifestGpu002;
+                };
+                scaleSets.legacy-eph.provider = lib.mkForce "hms-renamed";
+                providerRenames.hms = "hms-renamed";
+              };
               virtualisation.memorySize = 2048;
               environment.systemPackages = [
                 pkgs.curl
@@ -401,6 +423,24 @@ top@{ ... }:
                 f"reconcile not idempotent: {len(pools)} -> {len(pools2)} pools"
             )
             print("[idempotent] second reconcile did not duplicate pools")
+
+            # --- (7) PROVIDER RENAME keeps the pool and scale set ------------
+            hms_pool_id = by_provider["hms"][0]["id"]
+            ss_before = {s["name"]: s for s in J.loads(gcli(f"scaleset list --org {oid}"))}
+            controller.succeed("/run/booted-system/specialisation/renamed-provider/bin/switch-to-configuration test")
+            controller.wait_for_unit("garm.service")
+            controller.wait_for_open_port(9997)
+            controller.succeed("systemctl reset-failed garm-reconcile.service; systemctl restart garm-reconcile.service")
+            controller.wait_until_succeeds("test \"$(systemctl show -p Result --value garm-reconcile.service)\" = success")
+            pools3 = J.loads(gcli(f"pool list --org {oid}"))
+            assert len(pools3) == len(pools), f"the rename changed the pool count: {pools} -> {pools3}"
+            renamed = [p for p in pools3 if p.get("provider_name") == "hms-renamed"]
+            assert [p["id"] for p in renamed] == [hms_pool_id], f"the hms pool was not carried over: {pools3}"
+            assert not [p for p in pools3 if p.get("provider_name") == "hms"], f"a pool still names hms: {pools3}"
+            ss_after = {s["name"]: s for s in J.loads(gcli(f"scaleset list --org {oid}"))}
+            assert ss_after["legacy-eph"]["id"] == ss_before["legacy-eph"]["id"], f"the scale set was recreated: {ss_before} -> {ss_after}"
+            assert ss_after["legacy-eph"].get("provider_name") == "hms-renamed", f"scale set provider: {ss_after['legacy-eph']}"
+            print("[rename] pool and scale set kept their ids under the renamed provider")
 
             print("[t_garm_pools_labels] PASS")
           '';

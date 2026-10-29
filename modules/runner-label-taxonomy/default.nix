@@ -14,7 +14,7 @@
 #     (checks/runner-label-taxonomy.nix → gate `t_runner_label_taxonomy`).
 #
 # The derivation reads the RA6 signed capability manifest schema documented in
-# vm-harness/docs/serve-enrollment.md. The tool does the field→label mapping
+# gosti/docs/contributors/serve-enrollment.md. The tool does the field→label mapping
 # only — the caller verifies the manifest signature first (RA6 contract:
 # "an unverifiable manifest yields no labels").
 { ... }:

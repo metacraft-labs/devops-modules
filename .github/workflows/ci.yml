@@ -230,7 +230,7 @@ jobs:
       pull-requests: write
     secrets: inherit
     with:
-      # Foundry takes longer than vm-harness's currently deployed 600-second
+      # Foundry takes longer than gosti's currently deployed 600-second
       # default. Remove this override after this PR's provider fix is deployed.
       foundry-darwin-bootstrap-runner: '["aarch64-darwin"]'
       # Route this repo's flake-check matrix at the GPU hosts' ephemeral scale
@@ -269,8 +269,8 @@ jobs:
   # The `just act lint` step builds `ci-image` and runs the lint workflow inside
   # it via `act`, i.e. it needs nested Docker. Every `eph-linux-x64` container
   # now provides it: the runner-image consolidation folded the retired
-  # `vmharness-nested` provider's capability into the single `vmharness` provider
-  # and `vmh-linux-runner` image (nested Docker + nested KVM), so the separate
+  # `gosti-nested` provider's capability into the single `gosti` provider
+  # and `gosti-linux-runner` image (nested Docker + nested KVM), so the separate
   # `eph-linux-x64-nested` class is a transitional alias for the same container
   # and carries no extra capability.
   test-act:

@@ -279,12 +279,12 @@
         # (garm daemon + garm-cli), consumed by `services.garm` and its VM gate.
         garm = pkgs.callPackage ./garm { };
         # Ephemeral-Windows-Runners-GARM M1 — the stateless external provider
-        # `garm-provider-vmharness` (env+stdin/stdout JSON protocol; shells to
-        # virsh/vm-harness). Wired into `services.garm` as an optional provider.
-        garm-provider-vmharness = pkgs.callPackage ./garm-provider-vmharness { };
+        # `garm-provider-gosti` (env+stdin/stdout JSON protocol; shells to
+        # virsh/gosti). Wired into `services.garm` as an optional provider.
+        garm-provider-gosti = pkgs.callPackage ./garm-provider-gosti { };
         # Sovereign-CI-Fleet AH3 — `garm-provider-agentharbor`: ephemeral runners
         # as agent-harbor sandbox jobs over ah's REST direct-sandbox-launch API.
-        # Same Go module as garm-provider-vmharness (shared JIT templates).
+        # Same Go module as garm-provider-gosti (shared JIT templates).
         garm-provider-agentharbor = pkgs.callPackage ./garm-provider-agentharbor { };
         # Runner-Fleet-Capability-Pools-And-Remote-Driving RE3/RE4 — the AWS
         # burst provider `garm-provider-aws` (cloudbase's EC2 external provider)
@@ -292,14 +292,12 @@
         # into `services.garm` as an optional `backend = "aws"` provider; drives
         # the queue-driven burst tier with an always-warm floor.
         garm-provider-aws = pkgs.callPackage ./garm-provider-aws { };
-        # Runner-Fleet-Capability-Pools-And-Remote-Driving RA2 — the vm-harness
-        # CLI/daemon binary. Its single binary includes `vm-harness serve` (the
-        # RA1 remoting daemon), which `services.vm-harness-serve` packages into a
-        # hardened systemd unit. Vendored (like garm-provider-vmharness) to keep
-        # this repo's flake.lock free of vm-harness's own input tree.
+        # Runner-Fleet-Capability-Pools-And-Remote-Driving RA2 — the gosti
+        # CLI/daemon binary. Its single binary includes `gosti serve` (the
+        # RA1 remoting daemon), which `services.gosti-serve` packages into a
+        # hardened systemd unit. Vendored (like garm-provider-gosti) to keep
+        # this repo's flake.lock free of gosti's own input tree.
         gosti = pkgs.callPackage ./gosti { };
-        # GOSTI1b: the pre-rename attribute name, kept as an alias.
-        vm-harness = self'.packages.gosti;
       }
       // optionalAttrs (system == "x86_64-linux") {
         # Callers targeting a remote host override nix with that host's package.

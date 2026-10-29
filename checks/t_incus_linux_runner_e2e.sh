@@ -5,7 +5,7 @@
 # CONTAINER lifecycle (the container analog of the Windows M4 gate):
 #
 #   GARM (scale-set message queue) sees the queued job
-#     -> CreateInstance -> garm-provider-vmharness (backend = "incus")
+#     -> CreateInstance -> garm-provider-gosti (backend = "incus")
 #        `incus init` a FRESH runner container, injects GARM's Linux
 #        JIT bootstrap as cloud-init.user-data + a static IPv4 as
 #        cloud-init.network-config, then `incus start`
@@ -36,9 +36,9 @@
 #   is to trust incusbr0 for the GARM port in the host firewall config.
 #
 # ============================ PREREQUISITES ============================
-# Run as a user with: sudo nft (firewall rule), incus (via VMH_INCUS_CMD or
+# Run as a user with: sudo nft (firewall rule), incus (via GOSTI_INCUS_CMD or
 # incus-admin group), the App PEM readable (sudo), and gh authenticated with
-# repo+admin:org. The runner incus image (alias via VMH_RUNNER_ALIAS) must be
+# repo+admin:org. The runner incus image (alias via GOSTI_RUNNER_ALIAS) must be
 # present. Pass the GARM + provider binaries via GARM_BIN / GARM_CLI_BIN /
 # PROVIDER_BIN. Supply the App ID / installation / org / PEM path via env
 # (APP_ID, INSTALLATION_ID, ORG, APP_PEM).
@@ -52,16 +52,16 @@ APP_PEM="${APP_PEM:?set APP_PEM (path to the GitHub App private-key PEM)}"
 ORG="${ORG:?set ORG (the GitHub org)}"
 SCALESET_NAME="${SCALESET_NAME:-linux-ephemeral-e2e}"
 
-INCUS_CMD="${VMH_INCUS_CMD:-sudo -n incus}"
+INCUS_CMD="${GOSTI_INCUS_CMD:-sudo -n incus}"
 # The provider runs as ROOT under GARM and reaches the incus socket directly
 # (no sudo-to-user needed); it uses the absolute incus binary.
-INCUS_BIN="${VMH_INCUS_BIN:-$(command -v incus || echo /run/current-system/sw/bin/incus)}"
-RUNNER_IMAGE="${VMH_RUNNER_ALIAS:?set VMH_RUNNER_ALIAS (the incus runner image alias)}"
-INCUS_BRIDGE="${VMH_INCUS_BRIDGE:-incusbr0}"
+INCUS_BIN="${GOSTI_INCUS_BIN:-$(command -v incus || echo /run/current-system/sw/bin/incus)}"
+RUNNER_IMAGE="${GOSTI_RUNNER_ALIAS:?set GOSTI_RUNNER_ALIAS (the incus runner image alias)}"
+INCUS_BRIDGE="${GOSTI_INCUS_BRIDGE:-incusbr0}"
 
 GARM_BIN="${GARM_BIN:-$(command -v garm || true)}"
 GARM_CLI_BIN="${GARM_CLI_BIN:-$(command -v garm-cli || true)}"
-PROVIDER_BIN="${PROVIDER_BIN:-$(command -v garm-provider-vmharness || true)}"
+PROVIDER_BIN="${PROVIDER_BIN:-$(command -v garm-provider-gosti || true)}"
 
 GARM_PORT="${GARM_PORT:-9997}"
 WORKDIR="${WORKDIR:-/tmp/garm-im3-gate}"
@@ -255,9 +255,9 @@ passphrase = "$DBP"
   [database.sqlite3]
   db_file = "$WORKDIR/garm.sqlite"
 [[provider]]
-name = "vmharness-incus"
+name = "gosti-incus"
 provider_type = "external"
-description = "incus Linux ephemeral runners via vm-harness"
+description = "incus Linux ephemeral runners via gosti"
   [provider.external]
   provider_executable = "$PROVIDER_BIN"
   config_file = "$WORKDIR/provider.toml"
@@ -291,7 +291,7 @@ done
 [ "$r" = "True" ] || fail "GARM org pool manager did not start (App auth failed)"
 # Self-heal: drop any orphan scale set of this name left by an interrupted run.
 gh_purge_scalesets
-SCALESET_ID=$(sudo -n env "HOME=$WORKDIR" "$GARM_CLI_BIN" scaleset add --org "$ORG_ID" --provider-name vmharness-incus \
+SCALESET_ID=$(sudo -n env "HOME=$WORKDIR" "$GARM_CLI_BIN" scaleset add --org "$ORG_ID" --provider-name gosti-incus \
   --image linux-runner --name "$SCALESET_NAME" --flavor default --enabled \
   --min-idle-runners 0 --max-runners 1 --os-type linux --os-arch amd64 \
   --runner-bootstrap-timeout 20 --format json | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')

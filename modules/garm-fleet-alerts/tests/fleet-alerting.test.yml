@@ -90,7 +90,7 @@ tests:
     name: 'repeated CreateInstance failures page; one transient does not'
     input_series:
       # Broken backend: CreateInstance errors accrue steadily (4/min).
-      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="vmharness"}'
+      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="gosti"}'
         values: '0+4x20'
       # Healthy: a single lifetime CreateInstance failure, then flat.
       - series: 'garm_runner_errors_total{operation="CreateInstance", provider="win"}'
@@ -106,10 +106,10 @@ tests:
               severity: warning
               component: garm-fleet
               operation: CreateInstance
-              provider: vmharness
+              provider: gosti
             exp_annotations:
-              summary: 'GARM provider failing to create runners (vmharness)'
-              description: 'Provider vmharness has had at least 3 CreateInstance failures in the last 15m. The backend (incus/libvirt/tart/EC2) is likely broken — check the provider host.'
+              summary: 'GARM provider failing to create runners (gosti)'
+              description: 'Provider gosti has had at least 3 CreateInstance failures in the last 15m. The backend (incus/libvirt/tart/EC2) is likely broken — check the provider host.'
 
   # ── GarmProviderDeleteFailures ─────────────────────────────────────────────
   - interval: 1m
@@ -160,22 +160,22 @@ tests:
               summary: "GARM runners missing from hms-libvirt's instance list"
               description: "At least 3 instances GARM believes are running were absent from provider hms-libvirt's ListInstances in 30m. They are routed to deletion, but repeated absences mean the provider cannot see its own instances (enumeration/attribution broken) — before the fix this is exactly how ~210 VMs leaked."
 
-  # ── VmhEphemeralStoppedOrphans ─────────────────────────────────────────────
+  # ── GostiEphemeralStoppedOrphans ─────────────────────────────────────────────
   - interval: 1m
     name: 'stopped instances that never go away page; churn that clears does not'
     input_series:
       # gpu-server-001: STOPPED garm-* containers accumulate and stay.
-      - series: 'vmh_ephemeral_instances{instance="gpu-server-001", backend="incus", state="stopped", attributed="true"}'
+      - series: 'gosti_ephemeral_instances{instance="gpu-server-001", backend="incus", state="stopped", attributed="true"}'
         values: '5+1x60'
       # hms: finished runners are stopped briefly, then deleted.
-      - series: 'vmh_ephemeral_instances{instance="high-mem-server", backend="incus", state="stopped", attributed="true"}'
+      - series: 'gosti_ephemeral_instances{instance="high-mem-server", backend="incus", state="stopped", attributed="true"}'
         values: '4 0 0 0 3 0 0 0 4 0 0 0 2 0 0 0 5 0 0 0 3 0 0 0 4 0 0 0 3 0 0 0 4 0 0 0 3 0 0 0 4 0 0 0 3 0 0 0 4 0 0 0 3 0 0 0 4 0 0 0 3'
     alert_rule_test:
       - eval_time: 5m # for: 10m not elapsed
-        alertname: VmhEphemeralStoppedOrphans
+        alertname: GostiEphemeralStoppedOrphans
         exp_alerts: []
       - eval_time: 45m
-        alertname: VmhEphemeralStoppedOrphans
+        alertname: GostiEphemeralStoppedOrphans
         exp_alerts:
           - exp_labels:
               severity: warning
@@ -186,22 +186,22 @@ tests:
               summary: 'Stopped runner instances are piling up on gpu-server-001 (incus)'
               description: 'gpu-server-001 has held at least 3 STOPPED per-job incus instances continuously for 30m. A finished ephemeral runner is deleted within minutes, so these are orphans whose teardown failed or was never issued; they consume storage until the pool is full (gpu-server-001/002, 2026-09-23).'
 
-  # ── VmhEphemeralUnattributedInstances ──────────────────────────────────────
+  # ── GostiEphemeralUnattributedInstances ──────────────────────────────────────
   - interval: 1m
     name: 'instances no pool owns page; ones that get attributed do not'
     input_series:
       # high-mem-server: 161 leaked garm-* domains from before attribution.
-      - series: 'vmh_ephemeral_instances{instance="high-mem-server", backend="libvirt", state="running", attributed="false"}'
+      - series: 'gosti_ephemeral_instances{instance="high-mem-server", backend="libvirt", state="running", attributed="false"}'
         values: '161x120'
       # A transient unattributed instance (between create and label) that clears.
-      - series: 'vmh_ephemeral_instances{instance="gpu-server-002", backend="incus", state="running", attributed="false"}'
+      - series: 'gosti_ephemeral_instances{instance="gpu-server-002", backend="incus", state="running", attributed="false"}'
         values: '1 0x119'
     alert_rule_test:
       - eval_time: 20m # for: 30m not elapsed
-        alertname: VmhEphemeralUnattributedInstances
+        alertname: GostiEphemeralUnattributedInstances
         exp_alerts: []
       - eval_time: 100m
-        alertname: VmhEphemeralUnattributedInstances
+        alertname: GostiEphemeralUnattributedInstances
         exp_alerts:
           - exp_labels:
               severity: warning
@@ -212,20 +212,20 @@ tests:
               summary: 'Runner instances with no owning GARM pool on high-mem-server (libvirt)'
               description: 'high-mem-server has carried 161 runner-named libvirt instances with no GARM ownership record for over an hour. No pool lists them, so GARM will never delete them: they are orphans (typically created before attribution existed, or by a create whose labelling failed).'
 
-  # ── VmhEphemeralInventoryFailing ───────────────────────────────────────────
+  # ── GostiEphemeralInventoryFailing ───────────────────────────────────────────
   - interval: 1m
     name: 'a host that cannot enumerate pages; one failed cycle does not'
     input_series:
-      - series: 'vmh_ephemeral_list_success{instance="gpu-server-002", backend="incus"}'
+      - series: 'gosti_ephemeral_list_success{instance="gpu-server-002", backend="incus"}'
         values: '0x30'
-      - series: 'vmh_ephemeral_list_success{instance="high-mem-server", backend="libvirt"}'
+      - series: 'gosti_ephemeral_list_success{instance="high-mem-server", backend="libvirt"}'
         values: '1 0 1x28'
     alert_rule_test:
       - eval_time: 10m
-        alertname: VmhEphemeralInventoryFailing
+        alertname: GostiEphemeralInventoryFailing
         exp_alerts: []
       - eval_time: 20m
-        alertname: VmhEphemeralInventoryFailing
+        alertname: GostiEphemeralInventoryFailing
         exp_alerts:
           - exp_labels:
               severity: warning
@@ -234,16 +234,16 @@ tests:
               backend: incus
             exp_annotations:
               summary: 'gpu-server-002 cannot enumerate its incus instances'
-              description: "`vm-harness ephemeral-list --backend incus` has failed on gpu-server-002 for 15m. GARM's ListInstances for this host fails closed while this persists, so runners there are neither confirmed nor reconciled — fix the hypervisor/daemon access."
+              description: "`gosti ephemeral-list --backend incus` has failed on gpu-server-002 for 15m. GARM's ListInstances for this host fails closed while this persists, so runners there are neither confirmed nor reconciled — fix the hypervisor/daemon access."
 
   # ── GarmProviderHighErrorRatio ─────────────────────────────────────────────
   - interval: 1m
     name: 'a backend failing 40% of ops pages; a busy healthy one does not'
     input_series:
       # Broken: 2 errors/min against 5 ops/min = 40% failure ratio.
-      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="vmharness"}'
+      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="gosti"}'
         values: '0+2x20'
-      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="vmharness"}'
+      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="gosti"}'
         values: '0+5x20'
       # Healthy high-volume: 1 error/min against 100 ops/min = 1%.
       - series: 'garm_runner_errors_total{operation="CreateInstance", provider="win"}'
@@ -261,10 +261,10 @@ tests:
               severity: critical
               component: garm-fleet
               operation: CreateInstance
-              provider: vmharness
+              provider: gosti
             exp_annotations:
-              summary: 'GARM provider failing >0.2 of operations (vmharness)'
-              description: 'Provider vmharness is failing more than 0.2 of its runner operations over 15m (40%). The backend is broken (incus/libvirt/tart down, or AWS quota/subnet/AMI errors) — runners are not being provisioned.'
+              summary: 'GARM provider failing >0.2 of operations (gosti)'
+              description: 'Provider gosti is failing more than 0.2 of its runner operations over 15m (40%). The backend is broken (incus/libvirt/tart down, or AWS quota/subnet/AMI errors) — runners are not being provisioned.'
 
   # ── GarmGithubRateLimit{Low,Critical} ──────────────────────────────────────
   - interval: 1m
@@ -480,7 +480,7 @@ tests:
   - interval: 1m
     name: 'a herd (many runners created, few jobs served) pages; not before for elapses'
     input_series:
-      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="vmharness"}'
+      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="gosti"}'
         values: '0+12x120'
       - series: 'garm_job_status{job_id="1", owner="metacraft-labs", requested_labels="eph-linux-x64", status="completed"}'
         values: '0x40 1x80'
@@ -512,7 +512,7 @@ tests:
   - interval: 1m
     name: 'one runner per job (ratio ~1) stays silent above the served floor'
     input_series:
-      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="vmharness"}'
+      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="gosti"}'
         values: '0x40 0+1x6 6x90'
       - series: 'garm_job_status{job_id="11", owner="metacraft-labs", requested_labels="eph-linux-x64", status="completed"}'
         values: '0x40 1x80'
@@ -537,7 +537,7 @@ tests:
   - interval: 1m
     name: 'a high ratio below the served floor (warm floor / quiet) stays silent'
     input_series:
-      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="vmharness"}'
+      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="gosti"}'
         values: '0+12x120'
       - series: 'garm_job_status{job_id="21", owner="metacraft-labs", requested_labels="eph-linux-x64", status="completed"}'
         values: '0x40 1x80'

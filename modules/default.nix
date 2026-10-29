@@ -29,8 +29,8 @@
     ./github-actions-fit-exporter
     ./github-actions-fit-alerts
     ./runner-label-taxonomy
-    ./vm-harness-serve
-    ./vm-harness-serve/darwin.nix
+    ./gosti-serve
+    ./gosti-serve/darwin.nix
     ./virtualisation/desktop-vms.nix
     ./nix-topology
     ./alertmanager-fleet-routing

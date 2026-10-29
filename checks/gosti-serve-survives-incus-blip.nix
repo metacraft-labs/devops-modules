@@ -53,7 +53,7 @@ top@{ ... }:
             { ... }:
             {
               imports = [
-                flake.modules.nixos.vm-harness-serve
+                flake.modules.nixos.gosti-serve
                 flake.modules.nixos.garm-incus-runner-host
               ];
               networking.nftables.enable = true;
@@ -66,9 +66,9 @@ top@{ ... }:
                 image.enable = false;
               };
               system.activationScripts.gostiBlipToken.text = ''
-                mkdir -p /run/vmh-secrets
-                printf '%s' '${token}' > /run/vmh-secrets/token
-                chmod 0400 /run/vmh-secrets/token
+                mkdir -p /run/gosti-secrets
+                printf '%s' '${token}' > /run/gosti-secrets/token
+                chmod 0400 /run/gosti-secrets/token
               '';
               services.gosti-serve = {
                 enable = true;
@@ -76,7 +76,7 @@ top@{ ... }:
                 inherit port;
                 backend = "incus";
                 overlayInterface = null;
-                authTokenFile = "/run/vmh-secrets/token";
+                authTokenFile = "/run/gosti-secrets/token";
               };
               # A stand-in dependency for (B), declared but not wired: the test
               # attaches it to gosti-serve with a runtime drop-in.
@@ -157,11 +157,11 @@ top@{ ... }:
 
             with subtest("(C) an unwritable state file does not kill the watchdog"):
                 host.succeed("systemctl stop gosti-serve.service")
-                host.succeed("rm -rf /var/lib/vm-harness-serve-healthcheck/consecutive-failures && mkdir /var/lib/vm-harness-serve-healthcheck/consecutive-failures")
+                host.succeed("rm -rf /var/lib/gosti-serve-healthcheck/consecutive-failures && mkdir /var/lib/gosti-serve-healthcheck/consecutive-failures")
                 host.succeed("systemctl start gosti-serve-healthcheck.service")
                 host.succeed("journalctl -u gosti-serve-healthcheck.service -o cat | grep -q 'WARN: could not write'")
                 assert host.succeed("systemctl show -p Result --value gosti-serve-healthcheck.service").strip() == "success"
-                host.succeed("rmdir /var/lib/vm-harness-serve-healthcheck/consecutive-failures")
+                host.succeed("rmdir /var/lib/gosti-serve-healthcheck/consecutive-failures")
                 host.succeed("systemctl start gosti-serve.service")
           '';
         };

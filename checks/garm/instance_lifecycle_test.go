@@ -34,7 +34,7 @@
 //  1. cleanupOrphanedGithubRunners: a runner offline in GitHub for >5 min
 //     whose name is absent from the provider's ListInstances had its DB row
 //     DELETED and the provider's DeleteInstance was never called. The remote
-//     vmharness provider answered every ListInstances with an empty list, so
+//     gosti provider answered every ListInstances with an empty list, so
 //     every Windows runner (still booting at 5 min) was forgotten while its VM
 //     ran on: ~210 leaked libvirt domains. TestDroppedInstanceIsDeletedViaProvider.
 //

@@ -39,7 +39,7 @@ index c262e8c..9960451 100644
 +// pre-renders its runner-install wrapper with those URLs baked in and passes it
 +// as the `runner_install_template` extra-spec, so the old URLs are rewritten
 +// inside the cloud-config extra-specs too (`runner_install_template`,
-+// `pre_install_scripts`, `extra_context`). Same rewrite as the vm-harness
++// `pre_install_scripts`, `extra_context`). Same rewrite as the gosti
 +// provider's guest URL override.
 +func (c *Config) ApplyGuestURLOverrides(bootstrapParams params.BootstrapInstance) params.BootstrapInstance {
 +	oldMetadataURL, oldCallbackURL := bootstrapParams.MetadataURL, bootstrapParams.CallbackURL
