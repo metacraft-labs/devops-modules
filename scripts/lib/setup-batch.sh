@@ -72,6 +72,9 @@ dns_timeout="${GOOGLE_WORKSPACE_DOMAINS_DNS_TIMEOUT:-1800}"
 dns_interval="${GOOGLE_WORKSPACE_DKIM_DNS_INTERVAL:-30}"
 verify_timeout="${GOOGLE_WORKSPACE_DOMAINS_VERIFY_TIMEOUT:-900}"
 verify_interval="${GOOGLE_WORKSPACE_DOMAINS_VERIFY_INTERVAL:-30}"
+# Set, it bounds each round's wait by that many Directory reads rather than
+# by $verify_timeout (see google-workspace-domains.sh).
+verify_tries="${GOOGLE_WORKSPACE_DOMAINS_VERIFY_TRIES:-}"
 interactive=0
 state_file="" log_file="" lockd=""
 
@@ -676,7 +679,7 @@ newly_verified=()
 newly_verified=()
 verify_pending=()
 verify_served() {
-  local d waiting=() left start out
+  local d waiting=() left start out rounds=0
   newly_verified=() verify_pending=()
   forget_tenant
   while IFS= read -r d <&3; do
@@ -715,7 +718,14 @@ verify_served() {
     done
     waiting=("${left[@]}")
     [ "${#waiting[@]}" -gt 0 ] || return 0
-    if [ $(($(date +%s) - start)) -ge "$verify_timeout" ]; then
+    rounds=$((rounds + 1))
+    if [ -n "$verify_tries" ]; then
+      if [ "$rounds" -ge "$verify_tries" ]; then
+        verify_pending=("${waiting[@]}")
+        log "not verified yet after $rounds read(s): ${waiting[*]} (asked again later)"
+        return 0
+      fi
+    elif [ $(($(date +%s) - start)) -ge "$verify_timeout" ]; then
       verify_pending=("${waiting[@]}")
       log "not verified yet after ${verify_timeout}s: ${waiting[*]} (asked again later)"
       return 0
