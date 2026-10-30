@@ -313,7 +313,8 @@ top@{ config, ... }:
                 )
                 target.succeed(
                     "jq -s -e '"
-                    "([.[] | select(.phase == \"agent-restore\")][0].command.argv[0:4] == [\"nix\", \"copy\", \"--from\", \"http://attic:8080/${atticCacheName}\"]) and "
+                    "([.[] | select(.phase == \"agent-restore\")][0].command.argv[0:2] == [\"nix-store\", \"--realise\"]) and "
+                    "([.[] | select(.phase == \"agent-restore\")][0].command.argv[5:8] == [\"--option\", \"substituters\", \"http://attic:8080/${atticCacheName}\"]) and "
                     "([.[] | select(.phase == \"agent-restore\")][0].backend.substituters == [\"http://attic:8080/${atticCacheName}\"])"
                     "' /var/log/mcl/deployments/${targetName}.jsonl"
                 )

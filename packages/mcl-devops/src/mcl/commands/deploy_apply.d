@@ -19,7 +19,7 @@ import mcl.utils.deploy_manifest : ManifestBuildRequest, buildManifest,
     manifestTarget, verifyManifestSignature;
 import mcl.utils.deploy_state : acquireDeployTargetStateLock, DeployTargetStateLock,
     DesiredManifestDecision, DurableManifestSnapshot, loadDurableManifestSnapshot,
-    markDeploymentState, recordDesiredManifestBound;
+    markDeploymentState, recordDesiredManifestBound, safeTargetName;
 import mcl.utils.deployment_events : ClosureSummary, DeploymentEventContext,
     appendDeploymentEvent, deploymentEventJson, deploymentEventLogPathFromEnv,
     queryClosureSummary, stderrSummary;
@@ -250,6 +250,119 @@ string[] manifestTrustedPublicKeys(JSONValue manifest)
         if (substituter["trustedPublicKey"].str != "")
             result ~= substituter["trustedPublicKey"].str;
     return result;
+}
+
+// Remove the restore GC root, which is a symlink into the store. It may already be
+// gone, or point at a path that no longer exists, so test the link itself rather
+// than following it.
+void removeGcRoot(string gcRoot)
+{
+    import std.file : FileException, isSymlink;
+
+    try
+    {
+        if (gcRoot.isSymlink)
+            remove(gcRoot);
+    }
+    catch (FileException) {}
+}
+
+// The indirect GC root that keeps the desired closure live from its restore
+// until activation has registered it in the system profile. One fixed name per
+// target, so an agent killed mid-transaction leaves at most one stale root, and
+// the next restore replaces it.
+string restoreGcRootPath(string stateDir, string target)
+{
+    import std.path : buildPath;
+
+    return stateDir.buildPath("gcroots", safeTargetName(target));
+}
+
+// Restore the desired closure and root it, safely against a concurrent GC.
+//
+// A bare `nix copy --from <cache> <path>` is not GC-safe. It asks the local store
+// which closure paths are already valid, skips those, and copies the rest. The
+// skipped paths are not rooted by anything: a GC that runs before the copy
+// registers their referrers deletes them, and the copy then fails with
+// "path '...' is not valid". A host below its `min-free` runs that GC inside the
+// copy itself, since every addToStore calls auto-GC first (m3, 2026-10-30:
+// "libxslt-1.1.45 ... is not valid"). Even a successful copy leaves the closure
+// unrooted until activation writes the system profile.
+//
+// `nix-store --realise` substitutes through the store's substitution goals,
+// which register every path -- present or fetched -- as a temporary root before
+// they check whether it is valid. That registration goes through the GC's own
+// socket protocol, so it holds against a collector that is already running.
+// `--add-root` then leaves a permanent indirect root that keeps the closure live
+// through activation; deployApplyImpl removes it once the transaction ends.
+//
+// Holding the global GC lock instead would deadlock: we would hold it shared,
+// and the auto-GC that the copy itself starts waits for it exclusively.
+//
+// `min-free = 0` keeps the restore from starting an auto-GC of its own. Other
+// processes still collect, and the temporary roots hold against them. Nix runs
+// the worker's auto-GC on a background thread and crashes (SIGSEGV in
+// findRuntimeRoots, Nix 2.31.5 and 2.34.8) when the process exits while that
+// collection is still running -- which turned a restore that had succeeded and
+// rooted its closure into a failure.
+//
+// With no substituter in the manifest the path must already be present, as
+// before: `substituters` is overridden to empty, so a missing path fails rather
+// than falling back to the host's configured caches.
+string[] restoreClosureCommand(JSONValue manifest, string desired, string gcRoot)
+{
+    auto substituters = manifestSubstituters(manifest);
+    auto command = [
+        "nix-store", "--realise", desired, "--add-root", gcRoot,
+        "--option", "substituters", substituters.length ? substituters[0] : "",
+        "--option", "min-free", "0",
+    ];
+    // A signed latest manifest is fresher authority than Nix's per-user
+    // negative narinfo cache. Without this override, one transient 404 can
+    // poison every bounded deployment retry for the default one-hour TTL.
+    if (substituters.length)
+        command ~= ["--option", "narinfo-cache-negative-ttl", "0"];
+    auto keys = manifestTrustedPublicKeys(manifest);
+    if (keys.length)
+        command ~= ["--option", "trusted-public-keys", keys.join(" ")];
+    return command;
+}
+
+@("test_restore_closure_command_realises_under_a_gc_root")
+unittest
+{
+    import mcl.utils.deploy_manifest : ManifestSubstituter;
+
+    auto desired = "/nix/store/22222222222222222222222222222222-nixos-system-host";
+    auto request = ManifestBuildRequest(
+        deploymentId: "restore-command",
+        target: "host",
+        gitRevision: "0123456789abcdef0123456789abcdef01234567",
+        sequence: 1,
+        desiredSystemPath: desired,
+        substituters: [ManifestSubstituter(
+            url: "https://cache.example/deployments",
+            trustedPublicKey: "deployments.example:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )],
+    );
+    assert(restoreClosureCommand(buildManifest(request), desired, "/state/gcroots/host") == [
+        "nix-store", "--realise", desired, "--add-root", "/state/gcroots/host",
+        "--option", "substituters", "https://cache.example/deployments",
+        "--option", "min-free", "0",
+        "--option", "narinfo-cache-negative-ttl", "0",
+        "--option", "trusted-public-keys",
+        "deployments.example:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    ]);
+
+    // No substituter: the closure must already be present, and is still rooted.
+    request.substituters = [];
+    assert(restoreClosureCommand(buildManifest(request), desired, "/state/gcroots/host") == [
+        "nix-store", "--realise", desired, "--add-root", "/state/gcroots/host",
+        "--option", "substituters", "",
+        "--option", "min-free", "0",
+    ]);
+    assert(restoreGcRootPath("/var/lib/mcl/deployments", "m3")
+        == "/var/lib/mcl/deployments/gcroots/m3");
 }
 
 bool automaticRollbackRequested(JSONValue manifest)
@@ -714,6 +827,7 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
 
     ProcessResult restore;
     string[] restoreArgv;
+    JSONValue[string] restoreMetadata;
     if (args.restoreCommand != "")
     {
         restoreArgv = ["sh", "-c", args.restoreCommand];
@@ -721,27 +835,27 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
     }
     else
     {
-        auto restoreCommand = manifestSubstituters(manifest).length
-            ? ["nix", "copy", "--from", manifestSubstituters(manifest)[0], desired]
-            : ["nix", "path-info", desired];
-        // A signed latest manifest is fresher authority than Nix's per-user
-        // negative narinfo cache. Without this override, one transient 404 can
-        // poison every bounded deployment retry for the default one-hour TTL.
-        if (manifestSubstituters(manifest).length)
-            restoreCommand ~= ["--option", "narinfo-cache-negative-ttl", "0"];
-        auto keys = manifestTrustedPublicKeys(manifest);
-        if (keys.length)
-            restoreCommand ~= ["--option", "trusted-public-keys", keys.join(" ")];
+        import std.file : mkdirRecurse;
+        import std.path : dirName;
 
-        restoreArgv = restoreCommand;
-        restore = runner(restoreCommand);
+        auto gcRoot = restoreGcRootPath(args.stateDir, args.target);
+        mkdirRecurse(gcRoot.dirName);
+        restoreArgv = restoreClosureCommand(manifest, desired, gcRoot);
+        restoreMetadata["gcRoot"] = JSONValue(gcRoot);
+        restore = runner(restoreArgv);
     }
+    // Activation registers the generation in the system profile, which roots it
+    // from then on; a failed or rolled-back generation should not stay pinned.
+    scope(exit)
+        if (args.restoreCommand == "")
+            removeGcRoot(restoreGcRootPath(args.stateDir, args.target));
     emit("agent-restore", "nix restore deployment closure", restoreArgv,
         restore.succeeded ? "succeeded" : "failed",
         restore.exitCode,
         restore.succeeded ? "" : "Failed to restore deployment closure",
         "cache_restore_failed",
-        restore.succeeded ? "" : restore.stderr.stderrSummary);
+        restore.succeeded ? "" : restore.stderr.stderrSummary,
+        restoreMetadata);
     if (!restore.succeeded)
     {
         markDeploymentState(args.stateDir, manifest, "failed", "Closure restore failed.");
@@ -1786,7 +1900,9 @@ unittest
     )) == 0);
     assert(current == desired);
     assert(commands.canFind([
-        "nix", "copy", "--from", "https://cache.example/deployments", desired,
+        "nix-store", "--realise", desired, "--add-root", restoreGcRootPath(stateDir, "m3"),
+        "--option", "substituters", "https://cache.example/deployments",
+        "--option", "min-free", "0",
         "--option", "narinfo-cache-negative-ttl", "0",
         "--option", "trusted-public-keys",
         "deployments.example:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
