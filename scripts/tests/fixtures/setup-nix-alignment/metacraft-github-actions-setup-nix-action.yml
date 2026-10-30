@@ -1,0 +1,258 @@
+name: Setup Nix Environment
+description: >
+  Install Nix, configure nix.conf with access-tokens and netrc for private
+  GitHub repos, set up Git URL rewrites for authenticated submodule cloning,
+  and configure the caller-provided binary caches.
+
+inputs:
+  gh-token:
+    description: GitHub token for accessing private repos
+    required: true
+  token-owner:
+    description: >
+      Whitespace-separated GitHub owner(s) whose repositories `gh-token` is
+      allowed to authenticate. The Git CLI credential is installed as an
+      `http.https://github.com/<owner>/.extraHeader`, so it covers those owners'
+      repositories and nothing else — not nixpkgs, not `nim-lang/*`, not any
+      other third party a build happens to fetch from github.com.
+    required: false
+    default: "metacraft-labs"
+  extra-token-url-prefixes:
+    description: >
+      Optional whitespace/newline-separated extra `https://github.com/...` URL
+      prefixes the Git CLI credential should also cover. This is the deliberate
+      path for a cross-org PRIVATE clone authenticated by a per-repo minted
+      secret: name the repository (e.g.
+      `https://github.com/some-partner/one-repo.git`) or that owner's prefix
+      (`https://github.com/some-partner/`). Matching is by slash-delimited path
+      prefix, so naming one repository does not authenticate its neighbours.
+      A second, easily missed use: a cross-org PUBLIC fetch that must stop
+      being anonymous. GitHub accepts any VALID credential on a public
+      repository without requiring it to be scoped there, so this org's App
+      token declared for `https://github.com/status-im/` lifts those fetches
+      off the per-IP unauthenticated budget the ephemeral fleet shares (see
+      `reprobuild-provision/provision-reprobuild-siblings.sh`).
+    required: false
+    default: ""
+  substituters:
+    description: Additional Nix substituters
+    required: false
+    default: ""
+  trusted-public-keys:
+    description: Additional trusted public keys for Nix substituters
+    required: false
+    default: ""
+  attic-token:
+    description: >
+      Attic token for the cache named by `attic-cache`. It is used for BOTH
+      directions: it is written into the netrc nix reads, so nix can SUBSTITUTE
+      from the private cache named in `substituters`, and it is handed to
+      `attic login` so `watch-store` can UPLOAD newly built paths. Supplying it
+      without `attic-cache` configures the read half only, which is the useful
+      half for a job that consumes the cache and publishes nothing.
+    required: false
+    default: ""
+  attic-cache:
+    description: Attic cache name to upload newly built store paths to.
+    required: false
+    default: ""
+  attic-endpoint:
+    description: Attic server endpoint.
+    required: false
+    default: "https://cache.metacraft-labs.com/"
+  substituter-preflight:
+    description: >
+      Probe every configured substituter's `nix-cache-info` (with the netrc nix
+      will use) before anything asks nix to substitute. `fail`: any unusable
+      cache fails the job with the diagnosed cause (401 no/bad token, 403
+      network ACL, unreachable). `warn` (default): cache.nixos.org must be
+      usable; any other unusable cache produces a warning annotation and is
+      removed from this job's nix.conf so no nix command waits on it. `off`: no
+      probe. Same input, default and script as devops-modules
+      `.github/setup-nix`; see setup-nix/probe-substituters.sh.
+    required: false
+    default: "warn"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Detect pre-installed Nix
+      # macOS-15-arm64 hosted runners ship images where `_nixbld1` may
+      # already exist (or where a previous Nix volume is mounted). Skip the
+      # installer entirely if nix is already on PATH.
+      id: nix_check
+      shell: bash
+      run: |
+        if command -v nix >/dev/null 2>&1; then
+          echo "preinstalled=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "preinstalled=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Install Nix
+      if: steps.nix_check.outputs.preinstalled != 'true'
+      uses: DeterminateSystems/nix-installer-action@v22
+      with:
+        determinate: false
+
+    - name: Configure Nix authentication
+      shell: bash
+      env:
+        # Routed through `env:` rather than interpolated into the script body:
+        # `${{ }}` interpolation is textual substitution into the command file
+        # the runner writes to disk and executes, so the secret ends up in that
+        # file and in any `set -x` trace of it. An env var is neither.
+        GH_TOKEN: ${{ inputs.gh-token }}
+        EXTRA_SUBSTITUTERS: ${{ inputs.substituters }}
+        EXTRA_TRUSTED_PUBLIC_KEYS: ${{ inputs.trusted-public-keys }}
+        # The cache credential belongs here and not only in the Attic step
+        # below: that step configures the Attic CLI, which is the UPLOAD path.
+        # nix reads netrc, and netrc is written here.
+        ATTIC_TOKEN: ${{ inputs.attic-token }}
+        ATTIC_ENDPOINT: ${{ inputs.attic-endpoint }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::$GH_TOKEN"
+        # `if`, not `[ … ] && echo`: under `set -e` the latter exits the step
+        # with status 1 on the empty-token path, which is every caller today.
+        if [ -n "${ATTIC_TOKEN:-}" ]; then echo "::add-mask::$ATTIC_TOKEN"; fi
+
+        # nix.conf and netrc both carry the token. `umask 077` is not
+        # cosmetic: on the self-hosted runners in this org $HOME is reused
+        # between jobs, so these files are readable by whatever runs next
+        # unless they are mode 600.
+        umask 077
+        mkdir -p "$HOME/.config/nix"
+
+        # NOTE (scoping): unlike the Git CLI credential installed below, these
+        # two mechanisms are HOST-granular and stay that way here, deliberately:
+        #
+        #   * `netrc` has no path granularity at all — `machine github.com` is
+        #     the finest scope the format has.
+        #   * `access-tokens` DOES support `github.com/<owner>=<token>` (Nix
+        #     matches the entry as a slash-delimited prefix of host+path), but
+        #     that landed in Nix 2025-02. This action deliberately SKIPS
+        #     installing Nix when one is already present (pre-installed
+        #     ephemeral images, NixOS runners), so the running Nix version is not
+        #     something this action controls, and an older one would read
+        #     `github.com/<owner>=` as an entry matching nothing — silently
+        #     unauthenticating every private flake input in the org.
+        #
+        # Both send the token only to github.com, which issued it, and both
+        # reach only Nix's OWN HTTP traffic (`github:` inputs, tarballs,
+        # `builtins.fetch*` downloads); the exposure is that a third-party
+        # `github:` input gets it too. Narrowing them needs a Nix version
+        # floor, which is a separate change.
+        #
+        # They do NOT reach a `git+https://` input, and reading this note as if
+        # they did sends a diagnosis the wrong way. That fetcher execs the `git`
+        # binary with no credential of any kind (intercepted argv+env on Nix
+        # 2.25.2/2.28.5/2.28.7; `netrc`, `accessToken` and `extraHeader` occur
+        # nowhere in libfetchers/{git,git-utils}.cc through 2.35.2), so it is
+        # authenticated by the process's git configuration -- the Git CLI
+        # credential below -- or not at all, and a third-party one rides the
+        # fleet's shared per-IP anonymous budget. Its 401 prints `fatal: could
+        # not read Username for 'https://github.com'`, which does NOT prove
+        # that no credential was sent: with no credential helper reachable
+        # (GIT_CONFIG_GLOBAL=/dev/null), a REJECTED preemptive header prints
+        # the identical line. Diagnose by asking which configured scope matches
+        # the failing URL, not by the message.
+        cat << EOF > "$HOME/.config/nix/nix.conf"
+          # Enable flakes + nix-command additively, so this holds even when the
+          # DeterminateSystems installer is skipped because Nix is pre-installed
+          # (e.g. the Debian vmh-linux-runner ephemeral image, whose system
+          # nix.conf does not enable flakes). extra-experimental-features
+          # appends rather than replaces, so NixOS runners keep pipe-operators.
+          extra-experimental-features = nix-command flakes
+          accept-flake-config = true
+          allow-import-from-derivation = true
+          fallback = true
+          # Match metacraft-labs/devops-modules .github/setup-nix. libcurl's
+          # connect-timeout also counts time a request spends QUEUED for a
+          # free connection (http-connections), so a 3s timeout with one
+          # attempt failed narinfo lookups queued behind busy NAR downloads
+          # with "timed out ... 0 bytes received" on busy ephemeral runners.
+          # That was not a network fault, and fallback then disabled
+          # cache.nixos.org for the rest of the job.
+          connect-timeout = 20
+          download-attempts = 5
+          # HTTP/1.1: a group of multiplexed HTTP/2 cache.nixos.org NAR
+          # transfers was seen to stall together until the job ceiling on
+          # persistent self-hosted runners; per-object HTTP/1.1 transfers let
+          # stalled-download-timeout retry just the stuck object.
+          stalled-download-timeout = 30
+          http2 = false
+          http-connections = 16
+          # 0, not the 3600 default: on runners whose HOME persists between
+          # jobs, a cached "not found" outlives the job that saw it, so a path
+          # a producer job pushed minutes later is still rebuilt from source
+          # downstream. Each nix process still deduplicates its own lookups.
+          narinfo-cache-negative-ttl = 0
+          substituters = https://cache.nixos.org $EXTRA_SUBSTITUTERS
+          trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= $EXTRA_TRUSTED_PUBLIC_KEYS
+          netrc-file = $HOME/.config/nix/netrc
+          access-tokens = github.com=$GH_TOKEN
+        EOF
+
+        # The netrc `netrc-file` above names. It carries github.com — for Nix's
+        # internal git fetcher, needed by `?submodules=1` flake references that
+        # clone via git — and, when `attic-token` is supplied, the private
+        # binary cache the caller just added to `substituters`. Without that
+        # second entry nix has no credential for a cache it has been told to
+        # use, gets 401 from `nix-cache-info`, disables it and builds
+        # everything not on cache.nixos.org from source.
+        #
+        # In its own file so the credential logic is shellcheck-covered and has
+        # a contract suite that observes what curl — the client nix hands this
+        # file to — actually presents to each host. Same reasoning as
+        # configure-git-auth.sh below. Suite: setup-nix/nix-netrc-test.sh.
+        bash "${GITHUB_ACTION_PATH}/write-nix-netrc.sh"
+
+    # Prove the caches nix was just told about are READABLE, with the netrc it
+    # will use, before any step asks it to substitute. An unreadable cache is
+    # otherwise one warning line followed by a source build of the closure.
+    # Contract suite: setup-nix/tests/probe-substituters-test.sh.
+    - name: Probe binary caches
+      if: ${{ inputs.substituter-preflight != 'off' }}
+      shell: bash
+      env:
+        SETUP_NIX_PROBE_SUBSTITUTERS: https://cache.nixos.org ${{ inputs.substituters }}
+        SETUP_NIX_PROBE_MODE: ${{ inputs.substituter-preflight }}
+      run: |
+        SETUP_NIX_PROBE_NETRC="$HOME/.config/nix/netrc" \
+        SETUP_NIX_PROBE_NIX_CONF="$HOME/.config/nix/nix.conf" \
+          bash "${{ github.action_path }}/probe-substituters.sh"
+
+    - name: Configure Git authentication
+      # Scoped to the org's own repositories and to this job. See the long
+      # rationale in configure-git-auth.sh; in short, the credential this used
+      # to install was a global, URL-embedded, catch-all rewrite, and each of
+      # those three words was a separate problem. Contract suite:
+      # setup-nix/configure-git-auth-test.sh.
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+        TOKEN_OWNERS: ${{ inputs.token-owner }}
+        EXTRA_TOKEN_URL_PREFIXES: ${{ inputs.extra-token-url-prefixes }}
+      run: bash "${{ github.action_path }}/configure-git-auth.sh"
+
+    - name: Start Attic watch-store
+      if: ${{ inputs.attic-token != '' && inputs.attic-cache != '' }}
+      shell: bash
+      env:
+        ATTIC_TOKEN: ${{ inputs.attic-token }}
+        ATTIC_CACHE: ${{ inputs.attic-cache }}
+        ATTIC_ENDPOINT: ${{ inputs.attic-endpoint }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::$ATTIC_TOKEN"
+
+        attic=(nix shell --accept-flake-config nixpkgs#attic-client -c attic)
+        "${attic[@]}" login --set-default ci "$ATTIC_ENDPOINT" "$ATTIC_TOKEN"
+
+        log="${RUNNER_TEMP:-/tmp}/attic-watch-store.log"
+        nohup "${attic[@]}" watch-store \
+          --jobs 1 \
+          "$ATTIC_CACHE" >"$log" 2>&1 &
+        echo "$!" > "${RUNNER_TEMP:-/tmp}/attic-watch-store.pid"
+        echo "Attic watch-store started for $ATTIC_CACHE (log: $log)"

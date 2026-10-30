@@ -81,6 +81,9 @@ buildGo126Module rec {
     # The provider (garm-provider-vmharness) is correct: it exits 0 with a valid
     # JSON list per the external-provider contract. One-char fix inverts the
     # check so the error branch fires only on genuine provider failure.
+    # Fixed upstream in 488cf98b (2026-09-11), which our pin predates: drop
+    # this patch when the pin moves past 488cf98b. The upstream bundle in
+    # upstream-patches/garm-listinstances-inverted-error-check/ is retired.
     ./patches/fix-listinstances-inverted-error-check.patch
     # Upstream cloudbase/garm bug: reconcileStaleJobs() — the loop whose whole
     # purpose is to clear jobs that are stuck in `queued` for ever — can never
@@ -98,6 +101,10 @@ buildGo126Module rec {
     # they never clear, which corrupts the CI queue dashboards.
     # See upstream-patches/garm-stale-scaleset-job-reaper/ and the gate
     # t_garm_stale_scaleset_job_reaped.
+    # Superseded upstream by 8c64910f (2026-10-09, scale set jobs moved to
+    # their own table and pruned after 24h), which our pin predates: drop this
+    # patch, and retarget or retire the gate, when the pin moves past
+    # 8c64910f. The upstream bundle is retired.
     ./patches/fix-stale-scaleset-job-reaper.patch
     # Instance-lifecycle leaks (three pool-manager defects, observed on central
     # GARM, high-mem-server, 2026-09-22/23):

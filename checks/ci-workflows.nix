@@ -55,6 +55,50 @@
             touch "$out"
           '';
 
+      # A split caller (infra's `ci` + `ci-darwin`) evaluates each system once:
+      # every step that runs an mcl-devops eval gets the call's systems, and
+      # the merge downloads only this call's per-system shard artifacts. The
+      # selection logic itself is unit-tested in mcl-devops
+      # (`generateEvalMatrix`, `evalArtifactPattern`, `requestedEvalSystems`).
+      checks.reusable-flake-checks-eval-own-systems =
+        pkgs.runCommand "reusable-flake-checks-eval-own-systems"
+          {
+            nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
+          }
+          ''
+            python3 - <<'PY'
+            import yaml
+            from pathlib import Path
+
+            wf = yaml.safe_load(Path("${flakeChecksWorkflow}").read_text())
+            jobs = wf["jobs"]
+
+            def step(job, name):
+                return next(s for s in jobs[job]["steps"] if s.get("name") == name)
+
+            for job, name in [
+                ("shard-matrix", "Generate Shard Matrix"),
+                ("eval-matrix", "Generate CI Matrix"),
+                ("merge-matrices", "Regenerate CI matrix shards when artifacts are unavailable"),
+            ]:
+                env = step(job, name).get("env", {})
+                assert env.get("MCL_EVAL_SYSTEMS") == "''${{ inputs.build-systems }}", (job, name, env)
+
+            assert jobs["shard-matrix"]["outputs"]["eval_artifact_pattern"] == \
+                "''${{ steps.generate-matrix.outputs.eval_artifact_pattern }}"
+            download = step("merge-matrices", "Download CI matrix shards")
+            assert download["with"]["pattern"] == \
+                "''${{ needs.shard-matrix.outputs.eval_artifact_pattern }}", download
+
+            # Each call keeps its own PR comment (one per system set).
+            for job in jobs.values():
+                for s in job.get("steps", []):
+                    if "sticky-comment" in str(s.get("uses", "")):
+                        assert s["with"].get("key") == "''${{ inputs.build-systems }}", s
+            PY
+            touch "$out"
+          '';
+
       # A hung build must fail well before GitHub's 360-minute default, while
       # still leaving room for the longest observed legitimate build (217 min).
       checks.reusable-flake-checks-build-timeout =

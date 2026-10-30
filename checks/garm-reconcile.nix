@@ -281,7 +281,24 @@ top@{ ... }:
         { lib, ... }:
         {
           imports = [ flake.modules.nixos.garm ];
+
+          # (g) ARGV gate: record the argv of every execve made as the garm
+          # user (the reconcile runs as garm) in the kernel audit log, so the
+          # test can prove the admin password never appears on a command line
+          # (argv is world-readable via /proc/<pid>/cmdline). Scoped to that
+          # uid so the rest of the VM's boot does not flood the audit backlog.
+          security.audit = {
+            enable = true;
+            backlogLimit = 8192;
+            rules = [
+              "-a always,exit -F arch=b64 -S execve -F uid=garm -k argv"
+              "-a always,exit -F arch=b32 -S execve -F uid=garm -k argv"
+            ];
+          };
+          security.auditd.enable = true;
+
           environment.systemPackages = [
+            pkgs.audit
             pkgs.curl
             pkgs.jq
             self'.packages.garm
@@ -708,6 +725,72 @@ top@{ ... }:
                     f"adopt reconcile did not accept the initialized controller's 401 readiness response:\n{journal}"
                 assert "already converged" in journal, f"adopt did not report convergence:\n{journal}"
                 assert "created in org" not in journal, f"adopt CREATED a scale set:\n{journal}"
+
+            with subtest("(g) ARGV: the admin password never reaches a command line"):
+                # Every execve on these nodes is in the audit log (rules above);
+                # `ausearch -i` decodes the hex-encoded argv. The password is
+                # matched with `grep -F -f <file>` so it never enters this
+                # script, the driver log or a command line of its own.
+                def audit_text(node, path):
+                    return f"ausearch -i --input {path} 2>/dev/null || true"
+
+                def count_in(node, text_cmd, pw_file):
+                    return int(node.succeed(
+                        f"{{ {text_cmd}; }} | grep -cF -f {pw_file} || true"
+                    ).strip())
+
+                for node in (pruneoff, pruneon):
+                    # Nothing was dropped: a lost record could hide an argv.
+                    status = node.succeed("auditctl -s")
+                    assert "lost 0" in status, f"audit dropped records:\n{status}"
+                    pw_file = "/var/lib/garm/reconcile-admin-password.secret"
+                    node.succeed(f"test -s {pw_file}")
+                    text = audit_text(node, "/var/log/audit/audit.log")
+                    # Positive control: the reconcile's own execs were captured,
+                    # including the login request that now carries the password
+                    # on stdin (only the reconcile calls auth/login here).
+                    decoded = node.succeed(f"{{ {text}; }} | grep -c 'auth/login' || true")
+                    assert int(decoded.strip()) >= 1, "audit did not capture the reconcile's login exec"
+                    leaks = count_in(node, text, pw_file)
+                    assert leaks == 0, f"admin password appeared in {leaks} audited argv/proctitle record(s)"
+                    # Nor in the journal.
+                    jleaks = count_in(node, "journalctl -o cat --no-pager", pw_file)
+                    assert jleaks == 0, f"admin password appeared in {jleaks} journal line(s)"
+                    # The reconcile logged in and later calls were authorised.
+                    j = node.succeed("journalctl -u garm-reconcile.service --no-pager")
+                    assert "garm-cli profile 'reconcile' logged in" in j, j
+                    assert "WARNING: admin login" not in j, j
+
+                # Operator-supplied password (LoadCredential) on the adopt node:
+                # audit only what happened after the test's own `garm-cli init
+                # --password` above, by re-running the reconcile on a fresh
+                # offset of the log.
+                node = adopt
+                audit_log = "/var/log/audit/audit.log"
+                off = int(node.succeed(f"stat -c %s {audit_log}").strip())
+                node.systemctl("restart garm-reconcile.service")
+                node.wait_for_unit("garm-reconcile.service")
+                node.succeed(f"tail -c +{off + 1} {audit_log} > /tmp/after-reconcile.log")
+                seg = audit_text(node, "/tmp/after-reconcile.log")
+                assert int(node.succeed(f"{{ {seg}; }} | grep -c 'auth/login' || true").strip()) >= 1, \
+                    "audit did not capture the adopt reconcile's login exec"
+                assert count_in(node, seg, "${adminPwFile}") == 0, \
+                    "operator-supplied admin password appeared on a command line"
+                assert "lost 0" in node.succeed("auditctl -s")
+
+                # Detector control: an exec that DOES carry the password on argv
+                # must be caught, or the zero counts above prove nothing.
+                node = pruneoff
+                audit_log = "/var/log/audit/audit.log"
+                off = int(node.succeed(f"stat -c %s {audit_log}").strip())
+                node.succeed(
+                    "sudo -u garm /run/current-system/sw/bin/true "
+                    "\"$(cat /var/lib/garm/reconcile-admin-password.secret)\""
+                )
+                node.succeed(f"tail -c +{off + 1} {audit_log} > /tmp/control.log")
+                caught = count_in(node, audit_text(node, "/tmp/control.log"),
+                                  "/var/lib/garm/reconcile-admin-password.secret")
+                assert caught >= 1, "the argv detector missed a deliberate password-on-argv exec"
           '';
         };
       };

@@ -171,8 +171,10 @@ jobs:
           )
           # <<< billing-remaining
 
-          result="$(billing_remaining)"
-          rc=$?
+          # `|| rc=$?`: the step shell is `bash -e {0}`, so a bare failing
+          # assignment would end the step before the fail-safe branch.
+          rc=0
+          result="$(billing_remaining)" || rc=$?
           if [ "$rc" -eq 0 ]; then
             remaining="${result%%|*}"
             billed="${result#*|}"

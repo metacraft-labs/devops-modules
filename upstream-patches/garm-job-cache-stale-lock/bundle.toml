@@ -1,0 +1,45 @@
+# Prepared upstream PR bundle, driven by metacraft-dev-guidelines
+# scripts/submit-prepared-pr; the process is described in
+# metacraft-dev-guidelines policies/preparing-prs-for-internal-review.md.
+#
+# fix.patch (fix + tests in runner/pool/pool_test.go, one commit) was generated
+# against upstream main 20a0c4ba (2026-09-21) and rebased onto aa830b59
+# (2026-10-23; util.go context only: upstream added poolShadowedByScaleSet next
+# to the new helpers). The local Nix patch
+# (packages/garm/patches/fix-job-cache-stale-lock.patch) is the same change on
+# our older pin: it drops the tombstone calls (upstream's 22e24eb6 is not in
+# the pin) and sits on top of our other local patches.
+#
+# Build + test sanity on the PR tree (needs a Go toolchain with cgo):
+#   go build ./...
+#   go test -tags testing ./runner/pool/ -run 'TestPoolStressTestSuite/TestConsumeQueuedJobs'
+
+[upstream]
+repo = "cloudbase/garm"
+base_branch = "main"
+base_sha = "aa830b59c762fb02671d41cd478704fa01ca0e9c"
+
+[fork]
+repo = "<your-gh-user>/garm" # pass --fork or FORK=
+
+[pr]
+branch = "fix-job-cache-stale-lock"
+title = "Don't strand queued jobs when the pool manager's job cache goes stale"
+body = "PR.md"
+patches = ["fix.patch"]
+
+[review]
+# Private identifiers that must never reach the upstream PR. The lookaheads
+# let our contributor identity in Signed-off-by: through.
+forbid = [
+  'high-mem-server',
+  'gpu-server',
+  'codetracer-ci',
+  'metacraft(?!-labs\.com)(?! labs <)',
+  'hms-',
+  '100\.83\.',
+  '/var/lib/garm',
+  'zroot',
+  'checks/t_garm',
+  'reprobuild-specs',
+]

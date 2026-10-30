@@ -86,7 +86,11 @@
 #
 # $GOOGLE_WORKSPACE_DOMAINS_DNS_TIMEOUT and $GOOGLE_WORKSPACE_DOMAINS_VERIFY_TIMEOUT
 # set the defaults of --dns-timeout (1800 s per DNS phase) and --verify-timeout
-# (900 s).
+# (900 s). $GOOGLE_WORKSPACE_DOMAINS_VERIFY_TRIES, when set, bounds the wait for
+# the Directory to report a domain verified by that many reads instead of by
+# --verify-timeout: the bound then depends on what Google answered, not on how
+# long each read took (the offline test uses it; a read on a loaded host can
+# take longer than a whole wall-clock budget).
 #
 # status: per domain, its kind (data and tenant, with --key/--subject; the
 # read-only admin.directory.domain.readonly scope suffices), and what public DNS
@@ -223,6 +227,7 @@ done
 read -r -a resolvers <<<"${GOOGLE_WORKSPACE_DKIM_RESOLVERS:-1.1.1.1 8.8.8.8}"
 dns_interval="${GOOGLE_WORKSPACE_DKIM_DNS_INTERVAL:-30}"
 verify_interval="${GOOGLE_WORKSPACE_DOMAINS_VERIFY_INTERVAL:-30}"
+verify_tries="${GOOGLE_WORKSPACE_DOMAINS_VERIFY_TRIES:-}"
 
 domain_re='^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}$'
 host_re='^(([a-z0-9_]|[a-z0-9_][a-z0-9_-]*[a-z0-9])\.)+[a-z]{2,63}$'
@@ -230,6 +235,8 @@ mailbox_re='^[a-z0-9._+-]+@([a-z0-9-]+\.)+[a-z]{2,63}$'
 local_re='^[a-z0-9]([a-z0-9._+-]*[a-z0-9])?$'
 [[ $dns_timeout =~ ^[0-9]+$ ]] || die "--dns-timeout must be a number of seconds"
 [[ $verify_timeout =~ ^[0-9]+$ ]] || die "--verify-timeout must be a number of seconds"
+[ -z "$verify_tries" ] || [[ $verify_tries =~ ^[1-9][0-9]*$ ]] ||
+  die "\$GOOGLE_WORKSPACE_DOMAINS_VERIFY_TRIES must be a positive number of reads"
 if [ -n "$domain" ]; then
   domain="${domain,,}"
   [[ $domain =~ $domain_re ]] || die "\"$domain\" is not a domain name"
@@ -549,13 +556,19 @@ Opened by \`google-workspace-domains onboard\`. The MX/SPF/DMARC/TLS-RPT switch 
       "'$prog status --domain $domain --data $data' to see what is published"
     say "asking Google to verify $domain"
     api verify "$domain" >/dev/null || exit 1
-    start="$(date +%s)"
+    start="$(date +%s)" reads=0
     while :; do
       st="$(api state "$domain" --write)" || exit 1
+      reads=$((reads + 1))
       [ "$(state_field verified "$st")" = true ] && break
-      now="$(date +%s)"
-      [ $((now - start)) -lt "$verify_timeout" ] ||
-        die "Google accepted the verification but the Directory API still reports $domain unverified after ${verify_timeout}s; re-run to keep waiting"
+      if [ -n "$verify_tries" ]; then
+        [ "$reads" -lt "$verify_tries" ] ||
+          die "Google accepted the verification but the Directory API still reports $domain unverified after $reads reads; re-run to keep waiting"
+      else
+        now="$(date +%s)"
+        [ $((now - start)) -lt "$verify_timeout" ] ||
+          die "Google accepted the verification but the Directory API still reports $domain unverified after ${verify_timeout}s; re-run to keep waiting"
+      fi
       say "  waiting for the Directory API to report $domain verified"
       sleep "$verify_interval"
     done

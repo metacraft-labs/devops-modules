@@ -17,7 +17,13 @@ backend, and activation is performed out-of-band by an operator via
 3. `eval-matrix` runs `mcl-devops ci-matrix --flake-attribute-path ... --is-initial`
    for each evaluation shard and uploads matrix artifacts.
 4. `merge-matrices` runs `mcl-devops merge-ci-matrices` and publishes the merged
-   package table.
+   package table. An output that is already cached gets no build job. A cached
+   deployment target still gets one when `inputs.push-deployment-caches` is
+   true, because that job pushes it and proves its closure substitutes. When
+   it is false (PR checks) the target is dropped from the build matrix: it was
+   evaluated in step 3 and found in the cache, so building it would only
+   download it (`MCL_REBUILD_CACHED_DEPLOYMENT_TARGETS`). A changed target is
+   uncached and is built either way.
 5. `build` runs `nix build -L --no-link --keep-going --show-trace
 '.#${{ matrix.attrPath }}'` for each matrix item.
 6. When `inputs.push-deployment-caches` is true, `build` runs
@@ -25,10 +31,15 @@ backend, and activation is performed out-of-band by an operator via
    `deployment-cache-push-backends` (`attic` by default, with `none` as the
    only non-Attic option), using the Attic CI transport (`--transport
 attic-ci`).
-7. `results` runs on the JSON-encoded `results-runner` input, which defaults
+7. When `inputs.push-check-caches` is `true`, or is empty (the default) and
+   `inputs.push-deployment-caches` is true, `build` pushes the output of every
+   successfully built non-deployment output (checks, packages) to the Attic
+   cache with the same `ATTIC_TOKEN` push credential, so the next run finds it
+   cached instead of rebuilding it. The step never fails the job.
+8. `results` runs on the JSON-encoded `results-runner` input, which defaults
    to self-hosted Linux fleet runner labels. It prints the final matrix and
    updates the pull request comment.
-8. There is no longer an in-CI activation step. The removed `run-cachix-deploy`
+9. There is no longer an in-CI activation step. The removed `run-cachix-deploy`
    gate and `mcl-devops deploy-spec` step have no replacement in the workflow;
    activation happens out-of-band via `mcl-devops deploy-ssh` / `mcl-devops deploy-reconcile`.
 

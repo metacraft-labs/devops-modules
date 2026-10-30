@@ -133,3 +133,9 @@ the workflow-job case passes on both.
 
 <!-- After opening, record the PR URL here: -->
 <!-- PR: https://github.com/cloudbase/garm/pull/XXXX -->
+
+<!-- STATUS: RETIRED (2026-10-27), not submitted. Superseded upstream by
+     cloudbase/garm 8c64910f ("Split scaleset jobs in their own table",
+     2026-10-09): scale set jobs moved out of workflow_jobs and are pruned by a
+     retention worker after 24h. Our pin 0a9a939c predates it, so the local Nix
+     patch stays until the pin moves past 8c64910f. -->

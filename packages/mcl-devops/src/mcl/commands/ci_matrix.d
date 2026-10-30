@@ -176,9 +176,18 @@ version (unittest)
     }
 }
 
-bool shouldIncludeInBuildMatrix(in Package pkg)
+/// Whether a flake output gets a build job.
+///
+/// Uncached outputs always do. A deployment target that is already cached is
+/// rebuilt only when `rebuildCachedDeploymentTargets` is set: the run that
+/// publishes deployment closures needs a job per target to push it and prove
+/// the closure substitutes. A run that publishes nothing (PR checks) gains
+/// nothing from it: the target already evaluated in this run, and its
+/// toplevel is in the cache, so the job would only download the closure.
+/// The default keeps the previous behaviour for callers that do not say.
+bool shouldIncludeInBuildMatrix(in Package pkg, bool rebuildCachedDeploymentTargets = true)
 {
-    return pkg.cachedAt.empty || pkg.deploymentTarget;
+    return pkg.cachedAt.empty || (rebuildCachedDeploymentTargets && pkg.deploymentTarget);
 }
 
 bool isCachedPackageJson(JSONValue pkg)
@@ -203,9 +212,74 @@ bool isDeploymentTargetPackageJson(JSONValue pkg)
     return false;
 }
 
-bool shouldIncludeInBuildMatrix(JSONValue pkg)
+bool shouldIncludeInBuildMatrix(JSONValue pkg, bool rebuildCachedDeploymentTargets = true)
 {
-    return !isCachedPackageJson(pkg) || isDeploymentTargetPackageJson(pkg);
+    return !isCachedPackageJson(pkg)
+        || (rebuildCachedDeploymentTargets && isDeploymentTargetPackageJson(pkg));
+}
+
+/// Environment switch for `shouldIncludeInBuildMatrix`. The reusable
+/// flake-checks workflow sets it to its `push-deployment-caches` input. Only
+/// an explicit `false` drops cached deployment targets; unset or anything
+/// else keeps them.
+enum rebuildCachedDeploymentTargetsEnv = "MCL_REBUILD_CACHED_DEPLOYMENT_TARGETS";
+
+bool parseRebuildCachedDeploymentTargets(string value)
+{
+    import std.uni : toLower;
+
+    return value.strip.toLower != "false";
+}
+
+bool rebuildCachedDeploymentTargetsFromEnv()
+{
+    import std.process : environment;
+
+    return environment.get(rebuildCachedDeploymentTargetsEnv, "true")
+        .parseRebuildCachedDeploymentTargets;
+}
+
+@("cached deployment targets are dropped only when not publishing")
+unittest
+{
+    auto cachedDeploymentTarget = Package(
+        name: "cached-deployment-target",
+        cachedAt: ["https://cache.example/cached-deployment-target.narinfo"],
+        deploymentTarget: true,
+    );
+    auto uncachedDeploymentTarget = Package(
+        name: "uncached-deployment-target",
+        deploymentTarget: true,
+    );
+    auto cachedPackage = Package(
+        name: "cached-package",
+        cachedAt: ["https://cache.example/cached-package.narinfo"],
+    );
+
+    assert(cachedDeploymentTarget.shouldIncludeInBuildMatrix(true));
+    assert(!cachedDeploymentTarget.shouldIncludeInBuildMatrix(false));
+    // A changed (uncached) machine is always built, publishing or not.
+    assert(uncachedDeploymentTarget.shouldIncludeInBuildMatrix(false));
+    assert(!cachedPackage.shouldIncludeInBuildMatrix(false));
+
+    auto json = JSONValue([
+        "cachedAt": JSONValue([JSONValue("https://cache.example/x.narinfo")]),
+        "deploymentTarget": JSONValue(true),
+    ]);
+    assert(json.shouldIncludeInBuildMatrix(true));
+    assert(!json.shouldIncludeInBuildMatrix(false));
+}
+
+@("parseRebuildCachedDeploymentTargets")
+unittest
+{
+    // Only an explicit false drops cached targets; the workflow passes the
+    // boolean input as `true` / `false`.
+    assert(parseRebuildCachedDeploymentTargets("true"));
+    assert(parseRebuildCachedDeploymentTargets(""));
+    assert(parseRebuildCachedDeploymentTargets("yes"));
+    assert(!parseRebuildCachedDeploymentTargets("false"));
+    assert(!parseRebuildCachedDeploymentTargets(" False "));
 }
 
 @("build matrix includes cached deployment targets")
@@ -372,6 +446,55 @@ unittest
     assert(output.githubOutputValue("full_matrix").matrixPackageNames == [
         "cached-package",
         "cached-deployment-target",
+        "uncached-package",
+    ]);
+}
+
+@("merge ci matrices drops cached deployment targets when not publishing")
+unittest
+{
+    import std.file : deleteme, exists, mkdirRecurse, readText, rmdirRecurse, write;
+
+    auto testDir = deleteme ~ ".merge-ci-matrices-no-publish";
+    if (testDir.exists)
+        testDir.rmdirRecurse;
+    scope(exit)
+        if (testDir.exists)
+            testDir.rmdirRecurse;
+
+    testDir.buildPath("shard-a").mkdirRecurse;
+    testDir.buildPath("shard-a", "matrix-pre.json").write(JSONValue([
+        "include": JSONValue([
+            JSONValue([
+                "name": JSONValue("cached-deployment-target"),
+                "cachedAt": JSONValue([JSONValue("https://cache.example/cached-deployment-target.narinfo")]),
+                "deploymentTarget": JSONValue(true),
+            ]),
+            JSONValue([
+                "name": JSONValue("changed-deployment-target"),
+                "cachedAt": JSONValue(cast(JSONValue[]) []),
+                "deploymentTarget": JSONValue(true),
+            ]),
+            JSONValue([
+                "name": JSONValue("uncached-package"),
+                "cachedAt": JSONValue(cast(JSONValue[]) []),
+                "deploymentTarget": JSONValue(false),
+            ]),
+        ]),
+    ]).toString(JSONOptions.doNotEscapeSlashes));
+
+    auto outputPath = testDir.buildPath("gh-output.env");
+    assert(mergeCiMatrices(MergeMatricesArgs(githubOutput: outputPath), testDir, false) == 0);
+
+    const output = outputPath.readText;
+    assert(output.githubOutputValue("build_matrix").matrixPackageNames == [
+        "changed-deployment-target",
+        "uncached-package",
+    ]);
+    // The cached target is still reported (comment table, Final Results).
+    assert(output.githubOutputValue("full_matrix").matrixPackageNames == [
+        "cached-deployment-target",
+        "changed-deployment-target",
         "uncached-package",
     ]);
 }
@@ -724,12 +847,20 @@ Package packageFromNixEvalJobsJson(
 {
     auto sys = json["system"].fromJSON!NixSystem;
     const attr = json["attr"].str;
+    // A per-system shard (`shardsPerSystem.<system>.shard-NN`) names its
+    // outputs WITHOUT the `/<system>` suffix the all-systems `shards` add.
+    // Restore it, so an output carries the same name whichever way it was
+    // evaluated: the PR comment, Final Results, deployment-target detection
+    // (`machine/<host>/<system>`) and deploy-spec's agent names all key on it.
+    // `attrPath` stays the real attribute, which is what gets built.
+    const perSystem = flakeAttrPath.shardsPerSystemSystem;
+    const name = perSystem != "" ? attr ~ "/" ~ perSystem : attr;
 
     // WARN: The `isCached` property coming from `nix-eval-jobs` is
     //       insufficient as it just says if the package is cached
     //       "somewhere" (including in the local store)
     return Package(
-        name: attr,
+        name: name,
         allowedToFail: false,
         attrPath: flakeAttrPath ~ "." ~ attr,
         cachedAt: [],
@@ -737,8 +868,8 @@ Package packageFromNixEvalJobsJson(
         ghRunner: nixSystemToRunnerLabels[sys],
         derivation: json["drvPath"].str,
         output: json["outputs"]["out"].str,
-        deploymentTarget: isDeployableServerMachineAttr(flakeAttrPath, attr, deploymentTargetNames),
-        deploymentKind: deploymentKindFor(flakeAttrPath, attr, deploymentTargetNames),
+        deploymentTarget: isDeployableServerMachineAttr(flakeAttrPath, name, deploymentTargetNames),
+        deploymentKind: deploymentKindFor(flakeAttrPath, name, deploymentTargetNames),
     );
 }
 
@@ -747,6 +878,100 @@ enum deployableServerMachinesAttrPath = "legacyPackages.x86_64-linux.serverMachi
 bool isShardMatrixAttrPath(string flakeAttrPath)
 {
     return flakeAttrPath.startsWith("mcl.shard-matrix.result.shards");
+}
+
+enum shardsPerSystemAttrPrefix = "mcl.shard-matrix.result.shardsPerSystem.";
+
+/// The system of a per-system shard attribute path
+/// (`mcl.shard-matrix.result.shardsPerSystem.<system>.shard-NN`), or "".
+string shardsPerSystemSystem(string flakeAttrPath)
+{
+    if (!flakeAttrPath.startsWith(shardsPerSystemAttrPrefix))
+        return "";
+    const rest = flakeAttrPath[shardsPerSystemAttrPrefix.length .. $];
+    const dot = rest.indexOf('.');
+    return dot < 0 ? rest : rest[0 .. dot];
+}
+
+@("shardsPerSystemSystem")
+unittest
+{
+    assert("mcl.shard-matrix.result.shardsPerSystem.x86_64-linux.shard-03".shardsPerSystemSystem == "x86_64-linux");
+    assert("mcl.shard-matrix.result.shardsPerSystem.aarch64-darwin".shardsPerSystemSystem == "aarch64-darwin");
+    assert("mcl.shard-matrix.result.shards.shard-03".shardsPerSystemSystem == "");
+    assert("legacyPackages.x86_64-linux.checks".shardsPerSystemSystem == "");
+}
+
+@("per-system shard outputs keep the all-systems name and deployment detection")
+unittest
+{
+    const flakeAttrPath = "mcl.shard-matrix.result.shardsPerSystem.x86_64-linux.shard-03";
+    auto server = `{
+        "attr": "machine/gpu-node-001",
+        "drvPath": "/nix/store/server.drv",
+        "outputs": { "out": "/nix/store/11111111111111111111111111111111-server" },
+        "system": "x86_64-linux"
+    }`.parseJSON.packageFromNixEvalJobsJson(
+        flakeAttrPath,
+        NixSystemToGHRunner(`{ "x86_64-linux": ["self-hosted"] }`),
+        ["gpu-node-001"],
+    );
+    // Same name an all-systems shard gives the same output ...
+    assert(server.name == "machine/gpu-node-001/x86_64-linux");
+    // ... but the attribute that is BUILT is the real per-system one.
+    assert(server.attrPath == flakeAttrPath ~ ".machine/gpu-node-001");
+    assert(server.deploymentTarget);
+    assert(server.deploymentKind == "server");
+}
+
+/// The systems a CI call asked to evaluate, from `MCL_EVAL_SYSTEMS` (a JSON
+/// array of Nix systems, as the reusable workflow's `build-systems` input).
+/// Empty (unset, blank or `[]`) means "every system", today's behaviour.
+NixSystem[] requestedEvalSystems(string raw)
+{
+    const trimmed = raw.strip;
+    if (trimmed == "")
+        return [];
+    const json = parseJSON(trimmed);
+    enforce(json.type == JSONType.array,
+        "MCL_EVAL_SYSTEMS must be a JSON array of Nix systems, got: " ~ trimmed);
+    return json.fromJSON!(NixSystem[]);
+}
+
+NixSystem[] requestedEvalSystems()
+{
+    import std.process : environment;
+    return requestedEvalSystems(environment.get("MCL_EVAL_SYSTEMS", ""));
+}
+
+/// `systems` restricted to `requested`; `requested` empty keeps them all.
+NixSystem[] restrictToEvalSystems(NixSystem[] systems, const(NixSystem)[] requested)
+{
+    return requested.empty
+        ? systems
+        : systems.filter!(s => requested.canFind(s)).array;
+}
+
+@("requestedEvalSystems / restrictToEvalSystems")
+unittest
+{
+    import std.exception : assertThrown;
+
+    assert(requestedEvalSystems("") == []);
+    assert(requestedEvalSystems("  ") == []);
+    assert(requestedEvalSystems("[]") == []);
+    assert(requestedEvalSystems(`["x86_64-linux"]`) == [NixSystem.x86_64_linux]);
+    assert(requestedEvalSystems(`["aarch64-darwin", "x86_64-linux"]`)
+        == [NixSystem.aarch64_darwin, NixSystem.x86_64_linux]);
+    assertThrown(requestedEvalSystems(`"x86_64-linux"`));
+
+    auto all = [NixSystem.x86_64_linux, NixSystem.aarch64_darwin];
+    // Nothing requested: every system, exactly as before.
+    assert(all.restrictToEvalSystems([]) == all);
+    assert(all.restrictToEvalSystems([NixSystem.x86_64_linux]) == [NixSystem.x86_64_linux]);
+    assert(all.restrictToEvalSystems([NixSystem.aarch64_darwin]) == [NixSystem.aarch64_darwin]);
+    // A system the flake does not build contributes nothing.
+    assert(all.restrictToEvalSystems([NixSystem.aarch64_linux]) == []);
 }
 
 string shardMatrixMachineName(string attr)
@@ -1051,7 +1276,10 @@ NixSystem[] getSupportedSystems(string flakeRef = ".")
             `builtins.attrNames`
         ]))
         .ifThrown(JSONValue([ currentSystem.enumToString ]))
-        .fromJSON!(NixSystem[]);
+        .fromJSON!(NixSystem[])
+        // A caller that builds only some systems evaluates only those
+        // (MCL_EVAL_SYSTEMS; see `requestedEvalSystems`).
+        .restrictToEvalSystems(requestedEvalSystems);
 }
 
 Package[] nixEvalForAllSystems(T)(auto ref T args)
@@ -1060,6 +1288,9 @@ Package[] nixEvalForAllSystems(T)(auto ref T args)
     const systems = getSupportedSystems();
 
     infof("Evaluating flake for: %s", systems);
+
+    if (systems.empty)
+        return [];
 
     return systems.map!(system =>
             flakeAttr(args.flakeAttrPath, system)
@@ -1440,10 +1671,13 @@ void printTableForCacheStatus(T)(Package[] packages, auto ref T args)
     appendGHCIBuildOutput(packages, outputPath);
 }
 
-void appendGHCIBuildOutput(Package[] packages, string outputPath)
+void appendGHCIBuildOutput(Package[] packages, string outputPath,
+    bool rebuildCachedDeploymentTargets = rebuildCachedDeploymentTargetsFromEnv)
 {
     const buildMatrixLine = "build_matrix=" ~ JSONValue([
-        "include": JSONValue(packages.filter!shouldIncludeInBuildMatrix.map!toJSON.array)
+        "include": JSONValue(packages
+            .filter!(pkg => pkg.shouldIncludeInBuildMatrix(rebuildCachedDeploymentTargets))
+            .map!toJSON.array)
     ]).toString(JSONOptions.doNotEscapeSlashes) ~ "\n";
 
     const fullMatrixLine = "full_matrix=" ~ JSONValue([
@@ -1642,7 +1876,8 @@ export int merge_ci_matrices(MergeMatricesArgs args)
     return mergeCiMatrices(args);
 }
 
-int mergeCiMatrices(MergeMatricesArgs args, string searchRoot = ".")
+int mergeCiMatrices(MergeMatricesArgs args, string searchRoot = ".",
+    bool rebuildCachedDeploymentTargets = rebuildCachedDeploymentTargetsFromEnv)
 {
     import std.algorithm : sort;
     import std.file : isFile;
@@ -1660,6 +1895,7 @@ int mergeCiMatrices(MergeMatricesArgs args, string searchRoot = ".")
 
     JSONValue[] filteredInclude;
     JSONValue[] fullInclude;
+    infof("%s=%s", rebuildCachedDeploymentTargetsEnv, rebuildCachedDeploymentTargets);
 
     foreach (entry; matrixFiles)
     {
@@ -1675,7 +1911,8 @@ int mergeCiMatrices(MergeMatricesArgs args, string searchRoot = ".")
         foreach (pkg; json["include"].array)
         {
             fullInclude ~= pkg;
-            if (pkg.type == JSONType.object && pkg.shouldIncludeInBuildMatrix)
+            if (pkg.type == JSONType.object
+                && pkg.shouldIncludeInBuildMatrix(rebuildCachedDeploymentTargets))
                 filteredInclude ~= pkg;
         }
     }

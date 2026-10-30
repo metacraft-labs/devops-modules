@@ -6,3 +6,6 @@ node_modules
 *.json
 flake.lock
 *.mdx
+# Verbatim snapshot of another repository's file; formatting it would make
+# it no longer the file it records (see scripts/tests/test_setup_nix_alignment.py).
+scripts/tests/fixtures/setup-nix-alignment/

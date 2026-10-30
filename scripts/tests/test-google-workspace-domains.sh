@@ -45,6 +45,37 @@ expect() {
   shift
   if "$@"; then ok "$d"; else bad "$d"; fi
 }
+
+# Every wait in this file polls for the condition it is waiting for. The one
+# clock is the hang guard: the ceiling on any single step, there only to turn
+# a hang into a failure, never something a passing run waits out. Fixed budgets
+# (10 s for a stub to start, 20 s for a prompt, 300-600 s for a whole wizard)
+# used to be the bounds, and on a loaded builder they expired before the work
+# they were timing did: a slow run is not a failed one.
+hang_guard="${GWS_TEST_HANG_GUARD:-3600}"
+# wait_until CMD…: run CMD every 0.1 s until it succeeds (0); stops early when
+# CMD answers 2 or more (it can no longer succeed), and answers 1 after the guard.
+wait_until() {
+  local end=$((SECONDS + hang_guard))
+  local rc
+  while :; do
+    rc=0
+    "$@" || rc=$?
+    [ "$rc" = 0 ] && return 0
+    # 2+: the condition can no longer come true (what it waits on is gone).
+    [ "$rc" = 1 ] || return "$rc"
+    [ "$SECONDS" -lt "$end" ] || return 1
+    sleep 0.1
+  done
+}
+# wait_for_port FILE PID: until the stub PID writes its port to FILE; fails at
+# once if the stub exits first.
+port_ready() { [ -s "$1" ] || { kill -0 "$2" 2>/dev/null || return 2; false; }; }
+wait_for_port() {
+  local rc=0
+  wait_until port_ready "$1" "$2" 2>/dev/null || rc=$?
+  [ "$rc" = 0 ] && [ -s "$1" ]
+}
 expect_not() {
   local d="$1"
   shift
@@ -52,6 +83,12 @@ expect_not() {
 }
 run() { bash "$tool" "$@" >"$work/stdout" 2>"$work/stderr"; }
 stderr_has() { grep -qF -- "$1" "$work/stderr"; }
+# stderr_marker TEXT PID: TEXT is on stderr (0), or PID exited without it (2).
+stderr_marker() {
+  grep -q -- "$1" "$work/stderr" 2>/dev/null && return 0
+  kill -0 "$2" 2>/dev/null || return 2
+  return 1
+}
 # (grep without -q reads all of its input: an early exit would SIGPIPE the
 # writer and, under pipefail, fail the pipeline although the text is there)
 output_has() { cat "$work/stdout" "$work/stderr" | grep -F -- "$1" >/dev/null; }
@@ -233,7 +270,12 @@ export STUB_GH_STATE="$work/gh-prs" STUB_APPLY="$work/apply"
 # and GitHub saw can be asserted rather than inferred.
 export STUB_SEQ_LOG="$work/api.log"
 export GOOGLE_WORKSPACE_DKIM_DNS_INTERVAL=1 GOOGLE_WORKSPACE_DKIM_RESOLVERS="192.0.2.1 192.0.2.2"
-export GOOGLE_WORKSPACE_DKIM_CHECK_INTERVAL=0 GOOGLE_WORKSPACE_DOMAINS_VERIFY_INTERVAL=1 GOOGLE_WORKSPACE_DOMAINS_VERIFY_TIMEOUT=3
+# The wait for the Directory to report a domain verified is bounded by READS,
+# not seconds: the stub's lag ("verify_lag": N) is counted in reads too, so the
+# outcome depends only on what the stub answered. A wall-clock bound here
+# (it was 3 s) failed onboard --merge whenever one read took longer than the
+# whole budget, which is routine on a loaded builder.
+export GOOGLE_WORKSPACE_DKIM_CHECK_INTERVAL=0 GOOGLE_WORKSPACE_DOMAINS_VERIFY_INTERVAL=0 GOOGLE_WORKSPACE_DOMAINS_VERIFY_TRIES=5
 export GOOGLE_WORKSPACE_DOMAINS_DNS_TIMEOUT=5
 : >"$STUB_GH_LOG"
 
@@ -246,8 +288,7 @@ EOF
 : >"$api_log"
 python3 "$stub_py" "$state" "$work/dns" "$api_log" "$work/port" &
 stub_pid=$!
-for _ in $(seq 1 100); do [ -s "$work/port" ] && break; sleep 0.1; done
-[ -s "$work/port" ] || { echo "the Google API stub did not start"; exit 1; }
+wait_for_port "$work/port" "$stub_pid" || { echo "the Google API stub did not start"; exit 1; }
 port="$(cat "$work/port")"
 export GOOGLE_WORKSPACE_ADMIN_API="http://127.0.0.1:$port" GOOGLE_SITE_VERIFICATION_API="http://127.0.0.1:$port" \
   GOOGLE_GMAIL_API="http://127.0.0.1:$port" GOOGLE_GROUPS_SETTINGS_API="http://127.0.0.1:$port"
@@ -457,6 +498,24 @@ expect "... saying Google could not find it" stderr_has "Google could not find t
 expect "... and the data file has no MX for it" test "$(jq '.domains["example.info"] | has("mx")' "$data")" = false
 rm -f "$work/dns/example.info"* && git -C "$repo" checkout --quiet -- "$data"
 
+# The Directory never catching up: onboard gives up after exactly
+# $GOOGLE_WORKSPACE_DOMAINS_VERIFY_TRIES reads, however long each one took.
+jq --arg t google-site-verification=example-slow-Tok_123 \
+  '.domains["example.slow"] = {zone_id: "00000000000000000000000000000098", dkim: {}, google_verification: [$t]}' "$data" >"$data.new" && mv "$data.new" "$data"
+for f in example.slow example.slow@192.0.2.1 example.slow@192.0.2.2; do
+  printf '"google-site-verification=example-slow-Tok_123"\n' >"$work/dns/$f"
+done
+set_state '.verify_lag = 1000'
+: >"$api_log"
+expect_not "a domain the Directory never reports verified stops onboard after the read budget" \
+  env GOOGLE_WORKSPACE_DOMAINS_VERIFY_TRIES=2 bash "$tool" onboard --no-pr --dns-timeout 2 --domain example.slow --parent example.com --data "$data" 2>"$work/stderr" >/dev/null
+expect "... saying how many reads it waited" stderr_has "still reports example.slow unverified after 2 reads"
+expect "... having read the Directory exactly twice after asking Google to verify" \
+  test "$(sed -n '/^POST \/siteVerification\/v1\/webResource/,$p' "$api_log" | grep -c '^READ example.slow verified=false$')" = 2
+expect "... and the data file has no MX for it" test "$(jq '.domains["example.slow"] | has("mx")' "$data")" = false
+set_state '.verify_lag = 0 | del(.aliases["example.slow"]) | del(.domains["example.slow"])'
+rm -f "$work/dns/example.slow"* && git -C "$repo" checkout --quiet -- "$data"
+
 # ── 5. a domain the tenant already has, and the SPF merge rules ──────────────
 : >"$api_log"
 cp "$data" "$work/data.before-primary"
@@ -532,6 +591,13 @@ narrow() { ! awk 'length > 78 { t = $0; sub(/^ +/, "", t); if (t ~ / /) { print;
 # stdout, then runs ACTION (shell, may be empty) — the operator's console edit,
 # simulated on the stub — and types ANSWER. The guided flow's own verification
 # then has to see the change.
+prompt_out() {
+  local n
+  n="$(grep -c 'verify now' "$work/stdout" 2>/dev/null || true)"
+  [ "${n:-0}" -ge "$1" ] && return 0
+  kill -0 "$2" 2>/dev/null || return 2
+  return 1
+}
 guided_run() {
   local steps=() fifo="$work/guide.fifo" i=0 st n pid rc=0
   while [ "$1" != -- ]; do
@@ -541,17 +607,14 @@ guided_run() {
   shift
   rm -f "$fifo"
   mkfifo "$fifo"
-  timeout 300 "$@" <"$fifo" >"$work/stdout" 2>"$work/stderr" &
+  timeout "$hang_guard" "$@" <"$fifo" >"$work/stdout" 2>"$work/stderr" &
   pid=$!
   exec 7>"$fifo"
   for st in "${steps[@]}"; do
     i=$((i + 1))
-    for _ in $(seq 1 400); do
-      n="$(grep -c 'verify now' "$work/stdout" 2>/dev/null || true)"
-      [ "${n:-0}" -ge "$i" ] && break
-      kill -0 "$pid" 2>/dev/null || break
-      sleep 0.05
-    done
+    # Until the Nth prompt is out, or the tool has exited (then the answer's
+    # write fails below, and the assertions report what it printed).
+    wait_until prompt_out "$i" "$pid" || true
     eval "${st%%|*}"
     # A tool that already exited has closed the FIFO: the write must fail
     # (and the assertions report it), not kill this shell with SIGPIPE.
@@ -829,7 +892,7 @@ dkim_value="v=DKIM1; k=rsa; p=$(openssl rsa -in "$work/dkim.pem" -pubout -outfor
 : >"$STUB_GH_LOG"
 # Bounded: a guided flow that loops instead of reading its answers fails here.
 wizard() {
-  timeout 600 env STUB_ORIGIN="$worigin" STUB_GH_STATE="$work/wgh" \
+  timeout "$hang_guard" env STUB_ORIGIN="$worigin" STUB_GH_STATE="$work/wgh" \
     GOOGLE_WORKSPACE_DOMAINS_CMD="bash $tool" GOOGLE_WORKSPACE_DKIM_CMD="bash $dkim_tool" \
     bash "$setup_tool" "$@" --data "$wdata" --base main --dmarc-rua dmarc@example.com --test-to ext@example.net
 }
@@ -959,7 +1022,7 @@ EOF
 python3 "$work/smtp-stub.py" "$work/smtp.log" "$work/smtp.port" app-pw-123 &
 smtp_pid=$!
 trap '[ -n "$stub_pid" ] && kill "$stub_pid" 2>/dev/null; kill "$smtp_pid" 2>/dev/null; rm -rf "$work"' EXIT
-for _ in $(seq 1 100); do [ -s "$work/smtp.port" ] && break; sleep 0.1; done
+wait_for_port "$work/smtp.port" "$smtp_pid" || { echo "the SMTP stub did not start"; exit 1; }
 : >"$work/smtp.log"
 printf '\nwrong-pw\n\napp-pw-123\n' >"$work/answers"
 rc=0
@@ -1039,7 +1102,7 @@ benv=(env STUB_ORIGIN="$borigin" STUB_GH_STATE="$bgh" GOOGLE_WORKSPACE_DOMAINS_C
   GOOGLE_WORKSPACE_DKIM_CMD="bash $dkim_tool"
   GOOGLE_WORKSPACE_NOTIFY="{ echo \"TITLE \$NOTIFY_TITLE\"; cat; } >>$work/notify.log")
 bargs=(--data "$bdata" --base main --dmarc-rua dmarc@example.com --group dmarc@example.com --post-edit "$hook")
-batch() { timeout 600 "${benv[@]}" GOOGLE_WORKSPACE_FOLLOW_DETACH="${DETACH:-none}" bash "$setup_tool" "$1" "${bargs[@]}" "${@:2}"; }
+batch() { timeout "$hang_guard" "${benv[@]}" GOOGLE_WORKSPACE_FOLLOW_DETACH="${DETACH:-none}" bash "$setup_tool" "$1" "${bargs[@]}" "${@:2}"; }
 bst() { jq -r "$@" "$bstate"; }
 bst_set() { jq "$1" "$bstate" >"$bstate.t" && mv "$bstate.t" "$bstate"; }
 head_of() { git -C "$borigin" rev-parse "refs/heads/$(cat "$bgh/$1" "$bgh/merged-$1" 2>/dev/null | head -n1)"; }
@@ -1111,7 +1174,7 @@ expect "a second interactive run while the batch is in flight asks nothing and o
 touch "$bgh/hang"
 setsid "${benv[@]}" GOOGLE_WORKSPACE_FOLLOW_DETACH=none bash "$setup_tool" follow "${bargs[@]}" >"$work/stdout" 2>"$work/stderr" &
 fpid=$!
-for _ in $(seq 1 3000); do grep -q "watching the checks of PR #1" "$work/stderr" 2>/dev/null && break; sleep 0.1; done
+wait_until stderr_marker "watching the checks of PR #1" "$fpid" || true
 kill -TERM -- "-$fpid" 2>/dev/null || true
 wait "$fpid" 2>/dev/null || true
 rm -f "$bgh/hang"
@@ -1237,7 +1300,7 @@ expect "the interactive phase leaves a domain that an open hand-made PR changes 
   bash -c '[ "$1" = 0 ] && ! grep -q "^gh pr create" "$2" && tr -s " \n" "  " <"$3" | grep -qF "example.app: left to the open PR #52 (mail/batch-1-verification)"' _ "$rc" "$STUB_GH_LOG" "$work/stdout"
 GOOGLE_WORKSPACE_FOREIGN_PR_INTERVAL=1 batch follow >"$work/stdout" 2>"$work/stderr" &
 fpid=$!
-for _ in $(seq 1 3000); do grep -q "waiting for the open PR(s) that carry example.app: #52" "$work/stderr" 2>/dev/null && break; sleep 0.1; done
+wait_until stderr_marker "waiting for the open PR(s) that carry example.app: #52" "$fpid" || true
 expect "the follower waits for that PR rather than publishing the same change" \
   bash -c 'grep -qF "waiting for the open PR(s) that carry example.app: #52" "$1" && ! grep -q "^gh pr create" "$2"' _ "$work/stderr" "$STUB_GH_LOG"
 # Merged by hand, and applied.
@@ -1365,7 +1428,9 @@ set_state '.alias_verify_lag = 10'
 : >"$api_log"
 : >"$STUB_GH_LOG"
 rc=0
-GOOGLE_WORKSPACE_DOMAINS_VERIFY_TIMEOUT=1 batch follow >"$work/stdout" 2>"$work/stderr" || rc=$?
+# One Directory read per round, so the alias outlasts several rounds and the
+# follower has to come back for it.
+GOOGLE_WORKSPACE_DOMAINS_VERIFY_TRIES=1 batch follow >"$work/stdout" 2>"$work/stderr" || rc=$?
 expect "an alias whose verification lags is published, accepted by Site Verification, and waited for" \
   bash -c '[ "$1" = 0 ] && [ "$(jq -r ".aliases[\"example.lag\"].verified" "$2")" = true ]' _ "$rc" "$state"
 expect "... Site Verification asked only once the alias existed" \
@@ -1429,7 +1494,7 @@ EOF
 python3 "$work/cf-stub.py" "$work/cf-state.json" "$work/cf.log" "$work/cf.port" &
 cf_pid=$!
 trap '[ -n "$stub_pid" ] && kill "$stub_pid" 2>/dev/null; kill "$smtp_pid" "$cf_pid" 2>/dev/null; rm -rf "$work"' EXIT
-for _ in $(seq 1 100); do [ -s "$work/cf.port" ] && break; sleep 0.1; done
+wait_for_port "$work/cf.port" "$cf_pid" || { echo "the Cloudflare stub did not start"; exit 1; }
 CLOUDFLARE_API_BASE="http://127.0.0.1:$(cat "$work/cf.port")"
 export CLOUDFLARE_API_BASE
 printf 'ada.ns.cloudflare.com.\nbob.ns.cloudflare.com.\n' >"$work/dns/example.moved.NS"
@@ -1510,7 +1575,7 @@ touch "$bgh/hang"
 env GOOGLE_WORKSPACE_KEY="$missing_key" GOOGLE_WORKSPACE_KEY_UNLOCK="$unlock_key" "${benv[@]}" GOOGLE_WORKSPACE_FOLLOW_DETACH=none \
   bash "$setup_tool" follow "${bargs[@]}" >"$work/stdout" 2>"$work/stderr" &
 fpid=$!
-for _ in $(seq 1 3000); do grep -q "watching the checks of PR" "$work/stderr" 2>/dev/null && break; sleep 0.1; done
+wait_until stderr_marker "watching the checks of PR" "$fpid" || true
 expect "(the follower is watching its PR when the key disappears)" grep -q "watching the checks of PR" "$work/stderr"
 rm -f "$missing_key"
 rm -f "$bgh/hang"

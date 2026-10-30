@@ -3,7 +3,7 @@
 // injected into BOTH a patched and an UNPATCHED garm tree by
 // checks/t_garm_macos_pools_supported.sh, so the negative control runs the
 // identical assertions, and it is the same file
-// upstream-patches/garm-allow-macos-pools/open-pr.sh hands to upstream.
+// upstream-patches/garm-allow-macos-pools/prepare.sh hands to upstream.
 //
 // WHAT IS UNDER TEST
 //

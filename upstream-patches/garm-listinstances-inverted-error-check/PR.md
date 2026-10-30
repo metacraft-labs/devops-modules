@@ -57,3 +57,8 @@ provider binary genuinely fails.
 
 <!-- After opening, record the PR URL here: -->
 <!-- PR: https://github.com/cloudbase/garm/pull/XXXX -->
+
+<!-- STATUS: RETIRED (2026-10-27), not submitted. Upstream fixed this
+     independently in cloudbase/garm 488cf98b ("Improve metrics", 2026-09-11).
+     Our pin 0a9a939c predates it, so the local Nix patch stays until the pin
+     moves past 488cf98b. -->

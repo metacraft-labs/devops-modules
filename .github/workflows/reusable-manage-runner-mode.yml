@@ -258,7 +258,7 @@ jobs:
           ALLOW_GITHUB_HOSTED: ${{ inputs.allow_github_hosted }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          # No `set -e` at top level: a compute failure must NOT fail the job,
+          # A compute failure must NOT fail the job (the step shell is bash -e),
           # it must resolve fail-safe to self-hosted. billing_remaining() runs
           # in a subshell and turns every failure into a non-zero status.
           set -uo pipefail
@@ -343,12 +343,17 @@ jobs:
           )
           # <<< billing-remaining
 
-          # NB: call it in a PLAIN assignment (not `if billing_remaining`): bash
+          # NB: call it in an assignment (not `if billing_remaining`): bash
           # disables `set -e` inside a function invoked in a tested context. The
           # function also checks every step explicitly (`|| exit 1`), so a
           # mid-read failure surfaces as a non-zero status either way.
-          result="$(billing_remaining)"
-          rc=$?
+          # The `|| rc=$?` is load-bearing: GitHub runs this step as
+          # `bash -e {0}`, so a bare failing assignment would end the step
+          # before the fail-safe branch below (seen 2026-10-28: an enterprise
+          # org's App token got HTTP 403 and the job failed instead of
+          # resolving self-hosted).
+          rc=0
+          result="$(billing_remaining)" || rc=$?
           if [ "$rc" -eq 0 ]; then
             remaining="${result%%|*}"
             billed="${result#*|}"
