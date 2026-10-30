@@ -15,6 +15,22 @@ import mcl.utils.process : ProcessResult, ProcessRunner;
 enum ulong defaultCacheProbeTimeoutSeconds = 30;
 enum ulong defaultAtticPushTimeoutSeconds = 1800;
 enum ulong cacheProbeMaxAttempts = 3;
+// A probe TIMEOUT is not evidence that a path is missing. It means the cache
+// answered too slowly this time. On 2026-10-30 the hetzner-002/003 publishes
+// failed on 2 of 1533 paths: Attic on an overloaded high-mem-server (load
+// 180-360) missed the 30s budget for those two through all three quick
+// per-path attempts, which back off only 200 ms and 1 s. After the per-path
+// sweep, paths left uncovered ONLY by timeouts get this many slower rounds:
+// a longer pause before each, and a doubled timeout each round. A large
+// leftover set is an outage, not a slow minute, so it fails at once instead.
+enum ulong cacheProbeSettleRounds = 3;
+enum size_t cacheProbeSettleMaxPaths = 32;
+// The first probe of a substituter asks for the whole closure in one
+// `nix path-info` (1533 paths for a NixOS host). A flat 30 s budget for that
+// call made a merely slow cache fall through to the serial per-path sweep,
+// which took 17 minutes on 2026-10-30. Scale the batch budget with its size.
+enum ulong cacheProbeBatchPathsPerSecond = 10;
+enum ulong cacheProbeBatchMaxTimeoutSeconds = 600;
 // Deployment-closure pushes are idempotent (see isTransientAtticPushFailure), so
 // a transient network/proxy hiccup is worth several retries with backoff rather
 // than aborting the whole per-host publish loop. 5 attempts ≈ 2+5+10+20s of
@@ -515,6 +531,30 @@ private void sleepBeforeAtticPushRetry(ulong failedAttempt)
     }
 }
 
+ulong batchProbeTimeoutSeconds(size_t pathCount, ulong baseTimeoutSeconds)
+{
+    import std.algorithm : max, min;
+
+    const scaled = baseTimeoutSeconds + pathCount / cacheProbeBatchPathsPerSecond;
+    return min(scaled, max(baseTimeoutSeconds, cacheProbeBatchMaxTimeoutSeconds));
+}
+
+private void sleepBeforeCacheProbeSettle(ulong round)
+{
+    version (unittest)
+    {
+    }
+    else
+    {
+        import core.thread : Thread;
+        import core.time : seconds;
+
+        // 30 s, 60 s, 120 s: long enough to outlast a burst of load on the
+        // cache host, short enough to keep a publish well inside its budget.
+        Thread.sleep((30 << (round - 1)).seconds);
+    }
+}
+
 private void sleepBeforeCacheProbeRetry(ulong failedAttempt)
 {
     version (unittest)
@@ -651,7 +691,7 @@ int pushClosure(CachePushRequest request, ProcessRunner runProcess, ProcessRunne
 
                 auto batch = probeCacheSubstitutes(remaining, substituter,
                     request.trustedPublicKeys, queryRunner,
-                    request.probeTimeoutSeconds);
+                    batchProbeTimeoutSeconds(remaining.length, request.probeTimeoutSeconds));
                 probes ~= batch;
 
                 bool timedOut;
@@ -672,6 +712,7 @@ int pushClosure(CachePushRequest request, ProcessRunner runProcess, ProcessRunne
                 }
             }
 
+            bool[string] retryTimedOutPaths;
             if (remaining.length && timedOutSubstituterList.length)
             {
                 foreach (substituter; timedOutSubstituterList)
@@ -689,13 +730,53 @@ int pushClosure(CachePushRequest request, ProcessRunner runProcess, ProcessRunne
                         probes ~= retry;
                         attempted[retry.path] = true;
                         if (retry.outcome == "probe-timeout")
+                        {
                             retryTimedOut = true;
+                            retryTimedOutPaths[retry.path] = true;
+                        }
                         if (retry.successful)
                             covered[retry.path] = true;
                     }
                     remaining = pathsNotIn(remaining, covered);
                     if (retryTimedOut)
                         appendUnique(unavailableSubstituterList, substituter);
+                }
+            }
+
+            // SETTLE: paths still uncovered only because a cache timed out.
+            string[] settle;
+            foreach (path; remaining)
+                if (path in retryTimedOutPaths)
+                    settle ~= path;
+            if (settle.length && settle.length <= cacheProbeSettleMaxPaths)
+            {
+                foreach (round; 1 .. cacheProbeSettleRounds + 1)
+                {
+                    if (settle.length == 0)
+                        break;
+                    sleepBeforeCacheProbeSettle(round);
+                    const settleTimeout = request.probeTimeoutSeconds << round;
+                    foreach (substituter; timedOutSubstituterList)
+                    {
+                        if (settle.length == 0)
+                            break;
+                        auto batch = probeCacheSubstitutesOnce(settle, substituter,
+                            request.trustedPublicKeys, queryRunner, settleTimeout);
+                        probes ~= batch;
+                        bool[string] covered;
+                        bool[string] answered;
+                        foreach (probe; batch)
+                        {
+                            if (probe.successful)
+                                covered[probe.path] = true;
+                            else if (probe.outcome != "probe-timeout")
+                                answered[probe.path] = true;
+                        }
+                        remaining = pathsNotIn(remaining, covered);
+                        // A definite answer (missing, bad signature) ends the
+                        // wait for that path: only slowness is retried.
+                        settle = pathsNotIn(pathsNotIn(settle, covered), answered);
+                    }
                 }
             }
             foreach (path; remaining)
@@ -2247,13 +2328,144 @@ unittest
     assert(events[0]["error"]["details"]["stderrSummary"].str.canFind("narinfo-missing"));
     assert(events[0]["metadata"]["probeTimeoutSeconds"].integer == 3);
     assert(events[0]["metadata"]["coverage"]["complete"].boolean == false);
-    assert(events[0]["metadata"]["coverage"]["probeAttemptCount"].integer == 3);
+    // batch on each substituter, the per-path retry on the timed-out one, then
+    // three settle rounds on it at 6 s, 12 s and 24 s before giving up.
+    assert(events[0]["metadata"]["coverage"]["probeAttemptCount"].integer == 6);
     assert(events[0]["metadata"]["probes"][0]["outcome"].str == "probe-timeout");
     assert(events[0]["metadata"]["probes"][0]["message"].str.canFind("3s timeout"));
     assert(events[0]["metadata"]["probes"][1]["outcome"].str == "narinfo-missing");
     assert(events[0]["metadata"]["probes"][2]["outcome"].str == "probe-timeout");
+    assert(events[0]["metadata"]["probes"][3]["message"].str.canFind("6s timeout"));
+    assert(events[0]["metadata"]["probes"][4]["message"].str.canFind("12s timeout"));
+    assert(events[0]["metadata"]["probes"][5]["message"].str.canFind("24s timeout"));
     assert(events[0]["metadata"]["unavailableSubstituters"].array.length == 1);
     assert(events[0]["metadata"]["unavailableSubstituters"][0].str == "https://slow.example");
+}
+
+@("test_cache_probe_batch_timeout_scales_with_closure_size")
+unittest
+{
+    assert(batchProbeTimeoutSeconds(1, 3) == 3);
+    assert(batchProbeTimeoutSeconds(4, 30) == 30);
+    // A NixOS host closure (1533 paths on 2026-10-30) gets 3 minutes, not 30 s.
+    assert(batchProbeTimeoutSeconds(1533, 30) == 183);
+    assert(batchProbeTimeoutSeconds(1_000_000, 30) == cacheProbeBatchMaxTimeoutSeconds);
+    // The cap never undercuts an explicitly larger base timeout.
+    assert(batchProbeTimeoutSeconds(1_000_000, 900) == 900);
+}
+
+@("test_cache_probe_settles_a_path_that_only_timed_out")
+unittest
+{
+    import std.file : deleteme, readText, remove;
+    import std.json : parseJSON;
+    import std.string : splitLines;
+    import std.algorithm : any, filter;
+
+    auto eventLog = deleteme ~ ".cache-push-timeout-settle.events.jsonl";
+    scope(exit)
+        if (eventLog.exists) eventLog.remove;
+
+    // The 2026-10-30 shape: the cache answers, but too slowly for the quick
+    // attempts, and in time once it is given a longer budget.
+    auto root = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-root";
+    string[][] commands;
+    ProcessResult fakeRunner(string[] command)
+    {
+        commands ~= command;
+        if (command.length >= 2 && command[0] == "nix" && command[1] == "path-info"
+            && command.canFind("--json"))
+            return ProcessResult(0, `{"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-root":{"narSize":7}}`, "");
+        if (command.length >= 2 && command[0] == "nix" && command[1] == "path-info"
+            && command.canFind("--recursive"))
+            return ProcessResult(0, root ~ "\n", "");
+        if (command.canFind("--store") && command.canFind("https://slow.example"))
+            return command.canFind("12s")
+                ? ProcessResult(0, root ~ "\n", "")
+                : ProcessResult(124, "", "");
+        return ProcessResult(0, "", "");
+    }
+
+    assert(pushClosure(CachePushRequest(
+        backend: CacheBackend.cachix,
+        cache: "example-cache",
+        storePaths: [root],
+        substituters: ["https://slow.example"],
+        eventLogPath: eventLog,
+        probeTimeoutSeconds: 3,
+    ), &fakeRunner, &fakeRunner) == 0);
+
+    // Escalated: round 1 at 6 s still timed out, round 2 at 12 s answered, and
+    // no third round was needed.
+    assert(commands.any!(cmd => cmd.canFind("6s") && cmd.canFind("https://slow.example")));
+    assert(commands.any!(cmd => cmd.canFind("12s") && cmd.canFind("https://slow.example")));
+    assert(!commands.any!(cmd => cmd.canFind("24s")));
+
+    auto events = eventLog.readText.splitLines
+        .filter!(line => line.strip != "")
+        .map!(line => line.parseJSON)
+        .array;
+    assert(events.length == 1);
+    assert(events[0]["command"]["status"].str == "succeeded");
+    assert(events[0]["metadata"]["coverage"]["complete"].boolean);
+    // batch + per-path retry (which retries internally) + 2 settle rounds.
+    assert(events[0]["metadata"]["coverage"]["probeAttemptCount"].integer == 4);
+    assert(events[0]["metadata"]["probes"][3]["outcome"].str == "successful-substitute");
+}
+
+@("test_cache_probe_does_not_settle_a_large_timed_out_set")
+unittest
+{
+    import std.file : deleteme, remove;
+    import std.algorithm : any;
+    import std.conv : to;
+    import std.format : format;
+
+    auto eventLog = deleteme ~ ".cache-push-timeout-outage.events.jsonl";
+    scope(exit)
+        if (eventLog.exists) eventLog.remove;
+
+    // Every path times out: that is an outage, so the publish must fail
+    // without spending minutes of settle rounds on it.
+    auto root = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-root";
+    string closure = root ~ "\n";
+    foreach (i; 0 .. cacheProbeSettleMaxPaths)
+        closure ~= format("/nix/store/%032d-dep\n", i);
+    string[][] commands;
+    ProcessResult fakeRunner(string[] command)
+    {
+        commands ~= command;
+        if (command.length >= 2 && command[0] == "nix" && command[1] == "path-info"
+            && command.canFind("--json"))
+            return ProcessResult(0, `{"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-root":{"narSize":7}}`, "");
+        if (command.length >= 2 && command[0] == "nix" && command[1] == "path-info"
+            && command.canFind("--recursive"))
+            return ProcessResult(0, closure, "");
+        if (command.canFind("--store") && command.canFind("https://down.example"))
+            return ProcessResult(124, "", "");
+        return ProcessResult(0, "", "");
+    }
+
+    bool threw;
+    try
+        pushClosure(CachePushRequest(
+            backend: CacheBackend.cachix,
+            cache: "example-cache",
+            storePaths: [root],
+            substituters: ["https://down.example"],
+            eventLogPath: eventLog,
+            probeTimeoutSeconds: 30,
+        ), &fakeRunner, &fakeRunner);
+    catch (Exception e)
+    {
+        threw = true;
+        assert(e.msg == "Cache substitute integrity probe failed");
+    }
+    assert(threw);
+    // The batch ran with its scaled budget (30 + 33/10 = 33 s); a settle round
+    // would have used 60 s.
+    assert(commands.any!(cmd => cmd.canFind("33s")));
+    assert(!commands.any!(cmd => cmd.canFind("60s")));
 }
 
 @("test_cache_probe_requires_every_closure_path_covered")
