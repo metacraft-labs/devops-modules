@@ -193,6 +193,7 @@ in
                 git = lib.getExe config.pre-commit.settings.gitPackage;
               }}
               if _mcl_hooks_same_repo; then
+                _mcl_hooks_reprobuild_snapshot
               ${config.pre-commit.installationScript}
                 _mcl_hooks_reprobuild_handoff
               else

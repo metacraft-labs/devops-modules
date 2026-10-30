@@ -454,7 +454,8 @@ runs:
           # 0, not 120 (nor the 3600 default): on runners whose HOME persists
           # between jobs, a cached "not found" outlives the job that saw it, so
           # a path a producer job pushed minutes later is rebuilt from source
-          # downstream. mcl deploy-apply overrides it to 0 for the same reason.
+          # downstream. mcl-devops deploy-apply overrides it to 0 for the same
+          # reason.
           # Each nix process still deduplicates its own lookups.
           #
           # Keep these transfer settings identical to
