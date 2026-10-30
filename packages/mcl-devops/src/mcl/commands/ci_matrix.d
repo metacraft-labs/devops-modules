@@ -521,7 +521,7 @@ version (unittest)
 {
     static immutable SummaryTableEntry[] testSummaryTableEntryArray = [
         SummaryTableEntry("testPackage", SummaryTableEntry_x86_64("✅ cached", "✅ cached"), SummaryTableEntry_aarch64("🚫 not supported")),
-        SummaryTableEntry("testPackage2", SummaryTableEntry_x86_64("⏳ building...", "❌ build failed"), SummaryTableEntry_aarch64(
+        SummaryTableEntry("testPackage2", SummaryTableEntry_x86_64("⏳ building...", "not in Attic yet"), SummaryTableEntry_aarch64(
                 "⏳ building..."))
     ];
 }
@@ -559,6 +559,15 @@ mixin template CiMatrixBaseArgs()
         .EnvFallback("IS_INITIAL")
     )
     bool isInitial = true;
+
+    // True only on the post-build comment of a live/main push, after this
+    // workflow has uploaded deployment closures. A miss is then unexpected.
+    // A pull request does not upload, so a miss there is a new output path.
+    @(NamedArgument(["expect-published"])
+        .Description("Deployment closures were published to Attic before this probe")
+        .EnvFallback("EXPECT_DEPLOYMENT_PUBLISHED")
+    )
+    bool expectPublished = false;
 
     @(NamedArgument(["cachix-cache"])
         .Placeholder("cache-name")
@@ -730,7 +739,7 @@ unittest
 }
 
 @(Command("print-table", "print_table")
-    .Description("Print a table of the cache status of each package"))
+    .Description("Print Attic status for deployment closures"))
 struct PrintTableArgs
 {
     mixin CiMatrixBaseArgs!();
@@ -1293,9 +1302,18 @@ Package[] nixEvalForAllSystems(T)(auto ref T args)
         .array;
 }
 
-/// Memory one nix-eval-jobs worker is planned for: a full NixOS system
-/// evaluation peaks at roughly 2-3 GiB.
-enum evalWorkerMemoryMB = 3072;
+/// How far ONE attribute can grow a nix-eval-jobs worker past its
+/// `--max-memory-size`. That limit is only checked after an attribute
+/// finishes, so a worker's peak is the limit plus the growth of the attribute
+/// it is on. Measured on infra's `live` eval-matrix shard-03 in a 24 GiB
+/// runner container (gpu-server-001, 2026-10-29): under a 3 GiB limit the
+/// workers sat at 3.9, 5.3, 6.7 and 7.3 GiB when the cgroup OOM killer fired,
+/// three attempts in a row.
+enum evalAttrGrowthMB = 6144;
+
+/// Lowest `--max-memory-size` handed to a worker. Below this a worker would
+/// restart (and re-load the flake) after nearly every attribute.
+enum evalWorkerMinLimitMB = 1024;
 
 struct EvalWorkerBudget
 {
@@ -1304,36 +1322,39 @@ struct EvalWorkerBudget
 }
 
 /// Split the memory available to this job across nix-eval-jobs workers.
-/// Plans for 3/4 of `availableMB` (the per-worker limit only restarts a worker
-/// after the attribute it is evaluating, so peaks overshoot it). Unless the
-/// worker count was pinned, reduces the count so each worker gets at least
-/// `evalWorkerMemoryMB`.
+/// Plans for 3/4 of `availableMB` and sizes each worker for its restart limit
+/// plus `evalAttrGrowthMB`, the overshoot of the attribute it is on. Unless
+/// the worker count was pinned, reduces the count so that every worker fits
+/// with at least `evalWorkerMinLimitMB` of limit.
 EvalWorkerBudget evalWorkerBudget(int availableMB, int workers, bool workersPinned)
 {
     import std.algorithm.comparison : clamp, max;
 
-    const planMB = max(availableMB * 3 / 4, evalWorkerMemoryMB);
+    enum minFootprintMB = evalWorkerMinLimitMB + evalAttrGrowthMB;
+    const planMB = max(availableMB * 3 / 4, minFootprintMB);
     int n = workers < 1 ? 1 : workers;
     if (!workersPinned)
-        n = clamp(planMB / evalWorkerMemoryMB, 1, n);
-    return EvalWorkerBudget(n, max(planMB / n, 1024));
+        n = clamp(planMB / minFootprintMB, 1, n);
+    return EvalWorkerBudget(n, max(planMB / n - evalAttrGrowthMB, evalWorkerMinLimitMB));
 }
 
 @("evalWorkerBudget")
 unittest
 {
-    // 12 GiB container, 6 CPUs: 3 workers of 3 GiB each.
-    assert(evalWorkerBudget(12_288, 6, false) == EvalWorkerBudget(3, 3072));
-    // 10 GiB container: 2 workers.
-    assert(evalWorkerBudget(10_240, 6, false) == EvalWorkerBudget(2, 3840));
-    // 24 GiB container keeps all 6 workers.
-    assert(evalWorkerBudget(24_576, 6, false) == EvalWorkerBudget(6, 3072));
+    // 24 GiB runner container (the GPU hosts' and hms's generic and
+    // deploy-pipeline slots), 6 CPUs: 2 workers that restart past 3 GiB, so
+    // each peaks near 9 GiB and both together stay inside the 18 GiB plan.
+    assert(evalWorkerBudget(24_576, 6, false) == EvalWorkerBudget(2, 3072));
+    // 12 GiB container: 1 worker.
+    assert(evalWorkerBudget(12_288, 6, false) == EvalWorkerBudget(1, 3072));
+    // 10 GiB container: 1 worker with a lower restart limit.
+    assert(evalWorkerBudget(10_240, 6, false) == EvalWorkerBudget(1, 1536));
     // A large host keeps the CPU-derived count and splits memory across it.
-    assert(evalWorkerBudget(300_000, 8, false) == EvalWorkerBudget(8, 28_125));
-    // A pinned worker count is kept; memory is still split per worker.
-    assert(evalWorkerBudget(12_288, 6, true) == EvalWorkerBudget(6, 1536));
+    assert(evalWorkerBudget(300_000, 8, false) == EvalWorkerBudget(8, 21_981));
+    // A pinned worker count is kept; the limit falls to the floor.
+    assert(evalWorkerBudget(12_288, 6, true) == EvalWorkerBudget(6, 1024));
     // Tiny or unknown memory still yields one worker with a floor.
-    assert(evalWorkerBudget(0, 8, false) == EvalWorkerBudget(1, 3072));
+    assert(evalWorkerBudget(0, 8, false) == EvalWorkerBudget(1, 1024));
 }
 
 int getNixEvalWorkerCount(T)(auto ref T args)
@@ -1473,15 +1494,27 @@ unittest
 
 void saveGHCIComment(SummaryTableEntry[] tableSummaryJSON)
 {
-    import std.path : buildNormalizedPath, absolutePath;
+    import std.path : buildNormalizedPath;
 
-    string comment = "Thanks for your Pull Request!";
-    comment ~= "\n\nBelow you will find a summary of the cachix status of each package, for each supported platform.";
-    comment ~= "\n\n| package | `x86_64-linux` | `x86_64-darwin` | `aarch64-darwin` |";
-    comment ~= "\n| ------- | -------------- | --------------- | ---------------- |";
-    comment ~= tableSummaryJSON.map!(
-        pkg => "\n| " ~ pkg.name ~ " | " ~ pkg.x86_64.linux ~ " | " ~ pkg.x86_64.darwin ~ " | " ~ pkg.aarch64.darwin ~ " |")
-        .join("");
+    string comment = "Deployment closures in Attic.\n\n";
+    if (tableSummaryJSON.empty)
+    {
+        comment ~= "This matrix has no deployment closures. "
+            ~ "Only those closures are published to Attic, and only on a push to live.";
+    }
+    else
+    {
+        comment ~= "Only host closures this workflow publishes are listed. "
+            ~ "A closure already in Attic is unchanged. "
+            ~ "One that is absent has a new output path, or was never published. "
+            ~ "A pull request does not upload it. "
+            ~ "After a live publish, a missing row is unexpected.";
+        comment ~= "\n\n| package | `x86_64-linux` | `x86_64-darwin` | `aarch64-darwin` |";
+        comment ~= "\n| ------- | -------------- | --------------- | ---------------- |";
+        comment ~= tableSummaryJSON.map!(
+            pkg => "\n| " ~ pkg.name ~ " | " ~ pkg.x86_64.linux ~ " | " ~ pkg.x86_64.darwin ~ " | " ~ pkg.aarch64.darwin ~ " |")
+            .join("");
+    }
 
     auto outputPath = rootDir.buildNormalizedPath("comment.md");
     write(outputPath, comment);
@@ -1496,6 +1529,17 @@ unittest
     createResultDirs();
     saveGHCIComment(cast(SummaryTableEntry[]) testSummaryTableEntryArray);
     string comment = rootDir.buildPath("comment.md").readText;
+    assert(comment.indexOf("Deployment closures in Attic") != -1);
+    assert(comment.indexOf("cachix") == -1);
+    assert(comment.indexOf("Cachix") == -1);
+
+    saveGHCIComment([]);
+    comment = rootDir.buildPath("comment.md").readText;
+    assert(comment.indexOf("no deployment closures") != -1);
+    assert(comment.indexOf("| package |") == -1);
+
+    saveGHCIComment(cast(SummaryTableEntry[]) testSummaryTableEntryArray);
+    comment = rootDir.buildPath("comment.md").readText;
     foreach (pkg; testSummaryTableEntryArray)
     {
         assert(comment.indexOf(pkg.name) != -1);
@@ -1505,10 +1549,8 @@ unittest
     }
 }
 
-string getStatus(JSONValue pkg, string key, bool isInitial)
+string getStatus(JSONValue pkg, string key, bool expectPublished)
 {
-    auto pkgName = ("name" in pkg) ? pkg["name"].str : "unknown";
-
     if (key in pkg)
     {
         if (auto pkgOnSys = "cachedAt" in pkg[key])
@@ -1517,20 +1559,19 @@ string getStatus(JSONValue pkg, string key, bool isInitial)
             {
                 if (!cachedAt.empty)
                 {
-                    auto status = fmt!"✅ Cached at %-(%s%||%)"(
+                    return fmt!"✅ in Attic %-(%s%||%)"(
                         cachedAt
                             .enumerate()
                             .map!(t => "[<%s>](%s)".fmt(t.index, t.value.str))
                     );
-                    return status;
                 }
             }
         }
 
-        if (isInitial)
-            return "⏳ building...";
-
-        return "❌ build failed";
+        // A live publish has already uploaded this closure. Absence is the
+        // unexpected miss. A pull request does not upload, so absence means
+        // the output path is not the published one.
+        return expectPublished ? "❌ missing after publish" : "not in Attic yet";
     }
     else
     {
@@ -1540,10 +1581,11 @@ string getStatus(JSONValue pkg, string key, bool isInitial)
 
 SummaryTableEntry[] convertNixEvalToTableSummary(
     const Package[] packages,
-    bool isInitial
+    bool expectPublished
 )
 {
     SummaryTableEntry[] tableSummary = packages
+        .filter!(pkg => pkg.deploymentTarget)
         .chunkBy!((a, b) => a.name == b.name)
         .map!((group) {
             JSONValue pkg;
@@ -1555,10 +1597,10 @@ SummaryTableEntry[] convertNixEvalToTableSummary(
             }
             SummaryTableEntry entry = {
                 name, {
-                    getStatus(pkg, "x86_64-linux", isInitial),
-                    getStatus(pkg, "x86_64-darwin", isInitial)
+                    getStatus(pkg, "x86_64-linux", expectPublished),
+                    getStatus(pkg, "x86_64-darwin", expectPublished)
                 }, {
-                    getStatus(pkg, "aarch64-darwin", isInitial)
+                    getStatus(pkg, "aarch64-darwin", expectPublished)
                 }
             };
             return entry;
@@ -1572,32 +1614,42 @@ SummaryTableEntry[] convertNixEvalToTableSummary(
 @("convertNixEvalToTableSummary/getStatus")
 unittest
 {
-    auto tableSummary = convertNixEvalToTableSummary(
-        testPackageArray,
-        isInitial: false
+    auto published = Package(
+        name: "testPackage",
+        cachedAt: ["https://testPackage.com"],
+        system: NixSystem.x86_64_linux,
+        deploymentTarget: true,
     );
-    assert(tableSummary[0].name == testPackageArray[0].name);
-    assert(tableSummary[0].x86_64.linux == "✅ Cached at [<0>](https://testPackage.com)");
-    assert(tableSummary[0].x86_64.darwin == "🚫 not supported");
-    assert(tableSummary[0].aarch64.darwin == "🚫 not supported");
-    assert(tableSummary[1].name == testPackageArray[1].name);
-    assert(tableSummary[1].x86_64.linux == "🚫 not supported");
+    auto ignored = Package(
+        name: "testPackage2",
+        system: NixSystem.aarch64_darwin,
+    );
+    auto missing = Package(
+        name: "changed-host",
+        system: NixSystem.x86_64_linux,
+        deploymentTarget: true,
+    );
+
+    auto tableSummary = convertNixEvalToTableSummary(
+        [published, ignored, missing],
+        expectPublished: false
+    );
+    assert(tableSummary.length == 2);
+    assert(tableSummary[0].name == "changed-host");
+    assert(tableSummary[0].x86_64.linux == "not in Attic yet");
+    assert(tableSummary[1].name == "testPackage");
+    assert(tableSummary[1].x86_64.linux == "✅ in Attic [<0>](https://testPackage.com)");
     assert(tableSummary[1].x86_64.darwin == "🚫 not supported");
-    assert(tableSummary[1].aarch64.darwin == "❌ build failed");
+    assert(tableSummary[1].aarch64.darwin == "🚫 not supported");
 
     tableSummary = convertNixEvalToTableSummary(
-        testPackageArray,
-        isInitial: true
+        [missing],
+        expectPublished: true
     );
-    assert(tableSummary[0].name == testPackageArray[0].name);
-    assert(tableSummary[0].x86_64.linux == "✅ Cached at [<0>](https://testPackage.com)");
-    assert(tableSummary[0].x86_64.darwin == "🚫 not supported");
-    assert(tableSummary[0].aarch64.darwin == "🚫 not supported");
-    assert(tableSummary[1].name == testPackageArray[1].name);
-    assert(tableSummary[1].x86_64.linux == "🚫 not supported");
-    assert(tableSummary[1].x86_64.darwin == "🚫 not supported");
-    assert(tableSummary[1].aarch64.darwin == "⏳ building...");
+    assert(tableSummary.length == 1);
+    assert(tableSummary[0].x86_64.linux == "❌ missing after publish");
 
+    assert(convertNixEvalToTableSummary([ignored], expectPublished: false).empty);
 }
 
 void printTableForCacheStatus(T)(Package[] packages, auto ref T args)
@@ -1610,7 +1662,7 @@ void printTableForCacheStatus(T)(Package[] packages, auto ref T args)
         saveGHCIMatrix(packages, args);
     }
     saveCachixDeploySpec(packages);
-    saveGHCIComment(convertNixEvalToTableSummary(packages, args.isInitial));
+    saveGHCIComment(convertNixEvalToTableSummary(packages, args.expectPublished));
 
     const outputPath = args.githubOutput
         ? args.githubOutput
