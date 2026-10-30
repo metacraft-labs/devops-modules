@@ -1208,6 +1208,9 @@ jobs:
       - name: Print CI Matrix
         env:
           IS_INITIAL: 'false'
+          # Server closures are uploaded only on a push to live/main. A miss
+          # is unexpected only after that upload. Pull requests leave this false.
+          EXPECT_DEPLOYMENT_PUBLISHED: ${{ inputs.push-deployment-caches && 'true' || 'false' }}
           EXTRA_CACHE_URLS: ${{ vars.SUBSTITUTERS }}
           ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
           ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
