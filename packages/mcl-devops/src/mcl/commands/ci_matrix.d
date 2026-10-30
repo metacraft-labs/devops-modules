@@ -398,7 +398,7 @@ version (unittest)
 {
     static immutable SummaryTableEntry[] testSummaryTableEntryArray = [
         SummaryTableEntry("testPackage", SummaryTableEntry_x86_64("✅ cached", "✅ cached"), SummaryTableEntry_aarch64("🚫 not supported")),
-        SummaryTableEntry("testPackage2", SummaryTableEntry_x86_64("⏳ building...", "❌ not in cache"), SummaryTableEntry_aarch64(
+        SummaryTableEntry("testPackage2", SummaryTableEntry_x86_64("⏳ building...", "not in Attic yet"), SummaryTableEntry_aarch64(
                 "⏳ building..."))
     ];
 }
@@ -436,6 +436,15 @@ mixin template CiMatrixBaseArgs()
         .EnvFallback("IS_INITIAL")
     )
     bool isInitial = true;
+
+    // True only on the post-build comment of a live/main push, after this
+    // workflow has uploaded deployment closures. A miss is then unexpected.
+    // A pull request does not upload, so a miss there is a new output path.
+    @(NamedArgument(["expect-published"])
+        .Description("Deployment closures were published to Attic before this probe")
+        .EnvFallback("EXPECT_DEPLOYMENT_PUBLISHED")
+    )
+    bool expectPublished = false;
 
     @(NamedArgument(["cachix-cache"])
         .Placeholder("cache-name")
@@ -607,7 +616,7 @@ unittest
 }
 
 @(Command("print-table", "print_table")
-    .Description("Print a table of the cache status of each package"))
+    .Description("Print Attic status for deployment closures"))
 struct PrintTableArgs
 {
     mixin CiMatrixBaseArgs!();
@@ -1254,16 +1263,27 @@ unittest
 
 void saveGHCIComment(SummaryTableEntry[] tableSummaryJSON)
 {
-    import std.path : buildNormalizedPath, absolutePath;
+    import std.path : buildNormalizedPath;
 
-    string comment = "Thanks for your Pull Request!";
-    comment ~= "\n\nBelow you will find whether each package is already in the Attic binary cache, for each supported platform.";
-    comment ~= " A row that is not cached was absent from the cache. That is a cache miss, not a build result.";
-    comment ~= "\n\n| package | `x86_64-linux` | `x86_64-darwin` | `aarch64-darwin` |";
-    comment ~= "\n| ------- | -------------- | --------------- | ---------------- |";
-    comment ~= tableSummaryJSON.map!(
-        pkg => "\n| " ~ pkg.name ~ " | " ~ pkg.x86_64.linux ~ " | " ~ pkg.x86_64.darwin ~ " | " ~ pkg.aarch64.darwin ~ " |")
-        .join("");
+    string comment = "Deployment closures in Attic.\n\n";
+    if (tableSummaryJSON.empty)
+    {
+        comment ~= "This matrix has no deployment closures. "
+            ~ "Only those closures are published to Attic, and only on a push to live.";
+    }
+    else
+    {
+        comment ~= "Only host closures this workflow publishes are listed. "
+            ~ "A closure already in Attic is unchanged. "
+            ~ "One that is absent has a new output path, or was never published. "
+            ~ "A pull request does not upload it. "
+            ~ "After a live publish, a missing row is unexpected.";
+        comment ~= "\n\n| package | `x86_64-linux` | `x86_64-darwin` | `aarch64-darwin` |";
+        comment ~= "\n| ------- | -------------- | --------------- | ---------------- |";
+        comment ~= tableSummaryJSON.map!(
+            pkg => "\n| " ~ pkg.name ~ " | " ~ pkg.x86_64.linux ~ " | " ~ pkg.x86_64.darwin ~ " | " ~ pkg.aarch64.darwin ~ " |")
+            .join("");
+    }
 
     auto outputPath = rootDir.buildNormalizedPath("comment.md");
     write(outputPath, comment);
@@ -1278,9 +1298,17 @@ unittest
     createResultDirs();
     saveGHCIComment(cast(SummaryTableEntry[]) testSummaryTableEntryArray);
     string comment = rootDir.buildPath("comment.md").readText;
-    assert(comment.indexOf("Attic binary cache") != -1);
+    assert(comment.indexOf("Deployment closures in Attic") != -1);
     assert(comment.indexOf("cachix") == -1);
     assert(comment.indexOf("Cachix") == -1);
+
+    saveGHCIComment([]);
+    comment = rootDir.buildPath("comment.md").readText;
+    assert(comment.indexOf("no deployment closures") != -1);
+    assert(comment.indexOf("| package |") == -1);
+
+    saveGHCIComment(cast(SummaryTableEntry[]) testSummaryTableEntryArray);
+    comment = rootDir.buildPath("comment.md").readText;
     foreach (pkg; testSummaryTableEntryArray)
     {
         assert(comment.indexOf(pkg.name) != -1);
@@ -1290,10 +1318,8 @@ unittest
     }
 }
 
-string getStatus(JSONValue pkg, string key, bool isInitial)
+string getStatus(JSONValue pkg, string key, bool expectPublished)
 {
-    auto pkgName = ("name" in pkg) ? pkg["name"].str : "unknown";
-
     if (key in pkg)
     {
         if (auto pkgOnSys = "cachedAt" in pkg[key])
@@ -1302,22 +1328,19 @@ string getStatus(JSONValue pkg, string key, bool isInitial)
             {
                 if (!cachedAt.empty)
                 {
-                    auto status = fmt!"✅ Cached at %-(%s%||%)"(
+                    return fmt!"✅ in Attic %-(%s%||%)"(
                         cachedAt
                             .enumerate()
                             .map!(t => "[<%s>](%s)".fmt(t.index, t.value.str))
                     );
-                    return status;
                 }
             }
         }
 
-        if (isInitial)
-            return "⏳ building...";
-
-        // The narinfo probe did not find this output. The build job can
-        // still have succeeded; a miss often means the closure was not pushed.
-        return "❌ not in cache";
+        // A live publish has already uploaded this closure. Absence is the
+        // unexpected miss. A pull request does not upload, so absence means
+        // the output path is not the published one.
+        return expectPublished ? "❌ missing after publish" : "not in Attic yet";
     }
     else
     {
@@ -1327,10 +1350,11 @@ string getStatus(JSONValue pkg, string key, bool isInitial)
 
 SummaryTableEntry[] convertNixEvalToTableSummary(
     const Package[] packages,
-    bool isInitial
+    bool expectPublished
 )
 {
     SummaryTableEntry[] tableSummary = packages
+        .filter!(pkg => pkg.deploymentTarget)
         .chunkBy!((a, b) => a.name == b.name)
         .map!((group) {
             JSONValue pkg;
@@ -1342,10 +1366,10 @@ SummaryTableEntry[] convertNixEvalToTableSummary(
             }
             SummaryTableEntry entry = {
                 name, {
-                    getStatus(pkg, "x86_64-linux", isInitial),
-                    getStatus(pkg, "x86_64-darwin", isInitial)
+                    getStatus(pkg, "x86_64-linux", expectPublished),
+                    getStatus(pkg, "x86_64-darwin", expectPublished)
                 }, {
-                    getStatus(pkg, "aarch64-darwin", isInitial)
+                    getStatus(pkg, "aarch64-darwin", expectPublished)
                 }
             };
             return entry;
@@ -1359,32 +1383,42 @@ SummaryTableEntry[] convertNixEvalToTableSummary(
 @("convertNixEvalToTableSummary/getStatus")
 unittest
 {
-    auto tableSummary = convertNixEvalToTableSummary(
-        testPackageArray,
-        isInitial: false
+    auto published = Package(
+        name: "testPackage",
+        cachedAt: ["https://testPackage.com"],
+        system: NixSystem.x86_64_linux,
+        deploymentTarget: true,
     );
-    assert(tableSummary[0].name == testPackageArray[0].name);
-    assert(tableSummary[0].x86_64.linux == "✅ Cached at [<0>](https://testPackage.com)");
-    assert(tableSummary[0].x86_64.darwin == "🚫 not supported");
-    assert(tableSummary[0].aarch64.darwin == "🚫 not supported");
-    assert(tableSummary[1].name == testPackageArray[1].name);
-    assert(tableSummary[1].x86_64.linux == "🚫 not supported");
+    auto ignored = Package(
+        name: "testPackage2",
+        system: NixSystem.aarch64_darwin,
+    );
+    auto missing = Package(
+        name: "changed-host",
+        system: NixSystem.x86_64_linux,
+        deploymentTarget: true,
+    );
+
+    auto tableSummary = convertNixEvalToTableSummary(
+        [published, ignored, missing],
+        expectPublished: false
+    );
+    assert(tableSummary.length == 2);
+    assert(tableSummary[0].name == "changed-host");
+    assert(tableSummary[0].x86_64.linux == "not in Attic yet");
+    assert(tableSummary[1].name == "testPackage");
+    assert(tableSummary[1].x86_64.linux == "✅ in Attic [<0>](https://testPackage.com)");
     assert(tableSummary[1].x86_64.darwin == "🚫 not supported");
-    assert(tableSummary[1].aarch64.darwin == "❌ not in cache");
+    assert(tableSummary[1].aarch64.darwin == "🚫 not supported");
 
     tableSummary = convertNixEvalToTableSummary(
-        testPackageArray,
-        isInitial: true
+        [missing],
+        expectPublished: true
     );
-    assert(tableSummary[0].name == testPackageArray[0].name);
-    assert(tableSummary[0].x86_64.linux == "✅ Cached at [<0>](https://testPackage.com)");
-    assert(tableSummary[0].x86_64.darwin == "🚫 not supported");
-    assert(tableSummary[0].aarch64.darwin == "🚫 not supported");
-    assert(tableSummary[1].name == testPackageArray[1].name);
-    assert(tableSummary[1].x86_64.linux == "🚫 not supported");
-    assert(tableSummary[1].x86_64.darwin == "🚫 not supported");
-    assert(tableSummary[1].aarch64.darwin == "⏳ building...");
+    assert(tableSummary.length == 1);
+    assert(tableSummary[0].x86_64.linux == "❌ missing after publish");
 
+    assert(convertNixEvalToTableSummary([ignored], expectPublished: false).empty);
 }
 
 void printTableForCacheStatus(T)(Package[] packages, auto ref T args)
@@ -1397,7 +1431,7 @@ void printTableForCacheStatus(T)(Package[] packages, auto ref T args)
         saveGHCIMatrix(packages, args);
     }
     saveCachixDeploySpec(packages);
-    saveGHCIComment(convertNixEvalToTableSummary(packages, args.isInitial));
+    saveGHCIComment(convertNixEvalToTableSummary(packages, args.expectPublished));
 
     const outputPath = args.githubOutput
         ? args.githubOutput
