@@ -27,13 +27,13 @@
 # at run time.
 stdenv.mkDerivation (finalAttrs: {
   pname = "gosti";
-  version = "0.1.2-unstable-2026-10-29";
+  version = "0.1.2-unstable-2026-10-31";
 
   src = fetchFromGitHub {
     owner = "metacraft-labs";
     repo = "gosti";
-    rev = "5f21765055ba743dfc8f36a18335b4751fb5691c";
-    hash = "sha256-+rHmRulg1gP5KBlgfoYZaYU4akIm7rX7EeE3r4JSaoI=";
+    rev = "2ea450e2347f5f11639423b8a410e557c60e14dd";
+    hash = "sha256-nm5Zm7R4WciS+gyuQsyh9EuF9Teka440QEw3qDUw/w8=";
   };
 
   nativeBuildInputs = [ nim ];
