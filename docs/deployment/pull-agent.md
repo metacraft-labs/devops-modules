@@ -166,7 +166,16 @@ need new arguments.
    probe marks the new identity converged without restore, ordinary pre/post
    hooks, profile mutation, activation, health checks, or rollback.
 3. Otherwise, restore the desired closure and atomically select it with
-   `nix-env --profile ... --set`.
+   `nix-env --profile ... --set`. The restore is
+   `nix-store --realise <path> --add-root <state-dir>/gcroots/<target>`, never
+   a bare `nix copy`: substitution holds every closure path as a temporary GC
+   root, including those already present, and the indirect root keeps the
+   closure live until activation has written the profile. It is removed when
+   the transaction ends. A bare `nix copy` skips the paths already present
+   without rooting them, so a concurrent GC could delete one before its
+   referrers were registered; m3 runs below `min-free` and collects during
+   almost every store addition, and failed with `path '...' is not valid`
+   (2026-10-30). `checks.<system>.deployment-restore-gc-race` reproduces it.
 4. Execute the desired generation's `activate` directly, without
    `systemd-run`.
 5. If activation fails, atomically restore the previous profile and execute

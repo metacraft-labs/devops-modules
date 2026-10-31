@@ -781,7 +781,7 @@ top@{ config, ... }:
                     "--output /tmp/manifest.json"
                 )
 
-            with subtest("forced command restores from Attic with default nix copy path"):
+            with subtest("forced command restores from Attic with the default GC-rooted restore"):
                 controller.succeed(
                     "ssh -i /tmp/deploy-key "
                     "-o StrictHostKeyChecking=no "
@@ -807,9 +807,9 @@ top@{ config, ... }:
                     "assert phases.index('agent-restore') < phases.index('switch') < phases.index('healthcheck') < phases.index('complete'), phases\n"
                     "restore = next(event for event in events if event['phase'] == 'agent-restore')\n"
                     "assert restore['command']['status'] == 'succeeded', restore\n"
-                    "assert restore['command']['argv'][0:3] == ['nix', 'copy', '--from'], restore\n"
-                    "assert restore['command']['argv'][3] == substituter, restore\n"
-                    "assert restore['command']['argv'][4] == closure, restore\n"
+                    "assert restore['command']['argv'][0:5] == ['nix-store', '--realise', closure, '--add-root', '/var/lib/mcl/deployments/gcroots/target'], restore\n"
+                    "assert restore['command']['argv'][5:8] == ['--option', 'substituters', substituter], restore\n"
+                    "assert restore['metadata']['gcRoot'] == '/var/lib/mcl/deployments/gcroots/target', restore\n"
                     "assert restore['command']['argv'][-3:] == ['--option', 'trusted-public-keys', public_key], restore\n"
                     "assert restore['backend']['substituters'] == [substituter], restore\n"
                     "health = next(event for event in events if event['phase'] == 'healthcheck')\n"
