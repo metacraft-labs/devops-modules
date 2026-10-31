@@ -2,7 +2,7 @@
 #
 # prepare hook for submit-prepared-pr: runs in the PR tree after fix.patch is
 # applied. It adds the test as a second commit, taken from the gate's source of
-# truth (../../checks/garm/stale_scaleset_job_test.go, declared in bundle.toml
+# truth (stale_scaleset_job_test.go in this bundle, declared in bundle.toml
 # `inputs`), with two transformations on the way in:
 #
 #   (a) strip the gate preamble from the doc comment (upstream has no
@@ -19,7 +19,7 @@
 # The test commit carries the same author and Signed-off-by as the fix commit.
 set -euo pipefail
 
-TEST_SRC="${BUNDLE_DIR:?run me through submit-prepared-pr}/../../checks/garm/stale_scaleset_job_test.go"
+TEST_SRC="${BUNDLE_DIR:?run me through submit-prepared-pr}/stale_scaleset_job_test.go"
 DST=runner/pool/stale_scaleset_job_test.go
 command -v gofmt >/dev/null || { echo "prepare.sh needs gofmt on PATH (e.g. nix shell nixpkgs#go)" >&2; exit 1; }
 

@@ -1,11 +1,11 @@
 diff --git a/metrics/instance.go b/metrics/instance.go
-index 7e604bc..3a071d5 100644
+index 0b42dd4d..7e33e687 100644
 --- a/metrics/instance.go
 +++ b/metrics/instance.go
 @@ -39,4 +39,15 @@ var (
  		Name:      "errors_total",
  		Help:      "Total number of failed instance operation attempts",
- 	}, []string{"operation", "provider"})
+ 	}, []string{"operation", "provider", "pool_id", "scaleset_id", "entity_type", "entity_id"})
 +
 +	// InstanceAbsentFromProviderCount counts instances the pool manager
 +	// believed were running (and whose runner was offline in the forge) that
@@ -19,10 +19,10 @@ index 7e604bc..3a071d5 100644
 +	}, []string{"provider"})
  )
 diff --git a/metrics/metrics.go b/metrics/metrics.go
-index bd38e8a..25c7333 100644
+index ab0143bf..e9052b40 100644
 --- a/metrics/metrics.go
 +++ b/metrics/metrics.go
-@@ -74,6 +74,7 @@ func RegisterMetrics() error {
+@@ -77,6 +77,7 @@ func RegisterMetrics() error {
  		// runner instances
  		InstanceOperationCount,
  		InstanceOperationFailedCount,
@@ -31,18 +31,10 @@ index bd38e8a..25c7333 100644
  		GithubOperationCount,
  		GithubOperationFailedCount,
 diff --git a/runner/pool/pool.go b/runner/pool/pool.go
-index 2215c1d..556aee5 100644
+index 507e050b..dbb6138d 100644
 --- a/runner/pool/pool.go
 +++ b/runner/pool/pool.go
-@@ -41,6 +41,7 @@ import (
- 	"github.com/cloudbase/garm/database/watcher"
- 	garmErrors "github.com/cloudbase/garm/internal/errors"
- 	"github.com/cloudbase/garm/locking"
-+	"github.com/cloudbase/garm/metrics"
- 	"github.com/cloudbase/garm/params"
- 	"github.com/cloudbase/garm/runner/common"
- 	garmUtil "github.com/cloudbase/garm/util"
-@@ -727,7 +728,12 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+@@ -840,7 +840,12 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
  // first remove the instance from github, and then from our database.
  func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) error {
  	poolInstanceCache := map[string][]commonParams.ProviderInstance{}
@@ -56,7 +48,7 @@ index 2215c1d..556aee5 100644
  	g.SetLimit(10)
  	for _, runner := range runners {
  		if !isManagedRunner(labelsFromRunner(runner), r.controllerInfo.ControllerID.String()) {
-@@ -790,6 +796,10 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
+@@ -903,6 +908,10 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
  			}
  		}
  
@@ -67,7 +59,7 @@ index 2215c1d..556aee5 100644
  		pool, err := r.store.GetEntityPool(r.ctx, r.entity, dbInstance.PoolID)
  		if err != nil {
  			return fmt.Errorf("error fetching pool: %w", err)
-@@ -798,7 +808,11 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
+@@ -911,7 +920,11 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
  		// check if the provider still has the instance.
  		provider, ok := r.providers[dbInstance.ProviderName]
  		if !ok {
@@ -80,7 +72,7 @@ index 2215c1d..556aee5 100644
  		}
  
  		var poolInstances []commonParams.ProviderInstance
-@@ -814,7 +828,13 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
+@@ -927,7 +940,13 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
  			}
  			poolInstances, err = provider.ListInstances(r.ctx, pool.ID, listInstancesParams)
  			if err != nil {
@@ -95,7 +87,7 @@ index 2215c1d..556aee5 100644
  			}
  			poolInstanceCache[dbInstance.PoolID] = poolInstances
  		}
-@@ -851,14 +871,23 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
+@@ -964,14 +983,23 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
  						return fmt.Errorf("error removing runner from github: %w", err)
  					}
  				}
@@ -124,7 +116,7 @@ index 2215c1d..556aee5 100644
  				return nil
  			}
  
-@@ -890,6 +919,14 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
+@@ -1003,6 +1031,14 @@ func (r *basePoolManager) cleanupOrphanedGithubRunners(runners []forgeRunner) er
  	if err := r.waitForErrorGroupOrContextCancelled(g); err != nil {
  		return fmt.Errorf("error removing orphaned github runners: %w", err)
  	}
@@ -139,7 +131,7 @@ index 2215c1d..556aee5 100644
  	return nil
  }
  
-@@ -1422,6 +1459,33 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
+@@ -1537,6 +1573,33 @@ func (r *basePoolManager) ensureIdleRunnersForOnePool(pool params.Pool) error {
  	return nil
  }
  
@@ -173,7 +165,7 @@ index 2215c1d..556aee5 100644
  func (r *basePoolManager) retryFailedInstancesForOnePool(ctx context.Context, pool params.Pool) error {
  	if !pool.Enabled {
  		return nil
-@@ -1435,12 +1499,34 @@ func (r *basePoolManager) retryFailedInstancesForOnePool(ctx context.Context, po
+@@ -1550,12 +1613,34 @@ func (r *basePoolManager) retryFailedInstancesForOnePool(ctx context.Context, po
  		return fmt.Errorf("failed to list instances for pool %s: %w", pool.ID, err)
  	}
  
@@ -209,7 +201,7 @@ index 2215c1d..556aee5 100644
  			continue
  		}
  
-@@ -1464,19 +1550,19 @@ func (r *basePoolManager) retryFailedInstancesForOnePool(ctx context.Context, po
+@@ -1579,19 +1664,19 @@ func (r *basePoolManager) retryFailedInstancesForOnePool(ctx context.Context, po
  			// NOTE(gabriel-samfira): this is done in parallel. If there are many failed instances
  			// this has the potential to create many API requests to the target provider.
  			// TODO(gabriel-samfira): implement request throttling.
@@ -238,7 +230,7 @@ index 2215c1d..556aee5 100644
  			slog.DebugContext(
  				ctx, "cleanup of previously failed instance complete",
  				"runner_name", instance.Name)
-@@ -1678,6 +1764,7 @@ func (r *basePoolManager) deletePendingInstances() error {
+@@ -1793,6 +1878,7 @@ func (r *basePoolManager) deletePendingInstances() error {
  					// We can use it as a marker to signal that the backoff is no longer
  					// needed.
  					r.backoff.Delete(instance.Name)

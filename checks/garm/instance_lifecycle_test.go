@@ -34,7 +34,7 @@
 //  1. cleanupOrphanedGithubRunners: a runner offline in GitHub for >5 min
 //     whose name is absent from the provider's ListInstances had its DB row
 //     DELETED and the provider's DeleteInstance was never called. The remote
-//     vmharness provider answered every ListInstances with an empty list, so
+//     gosti provider answered every ListInstances with an empty list, so
 //     every Windows runner (still booting at 5 min) was forgotten while its VM
 //     ran on: ~210 leaked libvirt domains. TestDroppedInstanceIsDeletedViaProvider.
 //
@@ -142,7 +142,7 @@ func (s *InstanceLifecycleSuite) SetupTest() {
 	cache.SetEntity(entity)
 	cache.SetEntityPool(entity.ID, s.pool)
 
-	controllerInfo, err := db.InitController()
+	controllerInfo, err := db.InitController(context.Background())
 	s.Require().NoError(err)
 	backoff, err := locking.NewInstanceDeleteBackoff(context.Background())
 	s.Require().NoError(err)
@@ -157,6 +157,7 @@ func (s *InstanceLifecycleSuite) SetupTest() {
 		controllerInfo:   controllerInfo,
 		providers:        map[string]common.Provider{"hms-libvirt": s.provider},
 		jobs:             make(map[int64]params.Job),
+		jobTombstones:    make(map[int64]time.Time),
 		checkedJobs:      make(map[int64]time.Time),
 		quit:             make(chan struct{}),
 		consumer:         &garmTesting.MockConsumer{},

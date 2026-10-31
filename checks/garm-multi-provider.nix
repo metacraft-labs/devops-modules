@@ -25,7 +25,7 @@ top@{ ... }:
   #       libvirtd/kvm), and the STRICT knobs stay (ProtectSystem=strict,
   #       PrivateDevices, MemoryDenyWriteExecute, SystemCallFilter present) —
   #       proving the union picks the strict incus posture when no libvirt.
-  #   (3) QEMU-WINDOWS-ARM: a vm-harness-run provider renders the qemu Windows
+  #   (3) QEMU-WINDOWS-ARM: a gosti-run provider renders the qemu Windows
   #       ARM backend config with state_dir/source_image and no libvirt keys.
   #   (4) OFF: the M0 strict DynamicUser sandbox — DynamicUser, ProtectSystem=
   #       strict, PrivateDevices, MemoryDenyWriteExecute, SystemCallFilter
@@ -104,7 +104,7 @@ top@{ ... }:
       # (2) incus provider ONLY (a single-backend shape).
       incusUnit = mkGarmUnit {
         enable = true;
-        providers.vmharness = {
+        providers.gosti = {
           backend = "incus";
           incusIPv4CIDR = "10.0.100.0/24";
           incusIPv4Gateway = "10.0.100.1";
@@ -112,15 +112,15 @@ top@{ ... }:
         };
       };
 
-      # (3) qemu Windows ARM vm-harness-run provider.
+      # (3) qemu Windows ARM gosti-run provider.
       qemuWindowsArmUnit = mkGarmUnit {
         enable = true;
         providers.win-arm = {
           backend = "qemu-windows-arm";
-          vmHarnessPath = "/nix/store/test-vm-harness/bin/vm-harness";
-          stateDir = "/var/lib/garm-provider-vmharness/win-arm";
+          gostiPath = "/nix/store/test-gosti/bin/gosti";
+          stateDir = "/var/lib/garm-provider-gosti/win-arm";
           images.win-arm-runner = {
-            sourceImage = "/private/var/lib/vm-harness/qemu-windows-arm/golden/win-arm-runner";
+            sourceImage = "/private/var/lib/gosti/qemu-windows-arm/golden/win-arm-runner";
             osName = "windows";
             osVersion = "11-arm64";
           };
@@ -140,7 +140,7 @@ top@{ ... }:
       # config.toml — and therefore restart garm — on every existing host.
       cappedIncusUnit = mkGarmUnit {
         enable = true;
-        providers.vmharness = {
+        providers.gosti = {
           backend = "incus";
           incusIPv4CIDR = "10.0.100.0/24";
           incusIPv4Gateway = "10.0.100.1";
@@ -223,7 +223,7 @@ top@{ ... }:
               grep -q  '^SystemCallFilter=@system-service' "$incus" || fail "incus: SystemCallFilter must stay on"
               ! grep -q '^DeviceAllow=/dev/kvm' "$incus" || fail "incus: /dev/kvm must NOT be allowed"
 
-              # --- (3) QEMU-WINDOWS-ARM: vm-harness-run config -------------------
+              # --- (3) QEMU-WINDOWS-ARM: gosti-run config -------------------
               qpre=$(grep '^ExecStartPre=' "$qemuWindowsArm" | head -1 | cut -d= -f2-)
               [ -f "$qpre" ] || fail "qemu-windows-arm: render script not found at $qpre"
               qtmpl=$(grep -ohE '/nix/store/[a-z0-9]+-garm-config.toml.tmpl' "$qpre" | head -1)
@@ -231,9 +231,9 @@ top@{ ... }:
               qprovcfg=$(grep -ohE '/nix/store/[a-z0-9]+-garm-provider-win_arm\.toml' "$qtmpl" | head -1)
               [ -f "$qprovcfg" ] || fail "qemu-windows-arm: provider config not found"
               grep -q 'backend = "qemu-windows-arm"' "$qprovcfg" || fail "qemu-windows-arm: backend missing"
-              grep -q 'vm_harness_path = "/nix/store/test-vm-harness/bin/vm-harness"' "$qprovcfg" || fail "qemu-windows-arm: vm_harness_path missing"
-              grep -q 'state_dir = "/var/lib/garm-provider-vmharness/win-arm"' "$qprovcfg" || fail "qemu-windows-arm: state_dir missing"
-              grep -q 'source_image = "/private/var/lib/vm-harness/qemu-windows-arm/golden/win-arm-runner"' "$qprovcfg" || fail "qemu-windows-arm: source_image missing"
+              grep -q 'gosti_path = "/nix/store/test-gosti/bin/gosti"' "$qprovcfg" || fail "qemu-windows-arm: gosti_path missing"
+              grep -q 'state_dir = "/var/lib/garm-provider-gosti/win-arm"' "$qprovcfg" || fail "qemu-windows-arm: state_dir missing"
+              grep -q 'source_image = "/private/var/lib/gosti/qemu-windows-arm/golden/win-arm-runner"' "$qprovcfg" || fail "qemu-windows-arm: source_image missing"
               grep -q 'os_name = "windows"' "$qprovcfg" || fail "qemu-windows-arm: Windows OS mapping missing"
               ! grep -q 'virsh_path' "$qprovcfg" || fail "qemu-windows-arm: must not render libvirt keys"
 
@@ -260,7 +260,7 @@ top@{ ... }:
               [ -f "$cpre" ] || fail "incus-capped: render script not found at $cpre"
               ctmpl=$(grep -ohE '/nix/store/[a-z0-9]+-garm-config.toml.tmpl' "$cpre" | head -1)
               [ -f "$ctmpl" ] || fail "incus-capped: config template not found (from $cpre)"
-              ccfg=$(grep -ohE '/nix/store/[a-z0-9]+-garm-provider-vmharness\.toml' "$ctmpl" | head -1)
+              ccfg=$(grep -ohE '/nix/store/[a-z0-9]+-garm-provider-gosti\.toml' "$ctmpl" | head -1)
               [ -f "$ccfg" ] || fail "incus-capped: provider config not found"
               grep -qx 'incus_limits_cpu = "8"' "$ccfg" \
                 || fail "incus-capped: incus_limits_cpu not rendered (got: $(grep -c . "$ccfg") lines, none matching)"
@@ -271,7 +271,7 @@ top@{ ... }:
               # and would hand the provider a cap it was never asked for.
               ipre=$(grep '^ExecStartPre=' "$incus" | head -1 | cut -d= -f2-)
               itmpl=$(grep -ohE '/nix/store/[a-z0-9]+-garm-config.toml.tmpl' "$ipre" | head -1)
-              icfg=$(grep -ohE '/nix/store/[a-z0-9]+-garm-provider-vmharness\.toml' "$itmpl" | head -1)
+              icfg=$(grep -ohE '/nix/store/[a-z0-9]+-garm-provider-gosti\.toml' "$itmpl" | head -1)
               [ -f "$icfg" ] || fail "incus-uncapped: provider config not found"
               ! grep -q 'incus_limits_cpu' "$icfg" \
                 || fail "incus-uncapped: incus_limits_cpu present without the option being set; the key must be inert by default"

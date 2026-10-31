@@ -1,12 +1,12 @@
-# Gate `t_garm_provider_remote_old_daemon`: the remote vmharness provider must
-# keep a MIXED-VERSION fleet working, driving the REAL old `vm-harness serve`.
+# Gate `t_garm_provider_remote_old_daemon`: the remote gosti provider must
+# keep a MIXED-VERSION fleet working, driving the REAL old `gosti serve`.
 #
 # WHY. On 2026-09-24 the central GARM on high-mem-server got the fail-closed
-# provider (#686) while gpu-server-001/002 still ran a `vm-harness serve` that
+# provider (#686) while gpu-server-001/002 still ran a `gosti serve` that
 # predates `ephemeral-list`/`ephemeral-label` (gosti #47). The provider's
 # old-daemon tolerance matched "unknown subcommand 'ephemeral-label'", but the
 # old binary parses the whole argv before dispatching and dies on the flag:
-# "vm-harness: Unknown flag: '--label'". Every create ended in `error`. The unit
+# "gosti: Unknown flag: '--label'". Every create ended in `error`. The unit
 # tests passed because their fake daemon printed what the author EXPECTED the
 # old binary to print. This gate runs the binary itself.
 #
@@ -18,7 +18,7 @@
 #      that it created the instance unlabelled;
 #   2. ListInstances FAILS CLOSED with the distinguishable old-daemon error
 #      (never an empty list: the patched GARM would recycle live runners on it);
-# and, as the control, against the CURRENT pinned daemon (self'.packages.vm-harness):
+# and, as the control, against the CURRENT pinned daemon (self'.packages.gosti):
 #   4. the same create prints NO old-daemon line and List succeeds.
 #
 # Hermetic: target backend `noop` (the sanctioned test backend), loopback only.
@@ -28,9 +28,10 @@
     { pkgs, self', ... }:
     let
       # The serve the fleet ran on 2026-09-24 (infra flake.lock `gosti`), built
-      # with this repo's own vm-harness derivation. The hash is that input's
-      # narHash.
-      vmHarnessOld = self'.packages.vm-harness.overrideAttrs (_: {
+      # with this repo's own gosti derivation. The hash is that input's
+      # narHash. OLD-BINARY EVIDENCE: that source predates the product rename,
+      # so its entry point and the variables it reads keep their old names.
+      gostiOld = self'.packages.gosti.overrideAttrs (_: {
         version = "0.1.0-e337cb6";
         src = pkgs.fetchFromGitHub {
           owner = "metacraft-labs";
@@ -38,6 +39,11 @@
           rev = "e337cb6fa456aa7fd0d934e2e5a36eb3a9c7c551";
           hash = "sha256-We9CZcUOEvkE62FBuKdvi7cVYBUHpMkoIpVzcsOmfaA=";
         };
+        buildPhase = ''
+          runHook preBuild
+          nim c --hints:off --opt:speed --nimcache:$TMPDIR/nimcache -o:gosti src/vm_harness/cli.nim
+          runHook postBuild
+        '';
       });
     in
     {
@@ -51,9 +57,9 @@
                 pkgs.gnugrep
                 pkgs.bash
               ];
-              provider = "${self'.packages.garm-provider-vmharness}/bin/garm-provider-vmharness";
-              vmHarnessOld = "${vmHarnessOld}/bin/vm-harness";
-              vmHarnessNew = "${self'.packages.vm-harness}/bin/vm-harness";
+              provider = "${self'.packages.garm-provider-gosti}/bin/garm-provider-gosti";
+              gostiOld = "${gostiOld}/bin/gosti";
+              gostiNew = "${self'.packages.gosti}/bin/gosti";
             }
             ''
               set -euo pipefail
@@ -71,7 +77,7 @@
               start_serve() { # <binary> <tag>
                 rm -f "$work/port"
                 mkdir -p "$work/$2-labels"
-                VMH_EPHEMERAL_LABEL_DIR="$work/$2-labels" "$1" serve \
+                GOSTI_EPHEMERAL_LABEL_DIR="$work/$2-labels" "$1" serve \
                   --listen 127.0.0.1:0 --auth-token-file "$work/token" \
                   --port-file "$work/port" --quiet &
                 SERVE_PID=$!
@@ -123,11 +129,11 @@
               fail() { echo "FAIL: $1" >&2; echo "--- stdout"; cat "$RESP" >&2 || true; echo "--- stderr"; head -c 4000 "$work/err" >&2 || true; exit 1; }
 
               echo "=== OLD daemon (gosti e337cb6) ==="
-              start_serve "$vmHarnessOld" old
+              start_serve "$gostiOld" old
 
               echo "== 0. the old daemon's real answer to --label =="
               set +e
-              VMH_SERVE_TOKEN="$TOKEN" "$vmHarnessOld" --remote "127.0.0.1:$PORT" \
+              VMH_SERVE_TOKEN="$TOKEN" "$gostiOld" --remote "127.0.0.1:$PORT" \
                 ephemeral-list --backend noop --label "garm-pool=$POOL_ID" --log-format json > "$work/raw" 2>&1
               RAW_CODE=$?
               set -e
@@ -141,7 +147,7 @@
               run CreateInstance "GARM_POOL_ID=$POOL_ID" < "$work/bootstrap.json"
               [ "$LAST_CODE" -eq 0 ] || fail "create against the old daemon exited $LAST_CODE (the 2026-09-24 outage)"
               jq -e '.status == "running"' "$RESP" >/dev/null || fail "create status"
-              grep -q 'vmharness-provider old-daemon .*verb=ephemeral-label action=create-unlabelled' "$work/err" \
+              grep -q 'gosti-provider old-daemon .*verb=ephemeral-label action=create-unlabelled' "$work/err" \
                 || fail "no old-daemon create line"
 
               echo "== 2. ListInstances fails closed, distinguishably =="
@@ -149,7 +155,7 @@
               [ "$LAST_CODE" -ne 0 ] || fail "List against the old daemon returned $(cat "$RESP") instead of failing closed"
               grep -q 'enumeration unavailable' "$work/err" || fail "List error is not ErrEnumerationUnavailable"
               grep -q 'predates ephemeral-list' "$work/err" || fail "List error does not identify the old daemon"
-              grep -q 'vmharness-provider old-daemon .*verb=ephemeral-list action=fail-closed' "$work/err" \
+              grep -q 'gosti-provider old-daemon .*verb=ephemeral-list action=fail-closed' "$work/err" \
                 || fail "no old-daemon list line"
 
               # No Delete assertion against the old daemon: e337cb6's
@@ -160,7 +166,7 @@
               stop_serve
 
               echo "=== CURRENT daemon (control) ==="
-              start_serve "$vmHarnessNew" new
+              start_serve "$gostiNew" new
               echo "== 4. no old-daemon classification; List succeeds =="
               bootstrap_json garm-new-0001 > "$work/bootstrap.json"
               run CreateInstance "GARM_POOL_ID=$POOL_ID" < "$work/bootstrap.json"

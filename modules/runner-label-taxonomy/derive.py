@@ -6,7 +6,7 @@ Runner-Fleet-Capability-Pools-And-Remote-Driving RC1 (gate
 
 This is the *machine-checkable derivation* from an RA6 signed capability
 manifest (``GET /v1/manifest`` — see
-``vm-harness/docs/serve-enrollment.md``) to the GitHub runner label set a host
+``gosti/docs/contributors/serve-enrollment.md``) to the GitHub runner label set a host
 may advertise, plus the ``advertised ⊆ derived`` LINTER.
 
 Repo layering (campaign ``:repo_layering:``): the label *vocabulary* and the
@@ -83,7 +83,7 @@ def _extract_manifest(doc: dict[str, Any]) -> dict[str, Any]:
     """Accept either the full ``/v1/manifest`` envelope (``identity.manifest``)
     or a bare manifest object, and return the inner manifest.
 
-    The controller fetches the envelope; ``vm-harness manifest`` prints the bare
+    The controller fetches the envelope; ``gosti manifest`` prints the bare
     object. Both are valid inputs so the derivation is identical whether you
     prototype from a local dump or run against a live host.
     """

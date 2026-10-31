@@ -359,20 +359,20 @@ top@{ ... }:
             # A dummy provider (no real hypervisor needed — the reconcile only
             # NAMES the provider when creating the scale set; GARM stores the
             # provider name from config.toml, no provider daemon is contacted
-            # for a create/list/delete operation). Use a vm-harness-run backend
+            # for a create/list/delete operation). Use a gosti-run backend
             # (qemu-windows-arm) so the module's sandbox posture adds NO
             # supplementary groups (libvirtd/kvm/incus-admin), which would need
             # their host daemons enabled just to exist. This keeps the node a
             # pure garm+reconcile boot with the strict sandbox.
-            providers.vmharness = {
+            providers.gosti = {
               backend = "qemu-windows-arm";
-              vmHarnessPath = "/nonexistent/vm-harness";
-              stateDir = "/var/lib/garm-provider-vmharness";
+              gostiPath = "/nonexistent/gosti";
+              stateDir = "/var/lib/garm-provider-gosti";
               images.linux-runner.sourceImage = "/nonexistent/golden";
             };
 
             scaleSets.incus = {
-              provider = "vmharness";
+              provider = "gosti";
               org = "metacraft-labs";
               credentials = "mcl-app";
               image = "linux-runner";
@@ -387,7 +387,7 @@ top@{ ... }:
             # a declared-disabled set come up enabled). Same managed org, a
             # distinct GARM-side name.
             scaleSets.incus-disabled = {
-              provider = "vmharness";
+              provider = "gosti";
               org = "metacraft-labs";
               credentials = "mcl-app";
               image = "linux-runner";
@@ -565,7 +565,7 @@ top@{ ... }:
                 # Add an EXTRA (undeclared) scale set directly via garm-cli.
                 node.succeed(
                     "sudo -u garm env HOME=/var/lib/garm garm-cli scaleset add "
-                    f"--org {oid} --provider-name vmharness --image linux-runner "
+                    f"--org {oid} --provider-name gosti --image linux-runner "
                     "--name extra-unmanaged --flavor default --enabled "
                     "--min-idle-runners 0 --max-runners 1 --os-type linux --os-arch amd64 "
                     "--runner-bootstrap-timeout 20"
@@ -584,7 +584,7 @@ top@{ ... }:
                 oid = org_id(node, "metacraft-labs")
                 node.succeed(
                     "sudo -u garm env HOME=/var/lib/garm garm-cli scaleset add "
-                    f"--org {oid} --provider-name vmharness --image linux-runner "
+                    f"--org {oid} --provider-name gosti --image linux-runner "
                     "--name extra-unmanaged --flavor default --enabled "
                     "--min-idle-runners 0 --max-runners 1 --os-type linux --os-arch amd64 "
                     "--runner-bootstrap-timeout 20"
@@ -667,14 +667,14 @@ top@{ ... }:
                 oid = org_id(node, "metacraft-labs")
                 node.succeed(
                     "sudo -u garm env HOME=/var/lib/garm garm-cli scaleset add "
-                    f"--org {oid} --provider-name vmharness --image linux-runner "
+                    f"--org {oid} --provider-name gosti --image linux-runner "
                     "--name incus --flavor default --enabled=true "
                     "--min-idle-runners 0 --max-runners 4 --os-type linux --os-arch amd64 "
                     "--runner-bootstrap-timeout 20"
                 )
                 node.succeed(
                     "sudo -u garm env HOME=/var/lib/garm garm-cli scaleset add "
-                    f"--org {oid} --provider-name vmharness --image linux-runner "
+                    f"--org {oid} --provider-name gosti --image linux-runner "
                     "--name incus-disabled --flavor default --enabled=false "
                     "--min-idle-runners 0 --max-runners 2 --os-type linux --os-arch amd64 "
                     "--runner-bootstrap-timeout 20"

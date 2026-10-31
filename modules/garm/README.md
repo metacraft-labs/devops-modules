@@ -4,7 +4,7 @@ Declarative NixOS module for the [cloudbase/garm](https://github.com/cloudbase/g
 control plane, wired for the **Ephemeral-Windows-Runners-GARM** campaign: fresh
 Windows-11 VMs boot from a golden image, JIT-register with GitHub, run exactly one
 job, and are destroyed — orchestrated by GARM through the stateless
-`garm-provider-vmharness` libvirt provider.
+`garm-provider-gosti` libvirt provider.
 
 This document is the operator runbook and security posture reference (campaign
 milestone **M6**). It covers: the hardened-but-provider-capable systemd unit and
@@ -42,7 +42,7 @@ services.garm = {
 
   # The libvirt/KVM provider. Turning this on switches the unit to the
   # provider-capable posture (see §2).
-  providers.vmharness = {
+  providers.gosti = {
     enable = true;
     poolDir = "/var/lib/libvirt/images";
     memoryMb = 4096;
@@ -52,7 +52,7 @@ services.garm = {
 
   # Declarative autoscale policy (applied at runtime via garm-cli — see §4).
   scaleSets.windows-ephemeral = {
-    provider = "vmharness";
+    provider = "gosti";
     image = "golden";
     osType = "windows";
     maxRunners = 2;      # concurrency cap
@@ -85,9 +85,9 @@ provider shells to `virsh`/`qemu-img`/`genisoimage`, talks to the
 
 The module therefore uses a **provider-conditional posture**:
 
-- **`providers.vmharness.enable = false`** (M0/boot-gate): the strict
+- **`providers.gosti.enable = false`** (M0/boot-gate): the strict
   DynamicUser sandbox, **byte-for-byte unchanged**. The M0 boot gate still passes.
-- **`providers.vmharness.enable = true`**: a dedicated `garm` system user in the
+- **`providers.gosti.enable = true`**: a dedicated `garm` system user in the
   `libvirtd`/`kvm` groups, with **only** the minimum relaxations below. Everything
   that does not block the provider stays on.
 
@@ -121,7 +121,7 @@ harnesses did) surfaces two real access requirements the root path masked:
    ```
    or add `garm` to the owning group via `services.garm.extraGroups`.
 2. **Pool-dir writability.** The provider writes the per-job overlay +
-   config-drive + nvram into `providers.vmharness.poolDir`. The shared
+   config-drive + nvram into `providers.gosti.poolDir`. The shared
    `/var/lib/libvirt/images` is root-only (`0711`), so the module defaults
    `poolDir` to a **garm-owned** `/var/lib/garm/pool` and provisions it via
    systemd-tmpfiles as `garm:libvirtd 0771`. qemu runs the domains as root on a
@@ -141,7 +141,7 @@ harnesses did) surfaces two real access requirements the root path masked:
 
 ## 2a. IM4 — the incus (Linux container) posture
 
-Setting `providers.vmharness.backend = "incus"` drives the
+Setting `providers.gosti.backend = "incus"` drives the
 **Ephemeral-Linux-Runners** path: per-job Linux **system containers** launched
 from an incus runner image (e.g. `runner-linux`) instead of Windows VMs. Because
 containers share the host kernel and need **no `/dev/kvm`, no writable host pool
@@ -186,7 +186,7 @@ tmpfiles pool dir** (libvirt-only).
 - **DHCP.** `incusbr0`'s DHCP does not lease on this host (nixos-fw drops the DHCP
   path). The provider therefore injects a **static IPv4 per container** via
   `cloud-init.network-config`, allocated from
-  `providers.vmharness.incusIPv4RangeStart..incusIPv4RangeEnd` on
+  `providers.gosti.incusIPv4RangeStart..incusIPv4RangeEnd` on
   `incusIPv4CIDR`, routed via `incusIPv4Gateway`. This is the supported approach
   (no declarative DHCP needed); the range size is the true per-scale-set
   concurrency ceiling for the incus backend (one free IP per concurrent
@@ -205,7 +205,7 @@ dport <port> accept` rule the IM3 gate added by hand. It opens **only** the
 GARM's Linux install template treats `/home/<RunnerUsername>/actions-runner`
 (username defaults to `runner`) as the **cached** runner: when that directory
 exists the bootstrap skips the ~200 MB download+extract. The runner image
-(built by `vm-harness/guest-recipes/linux-x64-runner/build-runner-image.sh`)
+(built by `gosti/guest-recipes/linux-x64-runner/build-runner-image.sh`)
 therefore stages the runner at exactly `/home/runner/actions-runner` (owned
 `runner:runner`), so each job reuses the baked copy instead of re-downloading.
 
@@ -222,7 +222,7 @@ above + `/metrics` served + the declarative egress option.
 
 These two remote Incus capabilities are disabled by default. Opt-in booleans
 under `services.garm.providers.<name>.remote` grant the fixed capabilities
-implemented by the pinned `vm-harness` mainline:
+implemented by the pinned `gosti` mainline:
 
 - `incusSecurityNesting` maps only to `--incus-security-nesting`.
 - `incusNestedKvm` maps only to `--incus-nested-kvm`, whose contract attaches
@@ -275,7 +275,7 @@ and hostile pool `extra_specs` cannot change the remote create command.
 - **Controller URLs** (`metadata_url`, `callback_url`) go in `[default]` and must be
   guest-reachable (host bridge IP).
 - **Provider** is a `[[provider]]` external block pointing at the
-  `garm-provider-vmharness` binary + a secret-free provider `config.toml` carrying
+  `garm-provider-gosti` binary + a secret-free provider `config.toml` carrying
   `virsh_path`/`qemu_img_path`/`libvirt_uri`/`network`/`pool_dir`/`uefi_*`/
   `memory_mb`/`vcpus` (plus `current_memory_mb` when a balloon floor is set) +
   the golden `[images.*]` map (all from module options).
@@ -361,7 +361,7 @@ garm-cli organization add --name my-org --credentials my-app \
   --webhook-secret "$(openssl rand -hex 16)"   # scale sets ignore the webhook
 
 # scale set (the runs-on: selector is the scale-set NAME)
-garm-cli scaleset add --org <ORG_ID> --provider-name vmharness \
+garm-cli scaleset add --org <ORG_ID> --provider-name gosti \
   --image golden --name windows-ephemeral --flavor default --enabled \
   --min-idle-runners 0 --max-runners 2 --os-type windows --os-arch amd64 \
   --runner-bootstrap-timeout 30
@@ -665,14 +665,14 @@ The M5 autoscale gate enforced `MAX_RUNNERS * memory` against free RAM at **runt
 **eval**:
 
 ```
-sum over scaleSets (maxRunners * providers.vmharness.memoryMb) <= hostBudget.memoryMb
-sum over scaleSets (maxRunners * providers.vmharness.vcpus)    <= hostBudget.vcpus
+sum over scaleSets (maxRunners * providers.gosti.memoryMb) <= hostBudget.memoryMb
+sum over scaleSets (maxRunners * providers.gosti.vcpus)    <= hostBudget.vcpus
 ```
 
 An over-committed config aborts `nixos-rebuild`/`nix flake check` with, e.g.:
 
 > services.garm: worst-case ephemeral guest RAM (sum of maxRunners \*
-> providers.vmharness.memoryMb = 81920 MiB) exceeds hostBudget.memoryMb (16384
+> providers.gosti.memoryMb = 81920 MiB) exceeds hostBudget.memoryMb (16384
 > MiB). Lower maxRunners/memoryMb or raise hostBudget.memoryMb.
 
 This is a _ceiling_, not a live free-RAM check — the autoscale gate's runtime guard
@@ -697,19 +697,18 @@ returns an empty instance slice**, so scale-set runner-state consolidation never
 sees the runners the provider actually reported. The message is not cosmetic —
 it comes with genuine runner state drift.
 
-The `garm-provider-vmharness` provider is correct: `ListInstances`/`List` return
+The `garm-provider-gosti` provider is correct: `ListInstances`/`List` return
 `(nil, nil)` on the empty case (verified in `internal/backend/virsh.go`
 `listFiltered` and `internal/provider/provider.go` `ListInstances`), and
 `DeleteInstance` treats absence as success (idempotent).
 
-The GARM package in this repo carries the one-line fix:
-`packages/garm/default.nix` applies
-`packages/garm/patches/fix-listinstances-inverted-error-check.patch`, and the
-upstream submission material lives in
-`upstream-patches/garm-listinstances-inverted-error-check/`. Upstream fixed the
-bug independently in cloudbase/garm 488cf98b (2026-09-11), so that bundle is
-retired; the local patch stays until our pin moves past 488cf98b. Operators who
-still see the message are running an unpatched GARM.
+Upstream fixed the bug independently in cloudbase/garm 488cf98b (2026-09-11).
+The GARM package in this repo carried a one-line local patch for it until its
+pin moved to 33ec0921, which includes 488cf98b; the patch is gone and the
+upstream submission material in
+`upstream-patches/garm-listinstances-inverted-error-check/` is kept, retired,
+as the record. Operators who still see the message are running a GARM older
+than 488cf98b.
 
 ---
 
@@ -727,7 +726,7 @@ sibling eval — the resource-guard assertion fires on a bad config.
 
 - Run as root on the KVM host (`/dev/kvm`, `qemu:///system`, libvirt `default` net).
 - The Windows golden (prefer the sysprepped variant) with cloudbase-init + the
-  actions runner staged; UTC RTC. Path via env (`VMH_WIN_GOLDEN`).
+  actions runner staged; UTC RTC. Path via env (`GOSTI_WIN_GOLDEN`).
 - OVMF firmware under `/run/libvirt/nix-ovmf`.
 - The GitHub App PEM readable at the App PEM path (`APP_PEM`), for the GitHub App
   ID / installation / org supplied via env, with `Self-hosted runners: R/W`.

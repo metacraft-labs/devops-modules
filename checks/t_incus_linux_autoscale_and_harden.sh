@@ -10,7 +10,7 @@
 #
 #   PART 1 — HARDENED DECLARATIVE MODULE runs the INCUS provider.
 #     Build the `services.garm` module toplevel with
-#     `providers.vmharness.backend = "incus"` + metrics + the declarative
+#     `providers.gosti.backend = "incus"` + metrics + the declarative
 #     incus-bridge egress option, install the MODULE-PRODUCED garm.service unit
 #     and start GARM under it. Assert the IM4 incus sandbox posture:
 #       * User=garm in the `incus-admin` group (socket access) — NOT libvirtd/kvm
@@ -60,7 +60,7 @@
 # service account + drives incus/nft). Needs:
 #   * incus daemon reachable with the `incusbr0` bridge up (the bridge subnet is
 #     read at runtime) and the runner image present, its alias set via
-#     VMH_RUNNER_ALIAS (build with vm-harness/guest-recipes/linux-x64-runner).
+#     GOSTI_RUNNER_ALIAS (build with gosti/guest-recipes/linux-x64-runner).
 #   * The GitHub App PEM readable (APP_PEM = the App private-key PEM path), with
 #     the App ID / installation / org supplied via env (APP_ID, INSTALLATION_ID,
 #     ORG) and the org `Self-hosted runners: Read & write` permission.
@@ -75,11 +75,11 @@ APP_PEM="${APP_PEM:?set APP_PEM (path to the GitHub App private-key PEM)}"
 ORG="${ORG:?set ORG (the GitHub org)}"
 SCALESET_NAME="${SCALESET_NAME:-linux-ephemeral-im4}"
 
-RUNNER_IMAGE="${VMH_RUNNER_ALIAS:?set VMH_RUNNER_ALIAS (the incus runner image alias)}"
-INCUS_BRIDGE="${VMH_INCUS_BRIDGE:-incusbr0}"
+RUNNER_IMAGE="${GOSTI_RUNNER_ALIAS:?set GOSTI_RUNNER_ALIAS (the incus runner image alias)}"
+INCUS_BRIDGE="${GOSTI_INCUS_BRIDGE:-incusbr0}"
 # Use the HOST incus binary (matches the running daemon version) rather than the
 # module default pkgs.incus, to avoid client/server version skew on this host.
-INCUS_BIN="${VMH_INCUS_BIN:-$(command -v incus || echo /run/current-system/sw/bin/incus)}"
+INCUS_BIN="${GOSTI_INCUS_BIN:-$(command -v incus || echo /run/current-system/sw/bin/incus)}"
 
 GARM_PORT="${GARM_PORT:-9997}"
 FLAKE="${FLAKE:-$(cd "$(dirname "$0")/.." && pwd)}"   # the nixos-modules flake root
@@ -109,7 +109,7 @@ info() { echo "[im4] $*"; }
 [ -r "$APP_PEM" ] || fail "cannot read App PEM: $APP_PEM"
 command -v nix >/dev/null || fail "nix not on PATH (needed to build the module toplevel)"
 command -v gh  >/dev/null || fail "gh not on PATH"
-"$INCUS_BIN" image info "$RUNNER_IMAGE" >/dev/null 2>&1 || fail "runner image '$RUNNER_IMAGE' absent (build vm-harness/guest-recipes/linux-x64-runner)"
+"$INCUS_BIN" image info "$RUNNER_IMAGE" >/dev/null 2>&1 || fail "runner image '$RUNNER_IMAGE' absent (build gosti/guest-recipes/linux-x64-runner)"
 
 # Resolve `garm` + `garm-cli` onto PATH. Prefer already-on-PATH; else build the
 # flake's garm package and prepend its bin (this host does not install garm-cli
@@ -271,7 +271,7 @@ let flake = builtins.getFlake (toString $FLAKE); system = \"x86_64-linux\"; nixp
  sys = nixpkgs.lib.nixosSystem { inherit system; modules = [ flake.modules.nixos.garm
   ({ ... }: { boot.loader.grub.enable = false; fileSystems.\"/\" = { device = \"/dev/vda\"; fsType = \"ext4\"; }; system.stateVersion = \"24.11\";
     services.garm = { enable = true; openIncusBridgeFirewall = true;
-      providers.vmharness = { enable = true; backend = \"incus\";
+      providers.gosti = { enable = true; backend = \"incus\";
         incusBridge = \"$INCUS_BRIDGE\"; incusIPv4CIDR = \"$SUBNET\"; incusIPv4Gateway = \"$BRIDGE_IP\";
         images.linux-runner.sourceImage = \"$RUNNER_IMAGE\"; }; }; }) ]; };
  in sys.config.networking.firewall.interfaces.\"$INCUS_BRIDGE\".allowedTCPPorts" 2>&1 || true)
@@ -297,9 +297,9 @@ let flake = builtins.getFlake (toString $FLAKE); system = \"x86_64-linux\"; nixp
       callbackURL = \"$STATE_URL/api/v1/callbacks\";
       metrics = { enable = true; disableAuth = true; };
       openIncusBridgeFirewall = true;
-      providers.vmharness = {
+      providers.gosti = {
         enable = true;
-        package = flake.packages.\${system}.garm-provider-vmharness;
+        package = flake.packages.\${system}.garm-provider-gosti;
         backend = \"incus\";
         incusPath = \"$INCUS_BIN\";
         incusBridge = \"$INCUS_BRIDGE\";
@@ -309,7 +309,7 @@ let flake = builtins.getFlake (toString $FLAKE); system = \"x86_64-linux\"; nixp
         incusIPv4RangeEnd = \"${SUBNET_BASE}.250\";
         images.linux-runner = { sourceImage = \"$RUNNER_IMAGE\"; osName = \"linux\"; osVersion = \"debian12\"; };
       };
-      scaleSets.$SCALESET_NAME = { provider = \"vmharness\"; image = \"linux-runner\"; osType = \"linux\"; maxRunners = $MAX_RUNNERS; minIdleRunners = 0; };
+      scaleSets.$SCALESET_NAME = { provider = \"gosti\"; image = \"linux-runner\"; osType = \"linux\"; maxRunners = $MAX_RUNNERS; minIdleRunners = 0; };
       hostBudget = { memoryMb = 65536; vcpus = 32; };
     };
   }) ]; };
@@ -395,7 +395,7 @@ done
 [ "$r" = "True" ] || fail "GARM org pool manager did not start (App auth failed)"
 # Eager reconciler: react to queued jobs immediately (scale-to-zero needs this).
 garm-cli controller update --minimum-job-age-backoff 0 >/dev/null 2>&1 || true
-SCALESET_ID=$(garm-cli scaleset add --org "$ORG_ID" --provider-name vmharness \
+SCALESET_ID=$(garm-cli scaleset add --org "$ORG_ID" --provider-name gosti \
   --image linux-runner --name "$SCALESET_NAME" --flavor default --enabled \
   --min-idle-runners 0 --max-runners "$MAX_RUNNERS" --os-type linux --os-arch amd64 \
   --runner-bootstrap-timeout "$BOOTSTRAP_TIMEOUT_MIN" --format json \

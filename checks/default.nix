@@ -37,7 +37,6 @@
     ./ci-runs-on-capability.nix
     ./ci-nixos-runner-hazards.nix
     ./garm-reconcile.nix
-    ./garm-stale-scaleset-job-reaped.nix
     ./garm-job-cache-self-heal.nix
     ./garm-busy-runner-not-reaped.nix
     ./garm-deleting-capacity.nix
@@ -48,24 +47,24 @@
     ./garm-macos-runner-install-wrapper.nix
     ./garm-install-script-template-fixtures.nix
     ./garm-skip-queued-jobs-when-pools-full.nix
-    ./garm-provider-vmharness-backend.nix
+    ./garm-provider-gosti-backend.nix
     ./garm-provider-remote.nix
     ./garm-provider-remote-old-daemon.nix
     ./garm-remote-incus-capabilities.nix
     ./garm-remote-libvirt-settings.nix
     ./garm-central-multi-host.nix
     ./garm-central-recovery.nix
-    ./garm-provider-vmharness-protocol.nix
-    ./garm-provider-vmharness-windows-toolchain.nix
+    ./garm-provider-gosti-protocol.nix
+    ./garm-provider-gosti-windows-toolchain.nix
     ./garm-provider-agentharbor.nix
-    ./vmharness-image-is-honoured.nix
-    ./vmharness-serve-linux-deploy.nix
-    ./vmharness-serve-inventory-textfile.nix
-    ./vmharness-serve-darwin-posture.nix
-    ./gosti-serve-rename.nix
-    ./gosti-serve-unit-rename-switch.nix
+    ./gosti-image-is-honoured.nix
+    ./gosti-serve-linux-deploy.nix
+    ./gosti-serve-inventory-textfile.nix
+    ./gosti-serve-darwin-posture.nix
+    ./gosti-serve-identity.nix
+    ./gosti-serve-migrate-state.nix
     ./gosti-serve-survives-incus-blip.nix
-    ./vmharness-serve-win-libvirt.nix
+    ./gosti-serve-win-libvirt.nix
     ./runner-label-taxonomy.nix
     ./s3-artifact-store.nix
     ./repro-binary-cache-systemd.nix

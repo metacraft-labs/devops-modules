@@ -35,7 +35,7 @@ on:
         required: false
         type: string
       foundry-darwin-bootstrap-runner:
-        description: 'Temporary JSON-encoded runner class for Foundry on Darwin while vm-harness lifetime fixes are deployed'
+        description: 'Temporary JSON-encoded runner class for Foundry on Darwin while gosti lifetime fixes are deployed'
         default: ''
         required: false
         type: string

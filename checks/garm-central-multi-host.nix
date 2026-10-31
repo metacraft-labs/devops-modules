@@ -6,11 +6,11 @@ top@{ ... }:
   #
   # Proves the Phase-B END STATE at the module level: ONE central `services.garm`
   # control plane whose provider set is entirely RB1 REMOTE-TARGET providers, each
-  # an RPC client to a DIFFERENT `vm-harness serve` daemon — the single controller
+  # an RPC client to a DIFFERENT `gosti serve` daemon — the single controller
   # creating + destroying a runner on EACH remote host. It extends RB1's
   # single-provider proof (t_garm_provider_remote) to the multi-provider central
   # topology, WITHOUT the live fleet: the six per-host serve daemons are stood up
-  # as `vm-harness serve --backend noop` daemons on distinct loopback ports with
+  # as `gosti serve --backend noop` daemons on distinct loopback ports with
   # DISTINCT bearer tokens (the sanctioned hermetic stand-in, design doc §9.1) —
   # no hypervisor, but the whole wire path (TCP, bearer auth, the NDJSON exec
   # stream, the exit-code round-trip) is exercised for real, per provider.
@@ -21,7 +21,7 @@ top@{ ... }:
   #     provider pointing at 127.0.0.1:<distinct port> with its own staged token.
   #     This is the "one central GARM" — a single systemd unit, a single config,
   #     six [[provider]] blocks.
-  #   * SIX `vm-harness serve --backend noop` daemons, one per stand-in host
+  #   * SIX `gosti serve --backend noop` daemons, one per stand-in host
   #     (hms-incus, hms-libvirt, gpu001, gpu002, wincibare, m3), each on its own
   #     loopback port with its own bearer token.
   #
@@ -55,8 +55,8 @@ top@{ ... }:
     let
       flake = top.config.flake;
 
-      vmHarness = self'.packages.vm-harness;
-      provider = self'.packages.garm-provider-vmharness;
+      gosti = self'.packages.gosti;
+      provider = self'.packages.garm-provider-gosti;
 
       # The six stand-in hosts: attr name -> loopback port + bearer token.
       # DISTINCT ports AND distinct tokens, so a create landing on the wrong
@@ -108,18 +108,18 @@ top@{ ... }:
           ) standins;
         };
 
-      # One `vm-harness serve --backend noop` daemon per stand-in host, on its own
+      # One `gosti serve --backend noop` daemon per stand-in host, on its own
       # loopback port with its own token. Plain root services (the noop backend
       # needs nothing) — the point is the wire endpoint, not the hardening (which
       # the RA2 module gate already proves).
       serveDaemons = {
         systemd.services = lib.mapAttrs' (
           name: s:
-          lib.nameValuePair "vmh-serve-${name}" {
-            description = "vm-harness serve (noop stand-in for ${name})";
+          lib.nameValuePair "gosti-serve-${name}" {
+            description = "gosti serve (noop stand-in for ${name})";
             wantedBy = [ "multi-user.target" ];
             serviceConfig = {
-              ExecStart = "${vmHarness}/bin/vm-harness serve --listen 127.0.0.1:${toString s.port} --auth-token-file ${tokenSrc name} --backend noop --quiet";
+              ExecStart = "${gosti}/bin/gosti serve --listen 127.0.0.1:${toString s.port} --auth-token-file ${tokenSrc name} --backend noop --quiet";
               Restart = "on-failure";
             };
           }
@@ -167,7 +167,7 @@ top@{ ... }:
                   remote = {
                     endpoint = "100.83.180.254:8873";
                     targetBackend = "incus";
-                    authTokenFile = "/run/agenix/vm-harness-serve/hms-token";
+                    authTokenFile = "/run/agenix/gosti-serve/hms-token";
                   };
                 };
                 hms-libvirt = {
@@ -175,7 +175,7 @@ top@{ ... }:
                   remote = {
                     endpoint = "100.83.180.254:8873";
                     targetBackend = "libvirt";
-                    authTokenFile = "/run/agenix/vm-harness-serve/hms-token";
+                    authTokenFile = "/run/agenix/gosti-serve/hms-token";
                   };
                 };
                 gpu001-incus = {
@@ -183,7 +183,7 @@ top@{ ... }:
                   remote = {
                     endpoint = "100.83.80.37:8873";
                     targetBackend = "incus";
-                    authTokenFile = "/run/agenix/vm-harness-serve/gpu001-token";
+                    authTokenFile = "/run/agenix/gosti-serve/gpu001-token";
                   };
                 };
                 gpu002-incus = {
@@ -191,7 +191,7 @@ top@{ ... }:
                   remote = {
                     endpoint = "100.83.55.181:8873";
                     targetBackend = "incus";
-                    authTokenFile = "/run/agenix/vm-harness-serve/gpu002-token";
+                    authTokenFile = "/run/agenix/gosti-serve/gpu002-token";
                   };
                 };
                 wincibare-hyperv = {
@@ -199,7 +199,7 @@ top@{ ... }:
                   remote = {
                     endpoint = "100.83.99.99:8873";
                     targetBackend = "hyperv";
-                    authTokenFile = "/run/agenix/vm-harness-serve/wincibare-token";
+                    authTokenFile = "/run/agenix/gosti-serve/wincibare-token";
                   };
                 };
                 m3-tart = {
@@ -207,7 +207,7 @@ top@{ ... }:
                   remote = {
                     endpoint = "100.83.174.120:8873";
                     targetBackend = "tart-macos";
-                    authTokenFile = "/run/agenix/vm-harness-serve/m3-token";
+                    authTokenFile = "/run/agenix/gosti-serve/m3-token";
                   };
                 };
                 # m3 serves a SECOND guest class off the same daemon: Windows
@@ -227,7 +227,7 @@ top@{ ... }:
                   remote = {
                     endpoint = "100.83.174.120:8873";
                     targetBackend = "qemu-windows-arm";
-                    authTokenFile = "/run/agenix/vm-harness-serve/m3-token";
+                    authTokenFile = "/run/agenix/gosti-serve/m3-token";
                   };
                 };
               };
@@ -252,7 +252,7 @@ top@{ ... }:
               virtualisation.memorySize = 2048;
               environment.systemPackages = [
                 provider
-                vmHarness
+                gosti
                 pkgs.jq
               ];
             };
@@ -264,7 +264,7 @@ top@{ ... }:
               builtins.toJSON (
                 lib.mapAttrs (name: s: {
                   inherit (s) port token;
-                  svc = "vmh-serve-${name}";
+                  svc = "gosti-serve-${name}";
                 }) standins
               )
             }
@@ -330,7 +330,7 @@ top@{ ... }:
                     "metadata-url": "https://garm.example.com/api/v1/metadata",
                     "instance-token": "jwt-token",
                     "os_type": "linux", "arch": "amd64", "flavor": "linux-large",
-                    "image": "runner-linux", "labels": ["linux", "vmharness"],
+                    "image": "runner-linux", "labels": ["linux", "gosti"],
                     "pool_id": pool_id, "jit_config_enabled": True,
                 }
                 return json.dumps(doc)
@@ -342,7 +342,7 @@ top@{ ... }:
                     f"GARM_PROVIDER_CONFIG_FILE={pcfg} "
                     f"GARM_CONTROLLER_ID={controller_id} "
                     f"GARM_COMMAND={cmd} {extra} "
-                    f"${provider}/bin/garm-provider-vmharness"
+                    f"${provider}/bin/garm-provider-gosti"
                 )
 
             for name, s in standins.items():

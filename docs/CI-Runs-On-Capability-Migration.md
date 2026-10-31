@@ -93,7 +93,7 @@ once every runner image gained universal container + nested-VM support.)
 Provider-admin controls that make these universal guest capabilities available
 are deployment plumbing, not runner-selection labels. For a pool backed by a
 remote Incus provider, the fleet operator must opt that provider into
-`remote.incusNestedKvm`; the shared provider then passes only vm-harness's fixed
+`remote.incusNestedKvm`; the shared provider then passes only gosti's fixed
 `--incus-nested-kvm` contract. Without that operator setting the guest receives
 no `/dev/kvm`. Nested Docker similarly requires the separate
 `remote.incusSecurityNesting` operator grant. Workflows cannot set either value.

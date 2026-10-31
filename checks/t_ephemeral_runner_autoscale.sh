@@ -33,14 +33,14 @@
 #   * /dev/kvm + qemu:///system libvirtd with the "default" NAT net up
 #     (virbr0 = 192.168.122.1, a trusted iface so guests reach the host).
 #   * The M3 Windows golden with cloudbase-init + the actions runner staged
-#     (set VMH_WIN_GOLDEN to the golden qcow2 path), UTC RTC.
-#   * OVMF firmware (VMH_OVMF_CODE / VMH_OVMF_VARS).
+#     (set GOSTI_WIN_GOLDEN to the golden qcow2 path), UTC RTC.
+#   * OVMF firmware (GOSTI_OVMF_CODE / GOSTI_OVMF_VARS).
 #   * qemu-img, virsh, genisoimage on PATH.
 #   * The GitHub App PEM readable (APP_PEM = the App private-key PEM path), with
 #     the App ID / installation / org supplied via env (APP_ID, INSTALLATION_ID,
 #     ORG) and the org `Self-hosted runners: Read & write` permission.
 #   * `gh` CLI authenticated with repo+admin:org.
-#   * GARM + garm-provider-vmharness binaries (GARM_BIN/GARM_CLI_BIN/PROVIDER_BIN).
+#   * GARM + garm-provider-gosti binaries (GARM_BIN/GARM_CLI_BIN/PROVIDER_BIN).
 #
 # ======================= HOST RESOURCE GUARD =========================
 # Each Windows-11 ephemeral VM is heavy: MEMORY_MB (default 4096) RAM + VCPUS
@@ -62,9 +62,9 @@ APP_PEM="${APP_PEM:?set APP_PEM (path to the GitHub App private-key PEM)}"
 ORG="${ORG:?set ORG (the GitHub org)}"
 SCALESET_NAME="${SCALESET_NAME:-windows-ephemeral-m5}"
 
-VMH_WIN_GOLDEN="${VMH_WIN_GOLDEN:?set VMH_WIN_GOLDEN (path to the Windows golden qcow2)}"
-VMH_OVMF_CODE="${VMH_OVMF_CODE:-/run/libvirt/nix-ovmf/edk2-x86_64-code.fd}"
-VMH_OVMF_VARS="${VMH_OVMF_VARS:-/run/libvirt/nix-ovmf/edk2-i386-vars.fd}"
+GOSTI_WIN_GOLDEN="${GOSTI_WIN_GOLDEN:?set GOSTI_WIN_GOLDEN (path to the Windows golden qcow2)}"
+GOSTI_OVMF_CODE="${GOSTI_OVMF_CODE:-/run/libvirt/nix-ovmf/edk2-x86_64-code.fd}"
+GOSTI_OVMF_VARS="${GOSTI_OVMF_VARS:-/run/libvirt/nix-ovmf/edk2-i386-vars.fd}"
 POOL_DIR="${POOL_DIR:-/var/lib/libvirt/images}"
 LIBVIRT_URI="${LIBVIRT_URI:-qemu:///system}"
 GARM_PORT="${GARM_PORT:-9997}"
@@ -85,7 +85,7 @@ RAM_MARGIN_GIB="${RAM_MARGIN_GIB:-8}"
 
 GARM_BIN="${GARM_BIN:-$(command -v garm || true)}"
 GARM_CLI_BIN="${GARM_CLI_BIN:-$(command -v garm-cli || true)}"
-PROVIDER_BIN="${PROVIDER_BIN:-$(command -v garm-provider-vmharness || true)}"
+PROVIDER_BIN="${PROVIDER_BIN:-$(command -v garm-provider-gosti || true)}"
 VIRSH="${VIRSH:-$(command -v virsh)}"
 QEMU_IMG="${QEMU_IMG:-$(command -v qemu-img)}"
 
@@ -106,7 +106,7 @@ for b in "$GARM_BIN" "$GARM_CLI_BIN" "$PROVIDER_BIN"; do
   [ -n "$b" ] && [ -x "$b" ] || fail "missing binary (set GARM_BIN/GARM_CLI_BIN/PROVIDER_BIN): $b"
 done
 [ -r "$APP_PEM" ] || fail "cannot read App PEM: $APP_PEM (run as root)"
-[ -f "$VMH_WIN_GOLDEN" ] || fail "missing golden: $VMH_WIN_GOLDEN"
+[ -f "$GOSTI_WIN_GOLDEN" ] || fail "missing golden: $GOSTI_WIN_GOLDEN"
 command -v genisoimage >/dev/null || fail "genisoimage not on PATH (nix shell nixpkgs#cdrkit)"
 
 # ---- HOST RESOURCE GUARD ---------------------------------------------------
@@ -241,12 +241,12 @@ qemu_img_path = "$QEMU_IMG"
 libvirt_uri = "$LIBVIRT_URI"
 network = "default"
 pool_dir = "$POOL_DIR"
-uefi_loader = "$VMH_OVMF_CODE"
-uefi_nvram_template = "$VMH_OVMF_VARS"
+uefi_loader = "$GOSTI_OVMF_CODE"
+uefi_nvram_template = "$GOSTI_OVMF_VARS"
 memory_mb = $MEMORY_MB
 vcpus = $VCPUS
 [images.golden]
-source_image = "$VMH_WIN_GOLDEN"
+source_image = "$GOSTI_WIN_GOLDEN"
 os_name = "windows"
 os_version = "11"
 EOF
@@ -272,9 +272,9 @@ passphrase = "$DBP"
   [database.sqlite3]
   db_file = "$WORKDIR/garm.sqlite"
 [[provider]]
-name = "vmharness"
+name = "gosti"
 provider_type = "external"
-description = "libvirt/KVM Windows ephemeral runners via vm-harness"
+description = "libvirt/KVM Windows ephemeral runners via gosti"
   [provider.external]
   provider_executable = "$PROVIDER_BIN"
   config_file = "$WORKDIR/provider.toml"
@@ -319,7 +319,7 @@ done
 # GARM reacts to queued jobs immediately (per pools-and-scaling.md).
 sudo "$GARM_CLI_BIN" controller update --minimum-job-age-backoff 0 >/dev/null 2>&1 || true
 
-SCALESET_ID=$(sudo "$GARM_CLI_BIN" scaleset add --org "$ORG_ID" --provider-name vmharness \
+SCALESET_ID=$(sudo "$GARM_CLI_BIN" scaleset add --org "$ORG_ID" --provider-name gosti \
   --image golden --name "$SCALESET_NAME" --flavor default --enabled \
   --min-idle-runners 0 --max-runners "$MAX_RUNNERS" --os-type windows --os-arch amd64 \
   --runner-bootstrap-timeout "$BOOTSTRAP_TIMEOUT_MIN" --format json \

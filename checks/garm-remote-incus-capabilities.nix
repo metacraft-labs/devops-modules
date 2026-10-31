@@ -6,7 +6,7 @@ top@{ ... }:
   # provider-admin booleans and ordered profiles reach only [remote] TOML, are absent by
   # default, render in deterministic order when enabled, and fail closed for a
   # non-Incus remote target or a non-remote provider. The real /dev/kvm attach
-  # and read/write-open proof lives in vm-harness; concrete host enablement and
+  # and read/write-open proof lives in gosti; concrete host enablement and
   # a live runner build requiring the `kvm` Nix system feature belong in the
   # consuming private infrastructure repository.
   perSystem =

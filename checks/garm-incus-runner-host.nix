@@ -40,7 +40,7 @@ top@{ ... }:
       # the local image store without needing a bootable rootfs for THIS gate
       # (we assert registration, not launch).
       testImage =
-        pkgs.runCommand "vmh-linux-runner-test-image.tar.gz"
+        pkgs.runCommand "gosti-linux-runner-test-image.tar.gz"
           {
             nativeBuildInputs = [
               pkgs.gnutar
@@ -80,7 +80,7 @@ top@{ ... }:
                 enable = true;
                 bridgeSubnet = subnet;
                 image = {
-                  alias = "vmh-linux-runner";
+                  alias = "gosti-linux-runner";
                   source = testImage;
                 };
               };
@@ -173,11 +173,11 @@ top@{ ... }:
             with subtest("(3) image-import oneshot registered the alias"):
                 host.wait_for_unit("garm-incus-image-import.service")
                 aliases = host.succeed("incus image alias list --format csv | cut -d, -f1")
-                assert "vmh-linux-runner" in aliases, f"alias missing: {aliases!r}"
+                assert "gosti-linux-runner" in aliases, f"alias missing: {aliases!r}"
 
             with subtest("(3) a re-run of the image-import oneshot is a no-op"):
                 before = host.succeed(
-                    "incus image alias list --format csv | grep -c vmh-linux-runner"
+                    "incus image alias list --format csv | grep -c gosti-linux-runner"
                 ).strip()
                 host.systemctl("restart garm-incus-image-import.service")
                 host.wait_for_unit("garm-incus-image-import.service")
@@ -188,13 +188,24 @@ top@{ ... }:
                 ).strip()
                 assert state == "success", f"re-run result={state!r}"
                 after = host.succeed(
-                    "incus image alias list --format csv | grep -c vmh-linux-runner"
+                    "incus image alias list --format csv | grep -c gosti-linux-runner"
                 ).strip()
                 assert before == after == "1", f"alias count drifted: {before!r} -> {after!r}"
                 # The oneshot logged the no-op path.
                 host.succeed(
                     "journalctl -u garm-incus-image-import.service | grep -q 'already present'"
                 )
+
+            # MIGRATION TEST: a host still carrying the pre-rename alias.
+            with subtest("(3) the pre-rename image alias is renamed, not re-imported"):
+                images_before = host.succeed("incus image list --format csv | wc -l").strip()
+                host.succeed("incus image alias rename gosti-linux-runner vmh-linux-runner")
+                host.systemctl("restart garm-incus-image-import.service")
+                host.wait_for_unit("garm-incus-image-import.service")
+                aliases = host.succeed("incus image alias list --format csv | cut -d, -f1").split()
+                assert "gosti-linux-runner" in aliases and "vmh-linux-runner" not in aliases, aliases
+                images_after = host.succeed("incus image list --format csv | wc -l").strip()
+                assert images_before == images_after, f"image re-imported: {images_before} -> {images_after}"
           '';
         };
       };

@@ -58,8 +58,8 @@ _top@{ ... }:
               GarmControllerDown GarmControllerUnhealthy GarmPoolManagerNotRunning \
               GarmProviderCreateFailures GarmProviderHighErrorRatio \
               GarmProviderDeleteFailures GarmInstancesAbsentFromProvider \
-              VmhEphemeralStoppedOrphans VmhEphemeralUnattributedInstances \
-              VmhEphemeralInventoryFailing \
+              GostiEphemeralStoppedOrphans GostiEphemeralUnattributedInstances \
+              GostiEphemeralInventoryFailing \
               GarmGithubRateLimitLow GarmGithubRateLimitCritical GarmFleetStarvation \
               GarmFleetOverProvision \
               GarmListenerSessionShortfall GarmListenerPollStalled \
