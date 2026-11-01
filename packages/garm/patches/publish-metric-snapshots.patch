@@ -1,0 +1,506 @@
+diff --git a/runner/metrics/instance.go b/runner/metrics/instance.go
+index 7b5540e9..02768c38 100644
+--- a/runner/metrics/instance.go
++++ b/runner/metrics/instance.go
+@@ -31,8 +31,7 @@ type parentInfo struct {
+ // CollectInstanceMetric collects the metrics for the runner instances
+ // reflecting the statuses and the pool or scale set they belong to.
+ func CollectInstanceMetric(ctx context.Context, r *runner.Runner) error {
+-	// reset metrics
+-	metrics.InstanceStatus.Reset()
++	instanceStatusSnap := newGaugeSnapshot(metrics.InstanceStatus)
+ 
+ 	instances, err := r.ListAllInstances(ctx)
+ 	if err != nil {
+@@ -97,7 +96,7 @@ func CollectInstanceMetric(ctx context.Context, r *runner.Runner) error {
+ 			poolID = instance.PoolID
+ 		}
+ 
+-		metrics.InstanceStatus.WithLabelValues(
++		instanceStatusSnap.Set(1,
+ 			instance.Name,                 // label: name
+ 			string(instance.Status),       // label: status
+ 			string(instance.RunnerStatus), // label: runner_status
+@@ -106,7 +105,8 @@ func CollectInstanceMetric(ctx context.Context, r *runner.Runner) error {
+ 			poolID,                        // label: pool_id
+ 			scaleSetID,                    // label: scaleset_id
+ 			parent.ProviderName,           // label: provider
+-		).Set(1)
++		)
+ 	}
++	instanceStatusSnap.Publish()
+ 	return nil
+ }
+diff --git a/runner/metrics/jobs.go b/runner/metrics/jobs.go
+index 3e5948ae..08301bf7 100644
+--- a/runner/metrics/jobs.go
++++ b/runner/metrics/jobs.go
+@@ -25,8 +25,7 @@ import (
+ 
+ // CollectJobMetric collects the metrics for the jobs recorded by GARM
+ func CollectJobMetric(ctx context.Context, r *runner.Runner) error {
+-	// reset metrics
+-	metrics.JobStatus.Reset()
++	jobStatusSnap := newGaugeSnapshot(metrics.JobStatus)
+ 
+ 	jobs, err := r.ListAllJobs(ctx)
+ 	if err != nil {
+@@ -38,7 +37,7 @@ func CollectJobMetric(ctx context.Context, r *runner.Runner) error {
+ 		if job.PoolID != nil {
+ 			poolID = job.PoolID.String()
+ 		}
+-		metrics.JobStatus.WithLabelValues(
++		jobStatusSnap.Set(1,
+ 			fmt.Sprintf("%d", job.ID),            // label: job_id
+ 			fmt.Sprintf("%d", job.WorkflowJobID), // label: workflow_job_id
+ 			fmt.Sprintf("%d", job.RunID),         // label: workflow_run_id
+@@ -50,15 +49,16 @@ func CollectJobMetric(ctx context.Context, r *runner.Runner) error {
+ 			job.RepositoryName,                   // label: repository
+ 			strings.Join(job.Labels, " "),        // label: requested_labels
+ 			poolID,                               // label: pool_id
+-		).Set(1)
++		)
+ 	}
++	jobStatusSnap.Publish()
+ 	return nil
+ }
+ 
+ // CollectScaleSetJobMetric collects the metrics for jobs GitHub routed to
+ // scale sets.
+ func CollectScaleSetJobMetric(ctx context.Context, r *runner.Runner) error {
+-	metrics.ScaleSetJobStatus.Reset()
++	scaleSetJobStatusSnap := newGaugeSnapshot(metrics.ScaleSetJobStatus)
+ 
+ 	jobs, err := r.ListAllScaleSetJobs(ctx)
+ 	if err != nil {
+@@ -70,7 +70,7 @@ func CollectScaleSetJobMetric(ctx context.Context, r *runner.Runner) error {
+ 		if job.ScaleSetID != 0 {
+ 			scaleSetID = fmt.Sprintf("%d", job.ScaleSetID)
+ 		}
+-		metrics.ScaleSetJobStatus.WithLabelValues(
++		scaleSetJobStatusSnap.Set(1,
+ 			job.ScaleSetJobID,                    // label: scaleset_job_id
+ 			scaleSetID,                           // label: scaleset_id
+ 			fmt.Sprintf("%d", job.WorkflowRunID), // label: workflow_run_id
+@@ -82,7 +82,8 @@ func CollectScaleSetJobMetric(ctx context.Context, r *runner.Runner) error {
+ 			job.RepositoryOwner,                  // label: owner
+ 			job.RepositoryName,                   // label: repository
+ 			strings.Join(job.RequestLabels, " "), // label: requested_labels
+-		).Set(1)
++		)
+ 	}
++	scaleSetJobStatusSnap.Publish()
+ 	return nil
+ }
+diff --git a/runner/metrics/pool.go b/runner/metrics/pool.go
+index 6b06a8b9..251bd4a7 100644
+--- a/runner/metrics/pool.go
++++ b/runner/metrics/pool.go
+@@ -25,12 +25,11 @@ import (
+ 
+ // CollectPoolMetric collects the metrics for the pool objects
+ func CollectPoolMetric(ctx context.Context, r *runner.Runner) error {
+-	// reset metrics
+-	metrics.PoolInfo.Reset()
+-	metrics.PoolStatus.Reset()
+-	metrics.PoolMaxRunners.Reset()
+-	metrics.PoolMinIdleRunners.Reset()
+-	metrics.PoolBootstrapTimeout.Reset()
++	poolInfoSnap := newGaugeSnapshot(metrics.PoolInfo)
++	poolStatusSnap := newGaugeSnapshot(metrics.PoolStatus)
++	poolMaxRunnersSnap := newGaugeSnapshot(metrics.PoolMaxRunners)
++	poolMinIdleRunnersSnap := newGaugeSnapshot(metrics.PoolMinIdleRunners)
++	poolBootstrapTimeoutSnap := newGaugeSnapshot(metrics.PoolBootstrapTimeout)
+ 
+ 	pools, err := r.ListAllPools(ctx)
+ 	if err != nil {
+@@ -67,7 +66,7 @@ func CollectPoolMetric(ctx context.Context, r *runner.Runner) error {
+ 			poolTags = append(poolTags, tag.Name)
+ 		}
+ 
+-		metrics.PoolInfo.WithLabelValues(
++		poolInfoSnap.Set(1,
+ 			pool.ID,                     // label: id
+ 			pool.Image,                  // label: image
+ 			pool.Flavor,                 // label: flavor
+@@ -78,24 +77,29 @@ func CollectPoolMetric(ctx context.Context, r *runner.Runner) error {
+ 			pool.ProviderName,           // label: provider
+ 			poolNames[pool.ID].Name,     // label: pool_owner
+ 			poolNames[pool.ID].Type,     // label: pool_type
+-		).Set(1)
++		)
+ 
+-		metrics.PoolStatus.WithLabelValues(
++		poolStatusSnap.Set(metrics.Bool2float64(pool.Enabled),
+ 			pool.ID,                          // label: id
+ 			strconv.FormatBool(pool.Enabled), // label: enabled
+-		).Set(metrics.Bool2float64(pool.Enabled))
++		)
+ 
+-		metrics.PoolMaxRunners.WithLabelValues(
++		poolMaxRunnersSnap.Set(float64(pool.MaxRunners),
+ 			pool.ID, // label: id
+-		).Set(float64(pool.MaxRunners))
++		)
+ 
+-		metrics.PoolMinIdleRunners.WithLabelValues(
++		poolMinIdleRunnersSnap.Set(float64(pool.MinIdleRunners),
+ 			pool.ID, // label: id
+-		).Set(float64(pool.MinIdleRunners))
++		)
+ 
+-		metrics.PoolBootstrapTimeout.WithLabelValues(
++		poolBootstrapTimeoutSnap.Set(float64(pool.RunnerBootstrapTimeout),
+ 			pool.ID, // label: id
+-		).Set(float64(pool.RunnerBootstrapTimeout))
++		)
+ 	}
++	poolInfoSnap.Publish()
++	poolStatusSnap.Publish()
++	poolMaxRunnersSnap.Publish()
++	poolMinIdleRunnersSnap.Publish()
++	poolBootstrapTimeoutSnap.Publish()
+ 	return nil
+ }
+diff --git a/runner/metrics/scaleset.go b/runner/metrics/scaleset.go
+index 3b970ec0..618736a7 100644
+--- a/runner/metrics/scaleset.go
++++ b/runner/metrics/scaleset.go
+@@ -25,13 +25,12 @@ import (
+ 
+ // CollectScaleSetMetric collects the metrics for the scale set objects
+ func CollectScaleSetMetric(ctx context.Context, r *runner.Runner) error {
+-	// reset metrics
+-	metrics.ScaleSetInfo.Reset()
+-	metrics.ScaleSetStatus.Reset()
+-	metrics.ScaleSetMaxRunners.Reset()
+-	metrics.ScaleSetMinIdleRunners.Reset()
+-	metrics.ScaleSetDesiredRunnerCount.Reset()
+-	metrics.ScaleSetBootstrapTimeout.Reset()
++	scaleSetInfoSnap := newGaugeSnapshot(metrics.ScaleSetInfo)
++	scaleSetStatusSnap := newGaugeSnapshot(metrics.ScaleSetStatus)
++	scaleSetMaxRunnersSnap := newGaugeSnapshot(metrics.ScaleSetMaxRunners)
++	scaleSetMinIdleRunnersSnap := newGaugeSnapshot(metrics.ScaleSetMinIdleRunners)
++	scaleSetDesiredRunnerCountSnap := newGaugeSnapshot(metrics.ScaleSetDesiredRunnerCount)
++	scaleSetBootstrapTimeoutSnap := newGaugeSnapshot(metrics.ScaleSetBootstrapTimeout)
+ 
+ 	scaleSets, err := r.ListAllScaleSets(ctx)
+ 	if err != nil {
+@@ -56,7 +55,7 @@ func CollectScaleSetMetric(ctx context.Context, r *runner.Runner) error {
+ 
+ 		id := strconv.FormatUint(uint64(scaleSet.ID), 10)
+ 
+-		metrics.ScaleSetInfo.WithLabelValues(
++		scaleSetInfoSnap.Set(1,
+ 			id,                                // label: id
+ 			strconv.Itoa(scaleSet.ScaleSetID), // label: scaleset_id
+ 			scaleSet.Name,                     // label: name
+@@ -70,29 +69,35 @@ func CollectScaleSetMetric(ctx context.Context, r *runner.Runner) error {
+ 			scaleSet.GitHubRunnerGroup,        // label: runner_group
+ 			ownerName,                         // label: scaleset_owner
+ 			string(scaleSet.ScaleSetType()),   // label: scaleset_type
+-		).Set(1)
++		)
+ 
+-		metrics.ScaleSetStatus.WithLabelValues(
++		scaleSetStatusSnap.Set(metrics.Bool2float64(scaleSet.Enabled),
+ 			id,                                   // label: id
+ 			strconv.FormatBool(scaleSet.Enabled), // label: enabled
+ 			string(scaleSet.State),               // label: state
+-		).Set(metrics.Bool2float64(scaleSet.Enabled))
++		)
+ 
+-		metrics.ScaleSetMaxRunners.WithLabelValues(
++		scaleSetMaxRunnersSnap.Set(float64(scaleSet.MaxRunners),
+ 			id,
+-		).Set(float64(scaleSet.MaxRunners))
++		)
+ 
+-		metrics.ScaleSetMinIdleRunners.WithLabelValues(
++		scaleSetMinIdleRunnersSnap.Set(float64(scaleSet.MinIdleRunners),
+ 			id,
+-		).Set(float64(scaleSet.MinIdleRunners))
++		)
+ 
+-		metrics.ScaleSetDesiredRunnerCount.WithLabelValues(
++		scaleSetDesiredRunnerCountSnap.Set(float64(scaleSet.DesiredRunnerCount),
+ 			id,
+-		).Set(float64(scaleSet.DesiredRunnerCount))
++		)
+ 
+-		metrics.ScaleSetBootstrapTimeout.WithLabelValues(
++		scaleSetBootstrapTimeoutSnap.Set(float64(scaleSet.RunnerBootstrapTimeout),
+ 			id,
+-		).Set(float64(scaleSet.RunnerBootstrapTimeout))
++		)
+ 	}
++	scaleSetInfoSnap.Publish()
++	scaleSetStatusSnap.Publish()
++	scaleSetMaxRunnersSnap.Publish()
++	scaleSetMinIdleRunnersSnap.Publish()
++	scaleSetDesiredRunnerCountSnap.Publish()
++	scaleSetBootstrapTimeoutSnap.Publish()
+ 	return nil
+ }
+diff --git a/runner/metrics/snapshot.go b/runner/metrics/snapshot.go
+new file mode 100644
+index 00000000..4df945d3
+--- /dev/null
++++ b/runner/metrics/snapshot.go
+@@ -0,0 +1,87 @@
++// Copyright 2026 Cloudbase Solutions SRL
++//
++//    Licensed under the Apache License, Version 2.0 (the "License"); you may
++//    not use this file except in compliance with the License. You may obtain
++//    a copy of the License at
++//
++//         http://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++//    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++//    License for the specific language governing permissions and limitations
++//    under the License.
++
++package metrics
++
++import (
++	"strings"
++	"sync"
++
++	"github.com/prometheus/client_golang/prometheus"
++)
++
++// gaugeSnapshot collects the complete new contents of a GaugeVec and then
++// replaces the published series with them.
++//
++// The collectors used to call Reset() on a vector and then query the
++// database to fill it again. A scrape that arrived between the two saw the
++// family empty: no runners, no jobs, no pools. Under database load that gap
++// lasts as long as the slowest list query. A snapshot never empties the
++// vector. It sets every new series first and then deletes the series that
++// are no longer current. A scrape can catch the brief union of old and new
++// series, which costs a few in-memory map operations rather than a database
++// round trip. If a collector returns before Publish, for example because a
++// list query failed, the previous values stay published.
++type gaugeSnapshot struct {
++	vec     *prometheus.GaugeVec
++	samples map[string]gaugeSample
++}
++
++type gaugeSample struct {
++	labels []string
++	value  float64
++}
++
++var (
++	publishedMu sync.Mutex
++	// published holds the label values each vector exported at its last
++	// Publish, keyed the same way as gaugeSnapshot.samples.
++	published = map[*prometheus.GaugeVec]map[string][]string{}
++)
++
++func newGaugeSnapshot(vec *prometheus.GaugeVec) *gaugeSnapshot {
++	return &gaugeSnapshot{vec: vec, samples: map[string]gaugeSample{}}
++}
++
++// labelKey joins label values with a byte that cannot occur in valid UTF-8.
++func labelKey(labels []string) string {
++	return strings.Join(labels, "\xff")
++}
++
++// Set records a sample. A later Set with the same label values overwrites it.
++func (s *gaugeSnapshot) Set(value float64, labels ...string) {
++	s.samples[labelKey(labels)] = gaugeSample{labels: labels, value: value}
++}
++
++// Publish makes the recorded samples the vector's only series.
++func (s *gaugeSnapshot) Publish() {
++	publishedMu.Lock()
++	defer publishedMu.Unlock()
++
++	next := make(map[string][]string, len(s.samples))
++	for key, sample := range s.samples {
++		s.vec.WithLabelValues(sample.labels...).Set(sample.value)
++		next[key] = sample.labels
++	}
++
++	// Only snapshots write these vectors, so the previous publish names
++	// every series that can be stale.
++	prev := published[s.vec]
++	for key, labels := range prev {
++		if _, ok := next[key]; !ok {
++			s.vec.DeleteLabelValues(labels...)
++		}
++	}
++	published[s.vec] = next
++}
+diff --git a/runner/metrics/snapshot_test.go b/runner/metrics/snapshot_test.go
+new file mode 100644
+index 00000000..3a5501ca
+--- /dev/null
++++ b/runner/metrics/snapshot_test.go
+@@ -0,0 +1,163 @@
++// Copyright 2026 Cloudbase Solutions SRL
++//
++//    Licensed under the Apache License, Version 2.0 (the "License"); you may
++//    not use this file except in compliance with the License. You may obtain
++//    a copy of the License at
++//
++//         http://www.apache.org/licenses/LICENSE-2.0
++//
++//    Unless required by applicable law or agreed to in writing, software
++//    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++//    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++//    License for the specific language governing permissions and limitations
++//    under the License.
++
++package metrics
++
++import (
++	"fmt"
++	"sort"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"testing"
++
++	"github.com/prometheus/client_golang/prometheus"
++	"github.com/stretchr/testify/require"
++)
++
++func newTestVec(t *testing.T) (*prometheus.GaugeVec, *prometheus.Registry) {
++	t.Helper()
++	vec := prometheus.NewGaugeVec(prometheus.GaugeOpts{
++		Name: "test_status",
++		Help: "test",
++	}, []string{"name", "status"})
++	reg := prometheus.NewRegistry()
++	require.NoError(t, reg.Register(vec))
++	return vec, reg
++}
++
++// series returns "name/status=value" for every exported series, sorted.
++func series(t *testing.T, reg *prometheus.Registry) []string {
++	t.Helper()
++	families, err := reg.Gather()
++	require.NoError(t, err)
++	var out []string
++	for _, family := range families {
++		for _, m := range family.GetMetric() {
++			labels := map[string]string{}
++			for _, l := range m.GetLabel() {
++				labels[l.GetName()] = l.GetValue()
++			}
++			out = append(out, fmt.Sprintf("%s/%s=%g", labels["name"], labels["status"], m.GetGauge().GetValue()))
++		}
++	}
++	sort.Strings(out)
++	return out
++}
++
++func TestGaugeSnapshotReplacesSeries(t *testing.T) {
++	vec, reg := newTestVec(t)
++
++	first := newGaugeSnapshot(vec)
++	first.Set(1, "a", "running")
++	first.Set(1, "b", "running")
++	first.Publish()
++	require.Equal(t, []string{"a/running=1", "b/running=1"}, series(t, reg))
++
++	// b changes status, a goes away, c appears.
++	second := newGaugeSnapshot(vec)
++	second.Set(1, "b", "deleting")
++	second.Set(2, "c", "running")
++	second.Publish()
++	require.Equal(t, []string{"b/deleting=1", "c/running=2"}, series(t, reg))
++}
++
++func TestGaugeSnapshotKeepsPreviousSeriesUntilPublish(t *testing.T) {
++	vec, reg := newTestVec(t)
++
++	first := newGaugeSnapshot(vec)
++	first.Set(1, "a", "running")
++	first.Publish()
++
++	// A collector fills a snapshot and then fails, so it never publishes.
++	// That is the state a scrape sees while a list query is in flight, and
++	// the state left behind when the query errors: the previous values.
++	pending := newGaugeSnapshot(vec)
++	pending.Set(1, "b", "running")
++	require.Equal(t, []string{"a/running=1"}, series(t, reg))
++}
++
++func TestGaugeSnapshotEmptyPublishClears(t *testing.T) {
++	vec, reg := newTestVec(t)
++
++	first := newGaugeSnapshot(vec)
++	first.Set(1, "a", "running")
++	first.Publish()
++
++	// A successful query that returns nothing does clear the family.
++	newGaugeSnapshot(vec).Publish()
++	require.Empty(t, series(t, reg))
++}
++
++func TestGaugeSnapshotLastSetWins(t *testing.T) {
++	vec, reg := newTestVec(t)
++
++	snap := newGaugeSnapshot(vec)
++	snap.Set(1, "a", "running")
++	snap.Set(3, "a", "running")
++	snap.Publish()
++	require.Equal(t, []string{"a/running=3"}, series(t, reg))
++}
++
++// TestGaugeSnapshotScrapeNeverSeesEmptyFamily refreshes a vector of 50 series
++// continuously while another goroutine gathers it. With Reset() followed by a
++// refill, the gatherer catches the family empty. With snapshots it never does.
++func TestGaugeSnapshotScrapeNeverSeesEmptyFamily(t *testing.T) {
++	vec, reg := newTestVec(t)
++
++	publish := func(round int) {
++		snap := newGaugeSnapshot(vec)
++		for i := 0; i < 50; i++ {
++			status := "idle"
++			if (i+round)%3 == 0 {
++				status = "active"
++			}
++			snap.Set(1, fmt.Sprintf("runner-%d", i), status)
++		}
++		snap.Publish()
++	}
++	publish(0)
++
++	var stop atomic.Bool
++	var emptyScrapes atomic.Int64
++	var wg sync.WaitGroup
++	wg.Add(1)
++	go func() {
++		defer wg.Done()
++		for !stop.Load() {
++			families, err := reg.Gather()
++			if err != nil {
++				panic(err)
++			}
++			n := 0
++			for _, family := range families {
++				if strings.HasSuffix(family.GetName(), "test_status") {
++					n += len(family.GetMetric())
++				}
++			}
++			if n == 0 {
++				emptyScrapes.Add(1)
++			}
++		}
++	}()
++
++	for round := 1; round <= 2000; round++ {
++		publish(round)
++	}
++	stop.Store(true)
++	wg.Wait()
++
++	require.Zero(t, emptyScrapes.Load(), "a scrape saw the family empty")
++	require.Len(t, series(t, reg), 50)
++}

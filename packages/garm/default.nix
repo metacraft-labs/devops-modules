@@ -193,6 +193,17 @@ buildGo126Module rec {
     # before LockJob. Tests in runner/pool (testing tag), run by
     # t_garm_skip_queued_jobs_when_pools_full.
     ./patches/skip-queued-jobs-when-pools-full.patch
+    # The metric collectors cleared a gauge family with Reset() and then
+    # queried the database to fill it again, so a scrape in between got the
+    # family empty. On high-mem-server 2026-10-31 at 14:14:14Z one such scrape
+    # carried no garm_runner_status series and the fleet read as 2 runners
+    # against 42; 101 scrapes that day were empty, and every alert reading
+    # the family restarted its `for` on them. The runner, job, pool and scale
+    # set collectors now build a snapshot and publish it by setting the new
+    # series before deleting the stale ones. When a list query fails, the
+    # previous values stay. Tests in runner/metrics, run by
+    # t_garm_metrics_snapshots.
+    ./patches/publish-metric-snapshots.patch
   ];
 
   # go-sqlite3 is a cgo module; the daemon needs cgo to link SQLite.
