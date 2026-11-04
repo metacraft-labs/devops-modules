@@ -42,6 +42,16 @@ on:
         description: 'setup-dev-env flavor.'
         type: string
         default: 'nix'
+      token-owner:
+        description: >
+          Whitespace-separated GitHub owner(s) whose repositories the CI token
+          authenticates, forwarded to setup-dev-env's `token-owner`. A recorder
+          whose `.github/sibling-repos` names an `owner/name` sibling outside
+          `metacraft-labs` (for example `aiken-lang/stdlib`) lists that owner
+          here too: setup-dev-env refuses a sibling owner the token does not
+          cover, so without this input the recorder could not clone it at all.
+        type: string
+        default: 'metacraft-labs'
     secrets:
       CI_TOKEN_PROVIDER_APP_ID:
         required: true
@@ -78,6 +88,7 @@ jobs:
         with:
           env-flavor: ${{ inputs.env-flavor }}
           gh-token: ${{ steps.app-token.outputs.token }}
+          token-owner: ${{ inputs.token-owner }}
           substituters: ${{ vars.SUBSTITUTERS }}
           trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
           attic-token: ${{ secrets.ATTIC_TOKEN }}
