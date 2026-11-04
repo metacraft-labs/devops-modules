@@ -7,6 +7,31 @@
       terraformWorkflow = ../.github/workflows/reusable-terraform-ci.yml;
     in
     {
+      # nix-diff's synthetic base (inputs pinned to the PR's lock) falls back to
+      # the unmodified base when it cannot evaluate, instead of failing the job.
+      # The step's real script in real git repositories; `nix` is a justified
+      # stub (see the test's header).
+      checks.reusable-nix-diff-base-fallback =
+        pkgs.runCommand "reusable-nix-diff-base-fallback"
+          {
+            nativeBuildInputs = [
+              pkgs.bash
+              pkgs.git
+              pkgs.coreutils
+              pkgs.gnugrep
+              pkgs.jq
+              (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
+            ];
+          }
+          ''
+            export HOME="$TMPDIR"
+            cp -r ${../.github} .github
+            mkdir -p scripts/tests
+            cp ${../scripts/tests/test_reusable_nix_diff_base_fallback.py} scripts/tests/test_reusable_nix_diff_base_fallback.py
+            python3 scripts/tests/test_reusable_nix_diff_base_fallback.py
+            touch "$out"
+          '';
+
       checks.reusable-flake-checks-cancellation =
         pkgs.runCommand "reusable-flake-checks-cancellation"
           {
