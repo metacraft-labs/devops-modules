@@ -222,6 +222,18 @@
         # byte-identical domain XML) to before this option existed.
         + optionalString (p.currentMemoryMb > 0) ''
           current_memory_mb = ${toString p.currentMemoryMb}
+        ''
+        + mkGuestReproCachesKeys p;
+      # WR4: the reprobuild client trust file for Windows guests. Only emitted
+      # when set, so every provider that does not use it keeps a
+      # byte-identical config.toml (and byte-identical guest user data).
+      mkGuestReproCachesKeys =
+        p:
+        optionalString (p.guestReproCachesConfFile != null) ''
+          guest_repro_caches_conf_file = "${tomlStr "${p.guestReproCachesConfFile}"}"
+        ''
+        + optionalString (p.guestReproCachesConfPath != null) ''
+          guest_repro_caches_conf_path = "${tomlStr p.guestReproCachesConfPath}"
         '';
       mkIncusKeys =
         p:
@@ -258,7 +270,8 @@
         ''
         + optionalString (p.guestCallbackURL != null) ''
           guest_callback_url = "${p.guestCallbackURL}"
-        '';
+        ''
+        + mkGuestReproCachesKeys p;
       # RB1: the [remote] section. COMPANY-AGNOSTIC — the endpoint + target
       # backend + how to obtain the bearer token, with NO baked-in host. The
       # token itself never enters the store: `auth_token_file` points at a path
@@ -2332,6 +2345,38 @@
                 `services.garm.callbackURL`. For `aws` it is how a controller whose
                 own URL is on a private network (a VPN address) gives cloud
                 instances a reachable route to the same endpoint.
+              '';
+            };
+
+            guestReproCachesConfFile = mkOption {
+              type = types.nullOr types.path;
+              default = null;
+              example = lib.literalExpression ''pkgs.writeText "caches.conf" "..."'';
+              description = ''
+                A reprobuild client `caches.conf` (cache URL, trusted producer
+                public keys, priority). When set, the provider writes it into
+                every Windows guest it boots, at `guestReproCachesConfPath`,
+                and exports `REPRO_CACHES_CONFIG` to the runner and to every
+                job (reprobuild-pm Warm-Runners-And-Layered-CI-Images WR4).
+                It is read on each instance creation. Only `libvirt` and the
+                gosti-run Windows backends honour it; Linux and macOS guests
+                are unaffected.
+
+                Put trust and a read-only endpoint in it, nothing else: the
+                provider delivers no publisher key or certificate, and does not
+                set `REPRO_BINARY_CACHE_URL`. Null (the default) leaves the
+                rendered config and the guest user data byte-identical.
+              '';
+            };
+
+            guestReproCachesConfPath = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              example = "C:\\dev-deps\\repro\\caches.conf";
+              description = ''
+                In-guest absolute Windows path for `guestReproCachesConfFile`.
+                Null uses the provider's default,
+                `C:\dev-deps\repro\caches.conf`.
               '';
             };
 
@@ -5233,6 +5278,16 @@
             ++ lib.mapAttrsToList (n: p: {
               assertion = p.currentMemoryMb == 0 || providerIsLibvirt p;
               message = "services.garm.providers.${n}: currentMemoryMb is only honoured by the libvirt backend (this provider's backend = \"${p.backend}\"); it has no effect on incus containers or gosti-run VMs.";
+            }) cfg.providers
+            # WR4: the guest caches.conf is rendered only for the backends that
+            # boot Windows guests from a bootstrap this provider writes. Anywhere
+            # else it would look like cache trust while doing nothing, and a
+            # destination without a file is a provider config error at runtime.
+            ++ lib.mapAttrsToList (n: p: {
+              assertion =
+                (p.guestReproCachesConfFile == null && p.guestReproCachesConfPath == null)
+                || (p.guestReproCachesConfFile != null && (providerIsLibvirt p || providerIsGostiRun p));
+              message = "services.garm.providers.${n}: guestReproCachesConfPath needs guestReproCachesConfFile, and both are honoured only by the libvirt and gosti-run Windows backends (this provider's backend = \"${p.backend}\").";
             }) cfg.providers
             # RB1: a remote-target provider needs an endpoint. (The token is
             # resolved at runtime — file or env — so it cannot be asserted here.)

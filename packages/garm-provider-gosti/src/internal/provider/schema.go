@@ -163,6 +163,14 @@ const configJSONSchema = `{
 			"type": "string",
 			"description": "Optional guest-facing callback URL override used when a backend needs a different host alias than GARM's global callback_url."
 		},
+		"guest_repro_caches_conf_file": {
+			"type": "string",
+			"description": "Optional reprobuild client caches.conf on the provider host. When set, every Windows guest's bootstrap writes it to guest_repro_caches_conf_path and exports REPRO_CACHES_CONFIG to the runner and its jobs. Trust only: no publisher key or certificate is delivered."
+		},
+		"guest_repro_caches_conf_path": {
+			"type": "string",
+			"description": "In-guest absolute Windows path for guest_repro_caches_conf_file. Defaults to C:\\dev-deps\\repro\\caches.conf."
+		},
 		"libvirt_uri": {
 			"type": "string",
 			"description": "libvirt connection URI, e.g. qemu:///system."
