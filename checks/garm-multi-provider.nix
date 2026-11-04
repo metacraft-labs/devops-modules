@@ -167,6 +167,20 @@ top@{ ... }:
           guestReproCachesConfPath = "C:\\dev-deps\\repro\\caches.conf";
           images.golden.sourceImage = "/var/lib/garm/golden/windows-runner.qcow2";
         };
+        # The production shape: a central GARM's remote provider for a Windows
+        # serve target. The keys must land BEFORE the `[remote]` table, or TOML
+        # would file them under it and the provider would never see them.
+        providers.win-cache-remote = {
+          backend = "remote";
+          guestReproCachesConfFile = guestCachesConf;
+          remote = {
+            endpoint = "127.0.0.1:8873";
+            targetBackend = "libvirt";
+            guestOS = "windows";
+            authTokenFile = "/run/agenix/gosti-serve/test-token";
+          };
+          images.golden.sourceImage = "golden";
+        };
       };
     in
     {
@@ -307,6 +321,12 @@ top@{ ... }:
                 || fail "caches-conf: guest_repro_caches_conf_file not rendered as the store path"
               grep -qxF 'guest_repro_caches_conf_path = "C:\\dev-deps\\repro\\caches.conf"' "$gcfg" \
                 || fail "caches-conf: guest_repro_caches_conf_path not rendered (TOML-escaped)"
+              rcfg=$(grep -ohE '/nix/store/[a-z0-9]+-garm-provider-win_cache_remote\.toml' "$gtmpl" | head -1)
+              [ -f "$rcfg" ] || fail "caches-conf: remote provider config not found"
+              keyLine=$(grep -n '^guest_repro_caches_conf_file = ' "$rcfg" | cut -d: -f1)
+              tableLine=$(grep -n '^\[remote\]' "$rcfg" | cut -d: -f1)
+              [ -n "$keyLine" ] && [ -n "$tableLine" ] && [ "$keyLine" -lt "$tableLine" ] \
+                || fail "caches-conf: remote provider must render guest_repro_caches_conf_file before [remote] (key line '$keyLine', table line '$tableLine')"
               # ... and absent when not: shape (1)'s libvirt provider.
               mpre=$(grep '^ExecStartPre=' "$multi" | head -1 | cut -d= -f2-)
               mtmpl=$(grep -ohE '/nix/store/[a-z0-9]+-garm-config.toml.tmpl' "$mpre" | head -1)

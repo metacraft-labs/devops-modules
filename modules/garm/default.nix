@@ -493,7 +493,8 @@
         ''
         + (
           if providerIsRemote p then
-            mkRemoteKeys name p
+            # Top-level keys before the `[remote]` table opens.
+            mkGuestReproCachesKeys p + mkRemoteKeys name p
           else if providerIsAws p then
             mkAwsKeys p
           else if providerIsAgentharbor p then
@@ -2358,9 +2359,11 @@
                 every Windows guest it boots, at `guestReproCachesConfPath`,
                 and exports `REPRO_CACHES_CONFIG` to the runner and to every
                 job (reprobuild-pm Warm-Runners-And-Layered-CI-Images WR4).
-                It is read on each instance creation. Only `libvirt` and the
-                gosti-run Windows backends honour it; Linux and macOS guests
-                are unaffected.
+                It is read on each instance creation. Honoured by `libvirt`,
+                the gosti-run Windows backends, and `remote` providers with
+                `remote.guestOS = "windows"` (the bootstrap is rendered here
+                and carried to the serve daemon). Linux and macOS guests are
+                unaffected.
 
                 Put trust and a read-only endpoint in it, nothing else: the
                 provider delivers no publisher key or certificate, and does not
@@ -5286,8 +5289,13 @@
             ++ lib.mapAttrsToList (n: p: {
               assertion =
                 (p.guestReproCachesConfFile == null && p.guestReproCachesConfPath == null)
-                || (p.guestReproCachesConfFile != null && (providerIsLibvirt p || providerIsGostiRun p));
-              message = "services.garm.providers.${n}: guestReproCachesConfPath needs guestReproCachesConfFile, and both are honoured only by the libvirt and gosti-run Windows backends (this provider's backend = \"${p.backend}\").";
+                || (
+                  p.guestReproCachesConfFile != null
+                  && (
+                    providerIsLibvirt p || providerIsGostiRun p || (providerIsRemote p && p.remote.guestOS == "windows")
+                  )
+                );
+              message = "services.garm.providers.${n}: guestReproCachesConfPath needs guestReproCachesConfFile, and both are honoured only by providers that boot Windows guests from a bootstrap they render: libvirt, the gosti-run Windows backends, and remote with remote.guestOS = \"windows\" (this provider's backend = \"${p.backend}\").";
             }) cfg.providers
             # RB1: a remote-target provider needs an endpoint. (The token is
             # resolved at runtime — file or env — so it cannot be asserted here.)
