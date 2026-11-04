@@ -102,6 +102,8 @@ jobs:
           fi
           echo "::endgroup::"
 
+          echo "machines=$(jq -c . <<<"$machines")" >> "$GITHUB_OUTPUT"
+
           # Generate nix-diff-action attributes YAML
           attrs=$(echo "$machines" | jq -r \
             '.[] | "- displayName: " + . + "\n  attribute: nixosConfigurations." + . + ".config.system.build.toplevel"')
@@ -119,8 +121,10 @@ jobs:
           fi
 
       - name: Prepare synthetic base flake inputs
-        if: inputs.base-input-overrides != ''
+        if: inputs.base-input-overrides != '' && steps.discover.outputs.count != '0'
         shell: bash
+        env:
+          DIFF_MACHINES: ${{ steps.discover.outputs.machines }}
         run: |
           set -euo pipefail
 
@@ -185,6 +189,32 @@ jobs:
               git commit --no-verify -m "ci: synthesize base flake input overrides"
             fi
           )
+
+          # THE SYNTHETIC BASE MUST EVALUATE. Pinning the base's inputs to this
+          # PR's lock isolates the PR's own change -- unless the PR moves its
+          # configuration in lockstep with a changed interface of one of those
+          # inputs (a renamed module or option). Then the base's configuration
+          # cannot evaluate against the PR's input at all ("attribute ...
+          # missing"), and nix-diff fails without having diffed anything. In that
+          # case diff against the UNMODIFIED base instead: the diff then also
+          # carries the input's own changes, which is the true closure change of
+          # the merge. Said in a notice, never silently.
+          failed=()
+          for machine in $(jq -r '.[]' <<<"$DIFF_MACHINES"); do
+            if ! (cd "$base_worktree" && nix eval --raw --accept-flake-config \
+                  --option warn-dirty false \
+                  ".#nixosConfigurations.${machine}.config.system.build.toplevel.drvPath") \
+                  >/dev/null 2>"$tmp_root/eval-${machine}.err"; then
+              failed+=("$machine")
+            fi
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::notice title=nix-diff base::The base with this PR's '${override_inputs}' does not evaluate for: ${failed[*]}. This PR changes an interface those inputs provide, so it is diffed against the unmodified ${base_ref}; the diff includes the input changes."
+            echo "First error (${failed[0]}):"
+            grep -m3 'error' "$tmp_root/eval-${failed[0]}.err" || head -n 5 "$tmp_root/eval-${failed[0]}.err" || true
+            git worktree remove --force "$base_worktree"
+            exit 0
+          fi
 
           git init --bare "$synthetic_origin"
           # --no-verify, and this is the one that was actually breaking jobs.
