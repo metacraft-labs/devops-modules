@@ -65,9 +65,11 @@
 #       re-mint is the renewal path.
 #
 #   verify-leaf --cert L --root-cert C --names N1,N2 [--addresses A1,A2]
-#       Read-only: check that leaf L chains to C and that its subjectAltName is
-#       EXACTLY those names and addresses -- the check `mint` runs on every
-#       leaf it issues, for re-checking a committed leaf against its row.
+#       Read-only: check that leaf L is a TLS server leaf (CA:FALSE, serverAuth)
+#       that chains to C, and that its subjectAltName is EXACTLY the names and
+#       addresses GIVEN here -- the check `mint` runs on every leaf it issues.
+#       It does NOT check that a spec would permit those names or addresses;
+#       that is `rows_of`'s job, and only `mint`/`init-root` run it.
 #
 #   report --spec S --cert-dir CD [--fail-below DAYS]
 #       §4.1: print remaining validity for every leaf and EXIT NON-ZERO below
@@ -358,8 +360,29 @@ rows_of() {
 # Sorted under LC_ALL=C so that `comm`, which needs that exact order, agrees.
 assert_leaf_matches() {
   local leaf="$1" root="$2" label="$3" names="$4" addrs="$5"
-  openssl verify -CAfile "$root" "$leaf" >/dev/null 2>&1 ||
-    die "the leaf $label does not verify against $root"
+  # The certificate KIND first. A certificate with the right names that is a
+  # CA could sign certificates of its own, for any name; one without the
+  # serverAuth extended key usage is not a server certificate at all. Both are
+  # checked explicitly rather than left to `-purpose sslserver` alone, which
+  # does not refuse a CA:TRUE certificate presented as a leaf.
+  local bc eku
+  bc="$(openssl x509 -in "$leaf" -noout -ext basicConstraints 2>/dev/null)" ||
+    die "cannot read the leaf $label"
+  case "$bc" in
+  *CA:FALSE*) ;;
+  *) die "the leaf $label is a CA certificate (or has no basicConstraints); a leaf must be CA:FALSE" ;;
+  esac
+  eku="$(openssl x509 -in "$leaf" -noout -ext extendedKeyUsage 2>/dev/null)" ||
+    die "cannot read the leaf $label"
+  case "$eku" in
+  *"TLS Web Server Authentication"*) ;;
+  *) die "the leaf $label is not marked for TLS server authentication (extendedKeyUsage serverAuth)" ;;
+  esac
+  # Then the chain, as a TLS server certificate (-purpose sslserver), under
+  # RFC 5280's stricter checks (-x509_strict): see
+  # https://docs.openssl.org/master/man1/openssl-verification-options/
+  openssl verify -purpose sslserver -x509_strict -CAfile "$root" "$leaf" >/dev/null 2>&1 ||
+    die "the leaf $label does not verify against $root as a TLS server certificate"
 
   local -a want_nm want_ip=()
   IFS=, read -r -a want_nm <<<"$names"
@@ -392,8 +415,10 @@ assert_leaf_matches() {
 
 # verify-leaf: the same check, on a certificate already on disk. It is what
 # `mint` runs on every leaf it issues, exposed so that a committed leaf can be
-# re-checked against its row, and so the test can feed it leaves that `mint`
-# itself would never produce. Read-only; it signs and writes nothing.
+# re-checked, and so the test can feed it leaves that `mint` itself would never
+# produce. It compares the leaf with the names and addresses passed to it; it
+# does not run the spec guards, so passing it says nothing about whether a
+# spec may ask for those names. Read-only; it signs and writes nothing.
 cmd_verify_leaf() {
   local cert="" root_cert="" names="" addrs="-"
   while [ $# -gt 0 ]; do

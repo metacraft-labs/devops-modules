@@ -721,11 +721,15 @@ assert_fails "init-root refuses a spec with a bad host row" \
 #     given certificate, which is how these leaves -- signed here by hand with
 #     the wrong SAN sets, as a broken extfile would -- reach its refusals.
 # ---------------------------------------------------------------------------
-# hand_leaf <tag> <subjectAltName value>  -> $WORK/hand-<tag>.crt, signed by the minted root
+# hand_leaf <tag> <subjectAltName value> [<basicConstraints> <extendedKeyUsage>]
+#   -> $WORK/hand-<tag>.crt, signed by the minted root. By default it has the
+#   shape `mint` issues (CA:false, serverAuth), so only the SAN set differs.
 hand_leaf() {
+  local bc="${3:-critical,CA:false}" eku="${4:-serverAuth}"
   openssl req -new -newkey rsa:2048 -nodes -keyout "$WORK/hand-$1.key" \
     -subj "/CN=macbook-2012.home.arpa" -out "$WORK/hand-$1.csr" 2>/dev/null &&
-    printf 'basicConstraints=critical,CA:false\nsubjectAltName=%s\n' "$2" >"$WORK/hand-$1.ext" &&
+    printf 'basicConstraints=%s\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=%s\nsubjectAltName=%s\n' \
+      "$bc" "$eku" "$2" >"$WORK/hand-$1.ext" &&
     openssl x509 -req -in "$WORK/hand-$1.csr" \
       -CA "$WORK/certs/root-ca.crt" -CAkey "$WORK/root/ca.key" \
       -CAserial "$WORK/hand.srl" -CAcreateserial \
@@ -761,6 +765,16 @@ assert_fails "verify-leaf refuses a leaf whose address only CONTAINS the expecte
 hand_leaf missing-dns "IP:10.100.0.19,IP:100.83.29.229"
 assert_fails "verify-leaf refuses a leaf missing its DNS name" \
   "missing subjectAltName DNS:macbook-2012.home.arpa" verify_leaf missing-dns
+
+# The certificate KIND, not only its names: a CA certificate with the right
+# SANs could sign further certificates, and a clientAuth-only one is not a
+# server certificate at all. Both are signed by the right root.
+hand_leaf ca-true "DNS:macbook-2012.home.arpa,IP:10.100.0.19,IP:100.83.29.229" "critical,CA:true"
+assert_fails "verify-leaf refuses a root-signed CA:TRUE certificate with the right SANs" \
+  "is a CA certificate" verify_leaf ca-true
+hand_leaf client-only "DNS:macbook-2012.home.arpa,IP:10.100.0.19,IP:100.83.29.229" "critical,CA:false" clientAuth
+assert_fails "verify-leaf refuses a clientAuth-only certificate with the right SANs" \
+  "not marked for TLS server authentication" verify_leaf client-only
 
 # And the chain half: a leaf from a different root is refused before its SANs
 # are even looked at.
