@@ -408,22 +408,42 @@ runs:
         SETUP_NIX_ATTIC_TOKEN: ${{ inputs.attic-token }}
         SETUP_NIX_ATTIC_ENDPOINT: ${{ inputs.attic-endpoint }}
         SETUP_NIX_SUBSTITUTERS: ${{ inputs.substituters }}
+        SETUP_NIX_GITLAB_TOKEN: ${{ inputs.nix-gitlab-token }}
+        SETUP_NIX_GITLAB_DOMAIN: ${{ inputs.nix-gitlab-domain }}
       run: |
         if [[ -n "${SETUP_NIX_ATTIC_TOKEN:-}" ]]; then echo "::add-mask::$SETUP_NIX_ATTIC_TOKEN"; fi
+        if [[ -n "${SETUP_NIX_GITHUB_TOKEN:-}" ]]; then echo "::add-mask::$SETUP_NIX_GITHUB_TOKEN"; fi
+        if [[ -n "${SETUP_NIX_GITLAB_TOKEN:-}" ]]; then echo "::add-mask::$SETUP_NIX_GITLAB_TOKEN"; fi
 
+        umask 077
         mkdir -p $HOME/.config/nix
 
-        cat << EOF > "$HOME/.config/nix/nix.conf"
-          ${{
-            (inputs.nix-github-token != '' && inputs.nix-gitlab-token != '' && inputs.nix-gitlab-domain != '' &&
-              format('access-tokens = github.com={0} {1}=PAT:{2}', inputs.nix-github-token, inputs.nix-gitlab-domain, inputs.nix-gitlab-token)) ||
-            (inputs.nix-github-token != '' &&
-              format('access-tokens = github.com={0}', inputs.nix-github-token)) ||
-            (inputs.nix-gitlab-token != '' && inputs.nix-gitlab-domain != '' &&
-              format('access-tokens = {0}=PAT:{1}', inputs.nix-gitlab-domain, inputs.nix-gitlab-token)) ||
-            ''
-          }}
+        # The SECRETS do not go into $HOME, and not into this script's body
+        # either (a workflow expression is substituted into the script file the
+        # runner writes to disk). On persistent self-hosted runners $HOME
+        # outlives the job, and a token left there was inherited by later jobs
+        # that set up no credential of their own and failed with `401 Bad
+        # credentials` once it expired (codetracer-launcher job 126423778474).
+        # Tokens go into a private directory under RUNNER_TEMP, which the runner
+        # empties between jobs; nix.conf reaches it through `!include`, which
+        # Nix ignores once the file is gone. Same layout as
+        # metacraft-github-actions setup-nix (MCL_JOB_CREDENTIALS_DIR), so a
+        # job that runs both shares one directory.
+        cred_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+        if [[ -n "${MCL_JOB_CREDENTIALS_DIR:-}" && -d "$MCL_JOB_CREDENTIALS_DIR" && ! -L "$MCL_JOB_CREDENTIALS_DIR" ]]; then
+          cred_dir="$MCL_JOB_CREDENTIALS_DIR"
+        else
+          cred_dir="$(mktemp -d "${cred_root%/}/mcl-job-credentials.XXXXXXXX")"
+        fi
+        chmod 700 "$cred_dir"
+        case "$cred_dir" in
+          *[[:space:]]*)
+            echo "::error::RUNNER_TEMP '$cred_root' contains whitespace, which an nix.conf include cannot express"
+            exit 1
+            ;;
+        esac
 
+        cat << EOF > "$HOME/.config/nix/nix.conf"
           # See the 'fallback' input for the exact trade-off in both values.
           fallback = ${{ inputs.fallback == 'false' && 'false' || 'true' }}
           download-attempts = 5
@@ -465,17 +485,51 @@ runs:
           allow-import-from-derivation = true
           experimental-features = ${{ inputs.experimental-features }}
 
-          substituters = https://cache.nixos.org ${{inputs.substituters}}
-          trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= ${{inputs.trusted-public-keys}}
-          netrc-file = $HOME/.config/nix/netrc
+          # APPENDED to the host's lists, never replacing them: on a runner
+          # whose host provisions its own binary cache (mcl-attic-substituter,
+          # pull token in the host netrc) and whose CI users are trusted, a
+          # plain substituters = dropped the host's cache and jobs rebuilt
+          # what it held (nim-agents macOS job 126423740106). netrc-file is
+          # set by the include below, and only when the job's netrc is the
+          # one that must be in force.
+          extra-substituters = https://cache.nixos.org ${{inputs.substituters}}
+          extra-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= ${{inputs.trusted-public-keys}}
+          !include $cred_dir/nix-access-tokens.conf
         EOF
 
         if [[ "${{ steps.check-nix.outputs.symlinked_store }}" == "true" ]]; then
           echo "allow-symlinked-store = true" >> "$HOME/.config/nix/nix.conf"
         fi
 
-        touch "$HOME/.config/nix/netrc"
-        chmod 0600 "$HOME/.config/nix/netrc"
+        # $HOME keeps an EMPTY Nix netrc, replacing credentials earlier versions
+        # of this action left there.
+        rm -f "$HOME/.config/nix/netrc"
+        : >"$HOME/.config/nix/netrc"
+
+        # Which netrc Nix uses: the job's own when it carries the private cache
+        # credential (attic-token) or when the host configures none; otherwise
+        # the host's, because `netrc-file` is one path and pointing it at the
+        # job netrc would hide the host's cache pull token from the daemon.
+        # Read with every user-level layer masked.
+        host_netrc="$(NIX_USER_CONF_FILES=/dev/null NIX_CONFIG='' nix --extra-experimental-features nix-command config show netrc-file 2>/dev/null ||
+          NIX_USER_CONF_FILES=/dev/null NIX_CONFIG='' nix --extra-experimental-features nix-command show-config netrc-file 2>/dev/null || true)"
+        if [[ -z "${SETUP_NIX_ATTIC_TOKEN:-}" && -n "$host_netrc" && -s "$host_netrc" ]]; then
+          job_netrc="$cred_dir/probe-netrc"
+          echo "setup-nix: keeping the host's netrc-file ($host_netrc) and its binary-cache credential; no attic-token was given"
+        else
+          job_netrc="$cred_dir/netrc"
+        fi
+
+        tokens=""
+        if [[ -n "${SETUP_NIX_GITHUB_TOKEN:-}" ]]; then tokens="github.com=$SETUP_NIX_GITHUB_TOKEN"; fi
+        if [[ -n "${SETUP_NIX_GITLAB_TOKEN:-}" && -n "${SETUP_NIX_GITLAB_DOMAIN:-}" ]]; then
+          tokens="${tokens:+$tokens }$SETUP_NIX_GITLAB_DOMAIN=PAT:$SETUP_NIX_GITLAB_TOKEN"
+        fi
+        {
+          if [[ -n "$tokens" ]]; then printf 'access-tokens = %s\n' "$tokens"; fi
+          if [[ "$job_netrc" == "$cred_dir/netrc" ]]; then printf 'netrc-file = %s\n' "$job_netrc"; fi
+        } >"$cred_dir/nix-access-tokens.conf"
+        echo "MCL_JOB_CREDENTIALS_DIR=$cred_dir" >>"$GITHUB_ENV"
 
         # Two credentials, one file, neither of which `access-tokens` above can
         # carry:
@@ -493,7 +547,7 @@ runs:
         # tests/netrc-wire-test.sh (what curl actually SENDS; run by the
         # `setup-nix netrc` workflow, which does not share ci.yml's concurrency
         # group and so is not blocked behind the self-hosted pool).
-        bash "${{ github.action_path }}/write-netrc.sh"
+        SETUP_NIX_NIX_NETRC="$job_netrc" bash "${{ github.action_path }}/write-netrc.sh"
 
     # Writing nix.conf is not the same as the setting being IN EFFECT, and the
     # gap between those two is where the defect of the third-party installer
@@ -532,7 +586,25 @@ runs:
         SETUP_NIX_PROBE_SUBSTITUTERS: https://cache.nixos.org ${{ inputs.substituters }}
         SETUP_NIX_PROBE_MODE: ${{ inputs.substituter-preflight }}
       run: |
-        SETUP_NIX_PROBE_NETRC="$HOME/.config/nix/netrc" \
+        netrc="$MCL_JOB_CREDENTIALS_DIR/netrc"
+        if [ ! -e "$netrc" ]; then
+          # The host's netrc is in force and this job cannot read it, so a
+          # cache the host itself configures is not probed with the job's
+          # weaker netrc: it would answer 401 and be reported unusable while
+          # the daemon reads it fine.
+          netrc="$MCL_JOB_CREDENTIALS_DIR/probe-netrc"
+          host_subs=" $(NIX_USER_CONF_FILES=/dev/null NIX_CONFIG='' nix --extra-experimental-features nix-command config show substituters 2>/dev/null || true) "
+          kept=""
+          for sub in $SETUP_NIX_PROBE_SUBSTITUTERS; do
+            case "$host_subs" in
+            *" ${sub%/} "* | *" ${sub%/}/ "*) echo "substituter preflight: $sub is the host's own cache, read with the host's netrc; not probed" ;;
+            *) kept="$kept $sub" ;;
+            esac
+          done
+          SETUP_NIX_PROBE_SUBSTITUTERS="$kept"
+        fi
+        SETUP_NIX_PROBE_SUBSTITUTERS="$SETUP_NIX_PROBE_SUBSTITUTERS" \
+        SETUP_NIX_PROBE_NETRC="$netrc" \
         SETUP_NIX_PROBE_NIX_CONF="$HOME/.config/nix/nix.conf" \
           bash "${{ github.action_path }}/probe-substituters.sh"
 

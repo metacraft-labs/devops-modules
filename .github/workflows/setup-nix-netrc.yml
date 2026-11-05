@@ -88,3 +88,9 @@ jobs:
       - name: Run the fallback semantics test
         shell: bash
         run: bash .github/setup-nix/tests/fallback-semantics-test.sh
+
+      # The "Configure Nix" step's credentials and caches, read back from the
+      # real Nix parser: no token in HOME, host caches and netrc kept.
+      - name: Run the Configure Nix credentials contract
+        shell: bash
+        run: python3 .github/setup-nix/tests/configure-nix-credentials-test.py

@@ -265,16 +265,19 @@ if [[ "${#unusable[@]}" -gt 0 && -n "$nix_conf" ]]; then
   rewritten=""
   changed=0
   while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" =~ ^([[:space:]]*substituters[[:space:]]*=)(.*)$ ]]; then
+    # `extra-substituters` too: setup-nix APPENDS to the host's list rather
+    # than replacing it, so a runner host's own caches stay in effect.
+    if [[ "$line" =~ ^([[:space:]]*(extra-)?substituters[[:space:]]*=)(.*)$ ]]; then
       kept=""
-      for sub in ${BASH_REMATCH[2]}; do
+      prefix="${BASH_REMATCH[1]}"
+      for sub in ${BASH_REMATCH[3]}; do
         drop=0
         for bad in "${unusable[@]}"; do
           [[ "$(normalise "$sub")" == "$bad" ]] && drop=1
         done
         [[ "$drop" -eq 1 ]] || kept="$kept $sub"
       done
-      line="${BASH_REMATCH[1]}$kept"
+      line="$prefix$kept"
       changed=1
     fi
     rewritten+="$line"$'\n'

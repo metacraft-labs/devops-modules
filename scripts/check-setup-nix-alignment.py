@@ -71,7 +71,14 @@ INTENTIONAL_DIFFERENCES = {
 }
 
 # Compared after removing caller-supplied interpolations.
-BASE_COMPARED = ("substituters", "trusted-public-keys")
+BASE_COMPARED = (
+    "substituters",
+    "trusted-public-keys",
+    # Both actions APPEND to the host's lists (a replacing `substituters =`
+    # dropped a runner host's own cache), so these are the keys now written.
+    "extra-substituters",
+    "extra-trusted-public-keys",
+)
 
 HEREDOC_START = 'cat << EOF > "$HOME/.config/nix/nix.conf"'
 TERNARY = re.compile(

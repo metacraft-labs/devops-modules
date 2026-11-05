@@ -85,6 +85,8 @@
 #   SETUP_NIX_SUBSTITUTERS    optional, only to report the anonymous-read
 #                             condition in the log.
 #   SETUP_NIX_NETRC_HOME=DIR  test seam; defaults to $HOME.
+#   SETUP_NIX_NIX_NETRC=PATH  where the Nix netrc goes; defaults to
+#                             $SETUP_NIX_NETRC_HOME/.config/nix/netrc.
 #
 # Exit codes:
 #   0   written (or nothing to write)
@@ -467,7 +469,11 @@ write_netrc() {
 # has no business there. nix.conf names `$HOME/.config/nix/netrc` and that is
 # the file the 401 was coming from.
 user_netrc="$netrc_home/.netrc"
-nix_netrc="$netrc_home/.config/nix/netrc"
+# setup-nix passes a job-scoped path here (SETUP_NIX_NIX_NETRC, under
+# RUNNER_TEMP) so the Nix credential does not outlive the job in a persistent
+# $HOME; the default keeps this script's own contract for other callers.
+nix_netrc="${SETUP_NIX_NIX_NETRC:-$netrc_home/.config/nix/netrc}"
+mkdir -p "${nix_netrc%/*}"
 validate_netrc_target "$nix_netrc"
 if [[ -n "$token" ]]; then
   # `~/.netrc` exists in this script for exactly one reason — the GitHub
