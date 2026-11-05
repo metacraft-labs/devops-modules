@@ -596,7 +596,7 @@ assert_refused_mint "refuses a host row with a wildcard" \
   "takes no wildcard" wildcard \
   "{ $H, \"names\": [ \"*.macbook-2012.home.arpa\" ] }"
 assert_refused_mint "refuses a host row two labels under home.arpa" \
-  "single host label" two-labels \
+  "single lowercase host label" two-labels \
   '{ "id": "svc.macbook-2012.home.arpa", "kind": "host", "names": [ "svc.macbook-2012.home.arpa" ] }'
 assert_refused_mint "refuses a host row whose name is not under home.arpa" \
   "RFC 8375" public-name \
@@ -643,11 +643,65 @@ assert_refused_mint "refuses a home.arpa name in an explicit kind \"dev\" row" \
   "Declare it as a home-network host row" dev-kind-home-arpa \
   '{ "id": "macbook-2012.home.arpa", "kind": "dev", "names": [ "macbook-2012.home.arpa" ] }'
 assert_refused_mint "refuses an unknown kind" \
-  "unknown kind 'server'" unknown-kind \
+  'unknown kind "server"' unknown-kind \
   '{ "id": "macbook-2012.home.arpa", "kind": "server", "names": [ "macbook-2012.home.arpa" ] }'
 assert_refused_mint "refuses a kind that is not a string" \
-  "kind that is not a string" kind-number \
+  "unknown kind 1" kind-number \
   '{ "id": "x.test", "kind": 1, "names": [ "x.test" ] }'
+
+# Command substitution strips trailing newlines, so a kind or an id compared in
+# bash after `$(jq -r ...)` would accept "host\n" as "host" and "x.test\n" as
+# "x.test". Both are compared inside jq instead.
+assert_refused_mint "refuses a kind with a trailing newline (\"host\\n\")" \
+  'unknown kind "host\n"' kind-newline \
+  '{ "id": "macbook-2012.home.arpa", "kind": "host\n", "names": [ "macbook-2012.home.arpa" ] }'
+assert_refused_mint "refuses an id with a trailing newline (\"x.test\\n\")" \
+  "The id IS names[0]" id-newline \
+  '{ "id": "x.test\n", "names": [ "x.test" ] }'
+# `names` must be a list: `.[]` also iterates an object's values, and `join`
+# accepts an object, so { "a": "x.test" } would otherwise read as [ "x.test" ].
+assert_refused_mint "refuses names that is an object, not a list" \
+  "not a list" names-object \
+  '{ "id": "x.test", "names": { "a": "x.test" } }'
+assert_refused_mint "refuses names that is a string, not a list" \
+  "not a list" names-string \
+  '{ "id": "x.test", "names": "x.test" }'
+# Host labels are lowercase: on a case-insensitive filesystem (APFS default)
+# HUB.home.arpa and hub.home.arpa would be two rows writing one directory.
+assert_refused_mint "refuses an uppercase host label (HUB.home.arpa)" \
+  "lowercase" upper-label \
+  '{ "id": "HUB.home.arpa", "kind": "host", "names": [ "HUB.home.arpa" ] }'
+L63="$(printf 'a%.0s' $(seq 1 63))"
+assert_refused_mint "refuses a 64-character host label, before any earlier row's leaf is written" \
+  "at most 63" long-label \
+  "{ \"id\": \"ok.test\", \"names\": [ \"ok.test\" ] },
+   { \"id\": \"${L63}b.home.arpa\", \"kind\": \"host\", \"names\": [ \"${L63}b.home.arpa\" ] }"
+# The name is also the leaf's subject CN, which X.509 caps at 64 characters
+# (RFC 5280 ub-common-name), so the longest host name that mints is a 54-char
+# label + ".home.arpa". One more character must be refused up front, not die
+# inside openssl after earlier rows' keys were written.
+L54="$(printf 'a%.0s' $(seq 1 54))"
+jq --arg n "$L54.home.arpa" '.domains = [ { "id": $n, "kind": "host", "names": [ $n ] } ]' \
+  "$WORK/spec.json" >"$WORK/spec-label54.json"
+mint mint --spec "$WORK/spec-label54.json" \
+  --root-key "$WORK/root/ca.key" --root-cert "$WORK/certs/root-ca.crt" \
+  --key-out-dir "$WORK/k-label54" --cert-out-dir "$WORK/c-label54" >"$WORK/label54.log" 2>&1 &&
+  ok "a 64-character host name (the CN maximum) mints" ||
+  no "a 64-character host name (the CN maximum) mints" "$(cat "$WORK/label54.log")"
+assert_refused_mint "refuses a 65-character host name, before any earlier row's leaf is written" \
+  "64 characters" long-name \
+  "{ \"id\": \"ok.test\", \"names\": [ \"ok.test\" ] },
+   { \"id\": \"${L54}b.home.arpa\", \"kind\": \"host\", \"names\": [ \"${L54}b.home.arpa\" ] }"
+assert_refused_mint "refuses a 65-character Scheme A name the same way" \
+  "64 characters" long-dev-name \
+  "{ \"id\": \"ok.test\", \"names\": [ \"ok.test\" ] },
+   { \"id\": \"${L54}bbbbbb.test\", \"names\": [ \"${L54}bbbbbb.test\" ] }"
+assert_refused_mint "refuses a host row listing one address twice" \
+  "twice" dup-address \
+  "{ $H, \"names\": [ \"macbook-2012.home.arpa\" ], \"addresses\": [ \"10.100.0.19\", \"100.83.29.229\", \"10.100.0.19\" ] }"
+assert_refused_mint "refuses a host row with more than 8 addresses" \
+  "at most 8" many-addresses \
+  "{ $H, \"names\": [ \"macbook-2012.home.arpa\" ], \"addresses\": [ \"10.0.0.1\", \"10.0.0.2\", \"10.0.0.3\", \"10.0.0.4\", \"10.0.0.5\", \"10.0.0.6\", \"10.0.0.7\", \"10.0.0.8\", \"10.0.0.9\" ] }"
 
 # A bad host row is refused before init-root writes a root key, as for any row.
 jq '.domains = [ { "id": "hub.example.com", "kind": "host", "names": [ "hub.example.com" ] } ]' \
@@ -659,6 +713,63 @@ assert_fails "init-root refuses a spec with a bad host row" \
 [ ! -e "$WORK/z/ca.key" ] &&
   ok "a refused host row leaves no root key behind" ||
   no "a refused host row leaves no root key behind"
+
+# ---------------------------------------------------------------------------
+# 5c. The post-issue check: a leaf must carry EXACTLY its row's names and
+#     addresses -- all of them, and nothing else, each once. `mint` runs this
+#     check on every leaf it issues; `verify-leaf` runs the same function on a
+#     given certificate, which is how these leaves -- signed here by hand with
+#     the wrong SAN sets, as a broken extfile would -- reach its refusals.
+# ---------------------------------------------------------------------------
+# hand_leaf <tag> <subjectAltName value>  -> $WORK/hand-<tag>.crt, signed by the minted root
+hand_leaf() {
+  openssl req -new -newkey rsa:2048 -nodes -keyout "$WORK/hand-$1.key" \
+    -subj "/CN=macbook-2012.home.arpa" -out "$WORK/hand-$1.csr" 2>/dev/null &&
+    printf 'basicConstraints=critical,CA:false\nsubjectAltName=%s\n' "$2" >"$WORK/hand-$1.ext" &&
+    openssl x509 -req -in "$WORK/hand-$1.csr" \
+      -CA "$WORK/certs/root-ca.crt" -CAkey "$WORK/root/ca.key" \
+      -CAserial "$WORK/hand.srl" -CAcreateserial \
+      -days 1 -sha256 -extfile "$WORK/hand-$1.ext" -out "$WORK/hand-$1.crt" 2>/dev/null
+}
+verify_leaf() {
+  mint verify-leaf --root-cert "$WORK/certs/root-ca.crt" --cert "$WORK/hand-$1.crt" \
+    --names macbook-2012.home.arpa --addresses 10.100.0.19,100.83.29.229
+}
+
+hand_leaf exact "DNS:macbook-2012.home.arpa,IP:10.100.0.19,IP:100.83.29.229"
+out="$(verify_leaf exact 2>&1)" &&
+  ok "verify-leaf accepts a leaf carrying exactly its row's names and addresses" ||
+  no "verify-leaf accepts a leaf carrying exactly its row's names and addresses" "$out"
+
+hand_leaf extra-ip "DNS:macbook-2012.home.arpa,IP:10.100.0.19,IP:100.83.29.229,IP:8.8.8.8"
+assert_fails "verify-leaf refuses a leaf with an EXTRA IP SAN" \
+  "unexpected subjectAltName IP Address:8.8.8.8" verify_leaf extra-ip
+
+hand_leaf extra-dns "DNS:macbook-2012.home.arpa,DNS:evil.com,IP:10.100.0.19,IP:100.83.29.229"
+assert_fails "verify-leaf refuses a leaf with an EXTRA DNS SAN" \
+  "unexpected subjectAltName DNS:evil.com" verify_leaf extra-dns
+
+hand_leaf dup "DNS:macbook-2012.home.arpa,IP:10.100.0.19,IP:100.83.29.229,IP:10.100.0.19"
+assert_fails "verify-leaf refuses a leaf carrying one entry twice" \
+  "unexpected subjectAltName IP Address:10.100.0.19" verify_leaf dup
+
+# A longer address containing the expected one must not stand in for it.
+hand_leaf prefix "DNS:macbook-2012.home.arpa,IP:10.100.0.190,IP:100.83.29.229"
+assert_fails "verify-leaf refuses a leaf whose address only CONTAINS the expected one" \
+  "missing subjectAltName IP Address:10.100.0.19" verify_leaf prefix
+
+hand_leaf missing-dns "IP:10.100.0.19,IP:100.83.29.229"
+assert_fails "verify-leaf refuses a leaf missing its DNS name" \
+  "missing subjectAltName DNS:macbook-2012.home.arpa" verify_leaf missing-dns
+
+# And the chain half: a leaf from a different root is refused before its SANs
+# are even looked at.
+openssl req -x509 -new -newkey rsa:2048 -nodes -keyout "$WORK/other-root.key" \
+  -subj "/CN=Other Root" -days 1 -out "$WORK/other-root.crt" 2>/dev/null
+assert_fails "verify-leaf refuses a leaf that does not chain to the given root" \
+  "does not verify against" \
+  mint verify-leaf --root-cert "$WORK/other-root.crt" --cert "$WORK/hand-exact.crt" \
+  --names macbook-2012.home.arpa --addresses 10.100.0.19,100.83.29.229
 
 jq '.domains = []' "$WORK/spec.json" >"$WORK/spec-empty.json"
 assert_fails "refuses an empty domain set" \

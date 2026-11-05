@@ -64,6 +64,11 @@
 #       re-issues; it does not try to preserve an existing leaf, because a
 #       re-mint is the renewal path.
 #
+#   verify-leaf --cert L --root-cert C --names N1,N2 [--addresses A1,A2]
+#       Read-only: check that leaf L chains to C and that its subjectAltName is
+#       EXACTLY those names and addresses -- the check `mint` runs on every
+#       leaf it issues, for re-checking a committed leaf against its row.
+#
 #   report --spec S --cert-dir CD [--fail-below DAYS]
 #       §4.1: print remaining validity for every leaf and EXIT NON-ZERO below
 #       the threshold. Defaults to the spec's `leafExpiryFailBelowDays`.
@@ -77,6 +82,10 @@
 set -euo pipefail
 
 PROG="${0##*/}"
+
+# Most addresses one home-network host row may list (policy section 2.1: the
+# host's own inventory addresses -- today a home and an overlay address).
+MAX_HOST_ADDRESSES=8
 
 die() {
   printf '%s: %s\n' "$PROG" "$*" >&2
@@ -160,14 +169,21 @@ assert_home_host_name() {
     die "refusing host row name '$name': a home-network host row takes exactly one <host>.home.arpa name (RFC 8375). Not .local (mDNS, section 2), not a public name (those take a public certificate or none), not .localhost/.test (those are Scheme A rows) -- see environment-domains-and-dev-certificates.md section 2.1."
     ;;
   esac
-  # The label: letters, digits and interior hyphens (RFC 1123 §2.1 host-name
-  # syntax), spelled out so no locale can widen the set. A '.' here would mean
-  # more than one label, which is refused for the reason above.
+  # The label: LOWERCASE letters, digits and interior hyphens (RFC 1123 §2.1
+  # host-name syntax), spelled out so no locale can widen the set. A '.' here
+  # would mean more than one label, which is refused for the reason above.
+  # Lowercase only because DNS names are case-insensitive and the id is a
+  # directory name: on a case-insensitive filesystem (the APFS default)
+  # `HUB.home.arpa` and `hub.home.arpa` would pass the duplicate-id check as two
+  # rows and then write one directory.
   case "$label" in
-  '' | -* | *- | *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-]*)
-    die "refusing host row name '$name': the part before .home.arpa must be a single host label (letters, digits and interior '-'), e.g. macbook-2012.home.arpa."
+  '' | -* | *- | *[!abcdefghijklmnopqrstuvwxyz0123456789-]*)
+    die "refusing host row name '$name': the part before .home.arpa must be a single lowercase host label (a-z, 0-9 and interior '-'), e.g. macbook-2012.home.arpa."
     ;;
   esac
+  # RFC 1035 §2.3.4: a label is at most 63 octets (the label is ASCII by now).
+  [ "${#label}" -le 63 ] ||
+    die "refusing host row name '$name': its host label is ${#label} characters; a DNS label is at most 63 (RFC 1035 section 2.3.4)."
 }
 
 # Host-row address guard (policy §2.1 / §4). STRICT IPv4 dotted quad -- four
@@ -222,6 +238,11 @@ rows_of() {
   local -a seen=()
   for ((i = 0; i < n; i++)); do
     id="$(spec_get "$spec" ".domains[$i].id")"
+    # `names` must be a LIST. jq's `.[]` also iterates an object's values and
+    # `join` accepts an object, so { "a": "x.test" } would otherwise be read as
+    # [ "x.test" ] -- a spec this tool does not understand, read as one it does.
+    jq -e ".domains[$i].names | type == \"array\"" <"$spec" >/dev/null 2>&1 ||
+      die "spec row $i ($id) has \"names\" that is not a list of DNS names."
     # Every name must be a plain DNS name AS JQ SEES IT, checked here before it
     # is joined and split -- after that, a newline inside one name has already
     # become a line break in the stream below (see assert_reserved_tld).
@@ -233,8 +254,12 @@ rows_of() {
     [ -n "$names" ] || die "spec row $i ($id) has an empty name list"
     first="${names%%,*}"
     derived="${first#\*.}"
-    [ "$id" = "$derived" ] ||
-      die "spec row $i declares id '$id' but names[0] is '$first', which derives '$derived'. The id IS names[0] without a leading '*.' -- fix whichever is wrong."
+    # Compared INSIDE jq, not as "$id" = "$derived": the command substitution
+    # that read $id stripped its trailing newlines, so "x.test\n" would compare
+    # equal to "x.test" here and be accepted for a row it does not name.
+    jq -e ".domains[$i] | (.id | type == \"string\") and .id == (.names[0] | ltrimstr(\"*.\"))" \
+      <"$spec" >/dev/null 2>&1 && [ "$id" = "$derived" ] ||
+      die "spec row $i declares id $(jq -c ".domains[$i].id" <"$spec") but names[0] is '$first', which derives '$derived'. The id IS names[0] without a leading '*.' -- fix whichever is wrong."
     # Duplicate ids would have two rows writing one directory, last one wins.
     local s
     for s in ${seen[@]+"${seen[@]}"}; do
@@ -246,13 +271,19 @@ rows_of() {
     # before host rows existed means exactly what it meant then. Present, it
     # must be one of the two spelled-out values: an unknown kind is a spec this
     # tool does not understand, and guessing could only widen what it signs.
-    kind="$(jq -er ".domains[$i] | if has(\"kind\") then .kind else \"dev\" end | if type == \"string\" then . else error(\"kind\") end" \
-      <"$spec" 2>/dev/null)" ||
-      die "spec row $i ($id) has a kind that is not a string. Allowed kinds: \"dev\" (the default, Scheme A) and \"host\" (a home-network host, section 2.1)."
-    case "$kind" in
-    dev | host) ;;
-    *) die "spec row $i ($id) has unknown kind '$kind'. Allowed kinds: \"dev\" (the default, Scheme A) and \"host\" (a home-network host, section 2.1)." ;;
-    esac
+    #
+    # Compared INSIDE jq and decided by jq's exit status, so $kind is only ever
+    # one of two literals this script wrote. Reading the value out and
+    # comparing it in bash would let "host\n" through: the command substitution
+    # strips the trailing newline before the comparison sees it.
+    if jq -e ".domains[$i] | (has(\"kind\") | not) or .kind == \"dev\"" <"$spec" >/dev/null 2>&1; then
+      kind=dev
+    elif jq -e ".domains[$i].kind == \"host\"" <"$spec" >/dev/null 2>&1; then
+      kind=host
+    else
+      # jq -c prints the value JSON-encoded, so a newline in it shows as \n.
+      die "spec row $i ($id) has unknown kind $(jq -c ".domains[$i].kind" <"$spec"). Allowed kinds: \"dev\" (the default, Scheme A) and \"host\" (a home-network host, section 2.1)."
+    fi
 
     local nm one
     IFS=, read -r -a nm <<<"$names"
@@ -280,12 +311,119 @@ rows_of() {
         if [ -n "$addrs" ]; then
           local -a ips
           IFS=, read -r -a ips <<<"$addrs"
-          for one in "${ips[@]}"; do assert_private_ipv4 "$one"; done
+          # A host has a home address and an overlay address; a handful more
+          # (a second NIC, a migration) is plausible, a long list is a mistake.
+          [ "${#ips[@]}" -le "$MAX_HOST_ADDRESSES" ] ||
+            die "spec row $i ($id) lists ${#ips[@]} addresses; a home-network host row takes at most $MAX_HOST_ADDRESSES (its own inventory addresses, section 2.1)."
+          local j k
+          for ((j = 0; j < ${#ips[@]}; j++)); do
+            assert_private_ipv4 "${ips[$j]}"
+            # A repeated address would become a repeated SAN, which the
+            # post-issue check (exactly these entries, each once) then refuses
+            # only after keys have been written -- so refuse it here.
+            for ((k = 0; k < j; k++)); do
+              [ "${ips[$k]}" != "${ips[$j]}" ] ||
+                die "spec row $i ($id) lists address ${ips[$j]} twice."
+            done
+          done
         fi
       fi
     fi
+    # names[0] becomes the leaf's subject CN, which X.509 caps at 64 characters
+    # (RFC 5280 ub-common-name). openssl refuses a longer one only when it
+    # issues that row's leaf -- after earlier rows' keys have been written --
+    # so the whole spec is held to it here, before anything is.
+    [ "${#first}" -le 64 ] ||
+      die "spec row $i ($id): names[0] '$first' is ${#first} characters, and it becomes the certificate's Common Name, which is at most 64 characters (RFC 5280 ub-common-name)."
     printf '%s\t%s\t%s\t%s\n' "$id" "$kind" "$names" "${addrs:--}"
   done
+}
+
+# ---------------------------------------------------------------------------
+# Post-issue verification
+# ---------------------------------------------------------------------------
+
+# assert_leaf_matches <leaf> <root-cert> <label> <names-csv> <addrs-csv|->
+#
+# A leaf is accepted only if it chains to the root AND its subjectAltName is
+# EXACTLY the row's names and addresses: every one present, nothing else
+# present, nothing twice. "Every one present" alone would pass a leaf that also
+# names a host the row never asked for -- an openssl extfile mistake yields a
+# perfectly valid certificate for the wrong set of names, and for a host leaf
+# the wrong set may include a routable address.
+#
+# Both sides are compared as sorted lists of whole entries ("DNS:x",
+# "IP Address:a.b.c.d"), so "IP Address:10.0.0.1" is never satisfied by
+# "IP Address:10.0.0.12" and a duplicate entry is a difference, not a match.
+# Sorted under LC_ALL=C so that `comm`, which needs that exact order, agrees.
+assert_leaf_matches() {
+  local leaf="$1" root="$2" label="$3" names="$4" addrs="$5"
+  openssl verify -CAfile "$root" "$leaf" >/dev/null 2>&1 ||
+    die "the leaf $label does not verify against $root"
+
+  local -a want_nm want_ip=()
+  IFS=, read -r -a want_nm <<<"$names"
+  [ "$addrs" = "-" ] || [ -z "$addrs" ] || IFS=, read -r -a want_ip <<<"$addrs"
+
+  local want have one
+  want="$(
+    for one in "${want_nm[@]}"; do printf 'DNS:%s\n' "$one"; done
+    for one in ${want_ip[@]+"${want_ip[@]}"}; do printf 'IP Address:%s\n' "$one"; done
+  )"
+  want="$(LC_ALL=C sort <<<"$want")"
+  # openssl prints a header line, then the entries joined by ", ".
+  have="$(openssl x509 -in "$leaf" -noout -ext subjectAltName 2>/dev/null |
+    awk 'NR > 1 { sub(/^[ \t]+/, ""); n = split($0, e, ", "); for (k = 1; k <= n; k++) print e[k] }' |
+    LC_ALL=C sort)" ||
+    die "cannot read the subjectAltName of the leaf $label"
+  [ "$have" != "$want" ] || return 0
+
+  local missing extra msg=""
+  missing="$(LC_ALL=C comm -23 <(printf '%s\n' "$want") <(printf '%s\n' "$have") | sed '/^$/d')"
+  extra="$(LC_ALL=C comm -13 <(printf '%s\n' "$want") <(printf '%s\n' "$have") | sed '/^$/d')"
+  while IFS= read -r one; do
+    [ -z "$one" ] || msg="$msg; missing subjectAltName $one"
+  done <<<"$missing"
+  while IFS= read -r one; do
+    [ -z "$one" ] || msg="$msg; unexpected subjectAltName $one"
+  done <<<"$extra"
+  die "the leaf $label does not carry exactly its row's names and addresses${msg:-; (entries differ)}"
+}
+
+# verify-leaf: the same check, on a certificate already on disk. It is what
+# `mint` runs on every leaf it issues, exposed so that a committed leaf can be
+# re-checked against its row, and so the test can feed it leaves that `mint`
+# itself would never produce. Read-only; it signs and writes nothing.
+cmd_verify_leaf() {
+  local cert="" root_cert="" names="" addrs="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+    --cert)
+      cert="$2"
+      shift 2
+      ;;
+    --root-cert)
+      root_cert="$2"
+      shift 2
+      ;;
+    --names)
+      names="$2"
+      shift 2
+      ;;
+    --addresses)
+      addrs="$2"
+      shift 2
+      ;;
+    -h | --help) usage 0 ;;
+    *) die "verify-leaf: unknown argument '$1'" ;;
+    esac
+  done
+  [ -n "$cert" ] && [ -n "$root_cert" ] && [ -n "$names" ] ||
+    die "verify-leaf needs --cert, --root-cert and --names"
+  [ -r "$cert" ] || die "cannot read certificate $cert"
+  [ -r "$root_cert" ] || die "cannot read root cert $root_cert"
+  assert_leaf_matches "$cert" "$root_cert" "$cert" "$names" "$addrs"
+  printf 'ok %s\n' "$cert"
 }
 
 # ---------------------------------------------------------------------------
@@ -457,25 +595,9 @@ EOF
     # Verify before publishing. A leaf that does not chain to the root it was
     # just signed by is a mint that produced a file instead of a certificate,
     # and the next thing to notice would be a browser, on someone else's
-    # machine, a week later.
-    openssl verify -CAfile "$root_cert" "$tmp/leaf.crt" >/dev/null ||
-      die "the leaf just issued for $id does not verify against $root_cert"
-    # And it must actually carry every name and address the row asked for --
-    # an openssl extfile typo yields a valid certificate for the wrong set of
-    # names. Compared as WHOLE entries, one per line, not as substrings: as a
-    # substring "IP Address:10.0.0.1" is found inside "IP Address:10.0.0.12".
-    # openssl prints a header line, then the entries joined by ", ".
-    local have one2
-    have="$(openssl x509 -in "$tmp/leaf.crt" -noout -ext subjectAltName |
-      awk 'NR > 1 { sub(/^[ \t]+/, ""); n = split($0, e, ", "); for (k = 1; k <= n; k++) print e[k] }')"
-    for one2 in "${nm[@]}"; do
-      grep -Fxq -- "DNS:$one2" <<<"$have" ||
-        die "the leaf just issued for $id is missing subjectAltName DNS:$one2"
-    done
-    for one2 in ${ips[@]+"${ips[@]}"}; do
-      grep -Fxq -- "IP Address:$one2" <<<"$have" ||
-        die "the leaf just issued for $id is missing subjectAltName IP Address:$one2"
-    done
+    # machine, a week later. And it must carry exactly the names and addresses
+    # its row asked for (assert_leaf_matches says why "exactly").
+    assert_leaf_matches "$tmp/leaf.crt" "$root_cert" "just issued for $id" "$names" "$addrs"
 
     cat "$tmp/leaf.crt" "$root_cert" >"$certdir/fullchain.pem"
     (
@@ -592,6 +714,10 @@ report)
   shift
   cmd_report "$@"
   ;;
+verify-leaf)
+  shift
+  cmd_verify_leaf "$@"
+  ;;
 -h | --help | '') usage 0 ;;
-*) die "unknown subcommand '$1' (expected init-root, mint or report)" ;;
+*) die "unknown subcommand '$1' (expected init-root, mint, report or verify-leaf)" ;;
 esac
