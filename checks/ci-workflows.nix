@@ -806,5 +806,19 @@
             python3 scripts/tests/test_reusable_terraform_source_identity.py
             touch "$out"
           '';
+
+      # Every reusable Terraform job sets a provider cache under $HOME and
+      # minutes-long download retries before its first `tofu init`, and never
+      # lets the cache bypass the lock-file hashes.
+      checks.reusable-terraform-provider-cache =
+        pkgs.runCommand "reusable-terraform-provider-cache"
+          {
+            nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
+          }
+          ''
+            cd ${../.}
+            python3 scripts/tests/test_reusable_terraform_provider_cache.py
+            touch "$out"
+          '';
     };
 }

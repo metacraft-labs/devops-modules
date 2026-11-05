@@ -356,6 +356,48 @@ jobs:
           substituter-preflight: ${{ inputs.substituter_preflight }}
           fallback: ${{ inputs.nix_fallback }}
 
+      # PROVIDER DOWNLOADS: A PERSISTENT CACHE AND A RETRY BUDGET IN MINUTES.
+      # Every `tofu init` here used to download its providers from scratch, and
+      # OpenTofu's default of 2 retries with exponential backoff from 1 s gave a
+      # GitHub release-asset blip about 3 seconds before failing the job
+      # ("Failed to install provider ... giving up after 3 attempt(s)";
+      # metacraft-labs/infra runs 41996303481 and 42041846448 on 2026-11-05).
+      #   - TF_PROVIDER_DOWNLOAD_RETRY / TF_REGISTRY_DISCOVERY_RETRY=8 back off
+      #     1, 2, 4, 8, 16, 30, 30, 30 s: about two minutes. Only connection
+      #     errors and 5xx answers are retried; a 404 or a checksum mismatch
+      #     still fails at once.
+      #   - TF_PLUGIN_CACHE_DIR under $HOME persists across jobs on a persistent
+      #     runner (one job at a time per runner $HOME), and on an ephemeral one
+      #     still dedups the job's own inits. OpenTofu >= 1.10 locks the cache
+      #     for concurrent processes (opentofu#1878, #3090 in 1.10.5).
+      #   - Integrity is unchanged: with .terraform.lock.hcl present, a cache
+      #     entry is used only when it matches a lock-file hash. Nothing here
+      #     sets TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE.
+      #   - So the cache is reused only when the lock records an h1 hash for
+      #     the runner's platform (a zh: hash is of the zip and cannot match an
+      #     unpacked entry). A lock written on a Mac alone re-downloads on every
+      #     Linux job; record both with
+      #     `tofu providers lock -platform=linux_amd64 -platform=darwin_arm64`.
+      # A step and not a job-level `env:`, because OpenTofu does not expand
+      # variables in TF_PLUGIN_CACHE_DIR and a job-level `env:` cannot read
+      # $HOME or the `runner` context. The same step is in every job below;
+      # scripts/tests/test_reusable_terraform_provider_cache.py keeps them so.
+      - name: OpenTofu provider cache and download retries
+        run: |
+          set -euo pipefail
+          cache="${XDG_CACHE_HOME:-${HOME:-}/.cache}/opentofu/plugin-cache"
+          if [ -z "${HOME:-}" ] || ! mkdir -p "$cache" 2>/dev/null || [ ! -w "$cache" ]; then
+            cache="$RUNNER_TEMP/tofu-plugin-cache"
+            mkdir -p "$cache"
+            echo "::notice::\$HOME is not writable here; using a per-run provider cache"
+          fi
+          {
+            echo "TF_PLUGIN_CACHE_DIR=$cache"
+            echo "TF_PROVIDER_DOWNLOAD_RETRY=8"
+            echo "TF_REGISTRY_DISCOVERY_RETRY=8"
+          } >> "$GITHUB_ENV"
+          echo "provider cache: $cache ($(du -sh "$cache" 2>/dev/null | cut -f1) before this job)"
+
       - name: Resolve the Terraform dev shell
         # TERRAFORM_DEVSHELL_FLAKE names a flake directory in the CALLER's
         # checkout. A checkout that predates that directory (an older PR branch,
@@ -606,6 +648,23 @@ jobs:
           attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           substituter-preflight: ${{ inputs.substituter_preflight }}
           fallback: ${{ inputs.nix_fallback }}
+
+      # Provider cache and download retries: see the offline-checks job.
+      - name: OpenTofu provider cache and download retries
+        run: |
+          set -euo pipefail
+          cache="${XDG_CACHE_HOME:-${HOME:-}/.cache}/opentofu/plugin-cache"
+          if [ -z "${HOME:-}" ] || ! mkdir -p "$cache" 2>/dev/null || [ ! -w "$cache" ]; then
+            cache="$RUNNER_TEMP/tofu-plugin-cache"
+            mkdir -p "$cache"
+            echo "::notice::\$HOME is not writable here; using a per-run provider cache"
+          fi
+          {
+            echo "TF_PLUGIN_CACHE_DIR=$cache"
+            echo "TF_PROVIDER_DOWNLOAD_RETRY=8"
+            echo "TF_REGISTRY_DISCOVERY_RETRY=8"
+          } >> "$GITHUB_ENV"
+          echo "provider cache: $cache ($(du -sh "$cache" 2>/dev/null | cut -f1) before this job)"
 
       - name: Resolve the Terraform dev shell
         # TERRAFORM_DEVSHELL_FLAKE names a flake directory in the CALLER's
@@ -1248,6 +1307,23 @@ jobs:
           substituter-preflight: ${{ inputs.substituter_preflight }}
           fallback: ${{ inputs.nix_fallback }}
 
+      # Provider cache and download retries: see the offline-checks job.
+      - name: OpenTofu provider cache and download retries
+        run: |
+          set -euo pipefail
+          cache="${XDG_CACHE_HOME:-${HOME:-}/.cache}/opentofu/plugin-cache"
+          if [ -z "${HOME:-}" ] || ! mkdir -p "$cache" 2>/dev/null || [ ! -w "$cache" ]; then
+            cache="$RUNNER_TEMP/tofu-plugin-cache"
+            mkdir -p "$cache"
+            echo "::notice::\$HOME is not writable here; using a per-run provider cache"
+          fi
+          {
+            echo "TF_PLUGIN_CACHE_DIR=$cache"
+            echo "TF_PROVIDER_DOWNLOAD_RETRY=8"
+            echo "TF_REGISTRY_DISCOVERY_RETRY=8"
+          } >> "$GITHUB_ENV"
+          echo "provider cache: $cache ($(du -sh "$cache" 2>/dev/null | cut -f1) before this job)"
+
       - name: Resolve the Terraform dev shell
         # TERRAFORM_DEVSHELL_FLAKE names a flake directory in the CALLER's
         # checkout. A checkout that predates that directory (an older PR branch,
@@ -1749,6 +1825,23 @@ jobs:
           attic-token: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
           substituter-preflight: ${{ inputs.substituter_preflight }}
           fallback: ${{ inputs.nix_fallback }}
+
+      # Provider cache and download retries: see the offline-checks job.
+      - name: OpenTofu provider cache and download retries
+        run: |
+          set -euo pipefail
+          cache="${XDG_CACHE_HOME:-${HOME:-}/.cache}/opentofu/plugin-cache"
+          if [ -z "${HOME:-}" ] || ! mkdir -p "$cache" 2>/dev/null || [ ! -w "$cache" ]; then
+            cache="$RUNNER_TEMP/tofu-plugin-cache"
+            mkdir -p "$cache"
+            echo "::notice::\$HOME is not writable here; using a per-run provider cache"
+          fi
+          {
+            echo "TF_PLUGIN_CACHE_DIR=$cache"
+            echo "TF_PROVIDER_DOWNLOAD_RETRY=8"
+            echo "TF_REGISTRY_DISCOVERY_RETRY=8"
+          } >> "$GITHUB_ENV"
+          echo "provider cache: $cache ($(du -sh "$cache" 2>/dev/null | cut -f1) before this job)"
 
       - name: Resolve the Terraform dev shell
         # TERRAFORM_DEVSHELL_FLAKE names a flake directory in the CALLER's

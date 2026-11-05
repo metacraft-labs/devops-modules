@@ -148,6 +148,40 @@ top@{ ... }:
           images.linux-runner.sourceImage = "runner-linux";
         };
       };
+
+      # (6) WR4: a libvirt Windows provider handed a guest caches.conf. Shape
+      # (1)'s `windows` provider is the negative control: it sets neither
+      # option, so its config must carry neither key at all.
+      guestCachesConf = pkgs.writeText "guest-caches.conf" ''
+        [repro-cache]
+        url = "http://192.168.122.1:7881"
+        trusted-public-keys = "04aa"
+        priority = 20
+      '';
+      cachesConfUnit = mkGarmUnit {
+        enable = true;
+        providers.win-cache = {
+          backend = "libvirt";
+          poolDir = "/var/lib/garm/pool-win-cache";
+          guestReproCachesConfFile = guestCachesConf;
+          guestReproCachesConfPath = "C:\\dev-deps\\repro\\caches.conf";
+          images.golden.sourceImage = "/var/lib/garm/golden/windows-runner.qcow2";
+        };
+        # The production shape: a central GARM's remote provider for a Windows
+        # serve target. The keys must land BEFORE the `[remote]` table, or TOML
+        # would file them under it and the provider would never see them.
+        providers.win-cache-remote = {
+          backend = "remote";
+          guestReproCachesConfFile = guestCachesConf;
+          remote = {
+            endpoint = "127.0.0.1:8873";
+            targetBackend = "libvirt";
+            guestOS = "windows";
+            authTokenFile = "/run/agenix/gosti-serve/test-token";
+          };
+          images.golden.sourceImage = "golden";
+        };
+      };
     in
     {
       checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
@@ -160,6 +194,8 @@ top@{ ... }:
                 qemuWindowsArmUnit
                 offUnit
                 cappedIncusUnit
+                cachesConfUnit
+                guestCachesConf
                 ;
             }
             ''
@@ -276,7 +312,30 @@ top@{ ... }:
               ! grep -q 'incus_limits_cpu' "$icfg" \
                 || fail "incus-uncapped: incus_limits_cpu present without the option being set; the key must be inert by default"
 
-              echo "[t_garm_multi_provider][PASS] union sandbox, incus-only strict posture, qemu-windows-arm provider config, the incus CPU cap (present when set, absent when not), and provider-off M0 posture all verified"
+              # --- (6) WR4: the guest caches.conf keys, present when set -------
+              gpre=$(grep '^ExecStartPre=' "$cachesConfUnit/garm.service" | head -1 | cut -d= -f2-)
+              gtmpl=$(grep -ohE '/nix/store/[a-z0-9]+-garm-config.toml.tmpl' "$gpre" | head -1)
+              gcfg=$(grep -ohE '/nix/store/[a-z0-9]+-garm-provider-win_cache\.toml' "$gtmpl" | head -1)
+              [ -f "$gcfg" ] || fail "caches-conf: provider config not found"
+              grep -qxF "guest_repro_caches_conf_file = \"$guestCachesConf\"" "$gcfg" \
+                || fail "caches-conf: guest_repro_caches_conf_file not rendered as the store path"
+              grep -qxF 'guest_repro_caches_conf_path = "C:\\dev-deps\\repro\\caches.conf"' "$gcfg" \
+                || fail "caches-conf: guest_repro_caches_conf_path not rendered (TOML-escaped)"
+              rcfg=$(grep -ohE '/nix/store/[a-z0-9]+-garm-provider-win_cache_remote\.toml' "$gtmpl" | head -1)
+              [ -f "$rcfg" ] || fail "caches-conf: remote provider config not found"
+              keyLine=$(grep -n '^guest_repro_caches_conf_file = ' "$rcfg" | cut -d: -f1)
+              tableLine=$(grep -n '^\[remote\]' "$rcfg" | cut -d: -f1)
+              [ -n "$keyLine" ] && [ -n "$tableLine" ] && [ "$keyLine" -lt "$tableLine" ] \
+                || fail "caches-conf: remote provider must render guest_repro_caches_conf_file before [remote] (key line '$keyLine', table line '$tableLine')"
+              # ... and absent when not: shape (1)'s libvirt provider.
+              mpre=$(grep '^ExecStartPre=' "$multi" | head -1 | cut -d= -f2-)
+              mtmpl=$(grep -ohE '/nix/store/[a-z0-9]+-garm-config.toml.tmpl' "$mpre" | head -1)
+              wcfg=$(grep -ohE '/nix/store/[a-z0-9]+-garm-provider-windows\.toml' "$mtmpl" | head -1)
+              [ -f "$wcfg" ] || fail "multi: windows provider config not found"
+              ! grep -q 'guest_repro_caches_conf' "$wcfg" \
+                || fail "multi: guest_repro_caches_conf_* present without the option being set; the keys must be inert by default"
+
+              echo "[t_garm_multi_provider][PASS] union sandbox, incus-only strict posture, qemu-windows-arm provider config, the incus CPU cap and the WR4 guest caches.conf keys (each present when set, absent when not), and provider-off M0 posture all verified"
               touch $out
             '';
       };

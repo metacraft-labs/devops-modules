@@ -1124,6 +1124,16 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrapParams commonPar
 		if serr != nil {
 			return commonParams.ProviderInstance{}, fmt.Errorf("rendering runner bootstrap: %w", serr)
 		}
+		// WR4: the reprobuild client trust file, when the operator configured
+		// one (see repro_caches.go). Off by default, and then byte-identical.
+		conf, cerr := loadGuestReproCachesConf(p.cfg.GuestReproCachesConfFile)
+		if cerr != nil {
+			return commonParams.ProviderInstance{}, cerr
+		}
+		script, serr = applyGuestReproCaches(script, bootstrapParams.OSType, isGostiWindowsBackend(p.cfg.Backend), conf, p.cfg.GuestReproCachesConfPath)
+		if serr != nil {
+			return commonParams.ProviderInstance{}, fmt.Errorf("rendering runner bootstrap: %w", serr)
+		}
 		bootstrap = script
 	}
 	// NOTE: if no matching tools are supplied (eg the hermetic gate uses a

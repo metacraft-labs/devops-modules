@@ -241,6 +241,15 @@ run prune 0 SETUP_NIX_PROBE_NIX_CONF="$conf" SETUP_NIX_PROBE_NETRC="$good_netrc"
   expect_not_in prune "$base/acl" &&
   expect_in prune "  trusted-public-keys = a:1 b:2" &&
   expect_in prune "  fallback = true"
+# The same prune on the `extra-substituters` line setup-nix now writes, and
+# never on a line that merely ends in "substituters" (trusted-substituters).
+printf '%s\n' "  extra-substituters = $base/ok $base/acl/" \
+  "  trusted-substituters = $base/acl/" >"$conf"
+run prune-extra 0 SETUP_NIX_PROBE_NIX_CONF="$conf" SETUP_NIX_PROBE_NETRC="$good_netrc" \
+  SETUP_NIX_PROBE_SUBSTITUTERS="$base/ok $base/acl/" &&
+  out="$(<"$conf")" &&
+  expect_in prune-extra "  extra-substituters = $base/ok"$'\n' &&
+  expect_in prune-extra "  trusted-substituters = $base/acl/"
 write_conf
 run no-prune-in-fail 1 SETUP_NIX_PROBE_MODE=fail SETUP_NIX_PROBE_NIX_CONF="$conf" \
   SETUP_NIX_PROBE_SUBSTITUTERS="$base/ok $base/acl/" &&

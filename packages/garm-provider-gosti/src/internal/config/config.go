@@ -24,6 +24,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -425,6 +426,20 @@ type Config struct {
 	GuestMetadataURL string `toml:"guest_metadata_url"`
 	GuestCallbackURL string `toml:"guest_callback_url"`
 
+	// GuestReproCachesConfFile is a reprobuild client `caches.conf` on the
+	// provider host (infra renders it with mkCachesConf). When set, every
+	// Windows guest's bootstrap writes its bytes to GuestReproCachesConfPath
+	// and exports REPRO_CACHES_CONFIG to the runner and its jobs (reprobuild-pm
+	// Warm-Runners-And-Layered-CI-Images WR4). It is read on every
+	// CreateInstance. Empty (the default) changes nothing: the rendered
+	// bootstrap is byte-identical to one from before this key existed.
+	// Ignored for non-Windows guests. Only trust and an endpoint belong in the
+	// file: the provider delivers no publisher key or certificate.
+	GuestReproCachesConfFile string `toml:"guest_repro_caches_conf_file"`
+	// GuestReproCachesConfPath is the in-guest destination, an absolute
+	// Windows path. Defaults to C:\dev-deps\repro\caches.conf.
+	GuestReproCachesConfPath string `toml:"guest_repro_caches_conf_path"`
+
 	// ---- Remote-target mode (RB1) --------------------------------------
 	// Consulted only when Backend == "remote": the endpoint + auth material +
 	// remote backend id for the RPC client to a `gosti serve` daemon.
@@ -493,6 +508,9 @@ func (c *Config) applyDefaults() {
 	if c.StateDir == "" {
 		c.StateDir = "/var/lib/garm-provider-gosti"
 	}
+	if c.GuestReproCachesConfFile != "" && c.GuestReproCachesConfPath == "" {
+		c.GuestReproCachesConfPath = `C:\dev-deps\repro\caches.conf`
+	}
 	if c.Backend == BackendRemote && c.Remote != nil {
 		if c.Remote.TargetBackend == "" {
 			c.Remote.TargetBackend = string(BackendIncus)
@@ -505,6 +523,9 @@ func (c *Config) applyDefaults() {
 		}
 	}
 }
+
+// windowsAbsPathRe matches a drive-rooted Windows path such as C:\dir\file.
+var windowsAbsPathRe = regexp.MustCompile(`^[A-Za-z]:\\[^<>:"|?*]+$`)
 
 // Validate returns an error if the config is internally inconsistent.
 func (c *Config) Validate() error {
@@ -533,6 +554,14 @@ func (c *Config) Validate() error {
 	if c.Remote != nil && c.Remote.HasLibvirtSettings() &&
 		(c.Backend != BackendRemote || c.Remote.TargetBackend != string(BackendLibvirt)) {
 		return fmt.Errorf("remote libvirt_* settings require backend %q with remote.target_backend %q", BackendRemote, BackendLibvirt)
+	}
+	if c.GuestReproCachesConfPath != "" {
+		if c.GuestReproCachesConfFile == "" {
+			return fmt.Errorf("guest_repro_caches_conf_path is set but guest_repro_caches_conf_file is not")
+		}
+		if !windowsAbsPathRe.MatchString(c.GuestReproCachesConfPath) || strings.ContainsAny(c.GuestReproCachesConfPath, "\r\n'\"`$") {
+			return fmt.Errorf("guest_repro_caches_conf_path %q must be an absolute Windows path (for example C:\\dev-deps\\repro\\caches.conf) without quotes, '$' or line breaks", c.GuestReproCachesConfPath)
+		}
 	}
 	switch c.Backend {
 	case BackendLibvirt:
