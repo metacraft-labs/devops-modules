@@ -380,7 +380,7 @@
             assert next_job is not None, "job following merge-matrices disappeared"
             merge_job = merge_job[: next_job.start()]
 
-            checkout = "uses: actions/checkout@v6.0.2"
+            checkout = "uses: actions/checkout@"
             fallback = "name: Regenerate CI matrix shards when artifacts are unavailable"
             assert checkout in merge_job, "matrix artifact fallback requires a caller-repository checkout"
             assert fallback in merge_job, "matrix artifact fallback step disappeared"
