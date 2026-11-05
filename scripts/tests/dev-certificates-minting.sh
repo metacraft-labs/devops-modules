@@ -212,7 +212,8 @@ await_port() {
   return 1
 }
 
-# serve  -> starts a server on a free port; sets SRV_PORT and SRV_PID.
+# serve [<cert> <key>]  -> starts a server on a free port; sets SRV_PORT and
+# SRV_PID. Serves the example.localhost leaf unless told otherwise.
 #
 # Called directly, NEVER as `port="$(serve)"`: a command substitution runs it in
 # a subshell, so the `SRV_PID=$!` below would be lost with that subshell, and
@@ -221,10 +222,12 @@ await_port() {
 # under `nix shell ... | tail` the orphan held the pipeline open so the run hung.
 SRV_PORT=
 serve() {
+  local cert="${1:-$WORK/certs/example.localhost/fullchain.pem}"
+  local key="${2:-$WORK/keys/example.localhost.key.pem}"
   SRV_PORT="$(free_port)" || return 1
   openssl s_server -accept "$SRV_PORT" \
-    -cert "$WORK/certs/example.localhost/fullchain.pem" \
-    -key "$WORK/keys/example.localhost.key.pem" \
+    -cert "$cert" \
+    -key "$key" \
     -www >"$WORK/server-$SRV_PORT.log" 2>&1 &
   SRV_PID=$!
   await_port "$SRV_PORT" || return 1
@@ -245,6 +248,51 @@ handshake() {
       -verify_hostname "$2" \
       -CAfile "$WORK/certs/root-ca.crt" \
       -verify_return_error -brief 2>&1
+}
+
+# handshake_ip <port> <ip>  -> exit status of a client that verifies the server
+# as the IP address <ip>. It DIALS loopback and checks the leaf against <ip>,
+# exactly as `curl --connect-to` would: the address being verified is the one
+# the client believes it reached, which is what a client on the overlay does.
+handshake_ip() {
+  printf 'GET / HTTP/1.0\r\n\r\n' |
+    openssl s_client -connect "127.0.0.1:$1" \
+      -verify_ip "$2" \
+      -CAfile "$WORK/certs/root-ca.crt" \
+      -verify_return_error -brief 2>&1
+}
+
+# expect_verified <label> <rc> <transcript>
+expect_verified() {
+  if [ "$2" -ne 0 ]; then
+    no "$1" "exit $2: $3"
+    return
+  fi
+  # "Verification: OK" is what proves the chain was CHECKED and accepted, not
+  # that checking was skipped.
+  case "$3" in
+  *"Verification: OK"*) ok "$1" ;;
+  *) no "$1" "exit 0 but no 'Verification: OK' in the transcript: $3" ;;
+  esac
+}
+
+# expect_rejected <label> <rc> <transcript>: the handshake must fail ON A
+# VERIFICATION ERROR. A refused connection would also be non-zero and would
+# prove nothing about verification, so it is a failure of the control.
+expect_rejected() {
+  if [ "$2" -eq 0 ]; then
+    no "$1" "it was accepted -- verification is not actually on"
+    return
+  fi
+  case "$3" in
+  *"Connection refused"*)
+    no "$1" "the connection never happened, so this says nothing about verification: $3"
+    ;;
+  *"certificate verify failed"* | *"mismatch"* | *"Verify return code"*)
+    ok "$1"
+    ;;
+  *) no "$1" "exit $2 but for an unrecognised reason: $3" ;;
+  esac
 }
 
 if serve; then
@@ -326,6 +374,109 @@ if serve; then
 else
   no "TLS server came up on the minted leaf" "could not bind a port"
 fi
+
+# ---------------------------------------------------------------------------
+# 3b. Home-network HOST rows (policy section 2.1). The same root, a declared
+#     `"kind": "host"` row, one <host>.home.arpa name and the host's own
+#     private/overlay addresses as IP SANs -- proven by a real handshake to the
+#     name AND to each address, with negative controls on the same server.
+# ---------------------------------------------------------------------------
+jq '.domains = [
+      { "production": "example.com", "id": "example.localhost", "scheme": "localhost",
+        "names": [ "example.localhost", "*.example.localhost" ] },
+      { "id": "macbook-2012.home.arpa", "kind": "host",
+        "names": [ "macbook-2012.home.arpa" ],
+        "addresses": [ "10.100.0.19", "100.83.29.229" ] },
+      { "id": "nas.home.arpa", "kind": "host", "names": [ "nas.home.arpa" ] },
+      { "id": "dev.test", "kind": "dev", "names": [ "dev.test" ] }
+    ]' "$WORK/spec.json" >"$WORK/spec-host.json"
+
+if mint mint --spec "$WORK/spec-host.json" \
+  --root-key "$WORK/root/ca.key" --root-cert "$WORK/certs/root-ca.crt" \
+  --key-out-dir "$WORK/hkeys" --cert-out-dir "$WORK/hcerts" >"$WORK/mint-host.log" 2>&1; then
+  ok "mint succeeds for a spec with host rows"
+else
+  no "mint succeeds for a spec with host rows" "$(cat "$WORK/mint-host.log")"
+fi
+
+HLEAF="$WORK/hcerts/macbook-2012.home.arpa/fullchain.pem"
+HKEY="$WORK/hkeys/macbook-2012.home.arpa.key.pem"
+
+openssl verify -CAfile "$WORK/certs/root-ca.crt" <(openssl x509 -in "$HLEAF") >/dev/null 2>&1 &&
+  ok "host leaf verifies against the minted root" ||
+  no "host leaf verifies against the minted root"
+
+hkmode="$(stat -c '%a' "$HKEY" 2>/dev/null || stat -f '%Lp' "$HKEY")"
+[ "$hkmode" = "600" ] && ok "host leaf key is mode 600" || no "host leaf key is mode 600" "got $hkmode"
+
+# san_entries <cert>: one subjectAltName entry per line, so assertions compare
+# whole entries -- "IP Address:10.0.0.1" must not be satisfied by "...:10.0.0.12".
+san_entries() {
+  openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null |
+    awk 'NR > 1 { sub(/^[ \t]+/, ""); n = split($0, e, ", "); for (k = 1; k <= n; k++) print e[k] }'
+}
+hsan="$(san_entries "$HLEAF")"
+for want in "DNS:macbook-2012.home.arpa" "IP Address:10.100.0.19" "IP Address:100.83.29.229"; do
+  grep -Fxq -- "$want" <<<"$hsan" &&
+    ok "host leaf carries $want" ||
+    no "host leaf carries $want" "$hsan"
+done
+[ "$(grep -c . <<<"$hsan")" = "3" ] &&
+  ok "host leaf carries exactly its one name and two addresses" ||
+  no "host leaf carries exactly its one name and two addresses" "$hsan"
+
+# Addresses are optional on a host row; without them the leaf is DNS-only.
+nsan="$(san_entries "$WORK/hcerts/nas.home.arpa/fullchain.pem")"
+[ "$nsan" = "DNS:nas.home.arpa" ] &&
+  ok "a host row without addresses mints a DNS-only leaf" ||
+  no "a host row without addresses mints a DNS-only leaf" "$nsan"
+
+# A Scheme A row in the same spec is untouched: no IP SAN creeps onto it, and
+# an explicit `"kind": "dev"` means what an absent kind means.
+dsan="$(san_entries "$WORK/hcerts/example.localhost/fullchain.pem")"
+# (Its own name must be there too, or a missing leaf would pass vacuously.)
+if grep -Fxq "DNS:example.localhost" <<<"$dsan" && ! grep -q '^IP Address:' <<<"$dsan"; then
+  ok "a Scheme A leaf minted beside host rows carries no IP SAN"
+else
+  no "a Scheme A leaf minted beside host rows carries no IP SAN" "$dsan"
+fi
+[ "$(san_entries "$WORK/hcerts/dev.test/fullchain.pem")" = "DNS:dev.test" ] &&
+  ok "an explicit kind \"dev\" row mints as a Scheme A row" ||
+  no "an explicit kind \"dev\" row mints as a Scheme A row"
+
+if serve "$HLEAF" "$HKEY"; then
+  hport="$SRV_PORT"
+  ok "TLS server came up on the host leaf"
+
+  out="$(handshake "$hport" macbook-2012.home.arpa)"
+  expect_verified "a real client completed a VERIFIED handshake to macbook-2012.home.arpa" $? "$out"
+  out="$(handshake_ip "$hport" 10.100.0.19)"
+  expect_verified "a real client completed a VERIFIED handshake to the home address 10.100.0.19" $? "$out"
+  out="$(handshake_ip "$hport" 100.83.29.229)"
+  expect_verified "a real client completed a VERIFIED handshake to the overlay address 100.83.29.229" $? "$out"
+
+  out="$(handshake "$hport" other-host.home.arpa)"
+  expect_rejected "the client REJECTS a home.arpa name the host leaf does not carry" $? "$out"
+  out="$(handshake_ip "$hport" 10.100.0.20)"
+  expect_rejected "the client REJECTS an address the host leaf does not carry (10.100.0.20)" $? "$out"
+  # The address the client actually dialled is not on the leaf either: the
+  # IP check is against the SAN, not against where the bytes went.
+  out="$(handshake_ip "$hport" 127.0.0.1)"
+  expect_rejected "the client REJECTS the dialled loopback address, which the host leaf does not carry" $? "$out"
+
+  stop_srv
+else
+  no "TLS server came up on the host leaf" "could not bind a port"
+fi
+
+# Section 4.1 applies to host leaves unchanged; a lapse there breaks a running
+# service for every client.
+mint report --spec "$WORK/spec-host.json" --cert-dir "$WORK/hcerts" >"$WORK/report-host.log" 2>&1 &&
+  ok "report passes on fresh host leaves" ||
+  no "report passes on fresh host leaves" "$(cat "$WORK/report-host.log")"
+grep -q '^macbook-2012.home.arpa .* ok$' "$WORK/report-host.log" &&
+  ok "report lists the host leaf by its id" ||
+  no "report lists the host leaf by its id" "$(cat "$WORK/report-host.log")"
 
 # ---------------------------------------------------------------------------
 # 4. report
@@ -412,6 +563,102 @@ assert_fails "refuses two rows sharing one install directory" \
 [ ! -e "$WORK/x/ca.key" ] && [ ! -e "$WORK/y/ca.key" ] &&
   ok "a refused spec leaves no root key behind" ||
   no "a refused spec leaves no root key behind"
+
+# ---------------------------------------------------------------------------
+# 5b. Host-row refusals (policy section 2.1 / section 4). Each must exit
+#     non-zero with its own message AND leave no leaf behind: the host
+#     exception is narrow on purpose, and every way out of it is a refusal.
+# ---------------------------------------------------------------------------
+# assert_refused_mint <label> <expected substring> <tag> <jq row(s)>
+assert_refused_mint() {
+  local label="$1" want="$2" tag="$3" rows="$4"
+  jq ".domains = [ $rows ]" "$WORK/spec.json" >"$WORK/spec-$tag.json" || {
+    no "$label" "the test's own jq for this case failed"
+    return
+  }
+  assert_fails "$label" "$want" \
+    mint mint --spec "$WORK/spec-$tag.json" \
+    --root-key "$WORK/root/ca.key" --root-cert "$WORK/certs/root-ca.crt" \
+    --key-out-dir "$WORK/k-$tag" --cert-out-dir "$WORK/c-$tag"
+  if [ -n "$(ls -A "$WORK/k-$tag" "$WORK/c-$tag" 2>/dev/null)" ]; then
+    no "$label: no leaf is created" "$(ls -AR "$WORK/k-$tag" "$WORK/c-$tag" 2>&1)"
+  else
+    ok "$label: no leaf is created"
+  fi
+}
+
+H='"id": "macbook-2012.home.arpa", "kind": "host"'
+
+assert_refused_mint "refuses a host row with two names" \
+  "with 2 names" two-names \
+  "{ $H, \"names\": [ \"macbook-2012.home.arpa\", \"hub.home.arpa\" ] }"
+assert_refused_mint "refuses a host row with a wildcard" \
+  "takes no wildcard" wildcard \
+  "{ $H, \"names\": [ \"*.macbook-2012.home.arpa\" ] }"
+assert_refused_mint "refuses a host row two labels under home.arpa" \
+  "single host label" two-labels \
+  '{ "id": "svc.macbook-2012.home.arpa", "kind": "host", "names": [ "svc.macbook-2012.home.arpa" ] }'
+assert_refused_mint "refuses a host row whose name is not under home.arpa" \
+  "RFC 8375" public-name \
+  '{ "id": "hub.codetracer.com", "kind": "host", "names": [ "hub.codetracer.com" ] }'
+assert_refused_mint "refuses a host row with a .local (mDNS) name" \
+  "RFC 8375" mdns-host \
+  '{ "id": "macbook-2012.local", "kind": "host", "names": [ "macbook-2012.local" ] }'
+assert_refused_mint "refuses a host row with a public address (8.8.8.8)" \
+  "private (RFC 1918" public-ip \
+  "{ $H, \"names\": [ \"macbook-2012.home.arpa\" ], \"addresses\": [ \"10.100.0.19\", \"8.8.8.8\" ] }"
+assert_refused_mint "refuses a host row with a loopback address (127.0.0.1)" \
+  "private (RFC 1918" loopback-ip \
+  "{ $H, \"names\": [ \"macbook-2012.home.arpa\" ], \"addresses\": [ \"127.0.0.1\" ] }"
+assert_refused_mint "refuses a host row with an address just outside 100.64/10 (100.128.0.1)" \
+  "private (RFC 1918" cgnat-edge \
+  "{ $H, \"names\": [ \"macbook-2012.home.arpa\" ], \"addresses\": [ \"100.128.0.1\" ] }"
+assert_refused_mint "refuses a host row with an IPv6 address" \
+  "not a list of IPv4 dotted-quad strings" ipv6 \
+  "{ $H, \"names\": [ \"macbook-2012.home.arpa\" ], \"addresses\": [ \"fd00::1\" ] }"
+assert_refused_mint "refuses a host row with an octet over 255 (10.0.0.256)" \
+  "greater than 255" octet-256 \
+  "{ $H, \"names\": [ \"macbook-2012.home.arpa\" ], \"addresses\": [ \"10.0.0.256\" ] }"
+assert_refused_mint "refuses a host row with a leading-zero octet (010.0.0.1)" \
+  "without leading zeros" leading-zero \
+  "{ $H, \"names\": [ \"macbook-2012.home.arpa\" ], \"addresses\": [ \"010.0.0.1\" ] }"
+assert_refused_mint "refuses a host row with a three-octet address (10.0.0)" \
+  "exactly four octets" three-octets \
+  "{ $H, \"names\": [ \"macbook-2012.home.arpa\" ], \"addresses\": [ \"10.0.0\" ] }"
+# The smuggling case, as for names: a newline inside one address must not
+# split into an extra line of the row stream.
+assert_refused_mint "refuses an address carrying a newline (10.0.0.1\\nfoo)" \
+  "not a list of IPv4 dotted-quad strings" ip-newline \
+  "{ $H, \"names\": [ \"macbook-2012.home.arpa\" ], \"addresses\": [ \"10.0.0.1\\nfoo\" ] }"
+assert_refused_mint "refuses \"addresses\" that is not a list" \
+  "not a list of IPv4 dotted-quad strings" ip-scalar \
+  "{ $H, \"names\": [ \"macbook-2012.home.arpa\" ], \"addresses\": \"10.0.0.1\" }"
+assert_refused_mint "refuses \"addresses\" on a Scheme A row" \
+  'carries "addresses"' dev-addresses \
+  '{ "id": "x.test", "names": [ "x.test" ], "addresses": [ "10.0.0.1" ] }'
+assert_refused_mint "refuses a home.arpa name in a Scheme A row" \
+  "Declare it as a home-network host row" dev-home-arpa \
+  '{ "id": "macbook-2012.home.arpa", "names": [ "macbook-2012.home.arpa" ] }'
+assert_refused_mint "refuses a home.arpa name in an explicit kind \"dev\" row" \
+  "Declare it as a home-network host row" dev-kind-home-arpa \
+  '{ "id": "macbook-2012.home.arpa", "kind": "dev", "names": [ "macbook-2012.home.arpa" ] }'
+assert_refused_mint "refuses an unknown kind" \
+  "unknown kind 'server'" unknown-kind \
+  '{ "id": "macbook-2012.home.arpa", "kind": "server", "names": [ "macbook-2012.home.arpa" ] }'
+assert_refused_mint "refuses a kind that is not a string" \
+  "kind that is not a string" kind-number \
+  '{ "id": "x.test", "kind": 1, "names": [ "x.test" ] }'
+
+# A bad host row is refused before init-root writes a root key, as for any row.
+jq '.domains = [ { "id": "hub.example.com", "kind": "host", "names": [ "hub.example.com" ] } ]' \
+  "$WORK/spec.json" >"$WORK/spec-host-root.json"
+assert_fails "init-root refuses a spec with a bad host row" \
+  "RFC 8375" \
+  mint init-root --spec "$WORK/spec-host-root.json" \
+  --key-out "$WORK/z/ca.key" --cert-out "$WORK/z/root-ca.crt"
+[ ! -e "$WORK/z/ca.key" ] &&
+  ok "a refused host row leaves no root key behind" ||
+  no "a refused host row leaves no root key behind"
 
 jq '.domains = []' "$WORK/spec.json" >"$WORK/spec-empty.json"
 assert_fails "refuses an empty domain set" \
