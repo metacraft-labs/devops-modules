@@ -52,12 +52,12 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Checkout metacraft-github-actions (mainline)
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v7
         with:
           repository: metacraft-labs/metacraft-github-actions
           ref: dev
