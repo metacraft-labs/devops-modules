@@ -70,6 +70,10 @@
       ++ lib.optionals (cfg.alreadyCurrentRecoveryHook != "") [
         "--already-current-recovery-hook"
         cfg.alreadyCurrentRecoveryHook
+      ]
+      ++ lib.optionals (cfg.netrcFile != "") [
+        "--netrc-file"
+        cfg.netrcFile
       ];
 
       stableEntrypoint = "/run/current-system/sw/bin/mcl-deploy-agent";
@@ -838,6 +842,22 @@
             authenticated desired generation is already selected. It must verify that
             lifecycle state is clean or complete retained recovery without
             starting a new deployment transaction.
+          '';
+        };
+
+        netrcFile = mkOption {
+          type = types.str;
+          default = "";
+          example = "/etc/nix/netrc";
+          description = ''
+            Root-only netrc file the agent passes to its closure restore as
+            `--option netrc-file`, for the restore step only, when the file
+            exists. Needed where the Nix installation overrides the `netrc-file`
+            set in `nix.custom.conf` (Determinate Nix points it at its own
+            netrc), so the daemon never presents the substituter credentials
+            that `services/attic-substituter` renders. The token stays in the
+            root-only file; the Nix configuration is left untouched. Empty
+            passes nothing.
           '';
         };
 
