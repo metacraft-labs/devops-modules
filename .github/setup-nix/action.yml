@@ -622,6 +622,20 @@ runs:
         attic=(nix shell --accept-flake-config nixpkgs#attic-client -c attic)
         "${attic[@]}" login --set-default ci "$ATTIC_ENDPOINT" "$ATTIC_TOKEN"
 
+        # Not on macOS. attic-client's watcher is notify's kqueue backend
+        # (client/Cargo.toml: features = ["macos_kqueue"]), and kqueue holds an
+        # open descriptor for every entry of the watched directory: watching
+        # /nix/store NonRecursive opens one per store path. On m3 that was
+        # ~160k descriptors per watcher, and each one filled the kernel's whole
+        # file table (kern.maxfiles 524288), so every job on the host failed
+        # with ENFILE while it ran. Linux uses inotify, one watch for the
+        # directory. The login above stays, so a macOS job can still push what
+        # it built with `attic push "$ATTIC_CACHE" <paths>`.
+        if [ "${RUNNER_OS:-}" = macOS ]; then
+          echo "::notice::Attic watch-store is not started on macOS (kqueue holds one descriptor per /nix/store entry); push built paths with 'attic push $ATTIC_CACHE <paths>'."
+          exit 0
+        fi
+
         log="${RUNNER_TEMP:-/tmp}/attic-watch-store.log"
         nohup "${attic[@]}" watch-store \
           --jobs 1 \
