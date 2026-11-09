@@ -2,8 +2,9 @@
 """Contract tests for scripts/check-setup-nix-alignment.py.
 
 The fixture `fixtures/setup-nix-alignment/metacraft-github-actions-setup-nix-action.yml`
-is metacraft-labs/metacraft-github-actions `setup-nix/action.yml` at 063cb33,
-the commit that aligned it with this repository's `.github/setup-nix`.
+is metacraft-labs/metacraft-github-actions `setup-nix/action.yml` at a515a0a,
+refreshed after both actions moved the job credentials out of HOME and began
+appending to the host's caches (this repository's 0c51dda, its aaea729).
 
 It is compared against THIS repository's real action, so the first test also
 works as an offline drift guard from this side: change a nix.conf setting or
