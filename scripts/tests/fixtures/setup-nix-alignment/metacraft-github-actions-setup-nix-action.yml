@@ -96,6 +96,13 @@ runs:
       with:
         determinate: false
 
+    # The installer action writes `build-provenance-tags` (a Determinate Nix
+    # setting) even for upstream Nix, which then warns on stderr from every
+    # invocation. See strip-unknown-installer-settings.sh.
+    - name: Remove installer settings this Nix does not know
+      shell: bash
+      run: bash "${{ github.action_path }}/strip-unknown-installer-settings.sh"
+
     - name: Configure Nix authentication
       shell: bash
       env:
