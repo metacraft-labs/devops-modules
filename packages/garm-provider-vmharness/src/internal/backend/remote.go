@@ -97,6 +97,12 @@ type RemoteBackend struct {
 	LibvirtUEFINVRAMTemplate string
 	LibvirtCPUs              int
 	LibvirtMemoryMB          int
+	// TartCPUs / TartMemoryMB are trusted provider-admin per-job sizes for the
+	// remote Tart recipes (tart-linux-arm, tart-macos; 0 = unset). They map
+	// only to vm-harness's generic `--cpus` / `--memory-mb`, which the Tart
+	// backends apply to the per-job clone with `tart set` before it boots.
+	TartCPUs     int
+	TartMemoryMB int
 }
 
 // remoteRecipe builds the create/delete argv for a specific target backend.
@@ -145,8 +151,11 @@ var ephemeralRecipe = remoteRecipe{
 		}
 		// Only remote Incus consumes these provider-admin grants. The fixed
 		// flag order is part of the contract: the image pair first (base then
-		// source, above), then ordered profiles, nesting, nested KVM, and the
-		// pre-existing lifecycle/logging suffix.
+		// source, above), then the target's own block — for Incus ordered
+		// profiles, nesting, nested KVM and resource caps; for libvirt the
+		// firmware pair then --cpus/--memory-mb; for Tart --cpus/--memory-mb —
+		// and the pre-existing lifecycle/logging suffix last. At most one
+		// target block applies to any create.
 		//
 		// With profiles empty, capability grants off and resource limits unset,
 		// the legacy argv remains unchanged apart from the deliberate
@@ -187,6 +196,19 @@ var ephemeralRecipe = remoteRecipe{
 			}
 			if backend.LibvirtMemoryMB > 0 {
 				argv = append(argv, "--memory-mb", strconv.Itoa(backend.LibvirtMemoryMB))
+			}
+		}
+		// Remote Tart: per-job clone size. Without it every clone boots at the
+		// golden's own size (4 CPU / 4096 MiB for the cirruslabs Ubuntu base),
+		// too small for jobs that link several large binaries at once. Unset
+		// emits nothing, so a Tart provider that sets neither keeps its argv
+		// byte-identical; other targets never receive these values.
+		if backend.TargetBackend == "tart-linux-arm" || backend.TargetBackend == "tart-macos" {
+			if backend.TartCPUs > 0 {
+				argv = append(argv, "--cpus", strconv.Itoa(backend.TartCPUs))
+			}
+			if backend.TartMemoryMB > 0 {
+				argv = append(argv, "--memory-mb", strconv.Itoa(backend.TartMemoryMB))
 			}
 		}
 		argv = append(argv, "--keep", "--log-format", "json")

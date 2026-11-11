@@ -315,6 +315,13 @@
         ''
         + optionalString (p.remote.libvirtMemoryMb > 0) ''
           libvirt_memory_mb = ${toString p.remote.libvirtMemoryMb}
+        ''
+        # Remote Tart per-job clone size, likewise omitted when unset.
+        + optionalString (p.remote.tartCpus > 0) ''
+          tart_cpus = ${toString p.remote.tartCpus}
+        ''
+        + optionalString (p.remote.tartMemoryMb > 0) ''
+          tart_memory_mb = ${toString p.remote.tartMemoryMb}
         '';
       # RE3: the `garm-provider-aws` config.toml (config/config.go). It carries
       # ONLY the region, the subnet, and the credential TYPE — never a secret.
@@ -2812,6 +2819,36 @@
                       Rejected for non-libvirt targets.
                     '';
                   };
+                  tartCpus = mkOption {
+                    type = types.ints.unsigned;
+                    default = 0;
+                    example = 4;
+                    description = ''
+                      Per-job clone vCPUs for a remote Tart provider
+                      (`targetBackend` `tart-linux-arm` or `tart-macos`),
+                      emitted as `tart_cpus` and forwarded as `--cpus <n>` on
+                      the remote `vm-harness run --ephemeral`. The Tart backend
+                      applies it with `tart set --cpu` before the clone boots.
+                      0 (default) emits nothing and leaves the clone at the
+                      golden's own size. A serve daemon whose Tart backend
+                      predates this parses the flag and ignores it. Rejected for
+                      non-Tart targets.
+                    '';
+                  };
+                  tartMemoryMb = mkOption {
+                    type = types.ints.unsigned;
+                    default = 0;
+                    example = 12288;
+                    description = ''
+                      Per-job clone RAM (MiB) for a remote Tart provider,
+                      emitted as `tart_memory_mb` and forwarded as
+                      `--memory-mb <n>` (applied with `tart set --memory`).
+                      0 (default) emits nothing and leaves the clone at the
+                      golden's own size (4096 MiB for the cirruslabs Ubuntu
+                      base, too small for jobs that link several large binaries
+                      at once). Same rollout and target rules as `tartCpus`.
+                    '';
+                  };
                 };
               };
             };
@@ -5242,6 +5279,18 @@
                 )
                 || (providerIsRemote p && p.remote.targetBackend == "libvirt");
               message = "services.garm.providers.${n}.remote.libvirt* require backend = \"remote\" and remote.targetBackend = \"libvirt\"; they map only to vm-harness --uefi-loader/--uefi-nvram-template/--cpus/--memory-mb on the libvirt ephemeral path.";
+            }) cfg.providers
+            ++ lib.mapAttrsToList (n: p: {
+              assertion =
+                (p.remote.tartCpus == 0 && p.remote.tartMemoryMb == 0)
+                || (
+                  providerIsRemote p
+                  && builtins.elem p.remote.targetBackend [
+                    "tart-linux-arm"
+                    "tart-macos"
+                  ]
+                );
+              message = "services.garm.providers.${n}.remote.tartCpus/tartMemoryMb require backend = \"remote\" and remote.targetBackend = \"tart-linux-arm\" or \"tart-macos\"; they map only to vm-harness --cpus/--memory-mb on the Tart ephemeral path.";
             }) cfg.providers
             ++ lib.mapAttrsToList (n: p: {
               assertion = (p.remote.libvirtUefiLoader == null) == (p.remote.libvirtUefiNvramTemplate == null);

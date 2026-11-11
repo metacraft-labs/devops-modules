@@ -646,3 +646,61 @@ func TestRemoteNonLibvirtRecipesNeverReceiveLibvirtSettings(t *testing.T) {
 		})
 	}
 }
+
+// The remote Tart recipes: without an explicit size every per-job clone boots
+// at the golden's own (4 CPU / 4096 MiB for the cirruslabs Ubuntu base), and
+// jobs that link several large binaries at once are OOM-killed. tart_cpus /
+// tart_memory_mb reach `run --ephemeral` as --cpus / --memory-mb, after the
+// image pair and before the lifecycle suffix. Unset emits nothing.
+func TestRemoteCreateTartSize(t *testing.T) {
+	const image = "ghcr.io/cirruslabs/ubuntu:latest"
+	for _, target := range []string{"tart-linux-arm", "tart-macos"} {
+		for _, tc := range []struct {
+			name        string
+			cpus, memMB int
+			suffix      []string
+		}{
+			{name: "unset emits nothing", suffix: nil},
+			{name: "cpus only", cpus: 4, suffix: []string{"--cpus", "4"}},
+			{name: "memory only", memMB: 12288, suffix: []string{"--memory-mb", "12288"}},
+			{name: "both in fixed order", cpus: 4, memMB: 12288,
+				suffix: []string{"--cpus", "4", "--memory-mb", "12288"}},
+		} {
+			t.Run(target+"/"+tc.name, func(t *testing.T) {
+				b, fs, closeFn := newFakeBackend(t, target, 0)
+				defer closeFn()
+				b.TartCPUs = tc.cpus
+				b.TartMemoryMB = tc.memMB
+				if _, err := b.Create(context.Background(), CreateArgs{Name: "job-tart", SourceImage: image}); err != nil {
+					t.Fatalf("Create: %v", err)
+				}
+				want := []string{"run", "--ephemeral", "--backend", target, "--baseline", "job-tart",
+					"--base-image", image, "--source-image", image}
+				want = append(want, tc.suffix...)
+				want = append(want, "--keep", "--log-format", "json")
+				if !reflect.DeepEqual(fs.execArgv[0], want) {
+					t.Fatalf("create argv=%v want exact %v", fs.execArgv[0], want)
+				}
+			})
+		}
+	}
+}
+
+func TestRemoteNonTartRecipesNeverReceiveTartSize(t *testing.T) {
+	for _, target := range []string{"noop", "incus", "libvirt", "hyperv", "qemu-windows-arm"} {
+		t.Run(target, func(t *testing.T) {
+			b, fs, closeFn := newFakeBackend(t, target, 0)
+			defer closeFn()
+			b.TartCPUs = 4
+			b.TartMemoryMB = 12288
+			if _, err := b.Create(context.Background(), CreateArgs{Name: "job-other"}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			for _, a := range fs.execArgv[0] {
+				if a == "--cpus" || a == "--memory-mb" {
+					t.Fatalf("target %q received a Tart size: %v", target, fs.execArgv[0])
+				}
+			}
+		})
+	}
+}

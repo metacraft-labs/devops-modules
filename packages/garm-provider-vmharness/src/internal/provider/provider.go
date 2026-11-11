@@ -115,6 +115,8 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 			GuestOS:         "linux",
 			StateDir:        cfg.StateDir,
 			DetachBootstrap: cfg.DetachBootstrap,
+			CPUs:            cfg.VCPUs,
+			MemoryMB:        cfg.MemoryMB,
 		}
 	case config.BackendTartMacos:
 		b = &backend.VMHarnessRunBackend{
@@ -123,6 +125,8 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 			GuestOS:         "macos",
 			StateDir:        cfg.StateDir,
 			DetachBootstrap: cfg.DetachBootstrap,
+			CPUs:            cfg.VCPUs,
+			MemoryMB:        cfg.MemoryMB,
 		}
 	case config.BackendUtmWindowsArm:
 		b = &backend.VMHarnessRunBackend{
@@ -130,6 +134,8 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 			BackendID:     string(config.BackendUtmWindowsArm),
 			GuestOS:       "windows",
 			StateDir:      cfg.StateDir,
+			CPUs:          cfg.VCPUs,
+			MemoryMB:      cfg.MemoryMB,
 		}
 	case config.BackendQemuWindowsArm:
 		b = &backend.VMHarnessRunBackend{
@@ -137,6 +143,8 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 			BackendID:     string(config.BackendQemuWindowsArm),
 			GuestOS:       "windows",
 			StateDir:      cfg.StateDir,
+			CPUs:          cfg.VCPUs,
+			MemoryMB:      cfg.MemoryMB,
 		}
 	case config.BackendRemote:
 		// RB1 remote-target mode: an RPC client to a remote `vm-harness serve`
@@ -166,6 +174,8 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 			LibvirtUEFINVRAMTemplate: cfg.Remote.LibvirtUEFINVRAMTemplate,
 			LibvirtCPUs:              cfg.Remote.LibvirtCPUs,
 			LibvirtMemoryMB:          cfg.Remote.LibvirtMemoryMB,
+			TartCPUs:                 cfg.Remote.TartCPUs,
+			TartMemoryMB:             cfg.Remote.TartMemoryMB,
 		}
 	default:
 		return nil, fmt.Errorf("unsupported backend %q", cfg.Backend)

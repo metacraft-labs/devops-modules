@@ -86,6 +86,18 @@ const configJSONSchema = `{
 					"minimum": 0,
 					"default": 0,
 					"description": "Remote Incus only: per-job memory cap in MiB, forwarded as vm-harness --memory-mb and applied as limits.memory before the container starts. 0 sets no cap and preserves the existing remote create argv."
+				},
+				"tart_cpus": {
+					"type": "integer",
+					"minimum": 0,
+					"default": 0,
+					"description": "Remote Tart only (target_backend tart-linux-arm or tart-macos): per-job clone vCPUs, forwarded as vm-harness --cpus and applied with tart set before the clone boots. Ignored for other targets. 0 keeps the golden's own size and preserves the existing remote create argv."
+				},
+				"tart_memory_mb": {
+					"type": "integer",
+					"minimum": 0,
+					"default": 0,
+					"description": "Remote Tart only (target_backend tart-linux-arm or tart-macos): per-job clone memory in MiB, forwarded as vm-harness --memory-mb and applied with tart set before the clone boots. Ignored for other targets. 0 keeps the golden's own size and preserves the existing remote create argv."
 				}
 			},
 			"additionalProperties": false

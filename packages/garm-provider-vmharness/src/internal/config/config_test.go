@@ -373,3 +373,62 @@ func TestRemoteLibvirtSettings(t *testing.T) {
 		}
 	}
 }
+
+// tart_cpus / tart_memory_mb parse for the remote Tart targets, default to
+// unset, reject negatives, and are accepted (and ignored by the recipe) for
+// any other target rather than failing the whole provider config.
+func TestRemoteTartSize(t *testing.T) {
+	t.Setenv(DefaultAuthTokenEnv, "")
+	head := func(target string) string {
+		return "backend = \"remote\"\n[remote]\nendpoint = \"100.72.0.5:8873\"\ntarget_backend = \"" + target +
+			"\"\nauth_token_file = \"/run/creds/vmh\"\n"
+	}
+	size := "tart_cpus = 4\ntart_memory_mb = 12288\n"
+
+	for _, target := range []string{"tart-linux-arm", "tart-macos", "incus"} {
+		cfg, err := ParseBytes([]byte(head(target) + size))
+		if err != nil {
+			t.Fatalf("%s: tart size rejected: %v", target, err)
+		}
+		if cfg.Remote.TartCPUs != 4 || cfg.Remote.TartMemoryMB != 12288 {
+			t.Fatalf("%s: tart size not parsed: %+v", target, cfg.Remote)
+		}
+	}
+
+	plain, err := ParseBytes([]byte(head("tart-linux-arm")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.Remote.TartCPUs != 0 || plain.Remote.TartMemoryMB != 0 {
+		t.Fatalf("absent keys must leave the tart size unset: %+v", plain.Remote)
+	}
+
+	for name, body := range map[string]string{
+		"negative cpus":   head("tart-linux-arm") + "tart_cpus = -1\n",
+		"negative memory": head("tart-macos") + "tart_memory_mb = -1\n",
+	} {
+		if _, err := ParseBytes([]byte(body)); err == nil {
+			t.Errorf("%s: accepted, want rejection", name)
+		}
+	}
+}
+
+// memory_mb / vcpus are top-level keys shared by the libvirt domain and the
+// vm-harness-run (tart) guests; they parse for a tart backend and default to 0.
+func TestTopLevelGuestSizeParsesForTart(t *testing.T) {
+	head := "backend = \"tart-linux-arm\"\nvm_harness_path = \"/bin/vm-harness\"\n"
+	cfg, err := ParseBytes([]byte(head + "vcpus = 4\nmemory_mb = 12288\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.VCPUs != 4 || cfg.MemoryMB != 12288 {
+		t.Fatalf("guest size not parsed: vcpus=%d memory_mb=%d", cfg.VCPUs, cfg.MemoryMB)
+	}
+	plain, err := ParseBytes([]byte(head))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.VCPUs != 0 || plain.MemoryMB != 0 {
+		t.Fatalf("absent keys must leave the guest size unset: vcpus=%d memory_mb=%d", plain.VCPUs, plain.MemoryMB)
+	}
+}

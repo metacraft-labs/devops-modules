@@ -53,6 +53,7 @@
     ./garm-provider-remote-old-daemon.nix
     ./garm-remote-incus-capabilities.nix
     ./garm-remote-libvirt-settings.nix
+    ./garm-remote-tart-settings.nix
     ./garm-central-multi-host.nix
     ./garm-central-recovery.nix
     ./garm-provider-vmharness-protocol.nix
