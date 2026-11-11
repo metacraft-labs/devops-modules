@@ -47,6 +47,13 @@ type GostiRunBackend struct {
 	StateDir  string
 	// DetachBootstrap: see config.Config.DetachBootstrap.
 	DetachBootstrap bool
+	// CPUs / MemoryMB size each per-job guest via gosti `run --cpus` /
+	// `--memory-mb` (config.Config.VCPUs / MemoryMB). 0 (the default) emits
+	// neither flag, so the guest keeps the size gosti picks without them —
+	// for Tart, the golden image's own sizing — and the argv is byte-identical
+	// to a provider that predates these fields.
+	CPUs     int
+	MemoryMB int
 }
 
 type gostiState struct {
@@ -209,6 +216,27 @@ func (b *GostiRunBackend) toInstance(st gostiState) Instance {
 	}
 }
 
+// guestSizeArgs returns the `--cpus` / `--memory-mb` pair for the configured
+// guest size, omitting each flag whose value is unset (<= 0).
+//
+// gosti parses both flags for every backend and each backend applies them its
+// own way. The Tart backends resize the per-job clone with `tart set --cpu
+// --memory` before it boots; without the flags every clone runs at the
+// golden's size (4 CPU / 4096 MiB for the cirruslabs Ubuntu base), which is
+// too small for jobs that link several large binaries at once (`ld` killed
+// with status 137). A gosti whose Tart backend predates that support parses
+// the flags and ignores them, so setting them never breaks a create.
+func (b *GostiRunBackend) guestSizeArgs() []string {
+	var argv []string
+	if b.CPUs > 0 {
+		argv = append(argv, "--cpus", strconv.Itoa(b.CPUs))
+	}
+	if b.MemoryMB > 0 {
+		argv = append(argv, "--memory-mb", strconv.Itoa(b.MemoryMB))
+	}
+	return argv
+}
+
 func (b *GostiRunBackend) Create(ctx context.Context, args CreateArgs) (Instance, error) {
 	if args.SourceImage == "" {
 		return Instance{}, fmt.Errorf("gosti Create: SourceImage (baseline/golden) is required")
@@ -234,6 +262,7 @@ func (b *GostiRunBackend) Create(ctx context.Context, args CreateArgs) (Instance
 		"--output-dir", outDir,
 		"--timeout-sec", runnerTimeoutSec,
 	}
+	argv = append(argv, b.guestSizeArgs()...)
 	ephemeralPrefix := b.tartEphemeralPrefix(args.Name)
 	if ephemeralPrefix != "" {
 		argv = append(argv, "--ephemeral-prefix", ephemeralPrefix)
