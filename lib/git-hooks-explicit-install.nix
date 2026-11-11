@@ -4,6 +4,12 @@
   pkgs,
   preCommit,
   expectedFlakeNixHash,
+  # The matching Repro CLI (a package, or null). When given, the installer
+  # exports REPROBUILD_REPRO to it. When null, it exports the caller's
+  # REPROBUILD_REPRO, or else the `repro` found on PATH, as an absolute path.
+  # The guard refuses to run without an absolute constructor, so an empty
+  # lookup fails the installation closed.
+  repro ? null,
 }:
 let
   # Consume git-hooks.nix's declared installation stages, including its legacy
@@ -68,6 +74,17 @@ pkgs.writeShellApplication {
     preCommit.config.package
   ];
   text = ''
+    ${
+      if repro == null then
+        ''
+          REPROBUILD_REPRO="''${REPROBUILD_REPRO:-$(command -v repro || true)}"
+        ''
+      else
+        ''
+          REPROBUILD_REPRO=${pkgs.lib.escapeShellArg "${repro}/bin/repro"}
+        ''
+    }
+    export REPROBUILD_REPRO
     ${repoGuard}
     ${handoff}
     if ! _mcl_hooks_same_repo; then

@@ -189,7 +189,10 @@ app instead of copying installation or ownership logic into the consumer. Pass
 `pkgs`, the native `preCommit` configuration and the evaluated SHA256 of the
 consumer's `flake.nix`. The function derives intended Git stages from the native
 configuration and composes the same-repository guard with the native/Repro
-handoff. Importing it does not change a shell hook.
+handoff. Importing it does not change a shell hook. Pass the matching `repro`
+package as `repro` to export `REPROBUILD_REPRO` to it; without that argument the
+installer exports the caller's `REPROBUILD_REPRO`, or the `repro` on `PATH`, as
+an absolute path. An unresolved constructor refuses installation.
 
 Installation refuses unknown active hooks, unresolved legacy chains, foreign
 hook paths and unknown configuration before native installation. Existing
