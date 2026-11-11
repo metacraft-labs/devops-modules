@@ -176,6 +176,25 @@ need new arguments.
    referrers were registered; m3 runs below `min-free` and collects during
    almost every store addition, and failed with `path '...' is not valid`
    (2026-10-30). `checks.<system>.deployment-restore-gc-race` reproduces it.
+   **Requirement (operator decision, 2026-11-08): the agent passes the root
+   netrc to its own restore.** When `--netrc-file <path>` (or
+   `MCL_DEPLOY_NETRC_FILE`) names a file that exists, the restore command gains
+   `--option netrc-file <path>`, and only the restore does. On nix-darwin hosts
+   `services.mcl-deploy-agent.netrcFile` sets it; infra points it at
+   `/etc/nix/netrc`, the root-only (0600) file that
+   `services/attic-substituter` renders. There is no built-in default, so
+   NixOS hosts and m3 build the same command as before. Reason: Determinate Nix
+   ships `/etc/nix/nix.conf` with `!include nix.custom.conf` followed by its own
+   `netrc-file = /nix/var/determinate/netrc`, which overrides the
+   `netrc-file` infra writes into `nix.custom.conf`; the daemon then presents no
+   credential and every restore fails with `HTTP error 401` on the private cache
+   (m1, 2026-11-07, deployment `gh-42378786421-e714a5f-m1`). Rejected
+   alternatives: Determinate's `authentication.additionalNetrcSources`, which
+   merges the token into Determinate's world-readable (0644) netrc where
+   sandboxed CI jobs could read it, and whose daemon refuses to start while a
+   listed file is missing; and reinstalling m1 with stock Nix. A missing file
+   adds nothing to the command line, so the failure stays the substituter's own
+   401 rather than a new error class.
 4. Execute the desired generation's `activate` directly, without
    `systemd-run`.
 5. If activation fails, atomically restore the previous profile and execute

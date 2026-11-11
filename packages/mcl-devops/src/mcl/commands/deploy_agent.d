@@ -119,6 +119,12 @@ struct DeployAgentArgs
         .EnvFallback("MCL_DEPLOY_RESTORE_COMMAND"))
     string restoreCommand;
 
+    @(NamedArgument(["netrc-file"])
+        .Placeholder("PATH")
+        .Description("netrc file the closure restore passes to Nix as `--option netrc-file`, when it exists")
+        .EnvFallback("MCL_DEPLOY_NETRC_FILE"))
+    string netrcFile;
+
     @(NamedArgument(["switch-command"])
         .Placeholder("COMMAND")
         .Description("Override switch command for deterministic tests")
@@ -583,6 +589,7 @@ int deployAgentImpl(DeployAgentArgs args, DeployAgentDependencies deps)
     applyArgs.eventLog = eventLogPath;
     applyArgs.dryRun = args.dryRun;
     applyArgs.restoreCommand = args.restoreCommand;
+    applyArgs.netrcFile = args.netrcFile;
     applyArgs.switchCommand = args.switchCommand;
     applyArgs.rollbackCommand = args.rollbackCommand;
     applyArgs.generationCommand = args.generationCommand;

@@ -162,6 +162,14 @@ struct DeployApplyArgs
         .EnvFallback("MCL_DEPLOY_RESTORE_COMMAND"))
     string restoreCommand;
 
+    @(NamedArgument(["netrc-file"])
+        .Placeholder("PATH")
+        .Description("netrc file passed to the closure restore as `--option netrc-file`, when it exists. "
+            ~ "For hosts whose Nix configuration does not apply the substituter credentials to the daemon "
+            ~ "(Determinate Nix); the file stays root-only and is never read by this process.")
+        .EnvFallback("MCL_DEPLOY_NETRC_FILE"))
+    string netrcFile;
+
     @(NamedArgument(["switch-command"])
         .Placeholder("COMMAND")
         .Description("Override switch command for deterministic tests")
@@ -309,7 +317,13 @@ string restoreGcRootPath(string stateDir, string target)
 // With no substituter in the manifest the path must already be present, as
 // before: `substituters` is overridden to empty, so a missing path fails rather
 // than falling back to the host's configured caches.
-string[] restoreClosureCommand(JSONValue manifest, string desired, string gcRoot)
+//
+// `netrcFile` is the credential file the substituter needs. Determinate Nix
+// reapplies its own `netrc-file` after the include of `nix.custom.conf`, so the
+// path infra configures there never reaches the daemon; the restore passes it
+// explicitly instead. It is passed only when the file exists: a configured but
+// absent file must not change the command line of a host that never had one.
+string[] restoreClosureCommand(JSONValue manifest, string desired, string gcRoot, string netrcFile = "")
 {
     auto substituters = manifestSubstituters(manifest);
     auto command = [
@@ -325,6 +339,8 @@ string[] restoreClosureCommand(JSONValue manifest, string desired, string gcRoot
     auto keys = manifestTrustedPublicKeys(manifest);
     if (keys.length)
         command ~= ["--option", "trusted-public-keys", keys.join(" ")];
+    if (netrcFile != "" && netrcFile.exists)
+        command ~= ["--option", "netrc-file", netrcFile];
     return command;
 }
 
@@ -363,6 +379,37 @@ unittest
     ]);
     assert(restoreGcRootPath("/var/lib/mcl/deployments", "m3")
         == "/var/lib/mcl/deployments/gcroots/m3");
+}
+
+@("test_restore_closure_command_passes_netrc_only_when_present")
+unittest
+{
+    import mcl.utils.deploy_manifest : ManifestSubstituter;
+
+    auto desired = "/nix/store/22222222222222222222222222222222-darwin-system";
+    auto manifest = buildManifest(ManifestBuildRequest(
+        deploymentId: "restore-netrc",
+        target: "m1",
+        gitRevision: "0123456789abcdef0123456789abcdef01234567",
+        sequence: 1,
+        desiredSystemPath: desired,
+        substituters: [ManifestSubstituter(
+            url: "https://cache.example/deployments",
+            trustedPublicKey: "deployments.example:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        )],
+    ));
+    auto without = restoreClosureCommand(manifest, desired, "/state/gcroots/m1");
+    auto netrc = uniqueDeployStateTestPath("restore-netrc") ~ ".netrc";
+    scope(exit) if (netrc.exists) netrc.remove;
+
+    // Configured but absent: the command line is exactly what it was.
+    assert(restoreClosureCommand(manifest, desired, "/state/gcroots/m1", netrc) == without);
+    // Not configured: likewise.
+    assert(restoreClosureCommand(manifest, desired, "/state/gcroots/m1", "") == without);
+
+    netrc.write("");
+    assert(restoreClosureCommand(manifest, desired, "/state/gcroots/m1", netrc)
+        == without ~ ["--option", "netrc-file", netrc]);
 }
 
 bool automaticRollbackRequested(JSONValue manifest)
@@ -840,7 +887,7 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
 
         auto gcRoot = restoreGcRootPath(args.stateDir, args.target);
         mkdirRecurse(gcRoot.dirName);
-        restoreArgv = restoreClosureCommand(manifest, desired, gcRoot);
+        restoreArgv = restoreClosureCommand(manifest, desired, gcRoot, args.netrcFile);
         restoreMetadata["gcRoot"] = JSONValue(gcRoot);
         restore = runner(restoreArgv);
     }
@@ -1841,13 +1888,15 @@ unittest
     auto base = uniqueDeployStateTestPath("deploy-apply-darwin-success");
     auto keyPath = base ~ ".ed25519";
     auto manifestPath = base ~ ".manifest.json";
+    auto netrcPath = base ~ ".netrc";
     auto stateDir = base ~ ".state";
     scope(exit)
     {
-        foreach (path; [base, keyPath, keyPath ~ ".pub", manifestPath])
+        foreach (path; [base, keyPath, keyPath ~ ".pub", manifestPath, netrcPath])
             if (path.exists) path.remove;
         if (stateDir.exists) stateDir.rmdirRecurse;
     }
+    netrcPath.write("");
 
     auto keygen = runProcessCapture([
         "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", keyPath,
@@ -1893,6 +1942,7 @@ unittest
     args.activationMode = DeploymentActivationMode.nixDarwin;
     args.systemProfile = base ~ ".profile";
     args.generationCommand = "current-generation";
+    args.netrcFile = netrcPath;
 
     assert(deployApplyImpl(args, DeployApplyDependencies(
         runProcess: &fakeRun,
@@ -1906,6 +1956,7 @@ unittest
         "--option", "narinfo-cache-negative-ttl", "0",
         "--option", "trusted-public-keys",
         "deployments.example:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "--option", "netrc-file", netrcPath,
     ]));
     assert(commands.canFind(["nix-env", "--profile", args.systemProfile, "--set", desired]));
     assert(commands.canFind([desired ~ "/activate"]));

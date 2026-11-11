@@ -275,6 +275,8 @@ func TestConfigSchemaPinsRemoteIncusCapabilityBoundary(t *testing.T) {
 		"incus_security_nesting",
 		"request_timeout_sec",
 		"target_backend",
+		"tart_cpus",
+		"tart_memory_mb",
 	}
 	gotKeys := make([]string, 0, len(remote.Properties))
 	for key := range remote.Properties {
@@ -297,9 +299,9 @@ func TestConfigSchemaPinsRemoteIncusCapabilityBoundary(t *testing.T) {
 			t.Fatalf("remote schema %q=%+v want boolean default false", key, prop)
 		}
 	}
-	// The resource caps are integers that default to 0 (= no cap), so an
-	// operator who sets nothing keeps the pre-limits create argv.
-	for _, key := range []string{"incus_limits_cpu", "incus_limits_memory_mb"} {
+	// The resource caps and Tart sizes are integers that default to 0 (= unset),
+	// so an operator who sets nothing keeps the pre-limits create argv.
+	for _, key := range []string{"incus_limits_cpu", "incus_limits_memory_mb", "tart_cpus", "tart_memory_mb"} {
 		prop, ok := remote.Properties[key]
 		if !ok {
 			t.Fatalf("remote schema missing %q", key)
@@ -307,5 +309,56 @@ func TestConfigSchemaPinsRemoteIncusCapabilityBoundary(t *testing.T) {
 		if prop.Type != "integer" || string(prop.Default) != "0" {
 			t.Fatalf("remote schema %q=%+v want integer default 0", key, prop)
 		}
+	}
+}
+
+// The provider-config guest size reaches every backend that sizes a guest
+// through gosti: the top-level vcpus / memory_mb for the local
+// gosti-run backends, and remote tart_cpus / tart_memory_mb for a remote
+// Tart target.
+func TestGuestSizeReachesGostiBackends(t *testing.T) {
+	for _, kind := range []config.BackendKind{
+		config.BackendTartLinuxArm, config.BackendTartMacos,
+		config.BackendUtmWindowsArm, config.BackendQemuWindowsArm,
+	} {
+		p, err := NewWithConfig(&config.Config{
+			Backend:   kind,
+			GostiPath: "/nix/store/test/bin/gosti",
+			StateDir:  t.TempDir(),
+			VCPUs:     4,
+			MemoryMB:  12288,
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+		b, ok := p.backend.(*backend.GostiRunBackend)
+		if !ok {
+			t.Fatalf("%s: backend type=%T want *backend.GostiRunBackend", kind, p.backend)
+		}
+		if b.CPUs != 4 || b.MemoryMB != 12288 {
+			t.Fatalf("%s: guest size was not propagated: cpus=%d memory_mb=%d", kind, b.CPUs, b.MemoryMB)
+		}
+	}
+
+	p, err := NewWithConfig(&config.Config{
+		Backend: config.BackendRemote,
+		Remote: &config.RemoteConfig{
+			Endpoint:      "runner.example.test:8873",
+			TargetBackend: "tart-linux-arm",
+			AuthToken:     "test-token",
+			GuestOS:       "linux",
+			TartCPUs:      4,
+			TartMemoryMB:  12288,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, ok := p.backend.(*backend.RemoteBackend)
+	if !ok {
+		t.Fatalf("backend type=%T want *backend.RemoteBackend", p.backend)
+	}
+	if b.TartCPUs != 4 || b.TartMemoryMB != 12288 {
+		t.Fatalf("remote Tart size was not propagated: %+v", b)
 	}
 }

@@ -731,3 +731,82 @@ func TestGostiRunBackendDetachBootstrap(t *testing.T) {
 		})
 	}
 }
+
+// TestGostiRunBackendGuestSize pins the per-job guest size on the local
+// exec path. With CPUs / MemoryMB set, `--cpus` / `--memory-mb` follow
+// `--timeout-sec` (before the ephemeral prefix and the bootstrap tail, which
+// ends in `--`); the Tart backends apply them to the per-job clone, which
+// otherwise boots at the golden's 4 CPU / 4096 MiB and OOM-kills large links.
+// Unset, the argv is exactly the one a provider without these fields built.
+func TestGostiRunBackendGuestSize(t *testing.T) {
+	const image = "ghcr.io/cirruslabs/ubuntu:latest"
+	const name = "garm-size-test"
+	for _, tc := range []struct {
+		name        string
+		cpus, memMB int
+		size        []string
+	}{
+		{name: "unset", size: nil},
+		{name: "cpus only", cpus: 4, size: []string{"--cpus", "4"}},
+		{name: "memory only", memMB: 12288, size: []string{"--memory-mb", "12288"}},
+		{name: "both", cpus: 4, memMB: 12288, size: []string{"--cpus", "4", "--memory-mb", "12288"}},
+		{name: "negative is unset", cpus: -1, memMB: -1, size: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GOSTI_DARWIN_ASUSER_UID", "")
+			tmp := t.TempDir()
+			logPath := filepath.Join(tmp, "argv.log")
+			mock := filepath.Join(tmp, "gosti")
+			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellSingleQuote(logPath) + "\nsleep 30\n"
+			if err := os.WriteFile(mock, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			stateDir := filepath.Join(tmp, "state")
+			b := &GostiRunBackend{
+				GostiPath: mock,
+				BackendID: "tart-linux-arm",
+				GuestOS:   "linux",
+				StateDir:  stateDir,
+				CPUs:      tc.cpus,
+				MemoryMB:  tc.memMB,
+			}
+			inst, err := b.Create(context.Background(), CreateArgs{
+				Name:        name,
+				SourceImage: image,
+				OSName:      "linux",
+				Bootstrap:   []byte("#!/bin/sh\necho hi\n"),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = b.Delete(context.Background(), inst.Name) }()
+			var argv string
+			for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
+				if data, err := os.ReadFile(logPath); err == nil && len(data) > 0 {
+					argv = string(data)
+					break
+				}
+			}
+			if argv == "" {
+				t.Fatal("mock gosti did not record argv")
+			}
+
+			instDir := filepath.Join(stateDir, "instances", name)
+			want := []string{
+				"run", "--backend", "tart-linux-arm", "--guest", "linux",
+				"--baseline", image, "--source-image", image,
+				"--output-dir", filepath.Join(instDir, "run"),
+				"--timeout-sec", runnerTimeoutSec,
+			}
+			want = append(want, tc.size...)
+			want = append(want,
+				"--ephemeral-prefix", "repro-vm-tart-linux-"+name,
+				"--copy-to", filepath.Join(instDir, "garm-bootstrap.sh")+":/tmp/garm-bootstrap.sh",
+				"--", "/bin/sh", "-c", "chmod +x /tmp/garm-bootstrap.sh && exec /tmp/garm-bootstrap.sh",
+			)
+			if wantText := strings.Join(want, "\n") + "\n"; argv != wantText {
+				t.Fatalf("argv:\n%s\nwant exactly:\n%s", argv, wantText)
+			}
+		})
+	}
+}

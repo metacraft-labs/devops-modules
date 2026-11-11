@@ -166,6 +166,15 @@ type RemoteConfig struct {
 	// gosti's ephemeral defaults (2 vCPU / 1024 MiB, too small for Windows).
 	LibvirtCPUs     int `toml:"libvirt_cpus"`
 	LibvirtMemoryMB int `toml:"libvirt_memory_mb"`
+
+	// TartCPUs / TartMemoryMB size each remote Tart per-job clone via gosti
+	// `--cpus` / `--memory-mb`, which the Tart backends apply with `tart set`
+	// before the clone boots. They are emitted only when target_backend is
+	// tart-linux-arm or tart-macos and are ignored for every other target.
+	// 0 (default) emits nothing, leaving the clone at the golden's own size
+	// and the create argv byte-identical.
+	TartCPUs     int `toml:"tart_cpus"`
+	TartMemoryMB int `toml:"tart_memory_mb"`
 }
 
 // HasLibvirtSettings reports whether any remote-libvirt per-job setting is set.
@@ -251,8 +260,13 @@ type Config struct {
 	UEFILoader        string `toml:"uefi_loader"`
 	UEFINVRAMTemplate string `toml:"uefi_nvram_template"`
 
-	// MemoryMB / VCPUs size the per-job domain. Zero => conservative defaults
-	// (4096 MiB / 2 vCPU) applied in the domain-XML builder.
+	// MemoryMB / VCPUs size the per-job guest. For the libvirt backend they
+	// size the domain, and zero => conservative defaults (4096 MiB / 2 vCPU)
+	// applied in the domain-XML builder. For the gosti-run backends (tart-*,
+	// utm-windows-arm, qemu-windows-arm) a value > 0 is passed to `gosti run`
+	// as `--cpus` / `--memory-mb`, which the Tart backends apply to each
+	// per-job clone; zero passes nothing and leaves the guest at the size
+	// gosti picks without them (for Tart, the golden's own).
 	MemoryMB int `toml:"memory_mb"`
 	VCPUs    int `toml:"vcpus"`
 
@@ -547,6 +561,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Remote != nil && (c.Remote.LibvirtCPUs < 0 || c.Remote.LibvirtMemoryMB < 0) {
 		return fmt.Errorf("remote libvirt_cpus/libvirt_memory_mb must be >= 0")
+	}
+	if c.Remote != nil && (c.Remote.TartCPUs < 0 || c.Remote.TartMemoryMB < 0) {
+		return fmt.Errorf("remote tart_cpus/tart_memory_mb must be >= 0")
 	}
 	if c.Remote != nil && (c.Remote.LibvirtUEFILoader == "") != (c.Remote.LibvirtUEFINVRAMTemplate == "") {
 		return fmt.Errorf("remote libvirt_uefi_loader and libvirt_uefi_nvram_template must be set together")
