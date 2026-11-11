@@ -94,3 +94,21 @@ jobs:
       - name: Run the Configure Nix credentials contract
         shell: bash
         run: python3 .github/setup-nix/tests/configure-nix-credentials-test.py
+
+      # The installer action writes a Determinate-only setting that upstream
+      # Nix warns about on every invocation; the action strips it. Real nix,
+      # no mocks: the suite first proves its fixture reproduces the warning.
+      - name: Run the installer-setting strip contract suite
+        shell: bash
+        run: bash .github/setup-nix/tests/strip-unknown-installer-settings-test.sh
+
+      # End to end: after the action ran, a plain nix call must print nothing.
+      - name: Installed Nix is silent on stderr
+        shell: bash
+        run: |
+          rc=0
+          err="$(nix --extra-experimental-features nix-command eval --expr 1 2>&1 >/dev/null)" || rc=$?
+          if [ "$rc" -ne 0 ] || [ -n "$err" ]; then
+            echo "nix eval exited $rc; stderr: $err" >&2
+            exit 1
+          fi
