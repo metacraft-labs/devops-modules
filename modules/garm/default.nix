@@ -235,6 +235,20 @@
         + optionalString (p.guestReproCachesConfPath != null) ''
           guest_repro_caches_conf_path = "${tomlStr p.guestReproCachesConfPath}"
         '';
+      # The guest-facing GARM metadata/callback URL overrides, read by the
+      # gosti provider (config.Config GuestMetadataURL/GuestCallbackURL, applied
+      # in CreateInstance for every backend, `remote` included) and by
+      # garm-provider-aws. Only emitted when set, so a provider without an
+      # override keeps a byte-identical config.toml. Top-level keys: callers
+      # must place them before any table (`[remote]`, `[credentials]`) opens.
+      mkGuestURLKeys =
+        p:
+        optionalString (p.guestMetadataURL != null) ''
+          guest_metadata_url = "${p.guestMetadataURL}"
+        ''
+        + optionalString (p.guestCallbackURL != null) ''
+          guest_callback_url = "${p.guestCallbackURL}"
+        '';
       mkIncusKeys =
         p:
         ''
@@ -265,12 +279,7 @@
           gosti_path = "${p.gostiPath}"
           state_dir = "${p.stateDir}"
         ''
-        + optionalString (p.guestMetadataURL != null) ''
-          guest_metadata_url = "${p.guestMetadataURL}"
-        ''
-        + optionalString (p.guestCallbackURL != null) ''
-          guest_callback_url = "${p.guestCallbackURL}"
-        ''
+        + mkGuestURLKeys p
         + mkGuestReproCachesKeys p;
       # RB1: the [remote] section. COMPANY-AGNOSTIC — the endpoint + target
       # backend + how to obtain the bearer token, with NO baked-in host. The
@@ -366,12 +375,7 @@
         ''
         # The guest URL overrides (garm-provider-aws downstream patch): a cloud
         # instance cannot reach a controller URL that lives on a private network.
-        + optionalString (p.guestMetadataURL != null) ''
-          guest_metadata_url = "${p.guestMetadataURL}"
-        ''
-        + optionalString (p.guestCallbackURL != null) ''
-          guest_callback_url = "${p.guestCallbackURL}"
-        ''
+        + mkGuestURLKeys p
         + ''
 
           [credentials]
@@ -512,7 +516,7 @@
         + (
           if providerIsRemote p then
             # Top-level keys before the `[remote]` table opens.
-            mkGuestReproCachesKeys p + mkRemoteKeys name p
+            mkGuestURLKeys p + mkGuestReproCachesKeys p + mkRemoteKeys name p
           else if providerIsAws p then
             mkAwsKeys p
           else if providerIsAgentharbor p then
@@ -2346,10 +2350,13 @@
               description = ''
                 Optional provider-local override for the GARM metadata URL
                 rendered into guest bootstrap scripts for gosti-run,
-                `agentharbor` and `aws` backends. Leave null to use
+                `remote`, `agentharbor` and `aws` backends. Leave null to use
                 `services.garm.metadataURL`. For `aws` it is how a controller whose
                 own URL is on a private network (a VPN address) gives cloud
-                instances a reachable route to the same endpoint.
+                instances a reachable route to the same endpoint. For
+                `remote` the bootstrap is rendered on this host but the guest
+                boots on the remote serve host, whose network may not reach
+                this controller's own URL either.
               '';
             };
 
@@ -2360,10 +2367,13 @@
               description = ''
                 Optional provider-local override for the GARM callback URL
                 rendered into guest bootstrap scripts for gosti-run,
-                `agentharbor` and `aws` backends. Leave null to use
+                `remote`, `agentharbor` and `aws` backends. Leave null to use
                 `services.garm.callbackURL`. For `aws` it is how a controller whose
                 own URL is on a private network (a VPN address) gives cloud
-                instances a reachable route to the same endpoint.
+                instances a reachable route to the same endpoint. For
+                `remote` the bootstrap is rendered on this host but the guest
+                boots on the remote serve host, whose network may not reach
+                this controller's own URL either.
               '';
             };
 
