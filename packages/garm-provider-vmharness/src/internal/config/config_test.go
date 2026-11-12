@@ -432,3 +432,56 @@ func TestTopLevelGuestSizeParsesForTart(t *testing.T) {
 		t.Fatalf("absent keys must leave the guest size unset: vcpus=%d memory_mb=%d", plain.VCPUs, plain.MemoryMB)
 	}
 }
+
+func TestRemoteIncusSharedStoresParseAndValidate(t *testing.T) {
+	t.Setenv(DefaultAuthTokenEnv, "")
+	const head = `
+backend = "remote"
+[remote]
+endpoint = "runner.example.test:8873"
+auth_token = "t"
+`
+	cfg, err := ParseBytes([]byte(head + `target_backend = "incus"
+incus_share_host_nix_store = true
+incus_reprobuild_store = "/var/lib/reprobuild/shared-store"
+incus_reprobuild_store_guest_path = "/srv/repro-store"
+`))
+	if err != nil {
+		t.Fatalf("remote shared-store config rejected: %v", err)
+	}
+	r := cfg.Remote
+	if !r.IncusShareHostNixStore || r.IncusReprobuildStore != "/var/lib/reprobuild/shared-store" ||
+		r.IncusReprobuildStoreGuestPath != "/srv/repro-store" {
+		t.Fatalf("remote shared-store options did not parse: %+v", r)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		body  string
+		match string
+	}{
+		{name: "nix store on libvirt", body: `target_backend = "libvirt"
+incus_share_host_nix_store = true`, match: `remote.target_backend "incus"`},
+		{name: "store on tart", body: `target_backend = "tart-linux-arm"
+incus_reprobuild_store = "/var/lib/reprobuild/shared-store"`, match: `remote.target_backend "incus"`},
+		{name: "guest path without store", body: `target_backend = "incus"
+incus_reprobuild_store_guest_path = "/srv/repro-store"`, match: "requires incus_reprobuild_store"},
+		{name: "relative store", body: `target_backend = "incus"
+incus_reprobuild_store = "var/lib/x"`, match: "absolute, clean"},
+		{name: "unclean store", body: `target_backend = "incus"
+incus_reprobuild_store = "/var/lib/reprobuild/shared-store/"`, match: "absolute, clean"},
+		{name: "dotdot guest path", body: `target_backend = "incus"
+incus_reprobuild_store = "/var/lib/x"
+incus_reprobuild_store_guest_path = "/srv/../etc"`, match: "absolute, clean"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseBytes([]byte(head + tc.body + "\n"))
+			if err == nil {
+				t.Fatalf("invalid remote shared-store config accepted")
+			}
+			if !strings.Contains(err.Error(), tc.match) {
+				t.Fatalf("error %q does not mention %q", err, tc.match)
+			}
+		})
+	}
+}

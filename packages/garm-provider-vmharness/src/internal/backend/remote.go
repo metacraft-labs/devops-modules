@@ -79,6 +79,16 @@ type RemoteBackend struct {
 	// select arbitrary Incus configuration, device paths, or modes.
 	IncusSecurityNesting bool
 	IncusNestedKvm       bool
+	// IncusShareHostNixStore / IncusReprobuildStore /
+	// IncusReprobuildStoreGuestPath are the trusted provider-admin PM2/PM3
+	// shared-store grants for the remote Incus recipe. They map only to
+	// gosti's --incus-share-host-nix-store (fixed paths) and
+	// --incus-reprobuild-store / --incus-reprobuild-store-guest-path (a
+	// directory the serve daemon must allowlist). The paths name the SERVING
+	// host's directories; nothing a workflow or guest sends can select them.
+	IncusShareHostNixStore        bool
+	IncusReprobuildStore          string
+	IncusReprobuildStoreGuestPath string
 	// IncusProfiles is trusted provider configuration, not CreateArgs or bootstrap.
 	// Names and their order are forwarded to the existing Incus profile mechanism.
 	IncusProfiles []string
@@ -155,7 +165,8 @@ var ephemeralRecipe = remoteRecipe{
 		// profiles, nesting, nested KVM and resource caps; for libvirt the
 		// firmware pair then --cpus/--memory-mb; for Tart --cpus/--memory-mb —
 		// and the pre-existing lifecycle/logging suffix last. At most one
-		// target block applies to any create.
+		// target block applies to any create. The Incus block is profiles,
+		// nesting, nested KVM, shared stores (Nix, then reprobuild), caps.
 		//
 		// With profiles empty, capability grants off and resource limits unset,
 		// the legacy argv remains unchanged apart from the deliberate
@@ -172,6 +183,17 @@ var ephemeralRecipe = remoteRecipe{
 			}
 			if backend.IncusNestedKvm {
 				argv = append(argv, "--incus-nested-kvm")
+			}
+			// Shared build stores follow the capability grants, before the
+			// resource caps. Unset emits nothing.
+			if backend.IncusShareHostNixStore {
+				argv = append(argv, "--incus-share-host-nix-store")
+			}
+			if backend.IncusReprobuildStore != "" {
+				argv = append(argv, "--incus-reprobuild-store", backend.IncusReprobuildStore)
+				if backend.IncusReprobuildStoreGuestPath != "" {
+					argv = append(argv, "--incus-reprobuild-store-guest-path", backend.IncusReprobuildStoreGuestPath)
+				}
 			}
 			// Resource caps follow the capability grants. Unset (0) emits
 			// nothing, so the grants-only argv above is unchanged.
