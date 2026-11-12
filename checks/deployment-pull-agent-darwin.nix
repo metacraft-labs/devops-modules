@@ -380,6 +380,9 @@ top@{
         (lib.optional (staticServiceA.RunAtLoad != true) "LaunchDaemon does not poll at load")
         (lib.optional (staticServiceA.StartInterval != 421) "LaunchDaemon polling interval drifted")
         (lib.optional (
+          staticServiceA.ProcessType != "Standard"
+        ) "LaunchDaemon is not ProcessType Standard; Background QoS starves the pre-switch GARM login")
+        (lib.optional (
           staticServiceA.StandardOutPath != "/private/var/log/mcl/deployments/test-agent.stdout.log"
         ) "LaunchDaemon stdout is not durable")
         (lib.optional (
