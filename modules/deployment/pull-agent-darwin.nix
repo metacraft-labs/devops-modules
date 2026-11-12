@@ -1034,7 +1034,28 @@
             StartInterval = cfg.intervalSeconds;
             StandardOutPath = cfg.standardOutLog;
             StandardErrorPath = cfg.standardErrorLog;
-            ProcessType = "Background";
+            # NOT `ProcessType = "Background"` (changed 2026-11-12).
+            #
+            # On Apple Silicon, Background QoS confines the process tree to
+            # the efficiency cores and throttles its disk/network I/O, and
+            # every child inherits it — including the pre-switch hook, whose
+            # `timeout 45 garm-cli profile login` must reach the local GARM
+            # controller (127.0.0.1:9997).
+            #
+            # Measured on m3, 2026-11-12, at load average 34–50: the agent ran
+            # as launchd `spawn type = background (5)`, scheduler priority 4.
+            # A garm-cli sampled at 28 s wall time was runnable with 0.03 s of
+            # CPU and had never opened a socket; GARM's access log shows no
+            # login from it. All three 45 s attempts timed out, and the deploy
+            # was recorded `deployment_deferred` ("the local GARM controller
+            # is unreachable") — three times in a row for
+            # gh-43242382669-e0cf40d-m3. The same login run by hand over ssh
+            # at normal priority took 0.67 s. Background QoS therefore blocked
+            # every deploy to m3 while it was busy with CI.
+            #
+            # Same failure class as the benchmark runner's removed demotion in
+            # infra `services/github-runners/darwin.nix` (2026-10-04).
+            ProcessType = "Standard";
             ThrottleInterval = 10;
           };
         };
