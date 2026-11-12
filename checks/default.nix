@@ -54,6 +54,7 @@
     ./garm-remote-incus-capabilities.nix
     ./garm-remote-libvirt-settings.nix
     ./garm-remote-tart-settings.nix
+    ./garm-remote-guest-urls.nix
     ./garm-central-multi-host.nix
     ./garm-central-recovery.nix
     ./garm-provider-vmharness-protocol.nix
