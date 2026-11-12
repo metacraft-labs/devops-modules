@@ -704,3 +704,78 @@ func TestRemoteNonTartRecipesNeverReceiveTartSize(t *testing.T) {
 		})
 	}
 }
+
+// TestRemoteCreateIncusSharedStoresFollowCapabilities proves the PM2/PM3
+// remote recipe: the shared-store grants are forwarded as gosti's fixed flags,
+// after nesting/nested KVM and before the resource caps, only for an Incus
+// target, and never reach the delete argv.
+func TestRemoteCreateIncusSharedStoresFollowCapabilities(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		nix       bool
+		store     string
+		guestPath string
+		stores    []string
+	}{
+		{name: "unset emits nothing", stores: nil},
+		{name: "nix store only", nix: true, stores: []string{"--incus-share-host-nix-store"}},
+		{name: "reprobuild store mirrors host path", store: "/var/lib/reprobuild/shared-store",
+			stores: []string{"--incus-reprobuild-store", "/var/lib/reprobuild/shared-store"}},
+		{name: "both with guest path in fixed order", nix: true,
+			store: "/var/lib/reprobuild/shared-store", guestPath: "/srv/repro-store",
+			stores: []string{"--incus-share-host-nix-store",
+				"--incus-reprobuild-store", "/var/lib/reprobuild/shared-store",
+				"--incus-reprobuild-store-guest-path", "/srv/repro-store"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b, fs, closeFn := newFakeBackend(t, "incus", 0)
+			defer closeFn()
+			b.IncusSecurityNesting = true
+			b.IncusNestedKvm = true
+			b.IncusShareHostNixStore = tc.nix
+			b.IncusReprobuildStore = tc.store
+			b.IncusReprobuildStoreGuestPath = tc.guestPath
+			b.IncusLimitsCPU = 6
+
+			if _, err := b.Create(context.Background(), CreateArgs{Name: "job-store"}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			want := []string{"run", "--ephemeral", "--backend", "incus", "--baseline", "job-store",
+				"--incus-security-nesting", "--incus-nested-kvm"}
+			want = append(want, tc.stores...)
+			want = append(want, "--cpus", "6", "--keep", "--log-format", "json")
+			if !reflect.DeepEqual(fs.execArgv[0], want) {
+				t.Fatalf("create argv=%v want exact %v", fs.execArgv[0], want)
+			}
+			if err := b.Delete(context.Background(), "job-store"); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+			wantDelete := []string{"ephemeral-destroy", "--backend", "incus", "--baseline", "job-store", "--log-format", "json"}
+			if !reflect.DeepEqual(fs.execArgv[1], wantDelete) {
+				t.Fatalf("delete argv=%v want exact store-free argv %v", fs.execArgv[1], wantDelete)
+			}
+		})
+	}
+}
+
+// TestRemoteCreateNonIncusTargetsNeverReceiveSharedStores: the grants are
+// Incus-only even if a RemoteBackend is constructed with them set directly.
+func TestRemoteCreateNonIncusTargetsNeverReceiveSharedStores(t *testing.T) {
+	for _, target := range []string{"libvirt", "tart-linux-arm"} {
+		t.Run(target, func(t *testing.T) {
+			b, fs, closeFn := newFakeBackend(t, target, 0)
+			defer closeFn()
+			b.IncusShareHostNixStore = true
+			b.IncusReprobuildStore = "/var/lib/reprobuild/shared-store"
+			b.IncusReprobuildStoreGuestPath = "/srv/repro-store"
+			if _, err := b.Create(context.Background(), CreateArgs{Name: "job-x"}); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			for _, a := range fs.execArgv[0] {
+				if strings.HasPrefix(a, "--incus-") || a == "/var/lib/reprobuild/shared-store" {
+					t.Fatalf("%s create argv carries an Incus shared-store element %q: %v", target, a, fs.execArgv[0])
+				}
+			}
+		})
+	}
+}

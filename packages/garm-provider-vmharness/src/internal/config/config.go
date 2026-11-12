@@ -24,6 +24,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -130,6 +131,27 @@ type RemoteConfig struct {
 	// Default false preserves the pre-capability remote create argv byte-for-byte.
 	IncusNestedKvm bool `toml:"incus_nested_kvm"`
 
+	// IncusShareHostNixStore grants the fixed gosti shared-Nix-store
+	// capability (PM2) to remote Incus guests. It maps only to
+	// --incus-share-host-nix-store, whose gosti implementation mounts the
+	// SERVING host's /nix/store read-only plus its nix-daemon socket
+	// directory and installs /usr/local/bin/nix* daemon-client wrappers
+	// before the runner bootstrap runs. The paths are fixed by gosti, never
+	// configurable here. Default false preserves the create argv.
+	IncusShareHostNixStore bool `toml:"incus_share_host_nix_store"`
+
+	// IncusReprobuildStore, when non-empty, is the SERVING host's reprobuild
+	// CAS directory, mounted read-write into each remote Incus guest (PM3).
+	// It maps only to --incus-reprobuild-store; the serve daemon admits only
+	// directories on its --allow-incus-reprobuild-store list. Must be an
+	// absolute path. Empty (default) preserves the create argv.
+	IncusReprobuildStore string `toml:"incus_reprobuild_store"`
+
+	// IncusReprobuildStoreGuestPath is the in-guest mount point for
+	// IncusReprobuildStore (--incus-reprobuild-store-guest-path). Empty ⇒ the
+	// host path. Only meaningful with IncusReprobuildStore.
+	IncusReprobuildStoreGuestPath string `toml:"incus_reprobuild_store_guest_path"`
+
 	// IncusProfiles selects existing remote-host profiles in administrator order.
 	// Empty preserves Incus's automatic default profile; an explicit list must
 	// include default when its root disk and NIC are needed. Never pool/user-data.
@@ -185,6 +207,40 @@ func (r *RemoteConfig) HasLibvirtSettings() bool {
 // HasIncusLimits reports whether any per-job Incus resource cap is set.
 func (r *RemoteConfig) HasIncusLimits() bool {
 	return r.IncusLimitsCPU != 0 || r.IncusLimitsMemoryMB != 0
+}
+
+// HasIncusSharedStores reports whether any remote PM2/PM3 shared-store
+// option is set.
+func (r *RemoteConfig) HasIncusSharedStores() bool {
+	return r.IncusShareHostNixStore || r.IncusReprobuildStore != "" || r.IncusReprobuildStoreGuestPath != ""
+}
+
+// ValidateIncusSharedStores checks the remote PM2/PM3 options: they apply
+// only to a remote Incus target, the paths must be absolute and clean (they
+// are forwarded verbatim and the serve allowlist compares them verbatim), and
+// a guest path needs a store.
+func (r *RemoteConfig) ValidateIncusSharedStores(backend BackendKind) error {
+	if !r.HasIncusSharedStores() {
+		return nil
+	}
+	if backend != BackendRemote || r.TargetBackend != string(BackendIncus) {
+		return fmt.Errorf("remote incus_share_host_nix_store/incus_reprobuild_store* require backend %q with remote.target_backend %q", BackendRemote, BackendIncus)
+	}
+	if r.IncusReprobuildStoreGuestPath != "" && r.IncusReprobuildStore == "" {
+		return fmt.Errorf("remote incus_reprobuild_store_guest_path requires incus_reprobuild_store")
+	}
+	for name, p := range map[string]string{
+		"incus_reprobuild_store":            r.IncusReprobuildStore,
+		"incus_reprobuild_store_guest_path": r.IncusReprobuildStoreGuestPath,
+	} {
+		if p == "" {
+			continue
+		}
+		if !path.IsAbs(p) || path.Clean(p) != p {
+			return fmt.Errorf("remote %s %q must be an absolute, clean path", name, p)
+		}
+	}
+	return nil
 }
 
 // ValidateIncusProfiles is shared by file validation and direct construction.
@@ -524,6 +580,9 @@ func (c *Config) applyDefaults() {
 func (c *Config) Validate() error {
 	if c.Remote != nil {
 		if err := c.Remote.ValidateIncusProfiles(c.Backend); err != nil {
+			return err
+		}
+		if err := c.Remote.ValidateIncusSharedStores(c.Backend); err != nil {
 			return err
 		}
 	}

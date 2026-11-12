@@ -239,6 +239,28 @@ raw Incus config/device-path/mode escape hatch. A consumer must enable them only
 for a host whose verified capability manifest and live runner probe establish
 the corresponding capability.
 
+### Remote Incus shared build stores (PM2 / PM3)
+
+The remote counterparts of the local `incusShareHostNixStore`,
+`incusReprobuildStore` and `incusReprobuildStoreGuestPath` live under the same
+`remote` table, with the same `backend = "remote"` /
+`remote.targetBackend = "incus"` rule and the same omit-when-unset rendering:
+
+- `incusShareHostNixStore` maps only to `--incus-share-host-nix-store`. The
+  serving host's gosti mounts that host's `/nix/store` read-only and its
+  nix-daemon socket directory, then installs `/usr/local/bin/nix*` wrappers
+  that run the host's Nix client against the host daemon before the runner
+  bootstrap runs. No path is configurable.
+- `incusReprobuildStore` / `incusReprobuildStoreGuestPath` map to
+  `--incus-reprobuild-store` / `--incus-reprobuild-store-guest-path`: a
+  directory on the serving host, mounted read-write. The serve daemon admits
+  only directories on its `--allow-incus-reprobuild-store` list (default
+  `/var/lib/reprobuild/shared-store`), and the directory must exist on every
+  host the provider reaches.
+
+Every serving host needs a gosti that knows these flags before a provider
+sets them: an older one refuses the create.
+
 The older permissive `extra_specs` schema still advertises similarly named
 local-Incus keys for compatibility, although the provider does not currently
 consume them. This milestone deliberately neither implements nor expands that
