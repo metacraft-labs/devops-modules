@@ -160,7 +160,10 @@ top@{ ... }:
           lib.optional (!isExactFailure storesMessage badStoresNonRemote)
             "remote shared stores did not fail exactly once for a non-remote provider: ${toString (failedMessages badStoresNonRemote)}"
         ++
-          lib.optional (!isExactFailure "incusReprobuildStoreGuestPath requires remote.incusReprobuildStore" badGuestPathOnly)
+          lib.optional
+            (
+              !isExactFailure "incusReprobuildStoreGuestPath requires remote.incusReprobuildStore" badGuestPathOnly
+            )
             "a reprobuild guest path without a store was not refused exactly once: ${toString (failedMessages badGuestPathOnly)}";
     in
     {
