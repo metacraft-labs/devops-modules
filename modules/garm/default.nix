@@ -235,6 +235,20 @@
         + optionalString (p.guestReproCachesConfPath != null) ''
           guest_repro_caches_conf_path = "${tomlStr p.guestReproCachesConfPath}"
         '';
+      # The guest-facing GARM metadata/callback URL overrides, read by the
+      # gosti provider (config.Config GuestMetadataURL/GuestCallbackURL, applied
+      # in CreateInstance for every backend, `remote` included) and by
+      # garm-provider-aws. Only emitted when set, so a provider without an
+      # override keeps a byte-identical config.toml. Top-level keys: callers
+      # must place them before any table (`[remote]`, `[credentials]`) opens.
+      mkGuestURLKeys =
+        p:
+        optionalString (p.guestMetadataURL != null) ''
+          guest_metadata_url = "${p.guestMetadataURL}"
+        ''
+        + optionalString (p.guestCallbackURL != null) ''
+          guest_callback_url = "${p.guestCallbackURL}"
+        '';
       mkIncusKeys =
         p:
         ''
@@ -265,12 +279,7 @@
           gosti_path = "${p.gostiPath}"
           state_dir = "${p.stateDir}"
         ''
-        + optionalString (p.guestMetadataURL != null) ''
-          guest_metadata_url = "${p.guestMetadataURL}"
-        ''
-        + optionalString (p.guestCallbackURL != null) ''
-          guest_callback_url = "${p.guestCallbackURL}"
-        ''
+        + mkGuestURLKeys p
         + mkGuestReproCachesKeys p;
       # RB1: the [remote] section. COMPANY-AGNOSTIC — the endpoint + target
       # backend + how to obtain the bearer token, with NO baked-in host. The
@@ -306,6 +315,17 @@
         ''
         + optionalString p.remote.incusNestedKvm ''
           incus_nested_kvm = true
+        ''
+        # PM2/PM3 shared stores, likewise omitted when off so a provider that
+        # sets none keeps a byte-identical config.toml and create argv.
+        + optionalString p.remote.incusShareHostNixStore ''
+          incus_share_host_nix_store = true
+        ''
+        + optionalString (p.remote.incusReprobuildStore != "") ''
+          incus_reprobuild_store = "${tomlStr p.remote.incusReprobuildStore}"
+        ''
+        + optionalString (p.remote.incusReprobuildStoreGuestPath != "") ''
+          incus_reprobuild_store_guest_path = "${tomlStr p.remote.incusReprobuildStoreGuestPath}"
         ''
         + optionalString (p.remote.incusProfiles != [ ]) ''
           incus_profiles = ${builtins.toJSON p.remote.incusProfiles}
@@ -355,12 +375,7 @@
         ''
         # The guest URL overrides (garm-provider-aws downstream patch): a cloud
         # instance cannot reach a controller URL that lives on a private network.
-        + optionalString (p.guestMetadataURL != null) ''
-          guest_metadata_url = "${p.guestMetadataURL}"
-        ''
-        + optionalString (p.guestCallbackURL != null) ''
-          guest_callback_url = "${p.guestCallbackURL}"
-        ''
+        + mkGuestURLKeys p
         + ''
 
           [credentials]
@@ -501,7 +516,7 @@
         + (
           if providerIsRemote p then
             # Top-level keys before the `[remote]` table opens.
-            mkGuestReproCachesKeys p + mkRemoteKeys name p
+            mkGuestURLKeys p + mkGuestReproCachesKeys p + mkRemoteKeys name p
           else if providerIsAws p then
             mkAwsKeys p
           else if providerIsAgentharbor p then
@@ -2335,10 +2350,13 @@
               description = ''
                 Optional provider-local override for the GARM metadata URL
                 rendered into guest bootstrap scripts for gosti-run,
-                `agentharbor` and `aws` backends. Leave null to use
+                `remote`, `agentharbor` and `aws` backends. Leave null to use
                 `services.garm.metadataURL`. For `aws` it is how a controller whose
                 own URL is on a private network (a VPN address) gives cloud
-                instances a reachable route to the same endpoint.
+                instances a reachable route to the same endpoint. For
+                `remote` the bootstrap is rendered on this host but the guest
+                boots on the remote serve host, whose network may not reach
+                this controller's own URL either.
               '';
             };
 
@@ -2349,10 +2367,13 @@
               description = ''
                 Optional provider-local override for the GARM callback URL
                 rendered into guest bootstrap scripts for gosti-run,
-                `agentharbor` and `aws` backends. Leave null to use
+                `remote`, `agentharbor` and `aws` backends. Leave null to use
                 `services.garm.callbackURL`. For `aws` it is how a controller whose
                 own URL is on a private network (a VPN address) gives cloud
-                instances a reachable route to the same endpoint.
+                instances a reachable route to the same endpoint. For
+                `remote` the bootstrap is rendered on this host but the guest
+                boots on the remote serve host, whose network may not reach
+                this controller's own URL either.
               '';
             };
 
@@ -2809,6 +2830,55 @@
                       `/dev/kvm` to guest `/dev/kvm`, verifies exact mode 0666,
                       and opens it read-write. No path or mode is configurable.
                       Rejected for non-remote providers and non-Incus targets.
+                    '';
+                  };
+                  incusShareHostNixStore = mkOption {
+                    type = types.bool;
+                    default = false;
+                    description = ''
+                      PM2 for a remote Incus provider: the remote counterpart of
+                      the local `incusShareHostNixStore`. When true, the
+                      provider appends gosti's fixed
+                      `--incus-share-host-nix-store` flag, and the SERVING
+                      host's gosti mounts that host's `/nix/store` read-only
+                      and its nix-daemon socket directory into the per-job
+                      container before first start, then installs
+                      `/usr/local/bin/nix*` wrappers that run the host's Nix
+                      client against the host daemon (`NIX_REMOTE=daemon`)
+                      before the runner bootstrap runs. The guest is an
+                      untrusted daemon client. No path is configurable. The
+                      serving host needs a gosti that knows the flag (an older
+                      one refuses the create), and should bound its store with
+                      `nix.settings.min-free` / `max-free`. Rejected for
+                      non-remote providers and non-Incus targets.
+                    '';
+                  };
+                  incusReprobuildStore = mkOption {
+                    type = types.str;
+                    default = "";
+                    example = "/var/lib/reprobuild/shared-store";
+                    description = ''
+                      PM3 for a remote Incus provider: the SERVING host's
+                      reprobuild CAS directory, mounted read-write into each
+                      per-job container (gosti `--incus-reprobuild-store`).
+                      Content-addressed, so a guest cannot corrupt an existing
+                      entry. The serve daemon admits only directories on its
+                      `--allow-incus-reprobuild-store` list (default
+                      `/var/lib/reprobuild/shared-store`), and the directory
+                      must exist on every host this provider reaches. Empty
+                      (default) shares nothing. Absolute and clean. Rejected
+                      for non-remote providers and non-Incus targets.
+                    '';
+                  };
+                  incusReprobuildStoreGuestPath = mkOption {
+                    type = types.str;
+                    default = "";
+                    example = "/srv/repro-store";
+                    description = ''
+                      In-guest mount point for `remote.incusReprobuildStore`
+                      (gosti `--incus-reprobuild-store-guest-path`). Empty
+                      mirrors the host path. Requires
+                      `remote.incusReprobuildStore`.
                     '';
                   };
                   incusLimitsCpu = mkOption {
@@ -5377,6 +5447,20 @@
             ++ lib.mapAttrsToList (n: p: {
               assertion = !p.remote.incusNestedKvm || (providerIsRemote p && p.remote.targetBackend == "incus");
               message = "services.garm.providers.${n}.remote.incusNestedKvm requires backend = \"remote\" and remote.targetBackend = \"incus\"; it maps only to gosti --incus-nested-kvm with the fixed /dev/kvm device contract.";
+            }) cfg.providers
+            ++ lib.mapAttrsToList (n: p: {
+              assertion =
+                (
+                  !p.remote.incusShareHostNixStore
+                  && p.remote.incusReprobuildStore == ""
+                  && p.remote.incusReprobuildStoreGuestPath == ""
+                )
+                || (providerIsRemote p && p.remote.targetBackend == "incus");
+              message = "services.garm.providers.${n}.remote.incusShareHostNixStore/incusReprobuildStore/incusReprobuildStoreGuestPath require backend = \"remote\" and remote.targetBackend = \"incus\"; they map only to gosti --incus-share-host-nix-store/--incus-reprobuild-store* on the Incus ephemeral path.";
+            }) cfg.providers
+            ++ lib.mapAttrsToList (n: p: {
+              assertion = p.remote.incusReprobuildStoreGuestPath == "" || p.remote.incusReprobuildStore != "";
+              message = "services.garm.providers.${n}.remote.incusReprobuildStoreGuestPath requires remote.incusReprobuildStore.";
             }) cfg.providers
             ++ lib.mapAttrsToList (n: p: {
               assertion =

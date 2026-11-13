@@ -53,6 +53,9 @@ top@{ ... }:
           incusNestedKvm = true;
           incusLimitsCpu = 6;
           incusLimitsMemoryMb = 16384;
+          incusShareHostNixStore = true;
+          incusReprobuildStore = "/var/lib/reprobuild/shared-store";
+          incusReprobuildStoreGuestPath = "/srv/repro-store";
           incusProfiles = [
             "default"
             "ci-store"
@@ -83,6 +86,23 @@ top@{ ... }:
           incusNestedKvm = true;
         }
       );
+      badStoresTarget = mkSystem (
+        remoteProvider "libvirt" {
+          incusShareHostNixStore = true;
+        }
+      );
+      badStoresNonRemote = mkSystem {
+        backend = "libvirt";
+        remote = {
+          targetBackend = "incus";
+          incusReprobuildStore = "/var/lib/reprobuild/shared-store";
+        };
+      };
+      badGuestPathOnly = mkSystem (
+        remoteProvider "incus" {
+          incusReprobuildStoreGuestPath = "/srv/repro-store";
+        }
+      );
       badNonRemote = mkSystem {
         backend = "libvirt";
         remote = {
@@ -97,6 +117,7 @@ top@{ ... }:
       kvmMessage = "remote.incusNestedKvm requires backend = \"remote\" and remote.targetBackend = \"incus\"";
       limitsMessage = "remote.incusLimitsCpu/incusLimitsMemoryMb require backend = \"remote\" and remote.targetBackend = \"incus\"";
       profilesMessage = "remote.incusProfiles requires backend = \"remote\" and remote.targetBackend = \"incus\"";
+      storesMessage = "remote.incusShareHostNixStore/incusReprobuildStore/incusReprobuildStoreGuestPath require backend = \"remote\" and remote.targetBackend = \"incus\"";
       isExactFailure =
         needle: config:
         let
@@ -131,7 +152,19 @@ top@{ ... }:
         ) "remote profiles did not fail exactly once for a local provider"
         ++ lib.optional (
           !isExactFailure "incusProfiles must contain non-empty" badEmptyProfile
-        ) "an empty profile name was not refused exactly once";
+        ) "an empty profile name was not refused exactly once"
+        ++
+          lib.optional (!isExactFailure storesMessage badStoresTarget)
+            "remote shared stores did not fail exactly once for targetBackend=libvirt: ${toString (failedMessages badStoresTarget)}"
+        ++
+          lib.optional (!isExactFailure storesMessage badStoresNonRemote)
+            "remote shared stores did not fail exactly once for a non-remote provider: ${toString (failedMessages badStoresNonRemote)}"
+        ++
+          lib.optional
+            (
+              !isExactFailure "incusReprobuildStoreGuestPath requires remote.incusReprobuildStore" badGuestPathOnly
+            )
+            "a reprobuild guest path without a store was not refused exactly once: ${toString (failedMessages badGuestPathOnly)}";
     in
     {
       checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
@@ -158,7 +191,7 @@ top@{ ... }:
 
               grep -Fx '[remote]' "$default_config"
               grep -Fx 'target_backend = "incus"' "$default_config"
-              if grep -Eq '^incus_(security_nesting|nested_kvm|limits_cpu|limits_memory_mb|profiles)[[:space:]]*=' "$default_config"; then
+              if grep -Eq '^incus_(security_nesting|nested_kvm|limits_cpu|limits_memory_mb|profiles|share_host_nix_store|reprobuild_store|reprobuild_store_guest_path)[[:space:]]*=' "$default_config"; then
                 echo "default remote provider rendered an unrequested Incus capability" >&2
                 cat "$default_config" >&2
                 exit 1
@@ -173,6 +206,16 @@ top@{ ... }:
               grep -Fx 'incus_limits_cpu = 6' "$enabled_config"
               grep -Fx 'incus_limits_memory_mb = 16384' "$enabled_config"
               grep -Fx 'incus_profiles = ["default","ci-store"]' "$enabled_config"
+              # PM2/PM3 land in the [remote] table (after its header), the
+              # table garm-provider-gosti reads remote.* from.
+              remote_line="$(grep -nFx '[remote]' "$enabled_config" | cut -d: -f1)"
+              for key in 'incus_share_host_nix_store = true' \
+                'incus_reprobuild_store = "/var/lib/reprobuild/shared-store"' \
+                'incus_reprobuild_store_guest_path = "/srv/repro-store"'; do
+                line="$(grep -nFx "$key" "$enabled_config" | cut -d: -f1)"
+                test -n "$line"
+                test "$line" -gt "$remote_line"
+              done
 
               # Fixed capabilities and existing host profiles never expose a
               # caller-selected Incus key, path, type, or mode.

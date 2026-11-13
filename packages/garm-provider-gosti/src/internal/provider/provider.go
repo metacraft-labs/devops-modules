@@ -62,6 +62,9 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 		if err := cfg.Remote.ValidateIncusProfiles(cfg.Backend); err != nil {
 			return nil, err
 		}
+		if err := cfg.Remote.ValidateIncusSharedStores(cfg.Backend); err != nil {
+			return nil, err
+		}
 	}
 	if cfg.Remote != nil && (cfg.Remote.IncusSecurityNesting || cfg.Remote.IncusNestedKvm) &&
 		(cfg.Backend != config.BackendRemote || cfg.Remote.TargetBackend != string(config.BackendIncus)) {
@@ -163,19 +166,22 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 			Client: backend.NewServeClient(
 				cfg.Remote.Endpoint, token,
 				time.Duration(cfg.Remote.RequestTimeoutSec)*time.Second),
-			TargetBackend:            cfg.Remote.TargetBackend,
-			GuestOS:                  cfg.Remote.GuestOS,
-			IncusSecurityNesting:     cfg.Remote.IncusSecurityNesting,
-			IncusNestedKvm:           cfg.Remote.IncusNestedKvm,
-			IncusProfiles:            append([]string(nil), cfg.Remote.IncusProfiles...),
-			IncusLimitsCPU:           cfg.Remote.IncusLimitsCPU,
-			IncusLimitsMemoryMB:      cfg.Remote.IncusLimitsMemoryMB,
-			LibvirtUEFILoader:        cfg.Remote.LibvirtUEFILoader,
-			LibvirtUEFINVRAMTemplate: cfg.Remote.LibvirtUEFINVRAMTemplate,
-			LibvirtCPUs:              cfg.Remote.LibvirtCPUs,
-			LibvirtMemoryMB:          cfg.Remote.LibvirtMemoryMB,
-			TartCPUs:                 cfg.Remote.TartCPUs,
-			TartMemoryMB:             cfg.Remote.TartMemoryMB,
+			TargetBackend:                 cfg.Remote.TargetBackend,
+			GuestOS:                       cfg.Remote.GuestOS,
+			IncusSecurityNesting:          cfg.Remote.IncusSecurityNesting,
+			IncusNestedKvm:                cfg.Remote.IncusNestedKvm,
+			IncusShareHostNixStore:        cfg.Remote.IncusShareHostNixStore,
+			IncusReprobuildStore:          cfg.Remote.IncusReprobuildStore,
+			IncusReprobuildStoreGuestPath: cfg.Remote.IncusReprobuildStoreGuestPath,
+			IncusProfiles:                 append([]string(nil), cfg.Remote.IncusProfiles...),
+			IncusLimitsCPU:                cfg.Remote.IncusLimitsCPU,
+			IncusLimitsMemoryMB:           cfg.Remote.IncusLimitsMemoryMB,
+			LibvirtUEFILoader:             cfg.Remote.LibvirtUEFILoader,
+			LibvirtUEFINVRAMTemplate:      cfg.Remote.LibvirtUEFINVRAMTemplate,
+			LibvirtCPUs:                   cfg.Remote.LibvirtCPUs,
+			LibvirtMemoryMB:               cfg.Remote.LibvirtMemoryMB,
+			TartCPUs:                      cfg.Remote.TartCPUs,
+			TartMemoryMB:                  cfg.Remote.TartMemoryMB,
 		}
 	default:
 		return nil, fmt.Errorf("unsupported backend %q", cfg.Backend)
@@ -1004,6 +1010,34 @@ func isGostiWindowsBackend(backendKind config.BackendKind) bool {
 	return backendKind == config.BackendQemuWindowsArm || backendKind == config.BackendUtmWindowsArm
 }
 
+// bootstrapRendererBackend returns the backend kind whose bootstrap renderer
+// applies to this provider's guests.
+//
+// A `remote` provider drives a backend on another host, but the guest it gets
+// is the same guest the local backend of that id produces, so it is rendered
+// the same way. That matters for `tart-linux-arm`: its renderer emits a
+// complete, self-contained install script from the (already overridden)
+// metadata/callback URLs. Every other Linux path renders GARM's install-script
+// wrapper, which fetches a second-stage script that GARM renders SERVER-side
+// with the controller's own URLs, so a guest that reaches the controller only
+// through `guest_metadata_url`/`guest_callback_url` would fetch it and then
+// stall calling the controller's address (a Tart guest on a darwin serve host
+// cannot reach the central controller's overlay address).
+//
+// Only `tart-linux-arm` is mapped. A remote `tart-macos` guest already gets
+// the complete macOS script (renderRunnerBootstrapForBackend selects it by OS
+// type), and the remote incus/libvirt/hyperv renderers are those backends'
+// local ones already. `qemu-windows-arm` / `utm-windows-arm` are deliberately
+// NOT mapped: their foreground PowerShell script has never run through the
+// serve daemon's detached launch, and that path is unverified.
+func bootstrapRendererBackend(cfg *config.Config) config.BackendKind {
+	if cfg.Backend == config.BackendRemote && cfg.Remote != nil &&
+		config.BackendKind(cfg.Remote.TargetBackend) == config.BackendTartLinuxArm {
+		return config.BackendTartLinuxArm
+	}
+	return cfg.Backend
+}
+
 func renderRunnerBootstrapForBackend(backendKind config.BackendKind, bootstrapParams commonParams.BootstrapInstance, tools commonParams.RunnerApplicationDownload, runnerName string) ([]byte, error) {
 	if bootstrapParams.OSType == commonParams.OSType("macos") {
 		return renderMacOSRunnerInstallScript(bootstrapParams, tools, runnerName)
@@ -1130,7 +1164,8 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrapParams commonPar
 	// here and carry it through the backend seam.
 	var bootstrap []byte
 	if tools, err := pickTools(bootstrapParams); err == nil {
-		script, serr := renderRunnerBootstrapForBackend(p.cfg.Backend, bootstrapParams, tools, bootstrapParams.Name)
+		rendererBackend := bootstrapRendererBackend(p.cfg)
+		script, serr := renderRunnerBootstrapForBackend(rendererBackend, bootstrapParams, tools, bootstrapParams.Name)
 		if serr != nil {
 			return commonParams.ProviderInstance{}, fmt.Errorf("rendering runner bootstrap: %w", serr)
 		}
@@ -1140,7 +1175,7 @@ func (p *Provider) CreateInstance(ctx context.Context, bootstrapParams commonPar
 		if cerr != nil {
 			return commonParams.ProviderInstance{}, cerr
 		}
-		script, serr = applyGuestReproCaches(script, bootstrapParams.OSType, isGostiWindowsBackend(p.cfg.Backend), conf, p.cfg.GuestReproCachesConfPath)
+		script, serr = applyGuestReproCaches(script, bootstrapParams.OSType, isGostiWindowsBackend(rendererBackend), conf, p.cfg.GuestReproCachesConfPath)
 		if serr != nil {
 			return commonParams.ProviderInstance{}, fmt.Errorf("rendering runner bootstrap: %w", serr)
 		}
