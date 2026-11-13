@@ -267,6 +267,11 @@ jobs:
             exit 1
           fi
 
-          jq -e 'type == "array" and length > 0 and all(.[]; has("displayName") and has("diff"))' \
+          # nix-diff-action v1.2.1 flattens each result's dix output into the
+          # item (src/programs/shared.ts setDiffOutput spreads `...r.diff`), so
+          # an item carries `format` plus `text` (dix < 2.0) or `report`, not a
+          # `diff` key, despite what its action.yml description says.
+          jq -e 'type == "array" and length > 0 and all(.[]; has("displayName") and (
+            (.format == "text" and has("text")) or (.format == "json" and has("report"))))' \
             <<<"$FALLBACK_DIFF" >/dev/null
           echo "nix-diff produced fallback output; treating artifact/comment publication failure as non-gating."
