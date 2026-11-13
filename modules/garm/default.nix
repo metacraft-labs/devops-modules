@@ -5459,8 +5459,7 @@
               message = "services.garm.providers.${n}.remote.incusShareHostNixStore/incusReprobuildStore/incusReprobuildStoreGuestPath require backend = \"remote\" and remote.targetBackend = \"incus\"; they map only to gosti --incus-share-host-nix-store/--incus-reprobuild-store* on the Incus ephemeral path.";
             }) cfg.providers
             ++ lib.mapAttrsToList (n: p: {
-              assertion =
-                p.remote.incusReprobuildStoreGuestPath == "" || p.remote.incusReprobuildStore != "";
+              assertion = p.remote.incusReprobuildStoreGuestPath == "" || p.remote.incusReprobuildStore != "";
               message = "services.garm.providers.${n}.remote.incusReprobuildStoreGuestPath requires remote.incusReprobuildStore.";
             }) cfg.providers
             ++ lib.mapAttrsToList (n: p: {
