@@ -434,6 +434,8 @@
                     ${networkAcl}
                   }
                   client_max_body_size 10G;
+                  proxy_read_timeout 1h;
+                  proxy_send_timeout 1h;
                 '';
                 proxyPass = "http://127.0.0.1:${toString port}";
                 proxyWebsockets = true;
@@ -447,6 +449,14 @@
                   access_log /var/log/nginx/attic-cache.access.jsonl mcl_attic_cache;
                   ${networkAcl}
                   client_max_body_size 10G;
+                  # After the last byte of a large NAR, atticd hashes,
+                  # compresses and stores it before it answers. With nginx's
+                  # default 60s read timeout every push of a NAR of a few
+                  # hundred MiB came back 504 (the client retried the whole
+                  # NAR) while the server went on to store it anyway. The
+                  # same hour the repro binary cache vhost allows.
+                  proxy_read_timeout 1h;
+                  proxy_send_timeout 1h;
                 '';
                 proxyPass = "http://127.0.0.1:${toString port}/";
                 proxyWebsockets = true;
