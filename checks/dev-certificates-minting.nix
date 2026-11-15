@@ -24,12 +24,30 @@
 { ... }:
 {
   perSystem =
-    { pkgs, ... }:
+    { pkgs, lib, ... }:
+    let
+      # CARRY: NixOS/nixpkgs#588798 (bash: disable NLS on Darwin). On darwin
+      # the stdenv bash's bundled libintl calls CoreFoundation from
+      # setlocale(), and bash calls that in forked subshells when a temporary
+      # `LC_ALL=C cmd` inside `$(...)` restores the locale -- which
+      # mint-dev-certificates.sh does in its SAN comparison. CoreFoundation is
+      # not fork-safe, so those subshells intermittently die with SIGSEGV and
+      # this check failed with a different assertion on every run on m3
+      # (metacraft-pm issues/2026-11-13-dev-certificates-minting-crashes-on-m3-
+      # darwin-runners.md). Putting the NLS-free bash first on PATH makes every
+      # `bash` the test and the tool start the fixed one. This is applied here,
+      # not as a stdenv override, because replacing the darwin stdenv's shell
+      # rebuilds every darwin derivation in this flake from source.
+      # DROP this once that fix reaches the pinned nixos-26.05 channel.
+      darwinForkSafeBash = pkgs.bashNonInteractive.overrideAttrs (old: {
+        configureFlags = old.configureFlags ++ [ "--disable-nls" ];
+      });
+    in
     {
       checks.dev-certificates-minting =
         pkgs.runCommand "dev-certificates-minting"
           {
-            nativeBuildInputs = [
+            nativeBuildInputs = lib.optional pkgs.stdenv.hostPlatform.isDarwin darwinForkSafeBash ++ [
               pkgs.openssl
               pkgs.jq
               pkgs.coreutils
