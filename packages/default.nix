@@ -25,7 +25,17 @@
             # C++ ABI breaks when a different version is spliced in.
             cachix = pkgs.haskell.lib.justStaticExecutables pkgs.haskellPackages.cachix;
             inherit nix;
-            nixos-rebuild-ng = overrideNix pkgs.nixos-rebuild-ng;
+            # CARRY: the test-only fix of NixOS/nixpkgs#588801. Upstream's
+            # test_make_tmpdir reuses the fixed /tmp/not-too-long, which on a
+            # builder without a sandbox (m3: `sandbox = false`) stays owned by
+            # the first nixbld user and fails the test for every other one
+            # (metacraft-pm issues/2026-10-23-nixos-rebuild-ng-tempdir-test-
+            # reuses-a-shared-fixed-root.md). The patch gives each run its own
+            # temp root and keeps every assertion. DROP this `overrideAttrs`
+            # once that fix reaches the pinned nixos-26.05 channel.
+            nixos-rebuild-ng = (overrideNix pkgs.nixos-rebuild-ng).overrideAttrs (old: {
+              patches = (old.patches or [ ]) ++ [ ./nixos-rebuild-ng/test-tmpdir-owned-root.patch ];
+            });
             nix-fast-build = pkgs.nix-fast-build.override { inherit nix-eval-jobs; };
           };
           agenix = inputs'.agenix.packages;
