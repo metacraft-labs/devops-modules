@@ -52,6 +52,15 @@ on:
           cover, so without this input the recorder could not clone it at all.
         type: string
         default: 'metacraft-labs'
+      install-repro:
+        description: >
+          Install the `repro` CLI (setup-reprobuild) after setup-dev-env and the
+          optional prep, before lint/test. A recorder whose tests qualify against
+          a real Repro engine sets this: the nix flavor of setup-dev-env installs
+          no `repro`, and the flake dev shells do not provide one. Off by default,
+          so recorders that do not need it pay nothing.
+        type: boolean
+        default: false
     secrets:
       CI_TOKEN_PROVIDER_APP_ID:
         required: true
@@ -98,6 +107,26 @@ jobs:
       - name: Prepare (recorder-specific)
         if: inputs.prepare-recipe != ''
         run: dev-exec just ${{ inputs.prepare-recipe }}
+
+      - name: Install the repro CLI
+        # Opt-in (`install-repro`). Some recorders' `just lint` / `just test`
+        # qualify their managed-hook code against a real, selected Repro engine
+        # and deliberately fail without one rather than skipping. The recorder
+        # flakes' dev shells do not provide `repro` (locally the operator's own
+        # engine is used, the one that services their managed hooks), and the
+        # nix flavor of setup-dev-env installs none, so install it here with the
+        # same action and default release (`latest`) that setup-dev-env uses for
+        # ci-reprobuild.yml. It prepends the CLI to PATH for later steps, and
+        # `dev-exec` (`nix develop --command`) keeps that PATH.
+        if: inputs.install-repro
+        uses: metacraft-labs/metacraft-github-actions/setup-reprobuild@dev
+        with:
+          gh-token: ${{ steps.app-token.outputs.token }}
+          substituters: ${{ vars.SUBSTITUTERS }}
+          trusted-public-keys: ${{ vars.TRUSTED_PUBLIC_KEYS }}
+          attic-token: ${{ secrets.ATTIC_TOKEN }}
+          attic-cache: ${{ vars.ATTIC_CACHE }}
+          attic-endpoint: ${{ vars.ATTIC_ENDPOINT }}
 
       - name: Lint
         run: dev-exec just lint
