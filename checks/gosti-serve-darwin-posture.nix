@@ -133,16 +133,38 @@ top@{ ... }:
               # captures the pid: a backgrounded child inheriting that pipe keeps
               # it open, and `pid=$(serve_code …)` then blocks until the server
               # exits — i.e. forever.
-              python3 - "$1" >/dev/null 2>&1 <<'PY' &
-            import sys, http.server
+              #
+              # The responder touches work/serve-ready once its socket is bound
+              # and listening (HTTPServer's constructor does both), and the caller
+              # waits for that file instead of sleeping a fixed time: on a loaded
+              # builder a fixed `sleep 1` let the probe run before the bind, so a
+              # case meant to see a serving daemon saw "nothing is listening".
+              rm -f work/serve-ready
+              python3 - "$1" "$PWD/work/serve-ready" >/dev/null 2>&1 <<'PY' &
+            import sys, http.server, pathlib
             code = int(sys.argv[1])
             class H(http.server.BaseHTTPRequestHandler):
                 def do_GET(self):
                     self.send_response(code); self.end_headers()
                 def log_message(self, *a): pass
-            http.server.HTTPServer(("127.0.0.1", ${toString fixturePort}), H).serve_forever()
+            srv = http.server.HTTPServer(("127.0.0.1", ${toString fixturePort}), H)
+            pathlib.Path(sys.argv[2]).touch()
+            srv.serve_forever()
             PY
               echo $!
+            }
+
+            # await_serving <pid>: return once the responder is listening. A
+            # responder that dies first (e.g. the port is taken) is a fixture
+            # failure, reported as such rather than as a watchdog verdict.
+            await_serving() {
+              while [ ! -e work/serve-ready ]; do
+                if ! kill -0 "$1" 2>/dev/null; then
+                  bad "fixture: the HTTP responder on 127.0.0.1:${toString fixturePort} exited before it was listening"
+                  return 1
+                fi
+                sleep 0.05
+              done
             }
 
             # launchctl shim: `print` reports $SHIM_JOB (running | stuck |
@@ -237,7 +259,7 @@ top@{ ... }:
             # --- a serving listener must be left alone -----------------------
             for code in 200 401; do
               reset_state
-              pid=$(serve_code "$code"); sleep 1
+              pid=$(serve_code "$code"); await_serving "$pid"
               probe "ok$code"
               kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
               expect "ok$code" 0 "" "HTTP $code -> no action, counter reset"
@@ -245,7 +267,7 @@ top@{ ... }:
 
             # --- 503 is saturation: a real failure, not an answer ------------
             reset_state
-            pid=$(serve_code 503); sleep 1
+            pid=$(serve_code 503); await_serving "$pid"
             probe busy
             kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
             expect busy 1 "" "HTTP 503 counted as a failure"
@@ -274,7 +296,7 @@ top@{ ... }:
               probe few_stuck
             expect few_stuck 0 "" "stale zombies below the threshold (and other parents' zombies) are tolerated"
             reset_state
-            pid=$(serve_code 401); sleep 1
+            pid=$(serve_code 401); await_serving "$pid"
             SHIM_PS='4242 Z 01:16:00\n4242 Z 58:50\n4242 Z 1-02:00:00\n4242 Z 12:00\n' probe stuck_401
             kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
             expect stuck_401 1 "" "an answering daemon with leaked handlers still counts as a failure"
@@ -356,7 +378,7 @@ top@{ ... }:
             # --- marker + job loaded and serving: marker is cleared ----------
             reset_state
             date +%s > "$marker"
-            pid=$(serve_code 200); sleep 1
+            pid=$(serve_code 200); await_serving "$pid"
             probe marker_ok
             kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
             expect marker_ok 0 "" "a stale marker on a running job is cleared, no action"
