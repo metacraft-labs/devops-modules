@@ -15,17 +15,21 @@
 #   github_actions_job_duration_seconds{repo,workflow,job,runner_type,visibility}
 #   github_actions_job_resource_limit{...,signature=oom|no_space|timeout}
 #
-# TWO alerts:
+# One alert and one dashboard signal:
 #
-#   * DURATION REGRESSION — a public-repo, github-hosted job whose duration
-#     exceeds `regressionFactor` × its own trailing baseline (a recording rule:
-#     avg over `baselineWindow`, offset `baselineOffset` so the baseline excludes
-#     the regression itself), AND is above `minDurationSeconds` (so a 2s→5s job
-#     never pages). This is "it got slower after the move to ubuntu-latest".
+#   * DURATION REGRESSION — recorded as `github_actions_fit:duration_regression_ratio`:
+#     a public-repo, github-hosted job's duration over its own trailing baseline
+#     (a recording rule: avg over `baselineWindow`, offset `baselineOffset` so
+#     the baseline excludes the regression itself), for jobs above
+#     `minDurationSeconds` (so a 2s→5s job is not a regression). This is "it got
+#     slower after the move to ubuntu-latest". It is a DASHBOARD signal by
+#     default: as an alert (ratio > `regressionFactor`) it fired 73 times in two
+#     weeks on one fleet, none actionable (see the rule comment).
+#     `durationRegressionAlert = true` brings the warning back.
 #
 #   * RESOURCE LIMIT — a public-repo, github-hosted job hit an OOM / no-space /
 #     timeout signature. That is a hard fit failure (the ~14 GB SSD, the 16 GB
-#     RAM public-runner ceiling, or the job timeout), so it is the louder page.
+#     RAM public-runner ceiling, or the job timeout), so it is the alert.
 #
 # Both scope to `runner_type` × `visibility` (defaults github-hosted × public):
 # the operator's question is specifically about the PUBLIC repos moved to free
@@ -41,6 +45,9 @@
   regressionFactor ? "1.5",
   minDurationSeconds ? 120,
   durationRegressionFor ? "10m",
+  # Emit the GithubActionsUbuntuLatestDurationRegression warning on top of the
+  # ratio record. Off by default (see the header).
+  durationRegressionAlert ? false,
   # Resource-limit trip.
   resourceLimitFor ? "10m",
 }:
@@ -85,13 +92,18 @@ let
       ]
     );
 
+  # Optional `comment` on a record: YAML comment lines rendered above it ("" is
+  # a blank line), so the rationale ships in the rendered file.
   mkRecord =
     r:
-    concatStringsSep "\n" [
-      "      - record: ${r.record}"
-      "        expr: |"
-      (indentBlock 10 r.expr)
-    ];
+    concatStringsSep "\n" (
+      optionals (r ? comment) (map (c: if c == "" then "" else "      ${c}") r.comment)
+      ++ [
+        "      - record: ${r.record}"
+        "        expr: |"
+        (indentBlock 10 r.expr)
+      ]
+    );
 
   mkGroup =
     g:
@@ -120,6 +132,16 @@ let
     github_actions_job_duration_seconds{${scope}}
       > ${s minDurationSeconds}'';
 
+  # duration / baseline, for jobs above the floor. Same one-to-one label sets
+  # as regressionExpr.
+  regressionRatioExpr = ''
+    (
+      github_actions_job_duration_seconds{${scope}}
+        / github_actions_fit:duration_baseline_seconds
+    )
+      and
+    github_actions_job_duration_seconds{${scope}} > ${s minDurationSeconds}'';
+
   resourceExpr = "github_actions_job_resource_limit{${scope}} == 1";
 
   groups = [
@@ -136,8 +158,34 @@ let
           record = "github_actions_fit:duration_baseline_seconds";
           expr = baselineExpr;
         }
+        {
+          record = "github_actions_fit:duration_regression_ratio";
+          comment = [
+            "# DEMOTED TO A DASHBOARD SIGNAL, 2026-11-16 (OBS-AREQ7). This was the"
+            "# warning `GithubActionsUbuntuLatestDurationRegression`: the latest"
+            "# duration of a job over 1.5x its own value 30-60 minutes earlier, for"
+            "# 10m. Measured 2026-11-02..16 it fired 73 times (30 in W47), every one a"
+            "# 2-4 minute episode on metacraft-labs/codetracer. 58 were GitHub-hosted"
+            "# macOS jobs, which do not run on ubuntu-latest at all (test-ui-tests /"
+            "# test-non-gui (macos, aarch64-darwin), reprobuild-macos-smoke, the two"
+            "# origin-DAP macOS jobs), 14 were queue-watchdog and 1 the Linux release"
+            "# build. The"
+            "# exporter publishes each job's series for ~15 minutes after a run, so"
+            "# the \"baseline\" was the previous run, and run-to-run variance of a"
+            "# hosted macOS job is routinely above 1.5x. Lengthening the windows"
+            "# (3h/6h means against a 1d baseline) still left 38-48 episodes in 14"
+            "# days, none actionable."
+            "#"
+            "# The fault this family exists for — a public workflow that does NOT FIT"
+            "# ubuntu-latest — is the hard failure, and that is still an alert:"
+            "# GithubActionsUbuntuLatestResourceLimit below (critical). The duration"
+            "# trend stays visible on the runner-fit dashboard (panel \"Duration vs"
+            "# baseline\", the same ratio as this record)."
+          ];
+          expr = regressionRatioExpr;
+        }
       ];
-      rules = [
+      rules = optionals durationRegressionAlert [
         {
           name = "GithubActionsUbuntuLatestDurationRegression";
           expr = regressionExpr;

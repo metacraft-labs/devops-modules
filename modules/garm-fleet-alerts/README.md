@@ -16,13 +16,16 @@ controller (`:9997`, scale-set mode, 2026-09-08):
 
 | Alert                                  | Signal                                                                | Severity                         |
 | -------------------------------------- | --------------------------------------------------------------------- | -------------------------------- |
-| `GarmControllerDown`                   | `up{job=…} == 0`                                                      | critical                         |
+| `GarmControllerDown`                   | `up == 0` now **and** down for 10 of the last 60 minutes              | critical                         |
 | `GarmControllerUnhealthy`              | `garm_health == 0`                                                    | critical                         |
 | `GarmPoolManagerNotRunning`            | `garm_organization_pool_manager_status == 0`                          | critical                         |
-| `GarmProviderCreateFailures`           | `increase(garm_runner_errors_total{operation="CreateInstance"}[15m])` | warning                          |
-| `GarmProviderHighErrorRatio`           | `rate(errors)/rate(operations) > 0.2`                                 | critical                         |
+| `GarmProviderCreateFailures`           | a busy provider failing ≥ 10 creates/h while most still succeed       | warning                          |
+| `GarmProviderHighErrorRatio`           | > 50% of CreateInstance/Start failing over 1h, for 1h                 | warning                          |
 | `GarmGithubRateLimitLow` / `…Critical` | `garm_github_rate_limit_remaining`                                    | warning / critical               |
-| **`GarmFleetStarvation`**              | queued jobs vs a **saturated** class, past the bootstrap window       | **critical (the priority page)** |
+| **`GarmFleetStarvation`**              | a **saturated** class with jobs queued running **none**, 30 of 60 min | **critical (the priority page)** |
+| `GarmCapabilityPoolStarvation`         | an owner with jobs queued and zero free capability-pool slots         | critical                         |
+| `GarmInstanceStuckDeleting`            | ≥ 5 instances on one controller in teardown for 30m+                  | critical                         |
+| `GarmLiveRunnerCollapse`               | live runners below the declared min-idle floor                        | critical                         |
 | `GarmListenerSessionShortfall`         | live message sessions (created - deleted) below the declared count    | critical                         |
 | `GarmListenerPollStalled`              | `GetMessage` long-poll interval far above the ~50s ceiling            | critical                         |
 | `GarmFleetOverProvision`               | runners created ÷ jobs served over 1h > 2 (thundering herd, RC5)      | warning                          |
@@ -31,8 +34,11 @@ controller (`:9997`, scale-set mode, 2026-09-08):
 | `GithubWebhookEndpointProbeDown`       | external: blackbox probe of the public endpoint (post-Phase-C)        | critical                         |
 | `GarmWebhookHmacFailures`              | `garm_webhook_received{valid="false"}` (pool mode only)               | warning                          |
 
-Plus two recording rules (`garm:class_saturated`, `garm:class_queued_jobs`) that
-drive the starvation join, three LISTENER-LIVENESS rules
+Plus the capacity recording rules (`garm:class_saturated`,
+`garm:class_queued_jobs`, `garm:class_running_jobs`, `garm:class_starved`) that
+drive the starvation join, the capability-pool slot rules
+(`garm:pool_slots_{allocated,declared,free}`, `garm:owner_queued_jobs`),
+`garm:instance_deleting`, `garm:live_runners` and `garm:min_idle_floor`, three LISTENER-LIVENESS rules
 (`garm:listener_entities_declared`, `garm:message_sessions_live`,
 `garm:message_session_poll_interval_seconds`) described below, and three RC5
 over-provision rules
@@ -97,13 +103,37 @@ services.garm-fleet-alerts = {
   thresholds = {
     rateLimitWarn = 200;
     rateLimitCrit = 50;
-    providerCreateFailCount = 3;
-    providerErrorRatioCrit = "0.2";
+    providerCreateFailCount = 10;
+    providerErrorRatioCrit = "0.5";
   };
+  # Both groups default on. Turn them off for a fleet without the gosti-serve
+  # inventory exporter, or whose DeleteInstance retries are known noise.
+  instanceLifecycle = true;
+  overProvision = true;
 };
 ```
 
 It renders the library (`./rules.nix`) into `services.prometheus.ruleFiles`.
+
+## Noise budget
+
+Several thresholds were tuned against two weeks of one fleet's alert history
+(2026-11-02..16), because each alert was over its noise budget: one incident
+was paging as a sawtooth of episodes. The rationale and the replayed episode
+counts ship as comments next to each rule in the rendered file. In short:
+
+- **Fractions and holds, not long `for:`.** `GarmControllerDown` and
+  `GarmFleetStarvation` fire on a share of the last hour (down for 10 of 60
+  minutes; starved for 30 of 60), so a fault that keeps breaking for a minute
+  still pages, and `keep_firing_for` merges a flapping or retrying fault into
+  one episode.
+- **The provider pair splits a provisioning failure instead of both firing.**
+  `GarmProviderHighErrorRatio` is a provider failing most of its creates;
+  `GarmProviderCreateFailures` is a busy one losing a share. Neither counts
+  `DeleteInstance` (the H7 teardown retry) — teardown that stops converging is
+  `GarmInstanceStuckDeleting`'s, which pages per controller, not per corpse.
+- **A full class is a queue; a full class running nothing is a fault.**
+  `GarmFleetStarvation` excludes classes with jobs in progress.
 
 ## Scale-set vs pool
 

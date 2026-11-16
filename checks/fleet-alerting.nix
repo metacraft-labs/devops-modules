@@ -25,6 +25,15 @@ _top@{ ... }:
     let
       rules = config.packages.garm-fleet-alert-rules;
       testFile = ../modules/garm-fleet-alerts/tests/fleet-alerting.test.yml;
+      # The group toggles, off: the render a fleet without the gosti inventory
+      # exporter or the RC5 watch ships.
+      trimmedRules = pkgs.writeText "garm-fleet-alerts-trimmed.yml" (
+        import ../modules/garm-fleet-alerts/rules.nix {
+          inherit lib;
+          instanceLifecycle = false;
+          overProvision = false;
+        }
+      );
       # promtool ships in the `cli` output of the prometheus derivation.
       promtool = "${pkgs.prometheus.cli}/bin/promtool";
     in
@@ -52,8 +61,8 @@ _top@{ ... }:
               || fail "a fault-injection unit test did not fire/stay-silent as asserted"
 
             # Guard against silent shrinkage: every failure mode the gate names
-            # must have an alert. (20 alerts + 8 recording rules: 2 capacity +
-            # 3 RC5 over-provision + 3 MA6 listener liveness.)
+            # must have an alert. (23 alerts + Watchdog + 17 recording rules:
+            # 11 capacity + 3 RC5 over-provision + 3 MA6 listener liveness.)
             for a in \
               GarmControllerDown GarmControllerUnhealthy GarmPoolManagerNotRunning \
               GarmProviderCreateFailures GarmProviderHighErrorRatio \
@@ -61,6 +70,7 @@ _top@{ ... }:
               GostiEphemeralStoppedOrphans GostiEphemeralUnattributedInstances \
               GostiEphemeralInventoryFailing \
               GarmGithubRateLimitLow GarmGithubRateLimitCritical GarmFleetStarvation \
+              GarmCapabilityPoolStarvation GarmInstanceStuckDeleting GarmLiveRunnerCollapse \
               GarmFleetOverProvision \
               GarmListenerSessionShortfall GarmListenerPollStalled \
               GithubAppTokenMintFailing GithubWebhookDeliveryFailing \
@@ -81,6 +91,19 @@ _top@{ ... }:
                 END { exit(found ? 0 : 1) }
               ' garm-fleet-alerts.yml || fail "alert $a has no 'for:' clause — it would page on every controlled GARM restart"
             done
+
+            # The group toggles drop exactly their groups.
+            cp ${trimmedRules} garm-fleet-alerts-trimmed.yml
+            ${promtool} check rules garm-fleet-alerts-trimmed.yml \
+              || fail "promtool check rules rejected the trimmed render"
+            for g in garm-fleet-instance-lifecycle garm-fleet-overprovision; do
+              grep -q "name: $g$" garm-fleet-alerts.yml || fail "group $g missing from the default render"
+              if grep -q "name: $g$" garm-fleet-alerts-trimmed.yml; then
+                fail "group $g still rendered with its toggle off"
+              fi
+            done
+            grep -q "alert: GarmFleetStarvation" garm-fleet-alerts-trimmed.yml \
+              || fail "the trimmed render lost the capacity group"
 
             echo "[t_fleet_alerting][PASS] library valid; all fault-injection tests fire/stay-silent as asserted"
             touch $out

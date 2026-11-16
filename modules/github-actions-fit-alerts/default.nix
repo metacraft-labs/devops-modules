@@ -46,6 +46,7 @@
           baselineOffset
           regressionFactor
           durationRegressionFor
+          durationRegressionAlert
           resourceLimitFor
           ;
         inherit (cfg) minDurationSeconds;
@@ -83,12 +84,24 @@
         minDurationSeconds = mkOption {
           type = types.int;
           default = 120;
-          description = "Floor (seconds) below which a duration regression never pages (a fast job doubling is noise).";
+          description = "Floor (seconds) below which a duration is never recorded as a regression (a fast job doubling is noise).";
         };
         durationRegressionFor = mkOption {
           type = types.str;
           default = "10m";
-          description = "`for:` on the duration-regression alert.";
+          description = "`for:` on the duration-regression alert (when `durationRegressionAlert` is on).";
+        };
+        durationRegressionAlert = mkOption {
+          type = types.bool;
+          default = false;
+          description = ''
+            Also emit the `GithubActionsUbuntuLatestDurationRegression` warning
+            (ratio > `regressionFactor` for `durationRegressionFor`). Off by
+            default: the regression is always recorded as
+            `github_actions_fit:duration_regression_ratio` for the dashboard, and
+            as an alert it was measured to be noise (run-to-run variance of hosted
+            jobs routinely exceeds 1.5x). See ./rules.nix.
+          '';
         };
         resourceLimitFor = mkOption {
           type = types.str;
