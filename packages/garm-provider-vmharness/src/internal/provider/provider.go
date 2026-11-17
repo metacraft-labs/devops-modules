@@ -531,6 +531,7 @@ while :; do
 	sleep 15
 done
 
+{{ .BashDockerEngineSetup }}
 status "configuring runner"
 {{- if .UseJITConfig }}
 status "downloading JIT credentials"
@@ -929,6 +930,10 @@ type runnerInstallTemplateData struct {
 	// no offered runner version is derivable from the tools entry.
 	BashRunnerVersionGuard       string
 	PowershellRunnerVersionGuard string
+
+	// Docker Engine setup for the Tart Linux template (linux_docker_engine.sh).
+	// Only linuxForegroundRunnerInstallTemplate references it.
+	BashDockerEngineSetup string
 }
 
 func runnerInstallTemplateDataFrom(bootstrapParams commonParams.BootstrapInstance, tools commonParams.RunnerApplicationDownload, runnerName string) runnerInstallTemplateData {
@@ -949,6 +954,7 @@ func runnerInstallTemplateDataFrom(bootstrapParams commonParams.BootstrapInstanc
 
 		BashRunnerVersionGuard:       ownBashRunnerVersionGuard(tools),
 		PowershellRunnerVersionGuard: ownPowershellRunnerVersionGuard(tools),
+		BashDockerEngineSetup:        linuxDockerEngineSetup,
 	}
 }
 
