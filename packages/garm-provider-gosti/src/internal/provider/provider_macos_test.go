@@ -605,9 +605,25 @@ func TestLinuxBootstrapCreatesRunnerHomeBeforeDownload(t *testing.T) {
 			t.Fatalf("linux bootstrap missing foreground-runner behavior %q:\n%s", want, text)
 		}
 	}
-	for _, unwanted := range []string{"systemctl", "svc.sh", "systemd/unit-file"} {
+	for _, unwanted := range []string{"svc.sh", "systemd/unit-file"} {
 		if strings.Contains(text, unwanted) {
 			t.Fatalf("linux bootstrap must not use service manager path %q:\n%s", unwanted, text)
+		}
+	}
+	// The runner stays a foreground process, so the bootstrap uses no
+	// systemctl. The one exception is the Docker Engine setup
+	// (linux_docker_engine.sh), which starts dockerd's own units: the rest of
+	// the script is held to the original rule, and the fragment may not touch
+	// the runner either.
+	if !strings.Contains(text, linuxDockerEngineSetup) {
+		t.Fatalf("linux bootstrap does not carry the Docker Engine setup:\n%s", text)
+	}
+	if outside := strings.Replace(text, linuxDockerEngineSetup, "", 1); strings.Contains(outside, "systemctl") {
+		t.Fatalf("linux bootstrap must not use systemctl outside the Docker Engine setup:\n%s", outside)
+	}
+	for _, line := range strings.Split(linuxDockerEngineSetup, "\n") {
+		if strings.Contains(line, "systemctl") && strings.Contains(strings.ToLower(line), "runner") {
+			t.Fatalf("the Docker Engine setup must not manage the runner with systemctl: %q", line)
 		}
 	}
 	if strings.Index(text, "get_metadata_file \"credentials/runner\"") > strings.Index(text, "exec sudo -u \"$RUNNER_USER\" -H ./run.sh") {
