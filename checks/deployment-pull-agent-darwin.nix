@@ -161,7 +161,7 @@ top@{
       };
 
       staticSystem =
-        package:
+        package: interval:
         inputs.nix-darwin.lib.darwinSystem {
           system = pkgs.stdenv.hostPlatform.system;
           modules = [
@@ -180,7 +180,7 @@ top@{
                 eventLog = "/private/var/log/mcl/deployments/test-agent.jsonl";
                 standardOutLog = "/private/var/log/mcl/deployments/test-agent.stdout.log";
                 standardErrorLog = "/private/var/log/mcl/deployments/test-agent.stderr.log";
-                intervalSeconds = 421;
+                intervalSeconds = interval;
                 lockFile = "/private/var/run/mcl/test-pull-agent/m3.lock";
                 maxAttempts = 5;
                 fetchTimeoutSeconds = 11;
@@ -194,16 +194,51 @@ top@{
           ];
         };
 
-      staticA = checkedSystem "static generation A" (staticSystem (fakeMcl "generation-a"));
-      staticB = checkedSystem "static generation B" (staticSystem (fakeMcl "generation-b"));
+      staticA = checkedSystem "static generation A" (staticSystem (fakeMcl "generation-a") 421);
+      staticB = checkedSystem "static generation B" (staticSystem (fakeMcl "generation-b") 421);
+      changedPlistSystem = checkedSystem "changed polling interval" (
+        staticSystem (fakeMcl "generation-c") 422
+      );
+      staticSupervisorPackage = lib.findFirst (
+        package: lib.getName package == "mcl-deploy-agent-supervisor"
+      ) (throw "Darwin deployment supervisor is absent") staticA.config.environment.systemPackages;
+      staticPollerPackage = lib.findFirst (
+        package: lib.getName package == "mcl-deploy-agent"
+      ) (throw "Darwin deployment poller is absent") staticA.config.environment.systemPackages;
+      supervisorCheck =
+        pkgs.runCommand "test-darwin-pull-agent-changed-plist"
+          {
+            nativeBuildInputs = [ pkgs.python3 ];
+          }
+          ''
+            # Extract the actual immutable transient plist referenced by the poller.
+            worker_plist=$(grep -o '/nix/store/[^ ]*-mcl-deploy-agent-transaction.plist' ${lib.getExe staticPollerPackage})
+            python3 - "$worker_plist" ${lib.getExe staticEntrypointPackage} <<'PY'
+            import plistlib, sys
+            with open(sys.argv[1], 'rb') as stream:
+                job = plistlib.load(stream)
+            assert job['KeepAlive'] is False
+            assert job['RunAtLoad'] is True
+            assert job['ProcessType'] == 'Standard'
+            assert job['ProgramArguments'] == [sys.argv[2]]
+            assert job['Label'] == 'org.metacraft-labs.mcl-deploy-agent-transaction'
+            PY
+            python3 ${./test-darwin-pull-agent-supervisor.py} \
+              ${lib.getExe staticSupervisorPackage} "$worker_plist" \
+              ${lib.escapeShellArg (builtins.toJSON staticServiceA)} \
+              ${lib.escapeShellArg (
+                builtins.toJSON changedPlistSystem.config.launchd.daemons.mcl-deploy-agent.serviceConfig
+              )}
+            mkdir -p "$out"
+          '';
       staticServiceA = staticA.config.launchd.daemons.mcl-deploy-agent.serviceConfig;
       staticServiceB = staticB.config.launchd.daemons.mcl-deploy-agent.serviceConfig;
       staticEntrypointPackage =
-        lib.findFirst (package: lib.getName package == "mcl-deploy-agent")
+        lib.findFirst (package: lib.getName package == "mcl-deploy-agent-worker")
           (throw "Darwin pull-agent entrypoint package is absent from environment.systemPackages")
           staticA.config.environment.systemPackages;
       staticEntrypointPackageB =
-        lib.findFirst (package: lib.getName package == "mcl-deploy-agent")
+        lib.findFirst (package: lib.getName package == "mcl-deploy-agent-worker")
           (throw "second Darwin pull-agent entrypoint package is absent from environment.systemPackages")
           staticB.config.environment.systemPackages;
       staticLaunchdLauncherPackage =
@@ -224,8 +259,8 @@ top@{
         "120"
         "1"
       ];
-      staticSystemEntrypoint = "${staticA.config.system.path}/bin/mcl-deploy-agent";
-      staticSystemEntrypointB = "${staticB.config.system.path}/bin/mcl-deploy-agent";
+      staticSystemEntrypoint = "${staticA.config.system.path}/bin/mcl-deploy-agent-worker";
+      staticSystemEntrypointB = "${staticB.config.system.path}/bin/mcl-deploy-agent-worker";
       staticActivation = staticA.config.system.activationScripts.preActivation.text;
       staticPreparationPackage = staticA.config.services.mcl-deploy-agent.preparationPackage;
       staticActivationText = builtins.unsafeDiscardStringContext staticActivation;
@@ -259,7 +294,7 @@ top@{
         }
       );
       prerequisiteEntrypointPackage =
-        lib.findFirst (package: lib.getName package == "mcl-deploy-agent")
+        lib.findFirst (package: lib.getName package == "mcl-deploy-agent-worker")
           (throw "prerequisite Darwin pull-agent entrypoint package is absent")
           prerequisiteSystem.config.environment.systemPackages;
       prerequisitePreparationPackage =
@@ -976,7 +1011,7 @@ top@{
         }
       );
       lockDirEntrypointPackage =
-        lib.findFirst (package: lib.getName package == "mcl-deploy-agent")
+        lib.findFirst (package: lib.getName package == "mcl-deploy-agent-worker")
           (throw "lock-directory fixture Darwin pull-agent entrypoint package is absent")
           lockDirSystem.config.environment.systemPackages;
       lockDirRecoveryCheck =
@@ -1089,7 +1124,7 @@ top@{
         }
       );
       integrationEntrypointPackage =
-        lib.findFirst (package: lib.getName package == "mcl-deploy-agent")
+        lib.findFirst (package: lib.getName package == "mcl-deploy-agent-worker")
           (throw "integration Darwin pull-agent entrypoint package is absent")
           integrationSystem.config.environment.systemPackages;
       integrationPreparationPackage =
@@ -1144,7 +1179,7 @@ top@{
         }
       );
       lockEntrypointPackage =
-        lib.findFirst (package: lib.getName package == "mcl-deploy-agent")
+        lib.findFirst (package: lib.getName package == "mcl-deploy-agent-worker")
           (throw "lock-test Darwin pull-agent entrypoint package is absent")
           lockSystem.config.environment.systemPackages;
       lockPreparationPackage = lockSystem.config.services.mcl-deploy-agent.preparationPackage;
@@ -1201,7 +1236,7 @@ top@{
             }
 
                     entrypoint=${lib.escapeShellArg (lib.getExe integrationEntrypointPackage)}
-                    system_entrypoint=${lib.escapeShellArg "${integrationSystem.config.system.path}/bin/mcl-deploy-agent"}
+                    system_entrypoint=${lib.escapeShellArg "${integrationSystem.config.system.path}/bin/mcl-deploy-agent-worker"}
                     test -x "$entrypoint"
                     test -L "$system_entrypoint"
                     test "$(readlink "$system_entrypoint")" = "$entrypoint"
@@ -1689,6 +1724,7 @@ top@{
     in
     {
       checks = {
+        test_darwin_pull_agent_survives_changed_plist = supervisorCheck;
         # Needs no /private or real nix store, so it runs on every builder.
         test_darwin_pull_agent_recreates_missing_lock_dir = lockDirRecoveryCheck;
       }
