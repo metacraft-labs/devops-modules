@@ -605,9 +605,17 @@ func TestLinuxBootstrapCreatesRunnerHomeBeforeDownload(t *testing.T) {
 			t.Fatalf("linux bootstrap missing foreground-runner behavior %q:\n%s", want, text)
 		}
 	}
-	for _, unwanted := range []string{"systemctl", "svc.sh", "systemd/unit-file"} {
+	for _, unwanted := range []string{"svc.sh", "systemd/unit-file"} {
 		if strings.Contains(text, unwanted) {
 			t.Fatalf("linux bootstrap must not use service manager path %q:\n%s", unwanted, text)
+		}
+	}
+	// The runner stays a foreground process. systemctl itself is allowed: the
+	// Docker Engine setup (linux_docker_engine.sh) starts dockerd's units, and
+	// none of those lines may touch the runner.
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, "systemctl") && strings.Contains(strings.ToLower(line), "runner") {
+			t.Fatalf("linux bootstrap must not manage the runner with systemctl: %q", line)
 		}
 	}
 	if strings.Index(text, "get_metadata_file \"credentials/runner\"") > strings.Index(text, "exec sudo -u \"$RUNNER_USER\" -H ./run.sh") {
