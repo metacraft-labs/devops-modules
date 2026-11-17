@@ -891,6 +891,109 @@ jobs:
           grep -q "^machine $h " "$HOME/.config/nix/netrc" 2>/dev/null || \
             printf 'machine %s password %s\n' "$h" "$ATTIC_TOKEN" >> "$HOME/.config/nix/netrc"
 
+      # Each output in a batch is a separate `nix build .#<attr>`, and every one
+      # of them evaluates the flake from its own source store path
+      # (`/nix/store/<hash>-source`). Nothing roots that path between two
+      # invocations: the second one finds it through the fetcher cache, and a
+      # daemon auto-GC that runs inside that invocation deletes it from under
+      # the evaluator. The build then fails with
+      # `error: path '/nix/store/<hash>-source' is not valid` (m3, `min-free`
+      # above free space, so auto-GC runs before almost every command;
+      # metacraft-labs/infra jobs 132677356064, 133483446017, 133658250321).
+      #
+      # So root the flake's source for the whole job, before the first build,
+      # and root every locked input that is already in the store. The roots are
+      # indirect symlinks under RUNNER_TEMP, removed by the last step of this
+      # job. The Build step uses the same flake reference (`.`) on the same
+      # unmodified checkout, so it evaluates exactly the path rooted here.
+      # scripts/tests/test_flake_source_root.py runs this script against a real
+      # store and a real GC.
+      - name: Root the flake source for this job
+        if: ${{ !matrix.noop }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          root_dir="${RUNNER_TEMP:-/tmp}/flake-source-roots"
+          mkdir -p "$root_dir"
+          meta="$root_dir/metadata.json"
+          rows="$root_dir/sources.tsv"
+
+          # One read-only evaluation turns the metadata into
+          # "<name>\t<store path>" rows: `self` first, then every locked input.
+          # A flake input is a recursive sha256 "source" path, which is exactly
+          # the output path of a fixed-output derivation with the same hash.
+          # `--read-only` computes that path without writing a .drv or fetching
+          # anything.
+          # The ${...} below is Nix antiquotation, not shell expansion.
+          # shellcheck disable=SC2016
+          list_sources='
+            let
+              meta = builtins.fromJSON (builtins.readFile (builtins.getEnv "FLAKE_SOURCE_METADATA"));
+              nodes = meta.locks.nodes or { };
+              rootNode = meta.locks.root or "root";
+              fixed = narHash: builtins.unsafeDiscardStringContext (derivation {
+                name = "source";
+                system = "never-built";
+                builder = "never-built";
+                outputHashMode = "recursive";
+                outputHashAlgo = null;
+                outputHash = narHash;
+              }).outPath;
+              locked = name: nodes.${name}.locked or { };
+              inputs = builtins.filter (name: name != rootNode && (locked name) ? narHash)
+                (builtins.attrNames nodes);
+            in
+            builtins.concatStringsSep "" (
+              [ "self\t${meta.path}\n" ]
+              ++ map (name: "${name}\t${fixed (locked name).narHash}\n") inputs
+            )
+          '
+
+          self_path=""
+          for attempt in 1 2 3; do
+            # `nix flake metadata` copies the flake's own source into the store
+            # (it does not fetch inputs; their paths come from the lock file).
+            if nix flake metadata --json . > "$meta" &&
+              FLAKE_SOURCE_METADATA="$meta" nix eval --read-only --impure --raw \
+                --expr "$list_sources" > "$rows"; then
+              self_path="$(awk -F '\t' '$1 == "self" { print $2 }' "$rows")"
+              # Register the root, THEN check validity: once the root exists, a
+              # path that is still valid can no longer be collected. If a GC
+              # won the race in between, the next attempt copies it again.
+              if [[ "$self_path" == /nix/store/*-source ]] &&
+                nix-store --realise --add-root "$root_dir/self" --indirect "$self_path" > /dev/null &&
+                nix-store --check-validity "$self_path"; then
+                break
+              fi
+            fi
+            echo "::warning title=Flake source root::attempt $attempt to root the flake source failed; retrying"
+            self_path=""
+          done
+          if [[ -z "$self_path" ]]; then
+            # Fatal: without the root, every output after the first can fail at
+            # random with "path ... is not valid", which reads as a broken
+            # check. Failing here names the real cause instead.
+            echo "::error title=Flake source root::could not realise and GC-root the flake source; the per-output builds would race the garbage collector"
+            exit 1
+          fi
+          echo "Rooted the flake source $self_path at $root_dir/self"
+
+          # Inputs are best-effort, and deliberately so: the evidenced failure
+          # is the flake's own source, and an input that cannot be rooted
+          # leaves the job exactly as exposed as it was before this step.
+          # Inputs a build fetches later are not covered.
+          mapfile -t inputs < <(awk -F '\t' '$1 != "self" { print $2 }' "$rows" | sort -u)
+          if [[ "${#inputs[@]}" -gt 0 ]]; then
+            mapfile -t invalid < <(nix-store --check-validity --print-invalid "${inputs[@]}" || true)
+            mapfile -t present < <(comm -23 <(printf '%s\n' "${inputs[@]}") <(printf '%s\n' "${invalid[@]}" | sort -u) | sed '/^$/d')
+            if [[ "${#present[@]}" -gt 0 ]] &&
+              ! nix-store --realise --add-root "$root_dir/input" --indirect "${present[@]}" > /dev/null; then
+              echo "::warning title=Flake source root::could not root the ${#present[@]} locked input(s) already in the store; continuing with the flake source rooted"
+            fi
+            echo "Rooted ${#present[@]} of ${#inputs[@]} locked input source(s); ${#invalid[@]} not yet in the store."
+          fi
+
       - name: Build ${{ matrix.name }}
         if: ${{ !matrix.noop }}
         shell: bash
@@ -1341,6 +1444,21 @@ jobs:
           else
             echo "::warning title=S3 artifact mirror::upload failed (non-blocking); continuing"
           fi
+
+      # Release the roots taken by `Root the flake source for this job`. The
+      # daemon's gcroots/auto entries point at these symlinks, so removing the
+      # symlinks is what makes the sources collectable again. RUNNER_TEMP is
+      # also emptied between jobs, but a persistent runner should not hold the
+      # roots any longer than the job that needed them.
+      - name: Release the flake source roots
+        if: ${{ always() && !matrix.noop }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          root_dir="${RUNNER_TEMP:-/tmp}/flake-source-roots"
+          [[ -d "$root_dir" ]] || exit 0
+          find "$root_dir" -mindepth 1 -maxdepth 1 \( -type l -o -name metadata.json -o -name sources.tsv \) -delete
+          rmdir "$root_dir" 2>/dev/null || true
 
   results:
     runs-on: ${{ fromJSON(inputs.results-runner) }}
