@@ -1,0 +1,291 @@
+diff --git a/locking/interface.go b/locking/interface.go
+index 05b12b9..991ddfd 100644
+--- a/locking/interface.go
++++ b/locking/interface.go
+@@ -31,5 +31,8 @@ type Locker interface {
+ type InstanceDeleteBackoff interface {
+ 	ShouldProcess(key string) (bool, time.Time)
+ 	Delete(key string)
+-	RecordFailure(key string)
++	// RecordFailure records a failed attempt for key and returns how many
++	// consecutive failures the key now has and how long ShouldProcess will
++	// refuse it.
++	RecordFailure(key string) (failures int, backoff time.Duration)
+ }
+diff --git a/locking/local_backoff_locker.go b/locking/local_backoff_locker.go
+index 9334456..470fc9a 100644
+--- a/locking/local_backoff_locker.go
++++ b/locking/local_backoff_locker.go
+@@ -26,14 +26,30 @@ func NewInstanceDeleteBackoff(_ context.Context) (InstanceDeleteBackoff, error)
+ 	return &instanceDeleteBackoff{}, nil
+ }
+ 
++// NewInstanceDeleteBackoffWithClock is NewInstanceDeleteBackoff with the
++// clock injected, so a test can step through the schedule without waiting.
++func NewInstanceDeleteBackoffWithClock(now func() time.Time) InstanceDeleteBackoff {
++	return &instanceDeleteBackoff{now: now}
++}
++
+ type instanceBackOff struct {
+ 	backoffSeconds          float64
+ 	lastRecordedFailureTime time.Time
++	failures                int
+ 	mux                     sync.Mutex
+ }
+ 
+ type instanceDeleteBackoff struct {
+ 	muxes sync.Map
++	// now is the clock; nil means time.Now.
++	now func() time.Time
++}
++
++func (i *instanceDeleteBackoff) clock() time.Time {
++	if i.now != nil {
++		return i.now().UTC()
++	}
++	return time.Now().UTC()
+ }
+ 
+ func (i *instanceDeleteBackoff) ShouldProcess(key string) (bool, time.Time) {
+@@ -50,8 +66,8 @@ func (i *instanceDeleteBackoff) ShouldProcess(key string) (bool, time.Time) {
+ 		return true, time.Time{}
+ 	}
+ 
+-	now := time.Now().UTC()
+-	deadline := ib.lastRecordedFailureTime.Add(time.Duration(ib.backoffSeconds) * time.Second)
++	now := i.clock()
++	deadline := ib.lastRecordedFailureTime.Add(time.Duration(ib.backoffSeconds * float64(time.Second)))
+ 	return now.After(deadline), deadline
+ }
+ 
+@@ -59,19 +75,25 @@ func (i *instanceDeleteBackoff) Delete(key string) {
+ 	i.muxes.Delete(key)
+ }
+ 
+-func (i *instanceDeleteBackoff) RecordFailure(key string) {
++// RecordFailure doubles the key's backoff, starting at one consolidation
++// interval (5s) and capped at maxBackoffSeconds (20 minutes): 5s, 10s, 20s,
++// ... 640s, then 1200s. Delete (called when the delete finally succeeds)
++// resets it. The progression used to be 1.5x, which needs 15 failures to
++// reach the cap; a provider delete that cannot succeed (an incus dataset
++// pinned by a locked mount, 2026-11-16..18) takes ~4 minutes per attempt, so
++// for the first hour-plus the retries ran nearly back to back.
++func (i *instanceDeleteBackoff) RecordFailure(key string) (int, time.Duration) {
+ 	backoff, _ := i.muxes.LoadOrStore(key, &instanceBackOff{})
+ 	ib := backoff.(*instanceBackOff)
+ 	ib.mux.Lock()
+ 	defer ib.mux.Unlock()
+ 
+-	ib.lastRecordedFailureTime = time.Now().UTC()
++	ib.lastRecordedFailureTime = i.clock()
++	ib.failures++
+ 	if ib.backoffSeconds == 0 {
+ 		ib.backoffSeconds = common.PoolConsilitationInterval.Seconds()
+ 	} else {
+-		// Geometric progression of 1.5
+-		newBackoff := ib.backoffSeconds * 1.5
+-		// Cap the backoff to 20 minutes
+-		ib.backoffSeconds = min(newBackoff, maxBackoffSeconds)
++		ib.backoffSeconds = min(ib.backoffSeconds*2, maxBackoffSeconds)
+ 	}
++	return ib.failures, time.Duration(ib.backoffSeconds * float64(time.Second))
+ }
+diff --git a/locking/local_backoff_locker_test.go b/locking/local_backoff_locker_test.go
+index 00fe09c..a1978c1 100644
+--- a/locking/local_backoff_locker_test.go
++++ b/locking/local_backoff_locker_test.go
+@@ -75,7 +75,7 @@ func (l *LockerBackoffTestSuite) TestRecordFailure() {
+ 	ib = mux.(*instanceBackOff)
+ 	l.Require().NotNil(ib)
+ 	l.Require().NotEqual(time.Time{}, ib.lastRecordedFailureTime)
+-	l.Require().Equal(7.5, ib.backoffSeconds)
++	l.Require().Equal(float64(10), ib.backoffSeconds)
+ 
+ 	l.locker.Delete("test")
+ 	mux, ok = l.locker.muxes.Load("test")
+@@ -83,6 +83,47 @@ func (l *LockerBackoffTestSuite) TestRecordFailure() {
+ 	l.Require().Nil(mux)
+ }
+ 
++// TestDoublingScheduleAndReset steps an injected clock through the delete
++// backoff: 5s doubling to the 20-minute cap, ShouldProcess refusing until each
++// deadline passes, and Delete (a successful delete) starting over at 5s.
++func (l *LockerBackoffTestSuite) TestDoublingScheduleAndReset() {
++	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
++	b := NewInstanceDeleteBackoffWithClock(func() time.Time { return now })
++
++	want := []time.Duration{
++		5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second,
++		80 * time.Second, 160 * time.Second, 320 * time.Second, 640 * time.Second,
++		20 * time.Minute, 20 * time.Minute,
++	}
++	for i, w := range want {
++		failures, got := b.RecordFailure("garm-x")
++		l.Require().Equal(i+1, failures)
++		l.Require().Equal(w, got, "step %d", i+1)
++
++		ok, deadline := b.ShouldProcess("garm-x")
++		l.Require().False(ok, "step %d: retried before the backoff elapsed", i+1)
++		l.Require().Equal(now.Add(w), deadline)
++		now = now.Add(w - time.Second)
++		ok, _ = b.ShouldProcess("garm-x")
++		l.Require().False(ok, "step %d: retried 1s before the deadline", i+1)
++		now = now.Add(2 * time.Second)
++		ok, _ = b.ShouldProcess("garm-x")
++		l.Require().True(ok, "step %d: still refused 1s after the deadline", i+1)
++	}
++
++	// Another key is independent.
++	ok, _ := b.ShouldProcess("garm-y")
++	l.Require().True(ok)
++
++	// Success resets the schedule.
++	b.Delete("garm-x")
++	ok, _ = b.ShouldProcess("garm-x")
++	l.Require().True(ok)
++	failures, got := b.RecordFailure("garm-x")
++	l.Require().Equal(1, failures)
++	l.Require().Equal(5*time.Second, got)
++}
++
+ func TestBackoffTestSuite(t *testing.T) {
+ 	t.Parallel()
+ 	suite.Run(t, new(LockerBackoffTestSuite))
+diff --git a/runner/pool/pool.go b/runner/pool/pool.go
+index 7de1f7e..497a2f8 100644
+--- a/runner/pool/pool.go
++++ b/runner/pool/pool.go
+@@ -702,6 +702,14 @@ func (r *basePoolManager) cleanupOrphanedProviderRunners(runners []forgeRunner)
+ 		return fmt.Errorf("error fetching instances from db: %w", err)
+ 	}
+ 
++	// held is the instance lock this sweep holds; see below.
++	var held string
++	defer func() {
++		if held != "" {
++			locking.Unlock(held, false)
++		}
++	}()
++
+ 	runnerNames := map[string]bool{}
+ 	for _, run := range runners {
+ 		if !isManagedRunner(labelsFromRunner(run), r.controllerInfo.ControllerID.String()) {
+@@ -719,6 +727,10 @@ func (r *basePoolManager) cleanupOrphanedProviderRunners(runners []forgeRunner)
+ 			continue
+ 		}
+ 
++		if held != "" {
++			locking.Unlock(held, false)
++			held = ""
++		}
+ 		lockAcquired := locking.TryLock(instance.Name, r.consumerID)
+ 		if !lockAcquired {
+ 			slog.DebugContext(
+@@ -726,7 +738,15 @@ func (r *basePoolManager) cleanupOrphanedProviderRunners(runners []forgeRunner)
+ 				"runner_name", instance.Name)
+ 			continue
+ 		}
+-		defer locking.Unlock(instance.Name, false)
++		// Hold this instance's lock until the sweep moves on to the next
++		// instance (released before the next TryLock, or by the deferred
++		// release when the sweep returns). A defer here held every
++		// instance's lock until the whole pass, a DB read and possibly a
++		// forge call per instance, had finished. deletePendingInstances then
++		// could not lock an instance in pending_delete and logged "failed to
++		// acquire lock" on every tick, for minutes at a time every
++		// PoolReapTimeoutInterval (high-mem-server, 2026-11-18).
++		held = instance.Name
+ 
+ 		switch instance.Status {
+ 		case commonParams.InstancePendingCreate,
+@@ -793,6 +813,14 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+ 		return fmt.Errorf("error fetching instances from db: %w", err)
+ 	}
+ 
++	// held is the instance lock this sweep holds; see below.
++	var held string
++	defer func() {
++		if held != "" {
++			locking.Unlock(held, false)
++		}
++	}()
++
+ 	runnersByName := map[string]forgeRunner{}
+ 	for _, run := range runners {
+ 		if !isManagedRunner(labelsFromRunner(run), r.controllerInfo.ControllerID.String()) {
+@@ -814,6 +842,10 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+ 		slog.DebugContext(
+ 			r.ctx, "attempting to lock instance",
+ 			"runner_name", instance.Name)
++		if held != "" {
++			locking.Unlock(held, false)
++			held = ""
++		}
+ 		lockAcquired := locking.TryLock(instance.Name, r.consumerID)
+ 		if !lockAcquired {
+ 			slog.DebugContext(
+@@ -821,7 +853,15 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+ 				"runner_name", instance.Name)
+ 			continue
+ 		}
+-		defer locking.Unlock(instance.Name, false)
++		// Hold this instance's lock until the sweep moves on to the next
++		// instance (released before the next TryLock, or by the deferred
++		// release when the sweep returns). A defer here held every
++		// instance's lock until the whole pass, a DB read and possibly a
++		// forge call per instance, had finished. deletePendingInstances then
++		// could not lock an instance in pending_delete and logged "failed to
++		// acquire lock" on every tick, for minutes at a time every
++		// PoolReapTimeoutInterval (high-mem-server, 2026-11-18).
++		held = instance.Name
+ 
+ 		pool, err := r.store.GetEntityPool(r.ctx, r.entity, instance.PoolID)
+ 		if err != nil {
+@@ -1896,13 +1936,15 @@ func (r *basePoolManager) deletePendingInstances() error {
+ 			continue
+ 		}
+ 
+-		slog.InfoContext(
+-			r.ctx, "removing instance from pool",
+-			"runner_name", instance.Name,
+-			"pool_id", instance.PoolID)
++		// This loop runs every PoolConsilitationInterval. Log at info only
++		// when a delete is actually attempted: an instance waiting out its
++		// backoff (or locked by another pass) used to log "removing instance
++		// from pool" on every tick, ~300 lines per instance per 30 minutes,
++		// which read as a delete every 6s when the real attempts were ~24
++		// minutes apart.
+ 		lockAcquired := locking.TryLock(instance.Name, r.consumerID)
+ 		if !lockAcquired {
+-			slog.InfoContext(
++			slog.DebugContext(
+ 				r.ctx, "failed to acquire lock for instance",
+ 				"runner_name", instance.Name)
+ 			continue
+@@ -1917,6 +1959,11 @@ func (r *basePoolManager) deletePendingInstances() error {
+ 			continue
+ 		}
+ 
++		slog.InfoContext(
++			r.ctx, "removing instance from pool",
++			"runner_name", instance.Name,
++			"pool_id", instance.PoolID)
++
+ 		go func(instance params.Instance) (err error) {
+ 			// Prevent Thundering Herd. Should alleviate some of the database
+ 			// is locked errors in sqlite3.
+@@ -1953,7 +2000,13 @@ func (r *basePoolManager) deletePendingInstances() error {
+ 							r.ctx, "failed to update runner status",
+ 							"runner_name", instance.Name)
+ 					}
+-					r.backoff.RecordFailure(instance.Name)
++					failures, wait := r.backoff.RecordFailure(instance.Name)
++					slog.WarnContext(
++						r.ctx, "instance delete failed; backing off before the next attempt",
++						"runner_name", instance.Name,
++						"pool_id", instance.PoolID,
++						"consecutive_failures", failures,
++						"retry_in", wait.String())
+ 				}
+ 			}(instance)
+ 
