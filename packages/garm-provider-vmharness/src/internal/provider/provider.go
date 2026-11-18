@@ -62,6 +62,9 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 		if err := cfg.Remote.ValidateIncusProfiles(cfg.Backend); err != nil {
 			return nil, err
 		}
+		if err := cfg.Remote.ValidateIncusSharedStores(cfg.Backend); err != nil {
+			return nil, err
+		}
 	}
 	if cfg.Remote != nil && (cfg.Remote.IncusSecurityNesting || cfg.Remote.IncusNestedKvm) &&
 		(cfg.Backend != config.BackendRemote || cfg.Remote.TargetBackend != string(config.BackendIncus)) {
@@ -163,19 +166,22 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 			Client: backend.NewServeClient(
 				cfg.Remote.Endpoint, token,
 				time.Duration(cfg.Remote.RequestTimeoutSec)*time.Second),
-			TargetBackend:            cfg.Remote.TargetBackend,
-			GuestOS:                  cfg.Remote.GuestOS,
-			IncusSecurityNesting:     cfg.Remote.IncusSecurityNesting,
-			IncusNestedKvm:           cfg.Remote.IncusNestedKvm,
-			IncusProfiles:            append([]string(nil), cfg.Remote.IncusProfiles...),
-			IncusLimitsCPU:           cfg.Remote.IncusLimitsCPU,
-			IncusLimitsMemoryMB:      cfg.Remote.IncusLimitsMemoryMB,
-			LibvirtUEFILoader:        cfg.Remote.LibvirtUEFILoader,
-			LibvirtUEFINVRAMTemplate: cfg.Remote.LibvirtUEFINVRAMTemplate,
-			LibvirtCPUs:              cfg.Remote.LibvirtCPUs,
-			LibvirtMemoryMB:          cfg.Remote.LibvirtMemoryMB,
-			TartCPUs:                 cfg.Remote.TartCPUs,
-			TartMemoryMB:             cfg.Remote.TartMemoryMB,
+			TargetBackend:                 cfg.Remote.TargetBackend,
+			GuestOS:                       cfg.Remote.GuestOS,
+			IncusSecurityNesting:          cfg.Remote.IncusSecurityNesting,
+			IncusNestedKvm:                cfg.Remote.IncusNestedKvm,
+			IncusShareHostNixStore:        cfg.Remote.IncusShareHostNixStore,
+			IncusReprobuildStore:          cfg.Remote.IncusReprobuildStore,
+			IncusReprobuildStoreGuestPath: cfg.Remote.IncusReprobuildStoreGuestPath,
+			IncusProfiles:                 append([]string(nil), cfg.Remote.IncusProfiles...),
+			IncusLimitsCPU:                cfg.Remote.IncusLimitsCPU,
+			IncusLimitsMemoryMB:           cfg.Remote.IncusLimitsMemoryMB,
+			LibvirtUEFILoader:             cfg.Remote.LibvirtUEFILoader,
+			LibvirtUEFINVRAMTemplate:      cfg.Remote.LibvirtUEFINVRAMTemplate,
+			LibvirtCPUs:                   cfg.Remote.LibvirtCPUs,
+			LibvirtMemoryMB:               cfg.Remote.LibvirtMemoryMB,
+			TartCPUs:                      cfg.Remote.TartCPUs,
+			TartMemoryMB:                  cfg.Remote.TartMemoryMB,
 		}
 	default:
 		return nil, fmt.Errorf("unsupported backend %q", cfg.Backend)
