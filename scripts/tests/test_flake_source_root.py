@@ -8,14 +8,27 @@ check failed with `error: path '/nix/store/<hash>-source' is not valid`
 (metacraft-labs/infra jobs 132677356064, 133483446017, 133658250321).
 
 Nothing here is a double. The workflow's own `run:` blocks are extracted and
-executed by bash against the real `nix` CLI, on a throwaway local store
+executed exactly as a runner executes `shell: bash`
+(`bash --noprofile --norc -e -o pipefail <file>`) against the real `nix` CLI,
+on a throwaway local store
 (`store = local?root=<tmp>`) holding a real two-repo flake, and the store is
 collected with the real `nix store gc`. The negative control runs the same
 sequence without the rooting step and must see the source collected, which is
 what proves the GC in this test can delete the path at all.
 
+The check runs this file once per (bash, nix) pair: bash 3.2 is what the
+darwin runners' `shell: bash` resolves to (/bin/bash), and Nix 2.35 no longer
+copies the flake source in `nix flake metadata`. A single current bash and Nix
+let both of those through when this step first shipped (PR #822).
+
+Environment: BASH_BIN (the shell to run the steps with), EXPECT_BASH_MAJOR
+(asserted against that shell, so the pair under test is the pair named), and
+`nix` on PATH.
+
 Usage: test_flake_source_root.py [WORKFLOW]
 """
+
+import re
 
 import os
 import subprocess
@@ -31,6 +44,20 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/reusable-fla
 if len(sys.argv) > 1:
     WORKFLOW = Path(sys.argv.pop(1))
 BASH = os.environ.get("BASH_BIN", "bash")
+EXPECT_BASH_MAJOR = os.environ.get("EXPECT_BASH_MAJOR", "")
+
+# Constructs bash 3.2 (darwin /bin/bash) does not have, plus array expansion,
+# which is an unbound variable under `set -u` when empty before bash 4.4.
+BASH4_ONLY = re.compile(
+    r"\b(mapfile|readarray|coproc)\b|\bdeclare\s+-[a-zA-Z]*A|\blocal\s+-n\b"
+    r"|\$\{[^}]*(,,|\^\^|,|\^)\}|&>>|;;&|\[@\]|\[\*\]"
+)
+
+
+def bash4_constructs(script):
+    return [m.group(0) for line in script.splitlines()
+            if not line.lstrip().startswith("#")
+            for m in [BASH4_ONLY.search(line)] if m]
 
 ROOT_STEP = "Root the flake source for this job"
 RELEASE_STEP = "Release the flake source roots"
@@ -100,8 +127,15 @@ class Sandbox:
     def nix(self, *args):
         return self.run(["nix", *args]).stdout.strip()
 
+    def run_script(self, script):
+        path = self.tmp / "step.sh"
+        path.write_text(script)
+        # What a runner does for `shell: bash`.
+        return self.run([BASH, "--noprofile", "--norc", "-e", "-o", "pipefail", str(path)],
+                        check=False)
+
     def run_step(self, name):
-        return self.run([BASH, "-c", step(name)["run"]], check=False)
+        return self.run_script(step(name)["run"])
 
     def evaluate(self, attr):
         """What one per-output build does first: evaluate `.#<attr>`."""
@@ -115,6 +149,32 @@ class Sandbox:
 
 
 class FlakeSourceRoot(unittest.TestCase):
+    def test_shell_under_test_is_the_one_named(self):
+        major = subprocess.run([BASH, "-c", "echo ${BASH_VERSINFO[0]}"], text=True,
+                               capture_output=True, check=True).stdout.strip()
+        if EXPECT_BASH_MAJOR:
+            self.assertEqual(major, EXPECT_BASH_MAJOR)
+
+    def test_steps_use_no_bash4_constructs(self):
+        for name in (ROOT_STEP, RELEASE_STEP):
+            self.assertEqual(bash4_constructs(step(name)["run"]), [], name)
+
+    def test_bash4_lint_catches_bash4_constructs(self):
+        # Negative control for the lint above.
+        for bad in ('mapfile -t xs < f', 'readarray xs', 'declare -A m', 'echo "${xs[@]}"',
+                    'echo "${#xs[@]}"', 'echo "${v,,}"', 'cmd &>> log'):
+            self.assertNotEqual(bash4_constructs(bad), [], bad)
+
+    def test_bash32_rejects_a_bash4_step(self):
+        # Negative control for the shell: under bash 3.2 the same step with a
+        # bash-4 builtin added must fail, as it did on the darwin runners.
+        if EXPECT_BASH_MAJOR != "3":
+            self.skipTest("only meaningful under bash 3.2")
+        box = Sandbox()
+        result = box.run_script("mapfile -t probe < /dev/null\n" + step(ROOT_STEP)["run"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mapfile: command not found", result.stderr)
+
     def test_root_step_runs_before_the_first_build(self):
         build = next(i for i, n in enumerate(NAMES) if n.startswith("Build "))
         root = NAMES.index(ROOT_STEP)
