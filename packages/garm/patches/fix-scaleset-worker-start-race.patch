@@ -1,0 +1,63 @@
+diff --git a/workers/scaleset/scaleset.go b/workers/scaleset/scaleset.go
+index 602b1aa9..0a4d571c 100644
+--- a/workers/scaleset/scaleset.go
++++ b/workers/scaleset/scaleset.go
+@@ -323,6 +323,21 @@ func (w *Worker) Start() (err error) {
+ 		}
+ 	}()
+ 
++	// Our copy of the scale set was read before we subscribed (it is the row
++	// the controller loaded, possibly long before this worker was started),
++	// and the watcher only delivers changes made after RegisterConsumer. An
++	// update committed in between, for example the scale set being enabled
++	// while ensureScaleSetInGitHub() talked to the forge, would never reach
++	// this worker: repeating the same update changes nothing in the database,
++	// so no further event is sent. Re-read the scale set now that we are
++	// subscribed. Anything committed after this read arrives as an event.
++	if err := w.refreshScaleSetLocked(); err != nil {
++		return fmt.Errorf("refreshing scale set: %w", err)
++	}
++	if !w.scaleSet.Enabled {
++		slog.InfoContext(w.ctx, "scale set is disabled; the listener will not start until it is enabled", "scale_set", w.consumerID)
++	}
++
+ 	slog.DebugContext(w.ctx, "creating scale set listener")
+ 	listener := newListener(w.ctx, w)
+ 
+@@ -338,6 +353,22 @@ func (w *Worker) Start() (err error) {
+ 	return nil
+ }
+ 
++// refreshScaleSetLocked replaces our copy of the scale set with the one in
++// the database. Callers must hold w.mux.
++func (w *Worker) refreshScaleSetLocked() error {
++	scaleSet, err := w.store.GetScaleSetByID(w.ctx, w.scaleSet.ID)
++	if err != nil {
++		return fmt.Errorf("fetching scale set %d: %w", w.scaleSet.ID, err)
++	}
++	if scaleSet.Enabled != w.scaleSet.Enabled {
++		slog.InfoContext(
++			w.ctx, "scale set changed while the worker was starting",
++			"scale_set", w.consumerID, "enabled", scaleSet.Enabled)
++	}
++	w.scaleSet = scaleSet
++	return nil
++}
++
+ func (w *Worker) runnerByName() map[string]params.Instance {
+ 	runners := make(map[string]params.Instance)
+ 	for _, runner := range w.runners {
+@@ -658,6 +689,13 @@ func (w *Worker) handleScaleSetEvent(event dbCommon.ChangePayload) {
+ 		slog.DebugContext(w.ctx, "got update operation")
+ 		w.mux.Lock()
+ 
++		if scaleSet.Enabled != w.scaleSet.Enabled {
++			if scaleSet.Enabled {
++				slog.InfoContext(w.ctx, "scale set enabled; starting the listener", "scale_set", w.consumerID)
++			} else {
++				slog.InfoContext(w.ctx, "scale set disabled; stopping the listener", "scale_set", w.consumerID)
++			}
++		}
+ 		if scaleSet.MaxRunners < w.scaleSet.MaxRunners || !scaleSet.Enabled {
+ 			// we stop the listener if the scale set is disabled or if the max runners
+ 			// is decreased. In the case where max runners changes but the scale set
