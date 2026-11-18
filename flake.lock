@@ -2485,34 +2485,34 @@
     "nim-cli-spec-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1794810743,
-        "narHash": "sha256-1VQKhrGdO+P0IrVm401eya21FGLAjos9L08t86/jUpQ=",
+        "lastModified": 1794855652,
+        "narHash": "sha256-2PXrPF+3a2dYMbyoFliukQRLVXc3wIBuvqDOYZWR/ko=",
         "owner": "metacraft-labs",
         "repo": "nim-cli-spec",
-        "rev": "e6f976ca24fce6f9d794e334372d01d6b2f21790",
+        "rev": "8c36bf19c98f551f8eaa03e9d12ecad387f3a081",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "nim-cli-spec",
-        "rev": "e6f976ca24fce6f9d794e334372d01d6b2f21790",
+        "rev": "8c36bf19c98f551f8eaa03e9d12ecad387f3a081",
         "type": "github"
       }
     },
     "nim-confutils-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1794803824,
-        "narHash": "sha256-7VIYJo4s5NNnvLmzn9I3KpsojBzJBq66D1WjqHKXseI=",
+        "lastModified": 1794856118,
+        "narHash": "sha256-zHFUtlFQEmS3jK8oGm2ItMgMcWAsW2U1LciY3QspuS8=",
         "owner": "metacraft-labs",
         "repo": "nim-confutils",
-        "rev": "dcad14dd0f41e06dc61e8c01386923e6d5103dc3",
+        "rev": "0ad5824caee1672ed7d78eb5e3ff9f296a4d8f74",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "nim-confutils",
-        "rev": "dcad14dd0f41e06dc61e8c01386923e6d5103dc3",
+        "rev": "0ad5824caee1672ed7d78eb5e3ff9f296a4d8f74",
         "type": "github"
       }
     },
@@ -2605,11 +2605,11 @@
     "nim-shm-lease": {
       "flake": false,
       "locked": {
-        "lastModified": 1790618872,
-        "narHash": "sha256-hjlaK5aECxEbCGhG9CSPVOhTQoyFdF64m9nieVapDD8=",
+        "lastModified": 1794766859,
+        "narHash": "sha256-Jm0oyf3aT/ZJ7EixurDMBm3smLHQBRHbZOXZzJb4UPk=",
         "owner": "metacraft-labs",
         "repo": "nim-shm-lease",
-        "rev": "22e3100cdb4fbc374689ddac55b4b32c90654140",
+        "rev": "08a3f50a391b32b053598f64c670d5232e1eb051",
         "type": "github"
       },
       "original": {
@@ -3830,11 +3830,11 @@
         "vscode-server": "vscode-server"
       },
       "locked": {
-        "lastModified": 1794590569,
-        "narHash": "sha256-gCm0D1JESXQZCFJWOAvgVsd6Pp7VG8hKNSgCuSEGmyk=",
+        "lastModified": 1794829136,
+        "narHash": "sha256-29TZ+ttH5C2qeb6zEMWICUQ55u/1PjpEhMJgAVvtcZg=",
         "owner": "metacraft-labs",
         "repo": "devops-modules",
-        "rev": "88e4d74b07f58f341be48f2c4ddc0a28991a9028",
+        "rev": "a69415adff173f1a1649f3e27360fe10c53af3c8",
         "type": "github"
       },
       "original": {
@@ -4488,17 +4488,17 @@
         "test-certificates-tools-src": "test-certificates-tools-src"
       },
       "locked": {
-        "lastModified": 1794837906,
-        "narHash": "sha256-m6yAZ05Pgbc3VXgQA9DRLpGP2dBO8l2/QB2wG8ua2qs=",
+        "lastModified": 1794875900,
+        "narHash": "sha256-PHTwK78IL+vTKJ7rOxkEvr3OlTnI/YnX9if7GpReCcw=",
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "b9cf09b07e2c780f314c4244e4c8df7988fc2e78",
+        "rev": "e2fe4eb9f5b94abe382f10d39be0957e90a344a9",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "b9cf09b07e2c780f314c4244e4c8df7988fc2e78",
+        "rev": "e2fe4eb9f5b94abe382f10d39be0957e90a344a9",
         "type": "github"
       }
     },
@@ -4662,11 +4662,11 @@
         "runquota-package-catalog": "runquota-package-catalog"
       },
       "locked": {
-        "lastModified": 1794797954,
-        "narHash": "sha256-dP15GNERcepYJSACH3DZeleVJgSFJpciq8yA9kdwc00=",
+        "lastModified": 1794870716,
+        "narHash": "sha256-HV6YZN126tUUcrT4M8m2taNeavQ0ZZltEEvL8fvsP24=",
         "owner": "metacraft-labs",
         "repo": "runquota",
-        "rev": "98ea3e58df67f736a8527788d1563e31291a4881",
+        "rev": "6ff973131e7f715f0237cb0f08b8dd16cbeba0dc",
         "type": "github"
       },
       "original": {
