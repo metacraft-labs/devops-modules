@@ -204,6 +204,26 @@ buildGo126Module rec {
     # previous values stay. Tests in runner/metrics, run by
     # t_garm_metrics_snapshots.
     ./patches/publish-metric-snapshots.patch
+    # A scale-set worker could miss an update committed before it subscribed
+    # (m3, 2026-11-17). The deploy cordon disabled all six scale sets, the
+    # deploy restarted GARM, and the cordon's restore PUT {"enabled":true}
+    # for scale set 15 landed 0.17 s before that set's worker registered its
+    # watcher consumer. The worker had been built from the row while it was
+    # still disabled, and GARM only publishes an update event when a row
+    # changes, so the later identical PUTs published nothing. Worker 15 kept
+    # Enabled=false in memory, opened no listener session, logged nothing at
+    # info level, and its jobs queued for 28 h until an unrelated restart.
+    # Now Worker.Start() re-reads its scale set from the database after
+    # RegisterConsumer, so a write lands either before the read or as an
+    # event. The worker logs at info level when it starts disabled and when
+    # an update enables or disables it. Pools are not affected: the pool
+    # manager reads each pool's state from the cache on every pass.
+    # Cut against the tree with every patch above applied; keep it LAST.
+    # Gate: t_garm_scaleset_worker_update_race
+    # (checks/garm-scaleset-worker-update-race.nix), which runs
+    # checks/garm/scaleset_worker_update_race_test.go against this tree and,
+    # as a negative control, the tree without this patch.
+    ./patches/fix-scaleset-worker-start-race.patch
   ];
 
   # go-sqlite3 is a cgo module; the daemon needs cgo to link SQLite.

@@ -1,0 +1,265 @@
+From 517ff9f67ec1b60046cbd6cd2c69464a4a56897c Mon Sep 17 00:00:00 2001
+From: Zahary Karadjov <zahary@metacraft-labs.com>
+Date: Wed, 18 Nov 2026 02:07:13 +0200
+Subject: [PATCH] Re-read the scale set after the worker subscribes to updates
+
+A scale set worker is built from a copy of its scale set that the
+controller loaded earlier, and Worker.Start() only registers its watcher
+consumer after ensureScaleSetInGitHub() has talked to the forge. An
+update committed in that window is published before the worker is
+subscribed, so the worker never sees it. Repeating the same update does
+not help: the row does not change, so no event is published.
+
+The visible case is enabling a scale set while GARM is starting. The
+worker keeps Enabled=false in memory, keepListenerAlive() parks without
+opening a message session, and nothing is logged at info level. Jobs for
+the scale set queue until GARM is restarted.
+
+Re-read the scale set from the database once the consumer is registered.
+A write now lands either before that read or as an event. Log at info
+level when a worker starts with its scale set disabled, and when an
+update enables or disables it, so a parked worker is visible.
+
+The test enables the scale set from the fake forge while Start() is in
+ensureScaleSetInGitHub(), which reproduces the window deterministically.
+Without the re-read it fails: the worker keeps the disabled copy and
+never asks for a message session.
+
+Signed-off-by: Zahary Karadjov <zahary@metacraft-labs.com>
+---
+ workers/scaleset/scaleset.go                  |  38 +++++
+ .../scaleset_worker_update_race_test.go       | 160 ++++++++++++++++++
+ 2 files changed, 198 insertions(+)
+ create mode 100644 workers/scaleset/scaleset_worker_update_race_test.go
+
+diff --git a/workers/scaleset/scaleset.go b/workers/scaleset/scaleset.go
+index 87319d52..8aa03c77 100644
+--- a/workers/scaleset/scaleset.go
++++ b/workers/scaleset/scaleset.go
+@@ -363,6 +363,21 @@ func (w *Worker) Start() (err error) {
+ 		}
+ 	}()
+ 
++	// Our copy of the scale set was read before we subscribed (it is the row
++	// the controller loaded, possibly long before this worker was started),
++	// and the watcher only delivers changes made after RegisterConsumer. An
++	// update committed in between, for example the scale set being enabled
++	// while ensureScaleSetInGitHub() talked to the forge, would never reach
++	// this worker: repeating the same update changes nothing in the database,
++	// so no further event is sent. Re-read the scale set now that we are
++	// subscribed. Anything committed after this read arrives as an event.
++	if err := w.refreshScaleSetLocked(); err != nil {
++		return fmt.Errorf("refreshing scale set: %w", err)
++	}
++	if !w.scaleSet.Enabled {
++		slog.InfoContext(w.ctx, "scale set is disabled; the listener will not start until it is enabled", "scale_set", w.consumerID)
++	}
++
+ 	slog.DebugContext(w.ctx, "creating scale set listener")
+ 	listener := newListener(w.ctx, w)
+ 
+@@ -380,6 +395,22 @@ func (w *Worker) Start() (err error) {
+ 	return nil
+ }
+ 
++// refreshScaleSetLocked replaces our copy of the scale set with the one in
++// the database. Callers must hold w.mux.
++func (w *Worker) refreshScaleSetLocked() error {
++	scaleSet, err := w.store.GetScaleSetByID(w.ctx, w.scaleSet.ID)
++	if err != nil {
++		return fmt.Errorf("fetching scale set %d: %w", w.scaleSet.ID, err)
++	}
++	if scaleSet.Enabled != w.scaleSet.Enabled {
++		slog.InfoContext(
++			w.ctx, "scale set changed while the worker was starting",
++			"scale_set", w.consumerID, "enabled", scaleSet.Enabled)
++	}
++	w.scaleSet = scaleSet
++	return nil
++}
++
+ func (w *Worker) runnerByName() map[string]params.Instance {
+ 	runners := make(map[string]params.Instance)
+ 	for _, runner := range w.runners {
+@@ -782,6 +813,13 @@ func (w *Worker) handleScaleSetEvent(event dbCommon.ChangePayload) {
+ 		slog.DebugContext(w.ctx, "got update operation")
+ 		w.mux.Lock()
+ 
++		if scaleSet.Enabled != w.scaleSet.Enabled {
++			if scaleSet.Enabled {
++				slog.InfoContext(w.ctx, "scale set enabled; starting the listener", "scale_set", w.consumerID)
++			} else {
++				slog.InfoContext(w.ctx, "scale set disabled; stopping the listener", "scale_set", w.consumerID)
++			}
++		}
+ 		if scaleSet.MaxRunners < w.scaleSet.MaxRunners || !scaleSet.Enabled {
+ 			// we stop the listener if the scale set is disabled or if the max runners
+ 			// is decreased. In the case where max runners changes but the scale set
+diff --git a/workers/scaleset/scaleset_worker_update_race_test.go b/workers/scaleset/scaleset_worker_update_race_test.go
+new file mode 100644
+index 00000000..a551874e
+--- /dev/null
++++ b/workers/scaleset/scaleset_worker_update_race_test.go
+@@ -0,0 +1,160 @@
++// Copyright 2026 Cloudbase Solutions SRL
++//
++//	Licensed under the Apache License, Version 2.0 (the "License"); you may
++//	not use this file except in compliance with the License. You may obtain
++//	a copy of the License at
++//
++//	     http://www.apache.org/licenses/LICENSE-2.0
++//
++//	Unless required by applicable law or agreed to in writing, software
++//	distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++//	WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++//	License for the specific language governing permissions and limitations
++//	under the License.
++
++//go:build testing
++// +build testing
++
++package scaleset
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"strings"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/google/go-github/v84/github"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/mock"
++	"github.com/stretchr/testify/require"
++
++	commonParams "github.com/cloudbase/garm-provider-common/params"
++	"github.com/cloudbase/garm/cache"
++	"github.com/cloudbase/garm/database"
++	"github.com/cloudbase/garm/database/watcher"
++	garmTesting "github.com/cloudbase/garm/internal/testing"
++	"github.com/cloudbase/garm/params"
++	"github.com/cloudbase/garm/runner/common/mocks"
++)
++
++const forgeScaleSetID = 4242
++
++// TestWorkerStartSeesUpdateCommittedBeforeSubscribe reproduces a lost update
++// between a scale set worker's initial load and its watcher subscription.
++//
++// The worker is built from a DISABLED scale set. While Start() is talking to
++// the forge (ensureScaleSetInGitHub, which runs after the worker's state was
++// loaded and before it registers its watcher consumer), the fake forge enables
++// the scale set in the database. The update event is published before the
++// worker is subscribed, so the worker never receives it, and enabling the set
++// again later is a no-op that publishes nothing. Without a re-read after
++// subscribing, the worker keeps Enabled=false in memory and never opens a
++// message session.
++func TestWorkerStartSeesUpdateCommittedBeforeSubscribe(t *testing.T) {
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	watcher.InitWatcher(ctx)
++	defer watcher.CloseWatcher()
++
++	store, err := database.NewDatabase(ctx, garmTesting.GetTestSqliteDBConfig(t))
++	require.NoError(t, err)
++	_, err = store.InitController(ctx)
++	require.NoError(t, err)
++	adminCtx := garmTesting.ImpersonateAdminContext(ctx, store, t)
++
++	endpoint := garmTesting.CreateDefaultGithubEndpoint(adminCtx, store, t)
++	creds := garmTesting.CreateTestGithubCredentials(adminCtx, "test-creds", store, t, endpoint)
++	org, err := store.CreateOrganization(adminCtx, "test-org", creds, "test-webhook-secret", params.PoolBalancerTypeRoundRobin, false)
++	require.NoError(t, err)
++	entity, err := org.GetEntity()
++	require.NoError(t, err)
++
++	scaleSet, err := store.CreateEntityScaleSet(adminCtx, entity, params.CreateScaleSetParams{
++		Name:         "test-scaleset",
++		ProviderName: "test-provider",
++		MaxRunners:   1,
++		Image:        "test-image",
++		Flavor:       "test-flavor",
++		OSType:       commonParams.Linux,
++		OSArch:       commonParams.Amd64,
++		ScaleSetID:   forgeScaleSetID,
++		Enabled:      false,
++	})
++	require.NoError(t, err)
++	require.False(t, scaleSet.Enabled)
++
++	var raceInjected, sessionRequested atomic.Bool
++	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
++		switch {
++		case req.Method == http.MethodPost && req.URL.Path == "/actions/runner-registration":
++			_ = json.NewEncoder(rw).Encode(params.ActionsServiceAdminInfoResponse{
++				URL:   "http://" + req.Host + "/pipeline",
++				Token: "admin-token",
++			})
++		case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/_apis/runtime/runnerscalesets"):
++			// ensureScaleSetInGitHub() is between the worker's initial load
++			// and its watcher subscription. Enable the scale set right now:
++			// the update event is published to nobody.
++			if raceInjected.CompareAndSwap(false, true) {
++				enabled := true
++				_, err := store.UpdateEntityScaleSet(adminCtx, entity, scaleSet.ID, params.UpdateScaleSetParams{Enabled: &enabled}, nil)
++				if err != nil {
++					t.Errorf("enabling scale set mid-start: %s", err)
++				}
++			}
++			_ = json.NewEncoder(rw).Encode(params.RunnerScaleSetsResponse{
++				Count:           1,
++				RunnerScaleSets: []params.RunnerScaleSet{{ID: forgeScaleSetID, Name: "test-scaleset"}},
++			})
++		case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/sessions"):
++			// The listener only opens a session for an enabled scale set.
++			// Refusing it keeps the listener retrying without any further
++			// forge traffic.
++			sessionRequested.Store(true)
++			rw.WriteHeader(http.StatusServiceUnavailable)
++		default:
++			rw.WriteHeader(http.StatusNotFound)
++		}
++	}))
++	defer srv.Close()
++	baseURL, err := url.Parse(srv.URL)
++	require.NoError(t, err)
++
++	ghCli := &mocks.GithubClient{}
++	ghCli.On("GetEntity").Return(entity).Maybe()
++	ghCli.On("GithubBaseURL").Return(baseURL).Maybe()
++	ghCli.On("CreateEntityRegistrationToken", mock.Anything).Return(&github.RegistrationToken{
++		Token:     github.Ptr("registration-token"),
++		ExpiresAt: &github.Timestamp{Time: time.Now().Add(time.Hour)},
++	}, nil, nil).Maybe()
++	ghCli.On("GetEntityRunnerGroupIDByName", mock.Anything, mock.Anything).Return(int64(1), nil).Maybe()
++	cache.SetGithubClient(entity.ID, ghCli)
++	defer cache.DeleteGithubClient(entity.ID)
++
++	// The worker is built from the row as the controller loaded it: disabled.
++	worker, err := NewWorker(adminCtx, store, scaleSet, nil)
++	require.NoError(t, err)
++	require.NoError(t, worker.Start())
++	defer worker.Stop()
++
++	require.True(t, raceInjected.Load(), "the update was not injected between the initial load and the subscription")
++	dbScaleSet, err := store.GetScaleSetByID(adminCtx, scaleSet.ID)
++	require.NoError(t, err)
++	require.True(t, dbScaleSet.Enabled, "the scale set is not enabled in the database")
++
++	// Report both symptoms: the stale in-memory copy, and the listener that
++	// never opens a session because of it.
++	worker.mux.Lock()
++	enabled := worker.scaleSet.Enabled
++	worker.mux.Unlock()
++	assert.True(t, enabled, "worker kept a stale copy of the scale set: enabled in the database, disabled in the worker")
++
++	assert.Eventually(t, sessionRequested.Load, 30*time.Second, 50*time.Millisecond,
++		"the worker never opened a message session for its enabled scale set")
++}
+-- 
+2.53.0
