@@ -41,6 +41,7 @@
     ./garm-busy-runner-not-reaped.nix
     ./garm-deleting-capacity.nix
     ./garm-instance-lifecycle.nix
+    ./garm-pool-delete-backoff.nix
     ./garm-macos-pools-supported.nix
     ./garm-incus-runner-host.nix
     ./garm-incus-storage-pool-source.nix
