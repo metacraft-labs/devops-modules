@@ -65,9 +65,16 @@ with tempfile.TemporaryDirectory(prefix='mcl-explicit-hooks-host-') as temp:
     witness.chmod(0o755)
     env['REPROBUILD_REPRO'] = str(witness)
 
+    # The bound exists to turn a hang into a failure, not to time the steps.
+    # 30 s was too tight: on high-mem-server at load ~200 the installer alone
+    # (`mcl-install-own-hooks`, a dozen `pre-commit install/uninstall` Python
+    # start-ups) took ~44 s, so this hook failed every commit on that host.
+    # MCL_HOOK_TEST_TIMEOUT overrides the per-step bound in seconds.
+    step_timeout = float(os.environ.get('MCL_HOOK_TEST_TIMEOUT', '300'))
+
     def run(argv, cwd, success=True):
         result = subprocess.run([str(x) for x in argv], cwd=cwd, env=env,
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=step_timeout)
         if (result.returncode == 0) != success:
             raise AssertionError((argv, result.returncode, result.stdout, result.stderr))
         return result
