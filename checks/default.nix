@@ -49,6 +49,7 @@
     ./garm-install-script-template-fixtures.nix
     ./garm-skip-queued-jobs-when-pools-full.nix
     ./garm-metrics-snapshots.nix
+    ./garm-scaleset-worker-update-race.nix
     ./garm-provider-gosti-backend.nix
     ./garm-provider-remote.nix
     ./garm-provider-remote-old-daemon.nix

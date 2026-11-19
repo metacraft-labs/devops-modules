@@ -1,0 +1,43 @@
+# Prepared upstream PR bundle, driven by metacraft-dev-guidelines
+# scripts/submit-prepared-pr; the process is described in
+# metacraft-dev-guidelines policies/preparing-prs-for-internal-review.md.
+#
+# fix.patch was generated against upstream main 030a3915 (2026-11-18). The
+# local Nix patch (packages/garm/patches/fix-scaleset-worker-start-race.patch)
+# is the same change on our pin, cut on top of our other local patches (it
+# differs only in context); its test is checks/garm/
+# scaleset_worker_update_race_test.go, identical to the one in fix.patch.
+#
+# Build + test sanity on the PR tree (needs a Go toolchain with cgo):
+#   go build ./...
+#   go test -tags testing ./workers/scaleset/ -run TestWorkerStartSeesUpdateCommittedBeforeSubscribe
+
+[upstream]
+repo = "cloudbase/garm"
+base_branch = "main"
+base_sha = "030a39156879ab0d1197249d72328e3f69f7ad8d"
+
+[fork]
+repo = "<your-gh-user>/garm" # pass --fork or FORK=
+
+[pr]
+branch = "fix-scaleset-worker-start-race"
+title = "Re-read the scale set after the worker subscribes to updates"
+body = "PR.md"
+patches = ["fix.patch"]
+
+[review]
+# Private identifiers that must never reach the upstream PR.
+forbid = [
+  'high-mem-server',
+  'gpu-server',
+  'codetracer-ci',
+  'hms',
+  '\bm3\b',
+  'cordon',
+  'eph-win',
+  '100\.83\.',
+  '/var/lib/garm',
+  'checks/t_garm',
+  'reprobuild-specs',
+]
