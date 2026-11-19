@@ -389,11 +389,24 @@ assert_leaf_matches() {
   [ "$addrs" = "-" ] || [ -z "$addrs" ] || IFS=, read -r -a want_ip <<<"$addrs"
 
   local want have one
+  # Sorted in the same pipeline, NOT as a second `$(LC_ALL=C sort <<<"$want")`.
+  # On aarch64-darwin, nixpkgs' bash 5.3p9 makes the NEXT command substitution
+  # die with SIGSEGV after a `$(...)` that runs a command with BOTH a temporary
+  # LC_ALL assignment and a here-string. Here that was the subjectAltName read
+  # below, which exited 139 with no output and failed the dev-certificates
+  # check in a different subtest each run. Measured on m3 in the Nix sandbox,
+  # 300 fresh shells each, followed by `y=$(echo hi | cat)`:
+  #   x=$(LC_ALL=C sort <<<b)           36/300 and 43/300 died
+  #   x=$(sort <<<b), x=$(cat <<<b)     0/300
+  #   x=$(printf 'b\n' | LC_ALL=C sort)  0/300
+  # and verify-leaf died 36-41 times in 300 with that line, 0 without it.
+  # Linux is unaffected.
   want="$(
-    for one in "${want_nm[@]}"; do printf 'DNS:%s\n' "$one"; done
-    for one in ${want_ip[@]+"${want_ip[@]}"}; do printf 'IP Address:%s\n' "$one"; done
+    {
+      for one in "${want_nm[@]}"; do printf 'DNS:%s\n' "$one"; done
+      for one in ${want_ip[@]+"${want_ip[@]}"}; do printf 'IP Address:%s\n' "$one"; done
+    } | LC_ALL=C sort
   )"
-  want="$(LC_ALL=C sort <<<"$want")"
   # openssl prints a header line, then the entries joined by ", ".
   have="$(openssl x509 -in "$leaf" -noout -ext subjectAltName 2>/dev/null |
     awk 'NR > 1 { sub(/^[ \t]+/, ""); n = split($0, e, ", "); for (k = 1; k <= n; k++) print e[k] }' |
