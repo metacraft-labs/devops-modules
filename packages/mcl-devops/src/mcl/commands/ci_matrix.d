@@ -1309,7 +1309,16 @@ Package[] nixEvalForAllSystems(T)(auto ref T args)
 /// runner container (gpu-server-001, 2026-10-29): under a 3 GiB limit the
 /// workers sat at 3.9, 5.3, 6.7 and 7.3 GiB when the cgroup OOM killer fired,
 /// three attempts in a row.
-enum evalAttrGrowthMB = 6144;
+///
+/// Raised to 12 GiB on 2026-11-18: infra's `check/home-net-nm-profile`
+/// (seven NixOS configurations extended with a module, plus negative
+/// controls, in one attribute) peaks at 12.0 GiB in a FRESH worker under a
+/// 1405 MiB limit (nix-eval-jobs, `--workers 1`, cgroup MemoryPeak, no
+/// swap). With 6 GiB, a 20 GiB container got 2 workers and was OOM-killed on
+/// that attribute (infra#2394, eval-matrix shard-07 on nixos-ci-bare-003).
+/// A container smaller than about 14 GiB cannot evaluate that attribute
+/// with any worker count.
+enum evalAttrGrowthMB = 12_288;
 
 /// Lowest `--max-memory-size` handed to a worker. Below this a worker would
 /// restart (and re-load the flake) after nearly every attribute.
@@ -1341,16 +1350,21 @@ EvalWorkerBudget evalWorkerBudget(int availableMB, int workers, bool workersPinn
 @("evalWorkerBudget")
 unittest
 {
-    // 24 GiB runner container (the GPU hosts' and hms's generic and
-    // deploy-pipeline slots), 6 CPUs: 2 workers that restart past 3 GiB, so
-    // each peaks near 9 GiB and both together stay inside the 18 GiB plan.
-    assert(evalWorkerBudget(24_576, 6, false) == EvalWorkerBudget(2, 3072));
-    // 12 GiB container: 1 worker.
-    assert(evalWorkerBudget(12_288, 6, false) == EvalWorkerBudget(1, 3072));
-    // 10 GiB container: 1 worker with a lower restart limit.
-    assert(evalWorkerBudget(10_240, 6, false) == EvalWorkerBudget(1, 1536));
+    // 64 GiB container (hms's generic slots), 6 CPUs: 3 workers that
+    // restart past 4 GiB, each peaking near 16 GiB, 48 GiB together.
+    assert(evalWorkerBudget(65_536, 6, false) == EvalWorkerBudget(3, 4096));
+    // 24 GiB container (the GPU hosts' generic and deploy-pipeline slots):
+    // 1 worker that restarts past 6 GiB, so it peaks near 18 GiB.
+    assert(evalWorkerBudget(24_576, 6, false) == EvalWorkerBudget(1, 6144));
+    // 20 GiB container (nixos-ci-bare-002/003): 1 worker. With the old 6 GiB
+    // growth this was 2 workers at 1405 MiB, which OOM-killed at 20 GiB.
+    assert(evalWorkerBudget(20_480, 6, false) == EvalWorkerBudget(1, 3072));
+    // 12 GiB container: 1 worker at the floor.
+    assert(evalWorkerBudget(12_288, 6, false) == EvalWorkerBudget(1, 1024));
+    // 10 GiB container: the same.
+    assert(evalWorkerBudget(10_240, 6, false) == EvalWorkerBudget(1, 1024));
     // A large host keeps the CPU-derived count and splits memory across it.
-    assert(evalWorkerBudget(300_000, 8, false) == EvalWorkerBudget(8, 21_981));
+    assert(evalWorkerBudget(300_000, 8, false) == EvalWorkerBudget(8, 15_837));
     // A pinned worker count is kept; the limit falls to the floor.
     assert(evalWorkerBudget(12_288, 6, true) == EvalWorkerBudget(6, 1024));
     // Tiny or unknown memory still yields one worker with a floor.
@@ -1402,7 +1416,14 @@ int getAvailableMemoryMB(T)(auto ref T args)
             .find!(a => a.indexOf("Shmem:") != -1)
             .front
             .split[1].to!int;
-        return (free + cached + buffers - shmem) / 1024;
+        const meminfoMB = (free + cached + buffers - shmem) / 1024;
+        // /proc/meminfo is the cgroup's view only where something (lxcfs, as
+        // in the incus runner containers) virtualises it. In a plain
+        // container or a systemd slice it is the HOST's memory, and sizing
+        // workers to that is a cgroup OOM kill. Clamp to the cgroup's limit.
+        const cgroupMB = cgroupMemoryHeadroomMB(
+            "/proc/self/cgroup".readText.ifThrown(""), "/sys/fs/cgroup");
+        return cgroupMB < 0 || cgroupMB > meminfoMB ? meminfoMB : cgroupMB;
     }
     else version (OSX)
     {
@@ -1427,6 +1448,66 @@ int getAvailableMemoryMB(T)(auto ref T args)
     {
         static assert(false, "getAvailableMemoryMB not implemented for this platform");
     }
+}
+
+/// The memory left under the tightest cgroup v2 `memory.max` on the path from
+/// this process's cgroup up to the root, in MiB, or -1 when no ancestor sets a
+/// limit (or cgroup v2 is not mounted at `root`). `procSelfCgroup` is the
+/// content of /proc/self/cgroup; only its v2 line (`0::/path`) is read.
+int cgroupMemoryHeadroomMB(string procSelfCgroup, string root)
+{
+    import std.algorithm.comparison : min;
+    import std.path : buildNormalizedPath;
+
+    string rel = null;
+    foreach (line; procSelfCgroup.splitLines)
+        if (line.startsWith("0::"))
+            rel = line[3 .. $].strip;
+    if (rel is null)
+        return -1;
+
+    long best = -1;
+    for (string dir = buildNormalizedPath(root, "." ~ rel);; dir = dir.dirName)
+    {
+        const maxText = buildPath(dir, "memory.max").readText.ifThrown("").strip;
+        if (maxText.length && maxText != "max")
+        {
+            const limit = maxText.to!long.ifThrown(-1L);
+            const current = buildPath(dir, "memory.current").readText.ifThrown("0")
+                .strip.to!long.ifThrown(0L);
+            if (limit >= 0)
+            {
+                const headroom = limit > current ? limit - current : 0;
+                best = best < 0 ? headroom : min(best, headroom);
+            }
+        }
+        if (dir.length <= root.length || dir == root)
+            break;
+    }
+    return best < 0 ? -1 : cast(int)(best / (1024 * 1024));
+}
+
+@("cgroupMemoryHeadroomMB")
+unittest
+{
+    import std.file : tempDir, rmdirRecurse;
+
+    const root = buildPath(tempDir, "mcl-cgroup-test");
+    if (root.exists)
+        rmdirRecurse(root);
+    scope (exit)
+        if (root.exists)
+            rmdirRecurse(root);
+    mkdirRecurse(buildPath(root, "outer/job"));
+    // The job's own cgroup has no limit; its parent caps it at 20 GiB, of
+    // which 4 GiB is in use.
+    write(buildPath(root, "outer/job/memory.max"), "max\n");
+    write(buildPath(root, "outer/memory.max"), "21474836480\n");
+    write(buildPath(root, "outer/memory.current"), "4294967296\n");
+    assert(cgroupMemoryHeadroomMB("0::/outer/job\n", root) == 16_384);
+    // No v2 line, or no limit anywhere.
+    assert(cgroupMemoryHeadroomMB("1:name=systemd:/x\n", root) == -1);
+    assert(cgroupMemoryHeadroomMB("0::/\n", root) == -1);
 }
 
 @("getAvailableMemoryMB")
