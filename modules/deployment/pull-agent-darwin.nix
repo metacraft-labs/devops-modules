@@ -77,6 +77,16 @@
       ];
 
       stableEntrypoint = "/run/current-system/sw/bin/mcl-deploy-agent";
+      agentLabel = "org.metacraft-labs.mcl-deploy-agent";
+      agentPlist = "/Library/LaunchDaemons/${agentLabel}.plist";
+      supervisorPackage = pkgs.writeShellApplication {
+        name = "mcl-deploy-agent-supervisor";
+        runtimeInputs = [
+          pkgs.coreutils
+          pkgs.gnugrep
+        ];
+        text = builtins.readFile ./pull-agent-darwin-supervisor.sh;
+      };
       # nix-darwin loads a newly declared LaunchDaemon before it advances
       # /run/current-system. Naming the stable link directly therefore makes a
       # true first enable fail with ENOENT. Keep the plist stable across agent
@@ -118,8 +128,8 @@
           exit 75
         '';
       };
-      entrypointPackage = pkgs.writeShellApplication {
-        name = "mcl-deploy-agent";
+      workerPackage = pkgs.writeShellApplication {
+        name = "mcl-deploy-agent-worker";
         runtimeInputs = [
           cfg.package
           pkgs.coreutils
@@ -154,6 +164,32 @@
               ++ agentArguments
             )
           }
+        '';
+      };
+      # Not installed in /Library/LaunchDaemons and therefore never reconciled
+      # by nix-darwin. KeepAlive=false matters: launchctl submit creates a
+      # keepalive job on Darwin and can replay a completed transaction.
+      workerPlist = pkgs.writeText "mcl-deploy-agent-transaction.plist" (
+        lib.generators.toPlist { escape = true; } {
+          Label = "${agentLabel}-transaction";
+          ProgramArguments = [ (getExe workerPackage) ];
+          EnvironmentVariables = config.launchd.daemons.mcl-deploy-agent.serviceConfig.EnvironmentVariables;
+          RunAtLoad = true;
+          KeepAlive = false;
+          ProcessType = "Standard";
+          StandardOutPath = cfg.standardOutLog;
+          StandardErrorPath = cfg.standardErrorLog;
+        }
+      );
+      entrypointPackage = pkgs.writeShellApplication {
+        name = "mcl-deploy-agent";
+        text = ''
+          # Submit the WHOLE transaction, not only activate: health checks,
+          # rollback, lifecycle hooks and terminal journal writes must survive
+          # the poller's own bootout. The target lock remains in the worker.
+          exec ${getExe supervisorPackage} /bin/launchctl poll \
+            ${escapeShellArg "${agentLabel}-transaction"} \
+            ${workerPlist}
         '';
       };
 
@@ -1000,6 +1036,8 @@
           cfg.package
           launchdLauncherPackage
           entrypointPackage
+          workerPackage
+          supervisorPackage
         ];
 
         # This runs before nix-darwin reconciles launchd jobs, so launchd can
@@ -1008,6 +1046,29 @@
         system.activationScripts.preActivation.text = lib.mkAfter ''
           ${getExe preparationPackage}
         '';
+
+        # Independent of the polling job: an unloaded job has no StartInterval.
+        # Keep this job independent of the agent package, polling interval and
+        # environment settings. It never interrupts or enables a loaded job.
+        launchd.daemons.mcl-deploy-agent-recovery.serviceConfig = {
+          Label = "${agentLabel}-recovery";
+          ProgramArguments = [
+            "/bin/sh"
+            "-c"
+            ''/bin/wait4path /nix/store && exec "$@"''
+            "mcl-deploy-agent-recovery"
+            (getExe supervisorPackage)
+            "/bin/launchctl"
+            "recover"
+            agentLabel
+            agentPlist
+          ];
+          UserName = "root";
+          GroupName = "wheel";
+          RunAtLoad = true;
+          StartInterval = 60;
+          ProcessType = "Standard";
+        };
 
         launchd.daemons.mcl-deploy-agent = {
           serviceConfig = {
