@@ -6,54 +6,43 @@
 # and runs promtool.
 #
 # Every alert is asserted in BOTH directions: a replay of a real "does not fit"
-# incident that MUST fire, and controls (a sub-threshold blip, a job under the
-# duration floor, an out-of-scope self-hosted/private series) that MUST stay
-# silent. An alert with only a firing test is one that pages on every ordinary
-# job.
+# incident that MUST fire, and controls (a job under the duration floor, an
+# out-of-scope self-hosted/private series) that MUST stay silent. An alert with
+# only a firing test is one that pages on every ordinary job.
 rule_files:
   - github-actions-fit-alerts.yml
 
 evaluation_interval: 1m
 
 tests:
-  # ── GithubActionsUbuntuLatestDurationRegression ────────────────────────────
+  # ── github_actions_fit:duration_regression_ratio (the dashboard signal) ───
+  # The regression is RECORDED (ratio 3 for the 300s -> 900s build) and the
+  # tiny job and the self-hosted job stay out of it, but by default nothing
+  # warns: the alert name must produce no alert on the same input. A real
+  # "does not fit" failure is GithubActionsUbuntuLatestResourceLimit's. The
+  # opt-in warning (`durationRegressionAlert = true`) is replayed in
+  # fit-monitoring-duration-alert.test.yml.
   - interval: 1m
-    name: 'a hosted public job 3x its baseline pages; a blip, a tiny job, and a self-hosted job stay silent'
+    name: 'a 3x slower hosted build is recorded on the dashboard ratio, not alerted; a tiny job and a self-hosted job are not recorded'
     input_series:
-      # REGRESSION: build held 300s for 40m, then jumped to 900s (3x > 1.5x) and
-      # stayed. Baseline (avg over [30m] offset 30m) sees the 300s era; current
-      # is 900s. The real "moved to ubuntu-latest and got slower" case.
       - series: 'github_actions_job_duration_seconds{repo="metacraft-labs/web", workflow="CI", job="build", runner_type="github-hosted", visibility="public"}'
         values: '300x40 900x30'
-      # NEGATIVE 1 — a sub-threshold blip: 300 -> 400 (< 1.5x = 450). Never fires.
-      - series: 'github_actions_job_duration_seconds{repo="metacraft-labs/web", workflow="CI", job="lint", runner_type="github-hosted", visibility="public"}'
-        values: '300x40 400x30'
-      # NEGATIVE 2 — a tiny job doubling: 40 -> 100. Over 1.5x baseline but below
-      # the 120s floor, so it is noise, not a regression.
+      # A tiny job doubling (40 -> 100), below the 120s floor.
       - series: 'github_actions_job_duration_seconds{repo="metacraft-labs/web", workflow="CI", job="fast", runner_type="github-hosted", visibility="public"}'
         values: '40x40 100x30'
-      # NEGATIVE 3 — a self-hosted job with a huge regression. Out of the
-      # github-hosted/public scope, so the fit alert must ignore it entirely.
+      # A self-hosted regression: out of the github-hosted/public scope.
       - series: 'github_actions_job_duration_seconds{repo="metacraft-labs/web", workflow="CI", job="build-native", runner_type="self-hosted", visibility="public"}'
         values: '300x40 3000x30'
+    promql_expr_test:
+      - expr: github_actions_fit:duration_regression_ratio
+        eval_time: 65m
+        exp_samples:
+          - labels: '{__name__="github_actions_fit:duration_regression_ratio", repo="metacraft-labs/web", workflow="CI", job="build", runner_type="github-hosted", visibility="public"}'
+            value: 3
     alert_rule_test:
-      - eval_time: 45m # regression only 4m old; for: 10m not elapsed
-        alertname: GithubActionsUbuntuLatestDurationRegression
-        exp_alerts: []
       - eval_time: 65m
         alertname: GithubActionsUbuntuLatestDurationRegression
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              component: runner-fit
-              repo: metacraft-labs/web
-              workflow: CI
-              job: build
-              runner_type: github-hosted
-              visibility: public
-            exp_annotations:
-              summary: 'Workflow slower on ubuntu-latest: metacraft-labs/web CI/build'
-              description: 'Job build of workflow CI (metacraft-labs/web) is taking 15m 0s on the github-hosted runner — over 1.5x its recent baseline — for 10m. The workflow may not fit public ubuntu-latest (4 vCPU / 16 GB / 14 GB SSD); compare hosted vs self-hosted on the runner-fit dashboard and consider keeping it on self-hosted.'
+        exp_alerts: []
 
   # ── GithubActionsUbuntuLatestResourceLimit ─────────────────────────────────
   - interval: 1m

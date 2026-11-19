@@ -13,15 +13,24 @@ Delivered for milestone **RD4** of
 
 Over metrics from the companion `github-actions-fit-exporter`:
 
-| Alert                                         | Signal                                                                     | Severity |
-| --------------------------------------------- | -------------------------------------------------------------------------- | -------- |
-| `GithubActionsUbuntuLatestDurationRegression` | hosted public job duration > `regressionFactor`× its trailing baseline     | warning  |
-| `GithubActionsUbuntuLatestResourceLimit`      | hosted public job hit `oom` / `no_space` / `timeout` (from a job-log scan) | critical |
+| Alert                                                  | Signal                                                                     | Severity |
+| ------------------------------------------------------ | -------------------------------------------------------------------------- | -------- |
+| `GithubActionsUbuntuLatestResourceLimit`               | hosted public job hit `oom` / `no_space` / `timeout` (from a job-log scan) | critical |
+| `GithubActionsUbuntuLatestDurationRegression` (opt-in) | hosted public job duration > `regressionFactor`× its trailing baseline     | warning  |
 
-Plus one recording rule (`github_actions_fit:duration_baseline_seconds`) that is
-the offset trailing average the regression compares against.
+Plus two recording rules: `github_actions_fit:duration_baseline_seconds`, the
+offset trailing average, and `github_actions_fit:duration_regression_ratio`, a
+job's duration over that baseline (jobs above `minDurationSeconds` only) — the
+dashboard signal.
 
-Both alerts scope to `runner_type` × `visibility` (defaults `github-hosted` ×
+The duration regression is **recorded, not alerted, by default**
+(`durationRegressionAlert = false`). As a warning it fired 73 times in two weeks
+on one fleet, none actionable: the exporter keeps a job's series for ~15 minutes
+after a run, so the "baseline" is the previous run, and run-to-run variance of a
+hosted job (macOS ones especially) routinely exceeds 1.5×. The fault the family
+exists for — a workflow that does not fit — is the resource-limit alert.
+
+Both rules scope to `runner_type` × `visibility` (defaults `github-hosted` ×
 `public`): the operator's question is specifically about the public repos moved
 to free hosted runners.
 
@@ -45,7 +54,8 @@ services.github-actions-fit-alerts = {
   baselineOffset = "30m";     # so the baseline excludes the regression
   regressionFactor = "1.5";
   minDurationSeconds = 120;   # a fast job doubling is noise, not a regression
-  durationRegressionFor = "10m";
+  durationRegressionAlert = false; # true: also warn on the ratio
+  durationRegressionFor = "10m";   # its `for:`, when on
   resourceLimitFor = "10m";
 };
 ```
