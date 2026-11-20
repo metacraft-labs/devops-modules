@@ -1,0 +1,14 @@
+# Hosts other than github.com and gitlab.com that a flake.lock may fetch from.
+# Read by check_flake_lock_sources.py. One host per line, with the reason.
+# Add a host only when the input cannot come from GitHub/GitLab and the host is
+# one we would stake every consumer's CI on: when it is down, so is a fresh
+# `nix flake archive` of every consumer.
+#
+# spectrum-os.org is refused by the checker even if listed here.
+
+flakehub.com        # edolstra/flake-compat as upstream inputs name it (original)
+api.flakehub.com    # ...and the pinned tarball it locks to
+channels.nixos.org  # nixpkgs channel tarballs as upstream inputs name them (original)
+releases.nixos.org  # ...and the release tarball they lock to
+codeberg.org        # jcollie/zig-overlay (via zon2nix)
+git.sr.ht           # ~rycee/nmd (via nix-on-droid)

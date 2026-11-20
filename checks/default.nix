@@ -83,6 +83,7 @@
     ./netbird-with-agenix.nix
     ./ci-build-batching.nix
     ./ci-flake-source-root.nix
+    ./flake-lock-sources.nix
     ./packages-ci-matrix.nix
     ./pre-commit.nix
     ./git-hooks-reprobuild-handoff.nix
