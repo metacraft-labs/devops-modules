@@ -2426,7 +2426,7 @@
         "nixpkgs": [
           "nixpkgs"
         ],
-        "spectrum": "spectrum"
+        "spectrum": []
       },
       "locked": {
         "lastModified": 1778369133,
@@ -2449,7 +2449,7 @@
           "nixos-modules",
           "nixpkgs"
         ],
-        "spectrum": "spectrum_2"
+        "spectrum": []
       },
       "locked": {
         "lastModified": 1778369133,
@@ -4742,38 +4742,6 @@
         "owner": "andreymatin",
         "repo": "scss-reset",
         "type": "github"
-      }
-    },
-    "spectrum": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1772189877,
-        "narHash": "sha256-i1p90Rgssb//aNiTDFq46ZG/fk3LmyRLChtp/9lddyA=",
-        "ref": "refs/heads/main",
-        "rev": "fe39e122d898f66e89ffa17d4f4209989ccb5358",
-        "revCount": 1255,
-        "type": "git",
-        "url": "https://spectrum-os.org/git/spectrum"
-      },
-      "original": {
-        "type": "git",
-        "url": "https://spectrum-os.org/git/spectrum"
-      }
-    },
-    "spectrum_2": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1772189877,
-        "narHash": "sha256-i1p90Rgssb//aNiTDFq46ZG/fk3LmyRLChtp/9lddyA=",
-        "ref": "refs/heads/main",
-        "rev": "fe39e122d898f66e89ffa17d4f4209989ccb5358",
-        "revCount": 1255,
-        "type": "git",
-        "url": "https://spectrum-os.org/git/spectrum"
-      },
-      "original": {
-        "type": "git",
-        "url": "https://spectrum-os.org/git/spectrum"
       }
     },
     "stackable-hooks-macos-tools": {

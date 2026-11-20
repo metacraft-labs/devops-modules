@@ -67,7 +67,13 @@
     # name a revision that carries reprobuild's `nix/modules/` directory — a pin
     # older than that makes `modules/` fail to evaluate, not merely ship a stale
     # `repro`.
-    reprobuild.url = "github:metacraft-labs/reprobuild/cfbc5fd89094783dd48b0202f7d2d23f9ee3777f";
+    reprobuild = {
+      url = "github:metacraft-labs/reprobuild/cfbc5fd89094783dd48b0202f7d2d23f9ee3777f";
+      # reprobuild's own pin of this repo reaches microvm too, so the same
+      # spectrum-os.org input sits one level down. Drop it for the same reason
+      # as in `microvm` below.
+      inputs.nixos-modules.inputs.microvm.inputs.spectrum.follows = "";
+    };
 
     nixpkgs.follows = "nixos-2605";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -251,6 +257,14 @@
       url = "github:astro/microvm.nix";
       inputs = {
         nixpkgs.follows = "nixpkgs";
+        # microvm reads `spectrum` only in its `cloud-hypervisor-graphics`
+        # overlay, which is evaluated only for a guest with
+        # `microvm.graphics.enable` on the cloud-hypervisor hypervisor. Nothing
+        # here or in infra builds one. The input is fetched from
+        # spectrum-os.org, which stopped answering on 2026-11-19, and every
+        # consumer that fetches all locked inputs (`nix flake archive`) then
+        # fails. checks/flake-lock-sources.nix keeps it from coming back.
+        spectrum.follows = "";
       };
     };
 

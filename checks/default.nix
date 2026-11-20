@@ -82,6 +82,7 @@
     ./mcl-devops-rename.nix
     ./netbird-with-agenix.nix
     ./ci-build-batching.nix
+    ./flake-lock-sources.nix
     ./packages-ci-matrix.nix
     ./pre-commit.nix
     ./git-hooks-reprobuild-handoff.nix
