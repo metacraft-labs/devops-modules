@@ -147,6 +147,9 @@ Retry handling is bounded:
   source sequence, conflicting durable sequence identity, and exhausted retry
   budget are explicit non-retryable states.
 - Already converged deployments short-circuit without another apply attempt.
+- NixOS: a switch that failed after activation had already selected the
+  desired generation is not "already current". See
+  [Incomplete NixOS Switches](#incomplete-nixos-switches).
 
 ## Platform Activation And Lifecycle Hooks
 
@@ -256,6 +259,62 @@ message carries the same reason. A readiness hook should therefore print one
 specific reason line on stderr when it defers.
 Darwin activation events report target kind `darwin`.
 
+Both hooks accept a timeout (`--pre-switch-hook-timeout-seconds`,
+`--post-switch-hook-timeout-seconds`; 0, the CLI default, means none). The hook
+then runs under coreutils `timeout`, which terminates its whole process group
+and kills it 30 seconds later if it is still alive; a timed-out hook is a
+failed hook with error code `pre_switch_hook_timeout` /
+`post_switch_hook_timeout`. `--pre-switch-hook-failure abort|continue` decides
+what a failed or timed-out pre-switch hook does: `abort` (the default) fails the
+apply before any switch, retryable and counted against `maxAttempts`;
+`continue` records the failed hook event with `metadata.continuedAfterFailure`
+and switches anyway. Exit 75 always defers, whatever the policy.
+
+## Incomplete NixOS Switches
+
+`switch-to-configuration` selects the new generation (`/run/current-system`)
+during activation, before it reloads systemd and restarts units. When it fails
+after that point the host is half-applied: the new system is current, but
+changed services still run the old code and new units have not started.
+(macbook-2012, 2026-11-21: a 54-minute activation script, then `systemd daemon
+reload failed, timeout after 180s`. The retry two seconds later reported
+`Desired system generation was already current.` and would never have finished
+the switch; a manual `switch-to-configuration switch` did.)
+
+The engine therefore records every NixOS switch as started before it runs it,
+in `<state-dir>/switch-incomplete/<target>.json` (desired and previous
+generation, deployment, boot id, failure count, last failure time), and
+removes the record only when `switch-to-configuration` exits 0. The detached
+`systemd-run` unit removes it itself after a successful switch, so a switch that
+restarts the agent unit before the agent can record the outcome still confirms
+its completion. A failed switch that the inhibitor check refused before
+activation (`reboot-required`) removes it too.
+
+When a later run finds the desired generation current and the record names
+that generation, it does not take the already-current shortcut. It emits a
+failed `switch` event with error code `switch_incomplete`, then runs a full
+transaction for the same generation: restore (a no-op for a present closure),
+the pre-switch hook (with `DESIRED == PREVIOUS`), `switch-to-configuration`,
+health checks and the post-switch hook. Each such retry consumes one of
+`maxAttempts`. Retries back off exponentially from
+`--incomplete-switch-backoff-seconds` (default 300; doubled per failure, capped
+at four hours; 0 disables): a run inside the window records `deferred` with
+`switch_incomplete_backoff` without consuming an attempt. Once the budget is
+exhausted the agent stops switching, but every later run still emits the failed
+`switch_incomplete` event and a failed `complete` event and records
+`non-retryable` / `switch_incomplete_retry_budget_exhausted`, so
+`mcl_deployment_phase_failures_total{error_code="switch_incomplete"}` keeps
+rising until an operator completes the switch.
+
+A record from an earlier boot is discarded: booting a generation starts all of
+its units, so a reboot completes whatever the interrupted switch left undone.
+An unreadable record matches any generation (it fails towards re-switching).
+The record is written before the switch rather than after a failure, so it also
+covers an agent killed by the unit's `TimeoutStartSec` mid-switch. Detecting a
+half-applied host without the record (for example from `systemctl list-jobs`
+or unit-file timestamps) was rejected: no such signal reliably distinguishes
+"switch interrupted" from "switch finished, some unit later failed".
+
 ## NixOS Module
 
 The generic module is `flake.modules.nixos.deployment-pull-agent` and exposes
@@ -275,9 +334,25 @@ Example:
     interval = "15min";
     jitter = "5min";
     maxAttempts = 3;
+
+    # Optional: run before switch-to-configuration while the old generation
+    # still serves, e.g. an online database backup.
+    preSwitchHook = pkgs.writeShellScript "pre-switch" "...";
+    preSwitchHookTimeoutSeconds = 1200; # inside the unit's TimeoutStartSec
+    preSwitchHookFailurePolicy = "abort"; # or "continue"
+    alreadyCurrentRecoveryHook = "${pkgs.coreutils}/bin/true";
   };
 }
 ```
+
+`preSwitchHook` runs as root after the desired closure is restored and before
+`switch-to-configuration`, with `DESIRED CURRENT` system paths as arguments.
+`postSwitchHook` and `alreadyCurrentRecoveryHook` follow the contracts in
+[Platform Activation And Lifecycle Hooks](#platform-activation-and-lifecycle-hooks);
+as on nix-darwin, a module assertion requires `alreadyCurrentRecoveryHook`
+whenever a lifecycle hook is set (a no-op is fine for a hook that retains no
+state). Keep hook work out of activation scripts: those run inside the switch,
+where a long one delays every later phase and a failure half-applies the host.
 
 Production integrations should wire private source URLs, trust material, target
 selection, and any approval policy in the infrastructure repository. The

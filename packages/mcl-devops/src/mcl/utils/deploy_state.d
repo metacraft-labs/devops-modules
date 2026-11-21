@@ -943,6 +943,176 @@ void markDeploymentState(string stateDir, JSONValue manifest, string state, stri
     writeStatus(stateDir, category, manifest, state, message);
 }
 
+// A NixOS switch-to-configuration that failed part-way can leave the host
+// half-applied: activation already pointed /run/current-system at the new
+// generation, but the unit start/restart phase never ran (macbook-2012,
+// 2026-11-21: daemon-reload timeout after a 54-minute activation script). A
+// later run then sees `current == desired` and, without this record, reports
+// the generation as already current forever.
+//
+// The marker is written immediately BEFORE every NixOS switch and removed only
+// after switch-to-configuration exits 0, so it survives anything that stops
+// the switch from finishing -- a failed exit, the agent being killed by a unit
+// timeout, or the switch restarting the agent itself. A reboot activates the
+// boot-default generation completely, so a marker from an earlier boot is
+// stale and is discarded.
+struct IncompleteSwitchMarker
+{
+    string target;
+    string generation;
+    string previousGeneration;
+    string bootId;
+    string deploymentId;
+    long sequence;
+    long startedAt;
+    long failures;
+    long lastFailureAt;
+}
+
+string incompleteSwitchMarkerPath(string stateDir, string target)
+{
+    return stateDir.buildPath("switch-incomplete", safeTargetName(target) ~ ".json");
+}
+
+Nullable!IncompleteSwitchMarker loadIncompleteSwitchMarker(string stateDir, string target)
+{
+    auto path = incompleteSwitchMarkerPath(stateDir, target);
+    if (!path.exists)
+        return Nullable!IncompleteSwitchMarker.init;
+    try
+    {
+        auto json = path.readText.parseJSON;
+        long integer(string key) => key in json.object ? json[key].integer : 0;
+        string text(string key) => key in json.object ? json[key].str : "";
+        return Nullable!IncompleteSwitchMarker(IncompleteSwitchMarker(
+            target: text("target"),
+            generation: text("generation"),
+            previousGeneration: text("previousGeneration"),
+            bootId: text("bootId"),
+            deploymentId: text("deploymentId"),
+            sequence: integer("sequence"),
+            startedAt: integer("startedAt"),
+            failures: integer("failures"),
+            lastFailureAt: integer("lastFailureAt"),
+        ));
+    }
+    catch (Exception)
+    {
+        // An unreadable marker still proves a switch was started and never
+        // confirmed. Fail towards re-running the switch, not towards trusting
+        // `current == desired`; the generation is unknown, so match any.
+        return Nullable!IncompleteSwitchMarker(IncompleteSwitchMarker(
+            target: target, generation: "*"));
+    }
+}
+
+void writeIncompleteSwitchMarker(string stateDir, IncompleteSwitchMarker marker)
+{
+    auto path = incompleteSwitchMarkerPath(stateDir, marker.target);
+    mkdirRecurse(path.dirName);
+    auto temporary = path ~ ".tmp-" ~ randomUUID.toString;
+    scope(failure)
+        if (temporary.exists)
+            temporary.remove;
+    temporary.write(JSONValue([
+        "target": JSONValue(marker.target),
+        "generation": JSONValue(marker.generation),
+        "previousGeneration": JSONValue(marker.previousGeneration),
+        "bootId": JSONValue(marker.bootId),
+        "deploymentId": JSONValue(marker.deploymentId),
+        "sequence": JSONValue(marker.sequence),
+        "startedAt": JSONValue(marker.startedAt),
+        "failures": JSONValue(marker.failures),
+        "lastFailureAt": JSONValue(marker.lastFailureAt),
+    ]).toString(JSONOptions.doNotEscapeSlashes));
+    version (Posix)
+        temporary.setAttributes(416);
+    temporary.rename(path);
+}
+
+void removeIncompleteSwitchMarker(string stateDir, string target)
+{
+    auto path = incompleteSwitchMarkerPath(stateDir, target);
+    if (path.exists)
+        path.remove;
+}
+
+// True when the marker names the generation that is selected right now: the
+// switch into exactly that generation was started and never confirmed.
+bool incompleteSwitchMatches(Nullable!IncompleteSwitchMarker marker, string currentGeneration)
+{
+    return !marker.isNull && currentGeneration != ""
+        && (marker.get.generation == "*" || marker.get.generation == currentGeneration);
+}
+
+// The kernel's per-boot identifier; empty where it cannot be read (non-Linux).
+string currentBootId()
+{
+    import std.string : strip;
+
+    enum path = "/proc/sys/kernel/random/boot_id";
+    try
+        return path.exists ? path.readText.strip : "";
+    catch (Exception)
+        return "";
+}
+
+// Exponential backoff between retries of an incomplete switch: base, 2*base,
+// 4*base, ... capped at four hours. A zero base disables the backoff.
+long incompleteSwitchRetryDelaySeconds(long baseSeconds, long failures)
+{
+    enum long capSeconds = 4 * 3600;
+    if (baseSeconds <= 0 || failures <= 0)
+        return 0;
+    long delay = baseSeconds;
+    foreach (_; 1 .. failures)
+    {
+        if (delay >= capSeconds)
+            break;
+        delay *= 2;
+    }
+    return delay < capSeconds ? delay : capSeconds;
+}
+
+@("deployState.incompleteSwitchRetryDelaySeconds doubles and caps")
+unittest
+{
+    assert(incompleteSwitchRetryDelaySeconds(300, 0) == 0);
+    assert(incompleteSwitchRetryDelaySeconds(0, 5) == 0);
+    assert(incompleteSwitchRetryDelaySeconds(300, 1) == 300);
+    assert(incompleteSwitchRetryDelaySeconds(300, 2) == 600);
+    assert(incompleteSwitchRetryDelaySeconds(300, 3) == 1200);
+    assert(incompleteSwitchRetryDelaySeconds(300, 40) == 4 * 3600);
+}
+
+@("deployState.incompleteSwitchMarker round-trips and fails towards re-switching")
+unittest
+{
+    import std.file : rmdirRecurse;
+
+    auto stateDir = uniqueDeployStateTestPath("incomplete-switch-marker") ~ ".state";
+    scope(exit) if (stateDir.exists) stateDir.rmdirRecurse;
+
+    assert(loadIncompleteSwitchMarker(stateDir, "host").isNull);
+    writeIncompleteSwitchMarker(stateDir, IncompleteSwitchMarker(
+        target: "host", generation: "/nix/store/a-system", previousGeneration: "/nix/store/b-system",
+        bootId: "boot-1", deploymentId: "d", sequence: 3, startedAt: 10, failures: 2,
+        lastFailureAt: 20));
+    auto loaded = loadIncompleteSwitchMarker(stateDir, "host");
+    assert(!loaded.isNull);
+    assert(loaded.get.generation == "/nix/store/a-system");
+    assert(loaded.get.failures == 2 && loaded.get.lastFailureAt == 20);
+    assert(incompleteSwitchMatches(loaded, "/nix/store/a-system"));
+    assert(!incompleteSwitchMatches(loaded, "/nix/store/b-system"));
+
+    incompleteSwitchMarkerPath(stateDir, "host").write("{corrupt");
+    assert(incompleteSwitchMatches(loadIncompleteSwitchMarker(stateDir, "host"), "/nix/store/x"));
+
+    removeIncompleteSwitchMarker(stateDir, "host");
+    assert(loadIncompleteSwitchMarker(stateDir, "host").isNull);
+    removeIncompleteSwitchMarker(stateDir, "host");
+}
+
 JSONValue[] loadLatestManifests(string stateDir, string[] selectedTargets = null)
 {
     ensureDeployStateDirs(stateDir);

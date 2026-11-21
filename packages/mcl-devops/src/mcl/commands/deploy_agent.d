@@ -16,15 +16,16 @@ import std.uuid : randomUUID;
 import argparse : Command, Description, EnvFallback, NamedArgument, Placeholder;
 
 import mcl.commands.deploy_apply : DeploymentActivationMode, DeployApplyArgs,
-    DeployApplyDependencies, currentGeneration, deployApplyDeferredExitCode,
+    DeployApplyDependencies, HookFailurePolicy, LifecycleHookPolicyArgs,
+    currentGeneration, deployApplyDeferredExitCode,
     deployApplyRebootRequiredExitCode, deployApplyManifestConflictExitCode, deployApplyImpl,
     validateDurableManifest;
 import mcl.utils.deploy_manifest : manifestDeploymentId, manifestDesiredSystemPath,
     manifestSequence, manifestSystem, manifestTarget, verifyManifestSignature;
 import mcl.utils.deploy_state : acquireDeployTargetStateLock,
     DurableManifestSnapshot, enforceDurableManifestSnapshotCurrent,
-    ensureDeployStateDirs, loadDurableManifestSnapshot, manifestStatePath,
-    safeTargetName;
+    ensureDeployStateDirs, loadDurableManifestSnapshot, loadIncompleteSwitchMarker,
+    manifestStatePath, safeTargetName;
 import mcl.utils.deployment_events : deploymentEventLogPathFromEnv, utcTimestamp;
 import mcl.utils.process : ProcessResult, ProcessRunner, runProcessCapture;
 
@@ -93,6 +94,8 @@ struct DeployAgentArgs
         .Description("Executable recovery-only probe called with DESIRED CURRENT before exact-current convergence"))
     string alreadyCurrentRecoveryHook;
 
+    mixin LifecycleHookPolicyArgs;
+
     @(NamedArgument(["event-log"])
         .Placeholder("events.jsonl")
         .Description("Write deployment events as JSONL")
@@ -156,6 +159,10 @@ struct DeployAgentDependencies
     ProcessRunner runProcess;
     ProcessRunner queryProcess;
     void delegate() afterDurableValidation;
+    // Test seams forwarded to deploy-apply; null uses the wall clock and the
+    // kernel boot id.
+    long delegate() now;
+    string delegate() bootId;
 }
 
 struct AgentCandidate
@@ -535,7 +542,14 @@ int deployAgentImpl(DeployAgentArgs args, DeployAgentDependencies deps)
         return 1;
     }
 
-    if (isDurableLatest && isConverged(args.stateDir, manifest))
+    // Convergence evidence is not trusted while a switch into the desired
+    // generation is recorded as started and unconfirmed: deploy-apply decides
+    // whether the host is half-applied (it also discards a marker from an
+    // earlier boot).
+    auto switchMayBeIncomplete = args.activationMode == DeploymentActivationMode.nixos
+        && !args.dryRun
+        && !loadIncompleteSwitchMarker(args.stateDir, args.target).isNull;
+    if (isDurableLatest && isConverged(args.stateDir, manifest) && !switchMayBeIncomplete)
     {
         auto status = agentStatusJson(args.target, deploymentId, sequence,
             "succeeded", previousAttempts, args.maxAttempts, false,
@@ -586,6 +600,10 @@ int deployAgentImpl(DeployAgentArgs args, DeployAgentDependencies deps)
     applyArgs.preSwitchHook = args.preSwitchHook;
     applyArgs.postSwitchHook = args.postSwitchHook;
     applyArgs.alreadyCurrentRecoveryHook = args.alreadyCurrentRecoveryHook;
+    applyArgs.preSwitchHookTimeoutSeconds = args.preSwitchHookTimeoutSeconds;
+    applyArgs.preSwitchHookFailure = args.preSwitchHookFailure;
+    applyArgs.postSwitchHookTimeoutSeconds = args.postSwitchHookTimeoutSeconds;
+    applyArgs.incompleteSwitchBackoffSeconds = args.incompleteSwitchBackoffSeconds;
     applyArgs.eventLog = eventLogPath;
     applyArgs.dryRun = args.dryRun;
     applyArgs.restoreCommand = args.restoreCommand;
@@ -598,6 +616,8 @@ int deployAgentImpl(DeployAgentArgs args, DeployAgentDependencies deps)
     applyArgs.controller = "mcl-deploy-agent";
 
     bool alreadyCurrent;
+    bool incompleteSwitch;
+    bool incompleteSwitchBackoff;
     auto result = deployApplyImpl(applyArgs, DeployApplyDependencies(
         runProcess: deps.runProcess,
         queryProcess: deps.queryProcess,
@@ -607,7 +627,25 @@ int deployAgentImpl(DeployAgentArgs args, DeployAgentDependencies deps)
         retryIdempotentManifest: true,
         requireAlreadyCurrent: recoveryOnlyAtExhaustedBudget,
         onAlreadyCurrent: { alreadyCurrent = true; },
+        onIncompleteSwitch: { incompleteSwitch = true; },
+        onIncompleteSwitchBackoff: { incompleteSwitchBackoff = true; },
+        now: deps.now,
+        bootId: deps.bootId,
     ));
+
+    if (result == deployApplyDeferredExitCode && incompleteSwitchBackoff)
+    {
+        // Retryable and not a consumed attempt, but not quiet either: the
+        // status says the host is half-applied, and deploy-apply emitted a
+        // failed `switch_incomplete` event for this run.
+        auto status = writeAgentStatus(args.stateDir, args.target, deploymentId, sequence,
+            "deferred", previousAttempts, args.maxAttempts, true,
+            "The desired generation is selected but its last switch did not complete; "
+                ~ "the switch retry is backing off.",
+            "switch_incomplete_backoff");
+        writeln(status.toString(JSONOptions.doNotEscapeSlashes));
+        return 0;
+    }
 
     if (result == deployApplyDeferredExitCode)
     {
@@ -662,13 +700,22 @@ int deployAgentImpl(DeployAgentArgs args, DeployAgentDependencies deps)
         !succeeded && !exhausted,
         succeeded ? alreadyCurrent
             ? "Desired system generation was already current."
+            : incompleteSwitch
+                ? "Deployment converged; the incomplete switch was re-run to completion."
             : "Deployment converged."
             : alreadyCurrent
                 ? "Already-current lifecycle recovery failed; retry remains available."
+            : incompleteSwitch && exhausted
+                ? "Retry budget exhausted; the desired generation is selected but its switch "
+                    ~ "never completed (host is half-applied)."
             : exhausted ? "Retry budget exhausted for this deployment."
+            : incompleteSwitch
+                ? "Re-running the incomplete switch failed; retry remains available."
             : "Deployment apply failed; retry remains available.",
         succeeded ? "" : alreadyCurrent ? "already_current_recovery_failed"
-            : exhausted ? "retry_budget_exhausted" : "apply_failed");
+            : incompleteSwitch && exhausted ? "switch_incomplete_retry_budget_exhausted"
+            : exhausted ? "retry_budget_exhausted"
+            : incompleteSwitch ? "switch_incomplete" : "apply_failed");
     writeln(status.toString(JSONOptions.doNotEscapeSlashes));
     return result;
 }
@@ -2006,4 +2053,508 @@ unittest
     assert(statusPath.readText == statusBeforeReplay);
     assert(eventLog.readText == eventsBeforeReplay);
     assert(recoveryRuns == 2);
+}
+
+version (unittest)
+{
+    // A signed single-manifest fixture for the NixOS incomplete-switch and
+    // pre-switch-hook tests. The fake host starts on `previous`; the manifest
+    // names `desired`.
+    private struct HalfAppliedFixture
+    {
+        string base;
+        string keyPath;
+        string stateDir;
+        string manifestPath;
+        string eventLog;
+        string desired = "/nix/store/99999999999999999999999999999999-nixos-system-host";
+        string previous = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-nixos-system-host";
+
+        static HalfAppliedFixture create(string label)
+        {
+            import mcl.utils.deploy_manifest : ManifestBuildRequest, ManifestSigningRequest,
+                buildManifest, signManifest;
+
+            HalfAppliedFixture f;
+            f.base = uniqueDeployStateTestPath(label);
+            f.keyPath = f.base ~ ".ed25519";
+            f.stateDir = f.base ~ ".state";
+            f.manifestPath = f.base ~ ".manifest.json";
+            f.eventLog = f.base ~ ".events.jsonl";
+            auto keygen = runProcessCapture([
+                "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", f.keyPath,
+            ]);
+            assert(keygen.succeeded, keygen.stderr);
+            auto manifest = signManifest(buildManifest(ManifestBuildRequest(
+                deploymentId: "deploy-half-applied",
+                target: "target",
+                gitRevision: "0123456789abcdef0123456789abcdef01234567",
+                sequence: 1,
+                desiredSystemPath: f.desired,
+            )), ManifestSigningRequest(keyPath: f.keyPath, keyId: "mcl-deployment"));
+            f.manifestPath.write(manifest.toString(JSONOptions.doNotEscapeSlashes));
+            return f;
+        }
+
+        void cleanup()
+        {
+            foreach (path; [base, keyPath, keyPath ~ ".pub", manifestPath, eventLog])
+                if (path.exists) path.remove;
+            foreach (dir; [stateDir, base ~ ".control-state"])
+                if (dir.exists) dir.rmdirRecurse;
+        }
+
+        DeployAgentArgs args()
+        {
+            DeployAgentArgs a;
+            a.target = "target";
+            a.manifests = [manifestPath];
+            a.trustedManifestPublicKey = (keyPath ~ ".pub").readText.strip;
+            a.stateDir = stateDir;
+            a.eventLog = eventLog;
+            a.maxAttempts = 3;
+            a.restoreCommand = "restore";
+            a.switchCommand = "switch";
+            a.generationCommand = "current-generation";
+            a.noDetachSwitch = true;
+            a.incompleteSwitchBackoffSeconds = 0;
+            return a;
+        }
+
+        JSONValue status()
+        {
+            return agentStatusPath(stateDir, "target").readText.parseJSON;
+        }
+
+        JSONValue[] events()
+        {
+            return eventLog.exists
+                ? eventLog.readText.splitLines
+                    .filter!(line => line.strip != "")
+                    .map!(line => line.parseJSON)
+                    .array
+                : [];
+        }
+
+        size_t failedEvents(string phase, string code)
+        {
+            return events
+                .filter!(e => e["phase"].str == phase
+                    && e["command"]["status"].str == "failed"
+                    && "error" in e.object && e["error"]["code"].str == code)
+                .array.length;
+        }
+    }
+}
+
+@("test_deploy_agent_reruns_a_switch_that_failed_after_activation")
+unittest
+{
+    import mcl.utils.deploy_state : incompleteSwitchMarkerPath;
+
+    auto f = HalfAppliedFixture.create("deploy-agent-half-applied");
+    scope(exit) f.cleanup();
+
+    // macbook-2012, 2026-11-21: activation pointed /run/current-system at the
+    // new generation, then switch-to-configuration failed before restarting
+    // units. Only the first switch fails; a re-run completes.
+    string running = f.previous;
+    uint switchRuns;
+    string[][] commands;
+    ProcessResult fakeRun(string[] command)
+    {
+        commands ~= command.dup;
+        if (command == ["/bin/sh", "-c", "switch"])
+        {
+            switchRuns++;
+            running = f.desired;
+            return switchRuns == 1
+                ? ProcessResult(1, "", "Error: systemd daemon reload failed, timeout after 180s")
+                : ProcessResult(0, "", "");
+        }
+        return ProcessResult(0, "", "");
+    }
+    ProcessResult fakeQuery(string[] command)
+    {
+        if (command == ["/bin/sh", "-c", "current-generation"])
+            return ProcessResult(0, running ~ "\n", "");
+        return ProcessResult(0, "{}", "");
+    }
+    auto deps = DeployAgentDependencies(
+        runProcess: &fakeRun,
+        queryProcess: &fakeQuery,
+        bootId: () => "boot-1",
+    );
+    auto args = f.args;
+
+    // Run 1: the switch fails after activation selected the generation.
+    assert(deployAgentImpl(args, deps) == 1);
+    assert(running == f.desired);
+    assert(switchRuns == 1);
+    assert(f.status["errorCode"].str == "apply_failed");
+    assert(f.status["attempts"].integer == 1);
+    auto markerPath = incompleteSwitchMarkerPath(f.stateDir, "target");
+    assert(markerPath.exists);
+    auto marker = markerPath.readText.parseJSON;
+    assert(marker["generation"].str == f.desired);
+    assert(marker["previousGeneration"].str == f.previous);
+    assert(marker["failures"].integer == 1);
+    auto switchEvent = f.events.filter!(e => e["phase"].str == "switch").array[$ - 1];
+    assert(switchEvent["metadata"]["switchIncomplete"].boolean);
+
+    // Negative control: the same state WITHOUT the marker is the pre-fix
+    // behaviour -- `current == desired` reads as converged and the half-applied
+    // host is never finished.
+    auto controlState = f.base ~ ".control-state";
+    auto copy = runProcessCapture(["cp", "-a", f.stateDir, controlState]);
+    assert(copy.succeeded, copy.stderr);
+    incompleteSwitchMarkerPath(controlState, "target").remove;
+    auto controlArgs = args;
+    controlArgs.stateDir = controlState;
+    controlArgs.eventLog = "";
+    assert(deployAgentImpl(controlArgs, deps) == 0);
+    auto controlStatus = agentStatusPath(controlState, "target").readText.parseJSON;
+    assert(controlStatus["currentState"].str == "succeeded");
+    assert(controlStatus["message"].str == "Desired system generation was already current.",
+        controlStatus.toString);
+    assert(switchRuns == 1);
+
+    // Run 2: the marker makes the agent re-run the switch for the SAME
+    // generation, consuming one attempt, and the host converges.
+    assert(deployAgentImpl(args, deps) == 0);
+    assert(switchRuns == 2);
+    auto status = f.status;
+    assert(status["currentState"].str == "succeeded", status.toString);
+    assert(status["message"].str
+        == "Deployment converged; the incomplete switch was re-run to completion.", status.toString);
+    assert(status["attempts"].integer == 2);
+    assert(!markerPath.exists);
+    assert(f.failedEvents("switch", "switch_incomplete") == 1);
+    auto completes = f.events.filter!(e => e["phase"].str == "complete").array;
+    assert(completes[$ - 1]["command"]["status"].str == "succeeded");
+    assert(manifestStatePath(f.stateDir, "converged", "deploy-half-applied").exists);
+    // The retry was a full transaction: restore ran again before the switch.
+    assert(commands.filter!(c => c == ["/bin/sh", "-c", "restore"]).array.length == 2);
+
+    // Run 3: converged; no further switch.
+    assert(deployAgentImpl(args, deps) == 0);
+    assert(switchRuns == 2);
+}
+
+@("test_deploy_agent_incomplete_switch_retries_are_bounded_backed_off_and_alerting")
+unittest
+{
+    import mcl.utils.deploy_state : incompleteSwitchMarkerPath;
+
+    auto f = HalfAppliedFixture.create("deploy-agent-half-applied-bounded");
+    scope(exit) f.cleanup();
+
+    // A switch that selects the generation and then fails every time.
+    string running = f.previous;
+    uint switchRuns;
+    ProcessResult fakeRun(string[] command)
+    {
+        if (command == ["/bin/sh", "-c", "switch"])
+        {
+            switchRuns++;
+            running = f.desired;
+            return ProcessResult(1, "", "Error: systemd daemon reload failed, timeout after 180s");
+        }
+        return ProcessResult(0, "", "");
+    }
+    ProcessResult fakeQuery(string[] command)
+    {
+        if (command == ["/bin/sh", "-c", "current-generation"])
+            return ProcessResult(0, running ~ "\n", "");
+        return ProcessResult(0, "{}", "");
+    }
+    long clock = 1000;
+    auto deps = DeployAgentDependencies(
+        runProcess: &fakeRun,
+        queryProcess: &fakeQuery,
+        now: () => clock,
+        bootId: () => "boot-1",
+    );
+    auto args = f.args;
+    args.incompleteSwitchBackoffSeconds = 300;
+
+    // t=1000: the first apply fails half-applied.
+    assert(deployAgentImpl(args, deps) == 1);
+    assert(switchRuns == 1);
+
+    // t=1100: inside the 300 s backoff -- deferred, no switch, no attempt
+    // consumed, but still a failed switch_incomplete event.
+    clock = 1100;
+    assert(deployAgentImpl(args, deps) == 0);
+    assert(switchRuns == 1);
+    assert(f.status["currentState"].str == "deferred");
+    assert(f.status["errorCode"].str == "switch_incomplete_backoff");
+    assert(f.status["attempts"].integer == 1);
+    assert(f.failedEvents("switch", "switch_incomplete") == 1);
+
+    // t=1300: backoff elapsed -- retry, fail again (attempt 2).
+    clock = 1300;
+    assert(deployAgentImpl(args, deps) == 1);
+    assert(switchRuns == 2);
+    assert(f.status["currentState"].str == "failed");
+    assert(f.status["errorCode"].str == "switch_incomplete");
+    assert(f.status["retryable"].boolean);
+    assert(incompleteSwitchMarkerPath(f.stateDir, "target").readText.parseJSON["failures"].integer == 2);
+
+    // t=1800: the delay doubled to 600 s -- still backing off.
+    clock = 1800;
+    assert(deployAgentImpl(args, deps) == 0);
+    assert(switchRuns == 2);
+
+    // t=1900: retry, fail (attempt 3 of 3) -- the budget is exhausted.
+    clock = 1900;
+    assert(deployAgentImpl(args, deps) == 1);
+    assert(switchRuns == 3);
+    assert(f.status["currentState"].str == "non-retryable");
+    assert(f.status["errorCode"].str == "switch_incomplete_retry_budget_exhausted");
+    assert(!f.status["retryable"].boolean);
+
+    // Much later: the budget stays exhausted -- no further switch -- but every
+    // run keeps reporting the half-applied host as a failure, so the alert
+    // keeps firing instead of the host looking converged.
+    clock = 100_000;
+    auto alertsBefore = f.failedEvents("switch", "switch_incomplete");
+    foreach (_; 0 .. 2)
+        assert(deployAgentImpl(args, deps) == 1);
+    assert(switchRuns == 3);
+    assert(f.failedEvents("switch", "switch_incomplete") == alertsBefore + 2);
+    assert(f.status["currentState"].str == "non-retryable");
+    assert(f.status["errorCode"].str == "switch_incomplete_retry_budget_exhausted");
+    assert(f.failedEvents("complete", "switch_incomplete") == 2);
+    assert(!manifestStatePath(f.stateDir, "converged", "deploy-half-applied").exists);
+}
+
+@("test_deploy_agent_reboot_discards_an_incomplete_switch_marker")
+unittest
+{
+    import mcl.utils.deploy_state : incompleteSwitchMarkerPath;
+
+    auto f = HalfAppliedFixture.create("deploy-agent-half-applied-reboot");
+    scope(exit) f.cleanup();
+
+    string running = f.previous;
+    uint switchRuns;
+    ProcessResult fakeRun(string[] command)
+    {
+        if (command == ["/bin/sh", "-c", "switch"])
+        {
+            switchRuns++;
+            running = f.desired;
+            return ProcessResult(1, "", "switch failed");
+        }
+        return ProcessResult(0, "", "");
+    }
+    ProcessResult fakeQuery(string[] command)
+    {
+        if (command == ["/bin/sh", "-c", "current-generation"])
+            return ProcessResult(0, running ~ "\n", "");
+        return ProcessResult(0, "{}", "");
+    }
+    string boot = "boot-1";
+    auto deps = DeployAgentDependencies(
+        runProcess: &fakeRun,
+        queryProcess: &fakeQuery,
+        bootId: () => boot,
+    );
+    auto args = f.args;
+
+    assert(deployAgentImpl(args, deps) == 1);
+    assert(incompleteSwitchMarkerPath(f.stateDir, "target").exists);
+
+    // The host rebooted into the generation: boot activation started every
+    // unit, so the marker is stale and the generation is genuinely current.
+    boot = "boot-2";
+    assert(deployAgentImpl(args, deps) == 0);
+    assert(switchRuns == 1);
+    assert(!incompleteSwitchMarkerPath(f.stateDir, "target").exists);
+    assert(f.status["message"].str == "Desired system generation was already current.");
+}
+
+@("test_deploy_agent_nixos_pre_switch_hook_runs_before_switch_and_aborts_by_default")
+unittest
+{
+    import std.algorithm : countUntil;
+    import std.datetime.stopwatch : StopWatch, AutoStart;
+    import std.file : setAttributes;
+
+    auto f = HalfAppliedFixture.create("deploy-agent-nixos-pre-switch-hook");
+    scope(exit) f.cleanup();
+
+    string running = f.previous;
+    int hookExit;
+    string[][] commands;
+    ProcessResult fakeRun(string[] command)
+    {
+        commands ~= command.dup;
+        if (command.length && command[0] == "/hooks/pre-switch")
+            return ProcessResult(hookExit, "", hookExit ? "hub backup failed" : "");
+        if (command == ["/bin/sh", "-c", "switch"])
+            running = f.desired;
+        return ProcessResult(0, "", "");
+    }
+    ProcessResult fakeQuery(string[] command)
+    {
+        if (command == ["/bin/sh", "-c", "current-generation"])
+            return ProcessResult(0, running ~ "\n", "");
+        return ProcessResult(0, "{}", "");
+    }
+    auto deps = DeployAgentDependencies(
+        runProcess: &fakeRun,
+        queryProcess: &fakeQuery,
+        bootId: () => "boot-1",
+    );
+    auto args = f.args;
+    args.preSwitchHook = "/hooks/pre-switch";
+
+    // Default policy is abort: a failing hook stops the apply before any
+    // switch, the attempt is retryable, and the old generation keeps running.
+    assert(args.preSwitchHookFailure == HookFailurePolicy.abort);
+    hookExit = 1;
+    assert(deployAgentImpl(args, deps) == 1);
+    assert(!commands.canFind(["/bin/sh", "-c", "switch"]));
+    assert(running == f.previous);
+    assert(f.status["currentState"].str == "failed");
+    assert(f.status["retryable"].boolean);
+    assert(f.failedEvents("complete", "pre_switch_hook_failed") == 1);
+
+    // A passing hook runs after restore and before the switch, with the
+    // candidate and current system paths.
+    hookExit = 0;
+    commands = null;
+    assert(deployAgentImpl(args, deps) == 0);
+    auto restoreAt = commands.countUntil(["/bin/sh", "-c", "restore"]);
+    auto hookAt = commands.countUntil(["/hooks/pre-switch", f.desired, f.previous]);
+    auto switchAt = commands.countUntil(["/bin/sh", "-c", "switch"]);
+    assert(restoreAt >= 0 && hookAt > restoreAt && switchAt > hookAt, commands.to!string);
+    assert(running == f.desired);
+    assert(f.status["currentState"].str == "succeeded");
+
+    // The "continue" policy records the failure and switches anyway.
+    auto g = HalfAppliedFixture.create("deploy-agent-nixos-pre-switch-continue");
+    scope(exit) g.cleanup();
+    running = g.previous;
+    hookExit = 1;
+    commands = null;
+    auto continueArgs = g.args;
+    continueArgs.preSwitchHook = "/hooks/pre-switch";
+    continueArgs.preSwitchHookFailure = HookFailurePolicy.continue_;
+    assert(deployAgentImpl(continueArgs, deps) == 0);
+    assert(commands.canFind(["/bin/sh", "-c", "switch"]));
+    auto hookEvent = g.events
+        .filter!(e => e["phase"].str == "switch"
+            && e["command"]["name"].str == "deployment readiness hook")
+        .array;
+    assert(hookEvent.length == 1);
+    assert(hookEvent[0]["command"]["status"].str == "failed");
+    assert(hookEvent[0]["metadata"]["continuedAfterFailure"].boolean);
+    assert(g.status["currentState"].str == "succeeded");
+
+    // The timeout fires on a real hook: a hook that would sleep 60 s is killed
+    // after 1 s and the apply aborts with a timeout error, no switch.
+    auto h = HalfAppliedFixture.create("deploy-agent-nixos-pre-switch-timeout");
+    scope(exit) h.cleanup();
+    auto slowHook = h.base ~ ".slow-hook";
+    scope(exit) if (slowHook.exists) slowHook.remove;
+    slowHook.write("#!/bin/sh\nsleep 60\n");
+    slowHook.setAttributes(493);
+    running = h.previous;
+    commands = null;
+    ProcessResult realHookRun(string[] command)
+    {
+        if (command.length > 3 && command[0] == "timeout")
+        {
+            commands ~= command.dup;
+            return runProcessCapture(command);
+        }
+        return fakeRun(command);
+    }
+    auto timeoutArgs = h.args;
+    timeoutArgs.preSwitchHook = slowHook;
+    timeoutArgs.preSwitchHookTimeoutSeconds = 1;
+    auto watch = StopWatch(AutoStart.yes);
+    assert(deployAgentImpl(timeoutArgs, DeployAgentDependencies(
+        runProcess: &realHookRun,
+        queryProcess: &fakeQuery,
+        bootId: () => "boot-1",
+    )) == 1);
+    assert(watch.peek.total!"seconds" < 30, watch.peek.toString);
+    assert(commands.canFind(["timeout", "--kill-after=30", "1", slowHook, h.desired, h.previous]),
+        commands.to!string);
+    assert(!commands.canFind(["/bin/sh", "-c", "switch"]));
+    assert(running == h.previous);
+    assert(h.failedEvents("switch", "pre_switch_hook_timeout") == 1);
+    assert(h.failedEvents("complete", "pre_switch_hook_timeout") == 1);
+    assert(h.status["retryable"].boolean);
+}
+
+@("test_deploy_agent_detached_switch_confirms_its_own_completion")
+unittest
+{
+    import mcl.utils.deploy_state : incompleteSwitchMarkerPath;
+
+    // The detached switch can restart the agent unit that launched it, killing
+    // the agent before it records the outcome. The transient unit therefore
+    // clears the marker itself after a successful switch, so a completed
+    // switch is never mistaken for a half-applied one.
+    auto f = HalfAppliedFixture.create("deploy-agent-detached-self-confirm");
+    scope(exit) f.cleanup();
+    auto markerPath = incompleteSwitchMarkerPath(f.stateDir, "target");
+
+    string running = f.previous;
+    bool markerExistedBeforeSwitch;
+    bool markerGoneInsideUnit;
+    ProcessResult fakeRun(string[] command)
+    {
+        if (command.length && command[0] == "systemd-run")
+        {
+            // Execute the transient unit's payload for real, with the switch
+            // stubbed to `true`.
+            assert(command[$ - 3 .. $ - 1] == ["/bin/sh", "-c"], command.to!string);
+            markerExistedBeforeSwitch = markerPath.exists;
+            auto result = runProcessCapture(["/bin/sh", "-c", command[$ - 1]]);
+            markerGoneInsideUnit = !markerPath.exists;
+            running = f.desired;
+            return result;
+        }
+        return ProcessResult(0, "", "");
+    }
+    ProcessResult fakeQuery(string[] command)
+    {
+        if (command == ["/bin/sh", "-c", "current-generation"])
+            return ProcessResult(0, running ~ "\n", "");
+        return ProcessResult(0, "{}", "");
+    }
+    auto args = f.args;
+    args.noDetachSwitch = false;
+    args.switchCommand = "true";
+    assert(deployAgentImpl(args, DeployAgentDependencies(
+        runProcess: &fakeRun,
+        queryProcess: &fakeQuery,
+        bootId: () => "boot-1",
+    )) == 0);
+    assert(markerExistedBeforeSwitch);
+    assert(markerGoneInsideUnit);
+
+    // A failing detached switch keeps the marker (exit status preserved).
+    auto g = HalfAppliedFixture.create("deploy-agent-detached-failure-keeps-marker");
+    scope(exit) g.cleanup();
+    running = g.previous;
+    markerPath = incompleteSwitchMarkerPath(g.stateDir, "target");
+    auto failingArgs = g.args;
+    failingArgs.noDetachSwitch = false;
+    failingArgs.switchCommand = "exit 3";
+    assert(deployAgentImpl(failingArgs, DeployAgentDependencies(
+        runProcess: &fakeRun,
+        queryProcess: &fakeQuery,
+        bootId: () => "boot-1",
+    )) == 1);
+    assert(!markerGoneInsideUnit);
+    assert(markerPath.exists);
+    auto switchEvent = g.events.filter!(e => e["phase"].str == "switch").array[$ - 1];
+    assert(switchEvent["command"]["exitCode"].integer == 3);
 }
