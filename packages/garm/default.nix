@@ -193,6 +193,27 @@ buildGo126Module rec {
     # before LockJob. Tests in runner/pool (testing tag), run by
     # t_garm_skip_queued_jobs_when_pools_full.
     ./patches/skip-queued-jobs-when-pools-full.patch
+    # A pool instance whose provider delete keeps failing (central GARM on
+    # high-mem-server, 2026-11-16..18: incus datasets pinned by locked mount
+    # copies, ~4 min per failed attempt) was retried on a 1.5x backoff from
+    # 5s, which takes 15 failures to reach its 20-minute cap, so for the first
+    # hour-plus the retries ran nearly back to back. It now doubles (5s, 10s,
+    # ... 640s, then 20 min), resets when the delete succeeds, and each step
+    # logs a warning with the consecutive failure count and the wait. The
+    # delete loop logged "removing instance from pool" at info level on every
+    # 5s pass, before its lock and backoff checks: ~311 lines per instance per
+    # 30 minutes, read as a delete every 6s when the real attempts were ~24
+    # minutes apart. It now logs only an attempted delete. The orphan sweep
+    # (cleanupOrphanedProviderRunners, reapTimedOutRunners) took each
+    # instance's lock with a defer in the loop body, so it held every lock
+    # until the whole pass returned; deletePendingInstances then logged
+    # "failed to acquire lock" for minutes at a time every 5 minutes. Each lock
+    # is now released when the sweep is done with that instance. Touches only
+    # locking/ and runner/pool/. Gate: t_garm_pool_delete_backoff
+    # (checks/garm-pool-delete-backoff.nix), which runs
+    # checks/garm/pool_delete_backoff_test.go against this tree and, as a
+    # negative control, the tree without this patch.
+    ./patches/fix-pool-delete-backoff.patch
     # The metric collectors cleared a gauge family with Reset() and then
     # queried the database to fill it again, so a scrape in between got the
     # family empty. On high-mem-server 2026-10-31 at 14:14:14Z one such scrape
@@ -204,6 +225,26 @@ buildGo126Module rec {
     # previous values stay. Tests in runner/metrics, run by
     # t_garm_metrics_snapshots.
     ./patches/publish-metric-snapshots.patch
+    # A scale-set worker could miss an update committed before it subscribed
+    # (m3, 2026-11-17). The deploy cordon disabled all six scale sets, the
+    # deploy restarted GARM, and the cordon's restore PUT {"enabled":true}
+    # for scale set 15 landed 0.17 s before that set's worker registered its
+    # watcher consumer. The worker had been built from the row while it was
+    # still disabled, and GARM only publishes an update event when a row
+    # changes, so the later identical PUTs published nothing. Worker 15 kept
+    # Enabled=false in memory, opened no listener session, logged nothing at
+    # info level, and its jobs queued for 28 h until an unrelated restart.
+    # Now Worker.Start() re-reads its scale set from the database after
+    # RegisterConsumer, so a write lands either before the read or as an
+    # event. The worker logs at info level when it starts disabled and when
+    # an update enables or disables it. Pools are not affected: the pool
+    # manager reads each pool's state from the cache on every pass.
+    # Cut against the tree with every patch above applied; keep it LAST.
+    # Gate: t_garm_scaleset_worker_update_race
+    # (checks/garm-scaleset-worker-update-race.nix), which runs
+    # checks/garm/scaleset_worker_update_race_test.go against this tree and,
+    # as a negative control, the tree without this patch.
+    ./patches/fix-scaleset-worker-start-race.patch
   ];
 
   # go-sqlite3 is a cgo module; the daemon needs cgo to link SQLite.

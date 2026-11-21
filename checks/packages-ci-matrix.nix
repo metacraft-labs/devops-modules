@@ -42,7 +42,6 @@
             nix
             nix-eval-jobs
             nix-fast-build
-            nixos-rebuild-ng
             ;
           # The Ethereum clients (foundry, geth, nimbus, erigon, nethermind,
           # web3signer, mev-boost) are NOT in this matrix, by decision. They
@@ -78,6 +77,22 @@
           # nimbus-test, which would otherwise fail to lock.
         }
         // optionalAttrs isLinux {
+          # Linux only. This is `nixos-rebuild-ng` rebuilt against the Nix that
+          # `nix-eval-jobs` uses (packages/default.nix), so it is never
+          # substituted from cache.nixos.org and its pytest suite runs on our own
+          # builders. On aarch64-darwin `test_tmpdir.py::test_make_tmpdir` fails
+          # there: it points TMPDIR at /tmp/not-too-long, which the darwin
+          # sandbox does not let the build write to, so `tempfile` falls back to
+          # TMP/TEMP -- the build directory, /nix/var/nix/builds/nix-* since
+          # Nix moved build directories there -- and the test's own sanity
+          # assertion fails. nixos-26.05 still carries that version of the test
+          # (nixpkgs master reworked it in aead86a3b8, July 2026; not backported).
+          #
+          # Nothing needs this variant on darwin: no consumer reads
+          # `legacyPackages.inputs.nixpkgs.nixos-rebuild-ng` at all, and the
+          # darwin dev shells that ship nixos-rebuild-ng take the plain
+          # `pkgs.nixos-rebuild-ng`, which cache.nixos.org serves.
+          inherit (self'.legacyPackages.inputs.nixpkgs) nixos-rebuild-ng;
           disko = self'.legacyPackages.inputs.disko.default;
           nixos-anywhere = self'.legacyPackages.inputs.nixos-anywhere.default;
         }

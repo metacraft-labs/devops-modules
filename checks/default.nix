@@ -42,6 +42,7 @@
     ./garm-busy-runner-not-reaped.nix
     ./garm-deleting-capacity.nix
     ./garm-instance-lifecycle.nix
+    ./garm-pool-delete-backoff.nix
     ./garm-macos-pools-supported.nix
     ./garm-incus-runner-host.nix
     ./garm-incus-storage-pool-source.nix
@@ -49,6 +50,7 @@
     ./garm-install-script-template-fixtures.nix
     ./garm-skip-queued-jobs-when-pools-full.nix
     ./garm-metrics-snapshots.nix
+    ./garm-scaleset-worker-update-race.nix
     ./garm-provider-gosti-backend.nix
     ./garm-provider-remote.nix
     ./garm-provider-remote-old-daemon.nix
@@ -81,6 +83,8 @@
     ./mcl-devops-rename.nix
     ./netbird-with-agenix.nix
     ./ci-build-batching.nix
+    ./ci-flake-source-root.nix
+    ./flake-lock-sources.nix
     ./packages-ci-matrix.nix
     ./pre-commit.nix
     ./git-hooks-reprobuild-handoff.nix
