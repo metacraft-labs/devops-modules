@@ -208,6 +208,38 @@ jobs:
               done
           exit 0
 
+      # Warning-only (does not fail the build yet): flag self-hosted jobs with
+      # no job-level timeout-minutes, or one above the 120-minute ceiling
+      # without a `# timeout-justify:` comment. GitHub's default is 360
+      # minutes, and one hung self-hosted job holds its runner, and any
+      # deployment cordon draining that runner, for all of it (m3,
+      # 2026-11-16). Policy: scripts/ci/check_self_hosted_timeouts.py.
+      - name: Check self-hosted jobs declare timeout-minutes (warning only)
+        if: ${{ hashFiles('.github/workflows/*.yml', '.github/workflows/*.yaml') != '' }}
+        continue-on-error: true
+        run: |
+          set +e -uo pipefail
+          dir="$(mktemp -d)"
+          # Always the current checker from dev: this step only warns.
+          base="https://raw.githubusercontent.com/metacraft-labs/devops-modules/dev/scripts/ci"
+          for f in check_self_hosted_timeouts.py check_public_repo_runners.py; do
+            curl -fsSL --retry 3 -o "$dir/$f" "$base/$f" || { echo "::warning title=job timeouts::could not fetch $f; skipping"; exit 0; }
+          done
+          if ! command -v nix >/dev/null 2>&1; then
+            echo "::warning title=job timeouts::nix not available; skipping"; exit 0
+          fi
+          # shellcheck disable=SC2016 # a Nix expression, not a shell one
+          nix shell --impure --expr \
+            '(builtins.getFlake "nixpkgs").legacyPackages.${builtins.currentSystem}.python3.withPackages (p: [ p.pyyaml ])' \
+            -c python3 "$dir/check_self_hosted_timeouts.py" .github/workflows 2>&1 \
+            | while IFS= read -r line; do
+                case "$line" in
+                  *" :: job "*) echo "::warning title=job timeouts::${line#*✗ }" ;;
+                  *) echo "$line" ;;
+                esac
+              done
+          exit 0
+
       - name: Initialize submodules
         env:
           LINT_SUBMODULES: ${{ inputs.submodules }}

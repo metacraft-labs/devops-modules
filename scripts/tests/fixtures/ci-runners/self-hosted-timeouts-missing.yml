@@ -1,0 +1,43 @@
+# Fixture for check_self_hosted_timeouts.py (gate t_ci_self_hosted_timeouts):
+# every job here is a violation the linter must name.
+name: self-hosted-timeouts-missing
+
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  no-timeout:
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - run: just test
+
+  step-timeout-only:
+    runs-on: [self-hosted, macos, arm64]
+    steps:
+      - run: just test
+        timeout-minutes: 30
+
+  legacy-class:
+    runs-on: eph-win-arm64
+    steps:
+      - run: just test
+
+  dynamic-runner:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    steps:
+      - run: just test
+
+  matrix-expression:
+    strategy:
+      matrix:
+        runner: [eph-win-x64, eph-win-arm64]
+    runs-on: ${{ matrix.runner == 'eph-win-x64' && fromJSON('["self-hosted", "Windows", "X64"]') || matrix.runner }}
+    steps:
+      - run: just test
+
+  over-ceiling:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 600
+    steps:
+      - run: just test-everything

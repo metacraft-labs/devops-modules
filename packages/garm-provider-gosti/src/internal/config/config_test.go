@@ -413,6 +413,38 @@ func TestRemoteTartSize(t *testing.T) {
 	}
 }
 
+// tart_disk_gb parses for the remote Tart targets, defaults to unset, and
+// rejects negatives; like the other Tart sizes it is accepted (and ignored by
+// the recipe) for any other target.
+func TestRemoteTartDiskGB(t *testing.T) {
+	t.Setenv(DefaultAuthTokenEnv, "")
+	head := func(target string) string {
+		return "backend = \"remote\"\n[remote]\nendpoint = \"100.72.0.5:8873\"\ntarget_backend = \"" + target +
+			"\"\nauth_token_file = \"/run/creds/vmh\"\n"
+	}
+	for _, target := range []string{"tart-linux-arm", "tart-macos", "incus"} {
+		cfg, err := ParseBytes([]byte(head(target) + "tart_disk_gb = 100\n"))
+		if err != nil {
+			t.Fatalf("%s: tart_disk_gb rejected: %v", target, err)
+		}
+		if cfg.Remote.TartDiskGB != 100 {
+			t.Fatalf("%s: tart_disk_gb not parsed: %+v", target, cfg.Remote)
+		}
+	}
+
+	plain, err := ParseBytes([]byte(head("tart-linux-arm")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plain.Remote.TartDiskGB != 0 {
+		t.Fatalf("absent key must leave tart_disk_gb unset: %+v", plain.Remote)
+	}
+
+	if _, err := ParseBytes([]byte(head("tart-linux-arm") + "tart_disk_gb = -1\n")); err == nil {
+		t.Error("negative tart_disk_gb: accepted, want rejection")
+	}
+}
+
 // memory_mb / vcpus are top-level keys shared by the libvirt domain and the
 // gosti-run (tart) guests; they parse for a tart backend and default to 0.
 func TestTopLevelGuestSizeParsesForTart(t *testing.T) {

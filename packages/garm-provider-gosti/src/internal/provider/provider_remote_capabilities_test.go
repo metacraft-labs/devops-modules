@@ -276,6 +276,7 @@ func TestConfigSchemaPinsRemoteIncusCapabilityBoundary(t *testing.T) {
 		"request_timeout_sec",
 		"target_backend",
 		"tart_cpus",
+		"tart_disk_gb",
 		"tart_memory_mb",
 	}
 	gotKeys := make([]string, 0, len(remote.Properties))
@@ -301,7 +302,7 @@ func TestConfigSchemaPinsRemoteIncusCapabilityBoundary(t *testing.T) {
 	}
 	// The resource caps and Tart sizes are integers that default to 0 (= unset),
 	// so an operator who sets nothing keeps the pre-limits create argv.
-	for _, key := range []string{"incus_limits_cpu", "incus_limits_memory_mb", "tart_cpus", "tart_memory_mb"} {
+	for _, key := range []string{"incus_limits_cpu", "incus_limits_memory_mb", "tart_cpus", "tart_memory_mb", "tart_disk_gb"} {
 		prop, ok := remote.Properties[key]
 		if !ok {
 			t.Fatalf("remote schema missing %q", key)
@@ -314,8 +315,8 @@ func TestConfigSchemaPinsRemoteIncusCapabilityBoundary(t *testing.T) {
 
 // The provider-config guest size reaches every backend that sizes a guest
 // through gosti: the top-level vcpus / memory_mb for the local
-// gosti-run backends, and remote tart_cpus / tart_memory_mb for a remote
-// Tart target.
+// gosti-run backends, and remote tart_cpus / tart_memory_mb / tart_disk_gb
+// for a remote Tart target.
 func TestGuestSizeReachesGostiBackends(t *testing.T) {
 	for _, kind := range []config.BackendKind{
 		config.BackendTartLinuxArm, config.BackendTartMacos,
@@ -349,6 +350,7 @@ func TestGuestSizeReachesGostiBackends(t *testing.T) {
 			GuestOS:       "linux",
 			TartCPUs:      4,
 			TartMemoryMB:  12288,
+			TartDiskGB:    100,
 		},
 	})
 	if err != nil {
@@ -358,7 +360,7 @@ func TestGuestSizeReachesGostiBackends(t *testing.T) {
 	if !ok {
 		t.Fatalf("backend type=%T want *backend.RemoteBackend", p.backend)
 	}
-	if b.TartCPUs != 4 || b.TartMemoryMB != 12288 {
+	if b.TartCPUs != 4 || b.TartMemoryMB != 12288 || b.TartDiskGB != 100 {
 		t.Fatalf("remote Tart size was not propagated: %+v", b)
 	}
 }
