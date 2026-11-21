@@ -96,6 +96,34 @@ top@{ config, ... }:
           printf 'success\n' >> /var/lib/mcl-test/switch-runs
         fi
       '';
+      # macbook-2012, 2026-11-21: activation selects the new generation, then
+      # switch-to-configuration fails before it restarts units. The first switch
+      # reproduces that (selects the generation, exits 1); later ones complete.
+      halfAppliedSwitchScript = pkgs.writeShellScript "mcl-test-pull-half-applied-switch" ''
+        set -euo pipefail
+        mkdir -p /var/lib/mcl-test
+        printf '%s\n' ${lib.escapeShellArg newSystemPath} > /var/lib/mcl-test/current-generation
+        if [ ! -e /var/lib/mcl-test/half-applied-once ]; then
+          touch /var/lib/mcl-test/half-applied-once
+          printf 'half-applied\n' >> /var/lib/mcl-test/switch-runs
+          echo 'Error: systemd daemon reload failed, timeout after 180s' >&2
+          exit 1
+        fi
+        printf 'success\n' >> /var/lib/mcl-test/switch-runs
+      '';
+      # Records its arguments and how many switches had run when it was called,
+      # proving it runs before (not inside) each switch.
+      preSwitchHookScript = pkgs.writeShellScript "mcl-test-pull-pre-switch-hook" ''
+        set -euo pipefail
+        mkdir -p /var/lib/mcl-test
+        runs=0
+        [ -f /var/lib/mcl-test/switch-runs ] && runs=$(wc -l < /var/lib/mcl-test/switch-runs)
+        printf '%s %s %s\n' "$1" "$2" "$runs" >> /var/lib/mcl-test/pre-hook-runs
+      '';
+      halfAppliedHealthScript = pkgs.writeShellScript "mcl-test-pull-half-applied-health" ''
+        set -euo pipefail
+        test "$(cat /var/lib/mcl-test/current-generation)" = ${lib.escapeShellArg newSystemPath}
+      '';
       fakeClosureEnv = "MCL_DEPLOY_FAKE_CLOSURE_COUNT=1 MCL_DEPLOY_FAKE_CLOSURE_TOTAL_BYTES=4096";
       healthCommand = "generation|5|${healthScript}";
       commonTargetModule =
@@ -192,6 +220,13 @@ top@{ config, ... }:
               maxAttempts = 5;
               fetchTimeoutSeconds = 11;
               dryRun = true;
+              preSwitchHook = "/etc/mcl-test/pre-switch";
+              preSwitchHookTimeoutSeconds = 840;
+              preSwitchHookFailurePolicy = "continue";
+              postSwitchHook = "/etc/mcl-test/post-switch";
+              postSwitchHookTimeoutSeconds = 120;
+              alreadyCurrentRecoveryHook = "/etc/mcl-test/already-current";
+              incompleteSwitchBackoffSeconds = 90;
             };
           }
         ];
@@ -243,6 +278,27 @@ top@{ config, ... }:
         (lib.optional (
           !lib.hasInfix "--dry-run" staticExecStart
         ) "pull-agent service does not pass dry-run")
+        (lib.optional (
+          !lib.hasInfix "--pre-switch-hook /etc/mcl-test/pre-switch" staticExecStart
+        ) "pull-agent service does not pass the pre-switch hook")
+        (lib.optional (
+          !lib.hasInfix "--pre-switch-hook-timeout-seconds 840" staticExecStart
+        ) "pull-agent service does not pass the pre-switch hook timeout")
+        (lib.optional (
+          !lib.hasInfix "--pre-switch-hook-failure continue" staticExecStart
+        ) "pull-agent service does not pass the pre-switch hook failure policy")
+        (lib.optional (
+          !lib.hasInfix "--post-switch-hook /etc/mcl-test/post-switch" staticExecStart
+        ) "pull-agent service does not pass the post-switch hook")
+        (lib.optional (
+          !lib.hasInfix "--post-switch-hook-timeout-seconds 120" staticExecStart
+        ) "pull-agent service does not pass the post-switch hook timeout")
+        (lib.optional (
+          !lib.hasInfix "--already-current-recovery-hook /etc/mcl-test/already-current" staticExecStart
+        ) "pull-agent service does not pass the already-current recovery hook")
+        (lib.optional (
+          !lib.hasInfix "--incomplete-switch-backoff-seconds 90" staticExecStart
+        ) "pull-agent service does not pass the incomplete-switch backoff")
         (lib.optional (
           staticService.serviceConfig.CacheDirectory != "mcl-deploy-agent"
         ) "pull-agent service does not provision a writable cache directory")
@@ -909,6 +965,115 @@ top@{ config, ... }:
                     "assert status['currentState'] != 'non-retryable', status\n"
                     "PY"
                 )
+          '';
+        };
+
+        # Defect 1 (half-applied host) and defect 2 (NixOS pre-switch hook),
+        # end to end through the real systemd unit.
+        deployment-pull-agent-incomplete-switch-vm = pkgs.testers.nixosTest {
+          name = "deployment-pull-agent-incomplete-switch-vm";
+
+          nodes.target =
+            { ... }:
+            {
+              imports = [ flake.modules.nixos.deployment-pull-agent ];
+              networking.hostName = "target";
+              environment.systemPackages = [
+                self'.packages.mcl-devops
+                pkgs.python3
+              ];
+              services.mcl-deploy-agent = {
+                enable = true;
+                package = self'.packages.mcl-devops;
+                targetName = "target";
+                manifestPublicKeys = [ manifestPublicKey ];
+                manifestDirectories = [ "/var/lib/mcl/deployments/inbox" ];
+                eventLog = "/var/log/mcl/deployments/target.jsonl";
+                interval = "1h";
+                jitter = "0";
+                lockFile = "/run/lock/mcl-test-pull-agent.lock";
+                restoreCommand = "${restoreScript}";
+                switchCommand = "${halfAppliedSwitchScript}";
+                generationCommand = "${generationScript}";
+                preSwitchHook = "${preSwitchHookScript}";
+                preSwitchHookTimeoutSeconds = 60;
+                alreadyCurrentRecoveryHook = "${pkgs.coreutils}/bin/true";
+                incompleteSwitchBackoffSeconds = 0;
+              };
+            };
+
+          testScript = ''
+            start_all()
+            target.wait_for_unit("multi-user.target")
+
+            with subtest("publish a signed desired state for the target"):
+                target.succeed("install -d -m 0750 /var/lib/mcl/deployments/inbox")
+                target.succeed("install -m 0600 ${manifestPrivateKey} /tmp/manifest-key")
+                target.succeed(
+                    "${fakeClosureEnv} mcl-devops deploy-plan "
+                    "--target target "
+                    "--desired-system-path ${newSystemPath} "
+                    "--git-revision 0123456789abcdef0123456789abcdef01234568 "
+                    "--sequence 42 "
+                    "--health-command ${lib.escapeShellArg "generation|5|${halfAppliedHealthScript}"} "
+                    "--signing-key /tmp/manifest-key "
+                    "--signing-key-id mcl-deployment "
+                    "--output /var/lib/mcl/deployments/inbox/new.json"
+                )
+
+            with subtest("a switch that fails after activation leaves an incomplete-switch marker"):
+                target.fail("systemctl start mcl-deploy-agent.service")
+                target.succeed("test \"$(cat /var/lib/mcl-test/current-generation)\" = '${newSystemPath}'")
+                target.succeed("test \"$(cat /var/lib/mcl-test/switch-runs)\" = half-applied")
+                target.succeed("test -f /var/lib/mcl/deployments/switch-incomplete/target.json")
+                target.succeed(
+                    "grep -qx '${newSystemPath} ${initialGeneration} 0' /var/lib/mcl-test/pre-hook-runs"
+                )
+
+            with subtest("negative control: without the marker the host reads as already current"):
+                target.succeed("cp -a /var/lib/mcl/deployments /tmp/control-state")
+                target.succeed("rm /tmp/control-state/switch-incomplete/target.json")
+                target.succeed("printf 'mcl-deployment %s\\n' '${manifestPublicKey}' > /tmp/allowed-signers")
+                output = target.succeed(
+                    "mcl-devops deploy-agent --target target "
+                    "--allowed-signers /tmp/allowed-signers "
+                    "--state-dir /tmp/control-state "
+                    "--manifest-dir /var/lib/mcl/deployments/inbox "
+                    "--restore-command ${restoreScript} "
+                    "--switch-command ${halfAppliedSwitchScript} "
+                    "--generation-command ${generationScript} "
+                    "--pre-switch-hook ${preSwitchHookScript} "
+                    "--already-current-recovery-hook ${pkgs.coreutils}/bin/true"
+                )
+                assert "Desired system generation was already current." in output, output
+                target.succeed("test \"$(wc -l < /var/lib/mcl-test/switch-runs)\" = 1")
+
+            with subtest("the next agent run re-runs the switch, after the pre-switch hook, and converges"):
+                target.succeed("systemctl start mcl-deploy-agent.service")
+                target.succeed("test \"$(sed -n 2p /var/lib/mcl-test/switch-runs)\" = success")
+                target.succeed("test ! -e /var/lib/mcl/deployments/switch-incomplete/target.json")
+                # Second hook call: DESIRED == CURRENT (already selected), and it
+                # ran after the failed switch and before the completing one.
+                target.succeed(
+                    "grep -qx '${newSystemPath} ${newSystemPath} 1' /var/lib/mcl-test/pre-hook-runs"
+                )
+                target.succeed(
+                    "python3 - <<'PY'\n"
+                    "import json\n"
+                    "status = json.load(open('/var/lib/mcl/deployments/agent-status/target.json'))\n"
+                    "assert status['currentState'] == 'succeeded', status\n"
+                    "assert status['attempts'] == 2, status\n"
+                    "assert 'incomplete switch was re-run' in status['message'], status\n"
+                    "events = [json.loads(l) for l in open('/var/log/mcl/deployments/target.jsonl') if l.strip()]\n"
+                    "alerts = [e for e in events if e['phase'] == 'switch' and e.get('error', {}).get('code') == 'switch_incomplete']\n"
+                    "assert len(alerts) == 1, alerts\n"
+                    "assert alerts[0]['command']['status'] == 'failed', alerts\n"
+                    "PY"
+                )
+
+            with subtest("a converged host is not switched again"):
+                target.succeed("systemctl start mcl-deploy-agent.service")
+                target.succeed("test \"$(wc -l < /var/lib/mcl-test/switch-runs)\" = 2")
           '';
         };
 
