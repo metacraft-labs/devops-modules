@@ -342,6 +342,7 @@
         ./checks
         ./modules
         ./packages
+        ./packages/nim
         ./shells
       ];
       systems = [

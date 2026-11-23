@@ -152,6 +152,27 @@ jobs:
       CREATE_PR_APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 ```
 
+## Nim Toolchain
+
+This flake defines the organisation's Nim compiler once, so every Nim repo
+gets the same one: Nim 2.2.10, built from the nixpkgs 2.2.x recipe with only
+the source and patch list changed ([`packages/nim/`](packages/nim/)). The
+nixpkgs revisions pinned here still ship 2.2.4, whose allocator crashes
+threaded programs that free `Channel` buffers on another thread
+([nim-lang/Nim#25513](https://github.com/nim-lang/Nim/pull/25513), fixed in
+2.2.8).
+
+- `packages.<system>.nim`, `nim-unwrapped` and `nimble`: built against the
+  `nixpkgs-unstable` input, the package set Nim repos follow. A dev shell
+  takes them as `inputs.nixos-modules.packages.${system}.nim` (and `nimble`).
+  CI builds them, so they substitute from the binary cache.
+- `overlays.nim`: the same override, for a flake that builds its own package
+  set. Applied to the `nixpkgs-unstable` input it yields the same
+  derivations.
+- `checks.<system>.nim-toolchain`: asserts the version, the presence of the
+  allocator fix, and that a threaded ORC program using `Channel` builds and
+  runs.
+
 ## MCL CLI Tool
 
 The `mcl-devops` tool is a Swiss-knife CLI for managing NixOS deployments. For development best practices, see [packages/mcl-devops/AGENTS.md](packages/mcl-devops/AGENTS.md).
