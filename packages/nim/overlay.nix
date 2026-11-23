@@ -20,8 +20,9 @@
 #
 # The patch list is the one nixpkgs itself used for 2.2.10, at
 # https://github.com/NixOS/nixpkgs/tree/eec3e392d1862d49969beb75dd07a729002b6800/pkgs/by-name/ni/nim-unwrapped
-# Three of its four patches are byte-identical to the 2.2.4 recipe's and are
-# taken from the pinned nixpkgs. The fourth, `extra-mangling.patch`, is
+# Its koch flags are used too (see `kochArgs` below). Three of its four
+# patches are byte-identical to the 2.2.4 recipe's and are taken from the
+# pinned nixpkgs. The fourth, `extra-mangling.patch`, is
 # vendored here: 2.2.10's `mangleModuleName` already derives module names
 # relative to the search paths, so nixpkgs dropped the 2.2.4 patch's
 # `compiler/modulepaths.nim` hunk (which no longer applies) and kept only the
@@ -65,6 +66,19 @@ in
         ./extra-mangling.patch
         # Link OpenSSL at build time instead of loading it with dlopen.
         "${stockDir}/openssl.patch"
+      ];
+      # nixpkgs' own 2.2.10 recipe (NixOS/nixpkgs 81daafea8c72, "nim: remove
+      # nativeStacktraces and gnuReadline args") passes koch only the target and
+      # `-d:release`. The 2.2.4 recipe also passed `-d:nativeStacktrace` and
+      # `-d:useGnuReadline`, and the first no longer builds the 2.2.10
+      # compiler: `compiler/nim.cfg` now defines `nimPreviewCstringConversion`,
+      # and the native-stacktrace path in `lib/system/excpt.nim` calls
+      # `add(string, cstring)` before `system.nim` declares that overload, so
+      # `koch boot` stops at excpt.nim(214,14) with a type mismatch.
+      kochArgs = [
+        "--cpu:${pinned.passthru.nimHost.cpu}"
+        "--os:${pinned.passthru.nimHost.os}"
+        "-d:release"
       ];
     });
 }
