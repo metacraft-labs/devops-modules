@@ -67,7 +67,7 @@
     # name a revision that carries reprobuild's `nix/modules/` directory — a pin
     # older than that makes `modules/` fail to evaluate, not merely ship a stale
     # `repro`.
-    reprobuild.url = "github:metacraft-labs/reprobuild/84b459adda91535f0b89424dfc95aa34bfa67a32";
+    reprobuild.url = "github:metacraft-labs/reprobuild/ed186bfecd29f6e95c8673dbd5d8af3b61710815";
 
     nixpkgs.follows = "nixos-2605";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
