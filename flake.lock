@@ -2502,17 +2502,17 @@
     "nim-confutils-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1795078642,
-        "narHash": "sha256-+/i93sfFGAfVkrJc/KswSW8wfsIHEPmhWWyAxETnSsE=",
+        "lastModified": 1795282672,
+        "narHash": "sha256-ruZnbDwPit3onO/aJfWMgWwEawcA0mf5dNQ7X+Fcy9s=",
         "owner": "metacraft-labs",
         "repo": "nim-confutils",
-        "rev": "ffd5d9a6cf8481b2e696be3704f14b315a10aed9",
+        "rev": "f85c716c50f29344d9d28747632897c1ebc03ada",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "nim-confutils",
-        "rev": "ffd5d9a6cf8481b2e696be3704f14b315a10aed9",
+        "rev": "f85c716c50f29344d9d28747632897c1ebc03ada",
         "type": "github"
       }
     },
@@ -4506,17 +4506,17 @@
         "test-certificates-tools-src": "test-certificates-tools-src"
       },
       "locked": {
-        "lastModified": 1795260781,
-        "narHash": "sha256-Vn5s42l1hF53vFWjh96lF4H5sZzuh/utKdMxojRFlEw=",
+        "lastModified": 1795299905,
+        "narHash": "sha256-UH5Y9ANUW9XbuAsxyhDKfjZ1ZblnOq/4lF0vvKzPFas=",
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "0ced94b11def9c52da79da4b0a5bdf213f0e9e81",
+        "rev": "2f7cb5db5289fa1e9e060281ebe8c095bf9669e9",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "0ced94b11def9c52da79da4b0a5bdf213f0e9e81",
+        "rev": "2f7cb5db5289fa1e9e060281ebe8c095bf9669e9",
         "type": "github"
       }
     },
