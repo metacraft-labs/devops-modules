@@ -68,7 +68,7 @@
     # older than that makes `modules/` fail to evaluate, not merely ship a stale
     # `repro`.
     reprobuild = {
-      url = "github:metacraft-labs/reprobuild/2f7cb5db5289fa1e9e060281ebe8c095bf9669e9";
+      url = "github:metacraft-labs/reprobuild/ed186bfecd29f6e95c8673dbd5d8af3b61710815";
       # reprobuild's own pin of this repo reaches microvm too, so the same
       # spectrum-os.org input sits one level down. Drop it for the same reason
       # as in `microvm` below.
