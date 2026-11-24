@@ -98,6 +98,12 @@ const configJSONSchema = `{
 					"minimum": 0,
 					"default": 0,
 					"description": "Remote Tart only (target_backend tart-linux-arm or tart-macos): per-job clone memory in MiB, forwarded as vm-harness --memory-mb and applied with tart set before the clone boots. Ignored for other targets. 0 keeps the golden's own size and preserves the existing remote create argv."
+				},
+				"tart_disk_gb": {
+					"type": "integer",
+					"minimum": 0,
+					"default": 0,
+					"description": "Remote Tart Linux only (target_backend tart-linux-arm): per-job clone disk size in GB, forwarded as vm-harness --disk-gb and applied with tart set --disk-size before the clone boots. Ignored for other targets. 0 keeps vm-harness' default (50 GB) and preserves the existing remote create argv."
 				}
 			},
 			"additionalProperties": false

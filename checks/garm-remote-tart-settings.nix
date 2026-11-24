@@ -6,10 +6,12 @@ top@{ ... }:
   # garm-remote-libvirt-settings.nix. It proves `remote.tartCpus` /
   # `remote.tartMemoryMb` reach only the [remote] provider TOML, are absent by
   # default, render when set for both Tart targets, and fail closed for a
-  # non-Tart target or a non-remote provider. The argv those keys produce is
-  # pinned by the provider's Go tests (TestRemoteCreateTartSize); the resize of
-  # the real clone is vm-harness' (`tart set --cpu/--memory`) and is proven on the
-  # consuming host.
+  # non-Tart target or a non-remote provider. `remote.tartDiskGb` likewise
+  # renders only when set, and only for tart-linux-arm (tart-macos is
+  # refused). The argv those keys produce is pinned by the provider's Go tests
+  # (TestRemoteCreateTartSize, TestRemoteCreateTartDiskGB); the resize of the
+  # real clone is vm-harness' (`tart set --cpu/--memory/--disk-size`) and is proven
+  # on the consuming host.
   perSystem =
     {
       pkgs,
@@ -53,7 +55,7 @@ top@{ ... }:
       };
 
       defaultConfig = mkSystem (remoteProvider "tart-linux-arm" { });
-      linuxConfig = mkSystem (remoteProvider "tart-linux-arm" size);
+      linuxConfig = mkSystem (remoteProvider "tart-linux-arm" (size // { tartDiskGb = 100; }));
       macosConfig = mkSystem (remoteProvider "tart-macos" size);
       badTarget = mkSystem (remoteProvider "libvirt" { tartCpus = 4; });
       badNonRemote = mkSystem {
@@ -63,10 +65,19 @@ top@{ ... }:
           tartMemoryMb = 12288;
         };
       };
+      badDiskMacos = mkSystem (remoteProvider "tart-macos" { tartDiskGb = 100; });
+      badDiskNonRemote = mkSystem {
+        backend = "tart-linux-arm";
+        remote = {
+          targetBackend = "tart-linux-arm";
+          tartDiskGb = 100;
+        };
+      };
 
       failedMessages =
         config: map (a: a.message) (builtins.filter (a: !a.assertion) (config.assertions or [ ]));
       targetMessage = "remote.tartCpus/tartMemoryMb require backend = \"remote\" and remote.targetBackend = \"tart-linux-arm\" or \"tart-macos\"";
+      diskMessage = "remote.tartDiskGb requires backend = \"remote\" and remote.targetBackend = \"tart-linux-arm\"";
       isExactFailure =
         needle: config:
         let
@@ -89,7 +100,13 @@ top@{ ... }:
             "remote.tartCpus did not fail exactly once for targetBackend=libvirt: ${toString (failedMessages badTarget)}"
         ++
           lib.optional (!isExactFailure targetMessage badNonRemote)
-            "remote.tartMemoryMb did not fail exactly once for a non-remote provider: ${toString (failedMessages badNonRemote)}";
+            "remote.tartMemoryMb did not fail exactly once for a non-remote provider: ${toString (failedMessages badNonRemote)}"
+        ++
+          lib.optional (!isExactFailure diskMessage badDiskMacos)
+            "remote.tartDiskGb did not fail exactly once for targetBackend=tart-macos: ${toString (failedMessages badDiskMacos)}"
+        ++
+          lib.optional (!isExactFailure diskMessage badDiskNonRemote)
+            "remote.tartDiskGb did not fail exactly once for a non-remote provider: ${toString (failedMessages badDiskNonRemote)}";
     in
     {
       checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
@@ -115,7 +132,7 @@ top@{ ... }:
               default_config="$(provider_config "$defaultUnit")"
               grep -Fx '[remote]' "$default_config"
               grep -Fx 'target_backend = "tart-linux-arm"' "$default_config"
-              if grep -Eq '^tart_(cpus|memory_mb)[[:space:]]*=' "$default_config"; then
+              if grep -Eq '^tart_(cpus|memory_mb|disk_gb)[[:space:]]*=' "$default_config"; then
                 echo "default remote tart provider rendered an unrequested setting" >&2
                 cat "$default_config" >&2
                 exit 1
@@ -126,6 +143,11 @@ top@{ ... }:
                 grep -Fx 'tart_cpus = 4' "$config"
                 grep -Fx 'tart_memory_mb = 12288' "$config"
               done
+              grep -Fx 'tart_disk_gb = 100' "$(provider_config "$linuxUnit")"
+              if grep -Eq '^tart_disk_gb[[:space:]]*=' "$(provider_config "$macosUnit")"; then
+                echo "remote tart-macos provider rendered an unrequested tart_disk_gb" >&2
+                exit 1
+              fi
 
               touch "$out"
             '';

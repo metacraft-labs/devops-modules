@@ -342,6 +342,9 @@
         ''
         + optionalString (p.remote.tartMemoryMb > 0) ''
           tart_memory_mb = ${toString p.remote.tartMemoryMb}
+        ''
+        + optionalString (p.remote.tartDiskGb > 0) ''
+          tart_disk_gb = ${toString p.remote.tartDiskGb}
         '';
       # RE3: the `garm-provider-aws` config.toml (config/config.go). It carries
       # ONLY the region, the subnet, and the credential TYPE — never a secret.
@@ -2920,6 +2923,23 @@
                       at once). Same rollout and target rules as `tartCpus`.
                     '';
                   };
+                  tartDiskGb = mkOption {
+                    type = types.ints.unsigned;
+                    default = 0;
+                    example = 100;
+                    description = ''
+                      Per-job clone disk size (GB) for a remote Tart Linux
+                      provider (`targetBackend` `tart-linux-arm`), emitted as
+                      `tart_disk_gb` and forwarded as `--disk-gb <n>` on the
+                      remote `gosti run --ephemeral`. The Tart Linux backend
+                      grows the clone with `tart set --disk-size` before it
+                      boots, and cloud-init grows the root filesystem. 0
+                      (default) emits nothing and leaves gosti's default
+                      (50 GB, a ~45 GB root filesystem). Rejected for every
+                      other target, `tart-macos` included: gosti leaves macOS
+                      clones at the golden's size.
+                    '';
+                  };
                 };
               };
             };
@@ -5377,6 +5397,11 @@
                   ]
                 );
               message = "services.garm.providers.${n}.remote.tartCpus/tartMemoryMb require backend = \"remote\" and remote.targetBackend = \"tart-linux-arm\" or \"tart-macos\"; they map only to vm-harness --cpus/--memory-mb on the Tart ephemeral path.";
+            }) cfg.providers
+            ++ lib.mapAttrsToList (n: p: {
+              assertion =
+                p.remote.tartDiskGb == 0 || (providerIsRemote p && p.remote.targetBackend == "tart-linux-arm");
+              message = "services.garm.providers.${n}.remote.tartDiskGb requires backend = \"remote\" and remote.targetBackend = \"tart-linux-arm\"; it maps only to gosti --disk-gb on the Tart Linux ephemeral path.";
             }) cfg.providers
             ++ lib.mapAttrsToList (n: p: {
               assertion = (p.remote.libvirtUefiLoader == null) == (p.remote.libvirtUefiNvramTemplate == null);

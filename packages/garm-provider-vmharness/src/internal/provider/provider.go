@@ -182,6 +182,7 @@ func NewWithConfig(cfg *config.Config) (*Provider, error) {
 			LibvirtMemoryMB:               cfg.Remote.LibvirtMemoryMB,
 			TartCPUs:                      cfg.Remote.TartCPUs,
 			TartMemoryMB:                  cfg.Remote.TartMemoryMB,
+			TartDiskGB:                    cfg.Remote.TartDiskGB,
 		}
 	default:
 		return nil, fmt.Errorf("unsupported backend %q", cfg.Backend)
