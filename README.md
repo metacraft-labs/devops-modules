@@ -152,6 +152,24 @@ jobs:
       CREATE_PR_APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
 ```
 
+## Local builds and RunQuota
+
+The one heavy local build in the `Justfile`, building the `ci-image` closure for
+`just image` (and so `just exec` and `just act`), takes a lease from the host's
+RunQuota budget and runs at the width it is granted: the `nix` adapter of
+`runquota run` adds `--max-jobs 1 --cores N` after `build`, and every other
+argument passes through unchanged. Where `runquota` is not installed the command
+runs as before. The adapter bounds `nix build` but not `nix run`, so the recipe
+is a leased `nix build --no-link` followed by the unchanged `nix run`, which then
+finds the closure built and only runs the copy script.
+
+- `RQ= just image` runs without the lease; `RQ="runquota run --width 4 --" just image`
+  pins the width.
+- `--max-jobs 1` and `--cores N` limit LOCAL builds only; builds offloaded to
+  remote builders are not counted against them.
+- `just test-runquota-bridge` checks the bound against a private `runquotad` and
+  a stub `nix`; `--mutate` shows the check fails when the bridge is removed.
+
 ## MCL CLI Tool
 
 The `mcl-devops` tool is a Swiss-knife CLI for managing NixOS deployments. For development best practices, see [packages/mcl-devops/AGENTS.md](packages/mcl-devops/AGENTS.md).
