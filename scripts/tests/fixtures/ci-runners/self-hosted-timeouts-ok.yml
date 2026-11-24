@@ -1,0 +1,42 @@
+# Fixture for check_self_hosted_timeouts.py (gate t_ci_self_hosted_timeouts):
+# every job here is bounded, justified, or out of the linter's scope.
+#
+# timeout-justify: long-justified (the full nixosTest matrix takes about 3 h)
+name: self-hosted-timeouts-ok
+
+on:
+  push:
+    branches: [dev]
+
+jobs:
+  bounded:
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 45
+    steps:
+      - run: just test
+
+  at-ceiling:
+    runs-on: [self-hosted, macos, arm64]
+    timeout-minutes: 120
+    steps:
+      - run: just test
+
+  caller-bounded:
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - run: just test
+
+  long-justified:
+    runs-on: [self-hosted, linux, x64, bare-metal]
+    timeout-minutes: 240
+    steps:
+      - run: just test-nixos
+
+  github-hosted:
+    runs-on: ubuntu-latest
+    steps:
+      - run: just lint
+
+  reusable-call:
+    uses: ./.github/workflows/reusable-lint.yml

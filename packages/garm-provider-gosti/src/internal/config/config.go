@@ -197,6 +197,15 @@ type RemoteConfig struct {
 	// and the create argv byte-identical.
 	TartCPUs     int `toml:"tart_cpus"`
 	TartMemoryMB int `toml:"tart_memory_mb"`
+
+	// TartDiskGB sizes each remote Tart Linux per-job clone's disk (GB) via
+	// gosti `--disk-gb`, which the tart-linux-arm backend applies with
+	// `tart set --disk-size` before the clone boots (cloud-init then grows the
+	// root filesystem). It is emitted only when target_backend is
+	// tart-linux-arm: gosti leaves macOS clones at the golden's size. 0
+	// (default) emits nothing, leaving gosti's default (50 GB) and the create
+	// argv byte-identical.
+	TartDiskGB int `toml:"tart_disk_gb"`
 }
 
 // HasLibvirtSettings reports whether any remote-libvirt per-job setting is set.
@@ -623,6 +632,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Remote != nil && (c.Remote.TartCPUs < 0 || c.Remote.TartMemoryMB < 0) {
 		return fmt.Errorf("remote tart_cpus/tart_memory_mb must be >= 0")
+	}
+	if c.Remote != nil && c.Remote.TartDiskGB < 0 {
+		return fmt.Errorf("remote tart_disk_gb must be >= 0")
 	}
 	if c.Remote != nil && (c.Remote.LibvirtUEFILoader == "") != (c.Remote.LibvirtUEFINVRAMTemplate == "") {
 		return fmt.Errorf("remote libvirt_uefi_loader and libvirt_uefi_nvram_template must be set together")

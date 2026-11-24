@@ -113,6 +113,10 @@ type RemoteBackend struct {
 	// backends apply to the per-job clone with `tart set` before it boots.
 	TartCPUs     int
 	TartMemoryMB int
+	// TartDiskGB is the trusted provider-admin per-job disk size (GB) for the
+	// remote tart-linux-arm recipe (0 = unset). It maps only to gosti's
+	// `--disk-gb`, which that backend applies with `tart set --disk-size`.
+	TartDiskGB int
 }
 
 // remoteRecipe builds the create/delete argv for a specific target backend.
@@ -232,6 +236,12 @@ var ephemeralRecipe = remoteRecipe{
 			if backend.TartMemoryMB > 0 {
 				argv = append(argv, "--memory-mb", strconv.Itoa(backend.TartMemoryMB))
 			}
+		}
+		// Remote Tart Linux: per-job disk size. gosti's default (50 GB, a
+		// ~45 GB root fs) fills during large linux-arm64 builds. Only the
+		// Linux backend grows a clone's disk, so tart-macos never receives it.
+		if backend.TargetBackend == "tart-linux-arm" && backend.TartDiskGB > 0 {
+			argv = append(argv, "--disk-gb", strconv.Itoa(backend.TartDiskGB))
 		}
 		argv = append(argv, "--keep", "--log-format", "json")
 		return argv

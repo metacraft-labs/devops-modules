@@ -35,6 +35,7 @@
     ./runner-mode-switch.nix
     ./runner-mode-manager.nix
     ./ci-runs-on-capability.nix
+    ./ci-self-hosted-timeouts.nix
     ./ci-nixos-runner-hazards.nix
     ./garm-reconcile.nix
     ./garm-job-cache-self-heal.nix
