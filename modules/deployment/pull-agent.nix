@@ -33,6 +33,7 @@
         "--event-log ${escapeShellArg cfg.eventLog}"
         "--max-attempts ${toString cfg.maxAttempts}"
         "--fetch-timeout-seconds ${toString cfg.fetchTimeoutSeconds}"
+        "--incomplete-switch-backoff-seconds ${toString cfg.incompleteSwitchBackoffSeconds}"
       ]
       ++ map (source: "--manifest ${escapeShellArg source}") cfg.manifestSources
       ++ map (dir: "--manifest-dir ${escapeShellArg dir}") cfg.manifestDirectories
@@ -48,6 +49,18 @@
       ]
       ++ lib.optionals (cfg.generationCommand != "") [
         "--generation-command ${escapeShellArg cfg.generationCommand}"
+      ]
+      ++ lib.optionals (cfg.preSwitchHook != "") [
+        "--pre-switch-hook ${escapeShellArg cfg.preSwitchHook}"
+        "--pre-switch-hook-timeout-seconds ${toString cfg.preSwitchHookTimeoutSeconds}"
+        "--pre-switch-hook-failure ${cfg.preSwitchHookFailurePolicy}"
+      ]
+      ++ lib.optionals (cfg.postSwitchHook != "") [
+        "--post-switch-hook ${escapeShellArg cfg.postSwitchHook}"
+        "--post-switch-hook-timeout-seconds ${toString cfg.postSwitchHookTimeoutSeconds}"
+      ]
+      ++ lib.optionals (cfg.alreadyCurrentRecoveryHook != "") [
+        "--already-current-recovery-hook ${escapeShellArg cfg.alreadyCurrentRecoveryHook}"
       ];
 
       agentCommand = concatMapStringsSep " " (x: x) ([ "${getExe cfg.package} deploy-agent" ] ++ args);
@@ -298,6 +311,90 @@
           default = "";
           description = "Optional root command override that prints the current generation. Empty uses /run/current-system.";
         };
+
+        incompleteSwitchBackoffSeconds = mkOption {
+          type = types.ints.unsigned;
+          default = 300;
+          description = ''
+            Base delay before the agent re-runs a switch-to-configuration that
+            failed after activation had already selected the new generation (a
+            half-applied host). The delay doubles after every further failure,
+            capped at four hours; 0 retries on the next poll. Each retry still
+            consumes one of maxAttempts, and every run that finds the host
+            half-applied records a failed `switch_incomplete` deployment event.
+          '';
+        };
+
+        preSwitchHook = mkOption {
+          type = types.coercedTo types.package toString types.str;
+          default = "";
+          description = ''
+            Optional executable run as root after the desired closure is restored
+            and verified, and before switch-to-configuration, while the current
+            generation's services are still running. It is called with two
+            arguments, DESIRED and CURRENT system store paths (equal when the
+            agent re-runs a switch that did not complete). Exit 75 defers the
+            deployment without consuming a retry attempt; any other non-zero
+            exit (or a timeout) is handled by preSwitchHookFailurePolicy. Use it
+            for work that must happen before the new generation restarts
+            services, such as an online database backup -- not in an
+            activation script, which runs inside the switch.
+          '';
+        };
+
+        preSwitchHookTimeoutSeconds = mkOption {
+          type = types.ints.unsigned;
+          default = 1800;
+          description = ''
+            Seconds after which the pre-switch hook (and its process group) is
+            terminated and treated as failed; 0 disables the timeout. Leave room
+            for restore, switch and health checks inside the unit's
+            TimeoutStartSec.
+          '';
+        };
+
+        preSwitchHookFailurePolicy = mkOption {
+          type = types.enum [
+            "abort"
+            "continue"
+          ];
+          default = "abort";
+          description = ''
+            What a failed or timed-out pre-switch hook does: "abort" fails the
+            apply before switching (retryable, counted against maxAttempts);
+            "continue" records the failure as a deployment event and switches
+            anyway.
+          '';
+        };
+
+        postSwitchHook = mkOption {
+          type = types.coercedTo types.package toString types.str;
+          default = "";
+          description = ''
+            Optional executable run after the switch and health checks, called
+            with DESIRED PREVIOUS OUTCOME. A failure marks an otherwise
+            successful deployment failed (retryable).
+          '';
+        };
+
+        postSwitchHookTimeoutSeconds = mkOption {
+          type = types.ints.unsigned;
+          default = 600;
+          description = "Seconds after which the post-switch hook is terminated and treated as failed; 0 disables the timeout.";
+        };
+
+        alreadyCurrentRecoveryHook = mkOption {
+          type = types.coercedTo types.package toString types.str;
+          default = "";
+          description = ''
+            Recovery-only executable called with DESIRED CURRENT when the desired
+            generation is already selected (and its last switch completed). The
+            ordinary pre-switch hook is never run on that path, so lifecycle
+            hooks require this contract, as on nix-darwin: it must confirm that
+            nothing a hook left behind needs finishing. A hook with no retained
+            state can pass a no-op such as `''${pkgs.coreutils}/bin/true`.
+          '';
+        };
       };
 
       config = mkIf cfg.enable {
@@ -309,6 +406,11 @@
           {
             assertion = cfg.manifestSources != [ ] || cfg.manifestDirectories != [ ];
             message = "services.mcl-deploy-agent needs at least one manifest source or directory.";
+          }
+          {
+            assertion =
+              (cfg.preSwitchHook == "" && cfg.postSwitchHook == "") || cfg.alreadyCurrentRecoveryHook != "";
+            message = "services.mcl-deploy-agent lifecycle hooks require alreadyCurrentRecoveryHook for safe exact-current convergence.";
           }
         ];
 

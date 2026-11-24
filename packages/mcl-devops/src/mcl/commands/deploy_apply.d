@@ -17,9 +17,12 @@ import argparse : AllowedValues, Command, Description, EnvFallback, NamedArgumen
 import mcl.utils.deploy_manifest : ManifestBuildRequest, buildManifest,
     manifestDeploymentId, manifestDesiredSystemPath, manifestSequence, manifestSystem,
     manifestTarget, verifyManifestSignature;
-import mcl.utils.deploy_state : acquireDeployTargetStateLock, DeployTargetStateLock,
-    DesiredManifestDecision, DurableManifestSnapshot, loadDurableManifestSnapshot,
-    markDeploymentState, recordDesiredManifestBound, safeTargetName;
+import mcl.utils.deploy_state : acquireDeployTargetStateLock, currentBootId,
+    DeployTargetStateLock, DesiredManifestDecision, DurableManifestSnapshot,
+    IncompleteSwitchMarker, incompleteSwitchMarkerPath, incompleteSwitchMatches,
+    incompleteSwitchRetryDelaySeconds, loadDurableManifestSnapshot,
+    loadIncompleteSwitchMarker, markDeploymentState, recordDesiredManifestBound,
+    removeIncompleteSwitchMarker, safeTargetName, writeIncompleteSwitchMarker;
 import mcl.utils.deployment_events : ClosureSummary, DeploymentEventContext,
     appendDeploymentEvent, deploymentEventJson, deploymentEventLogPathFromEnv,
     queryClosureSummary, stderrSummary;
@@ -77,6 +80,49 @@ enum DeploymentActivationMode
 
     @AllowedValues("nix-darwin")
     nixDarwin,
+}
+
+// What a failing (non-deferring) pre-switch hook does to the deployment.
+enum HookFailurePolicy
+{
+    // Fail the apply before switch-to-configuration; the agent retries it.
+    abort,
+
+    // Record the failure as a deployment event and switch anyway.
+    @AllowedValues("continue")
+    continue_,
+}
+
+string hookFailurePolicyName(HookFailurePolicy policy)
+{
+    return policy == HookFailurePolicy.abort ? "abort" : "continue";
+}
+
+// Lifecycle hook timeouts and failure policy, shared by deploy-apply and the
+// deploy-agent wrapper so both spell the options identically.
+mixin template LifecycleHookPolicyArgs()
+{
+    @(NamedArgument(["pre-switch-hook-timeout-seconds"])
+        .Placeholder("N")
+        .Description("Kill the pre-switch hook after N seconds and treat it as failed; 0 means no timeout"))
+    ulong preSwitchHookTimeoutSeconds;
+
+    @(NamedArgument(["pre-switch-hook-failure"])
+        .Placeholder("abort|continue")
+        .Description("On a pre-switch hook failure or timeout: abort the apply (retryable, the default) "
+            ~ "or record the failure and switch anyway. Exit 75 always defers."))
+    HookFailurePolicy preSwitchHookFailure = HookFailurePolicy.abort;
+
+    @(NamedArgument(["post-switch-hook-timeout-seconds"])
+        .Placeholder("N")
+        .Description("Kill the post-switch hook after N seconds and treat it as failed; 0 means no timeout"))
+    ulong postSwitchHookTimeoutSeconds;
+
+    @(NamedArgument(["incomplete-switch-backoff-seconds"])
+        .Placeholder("N")
+        .Description("NixOS: base delay before re-running a switch-to-configuration that failed after "
+            ~ "activation selected the generation; doubles per failure, capped at 4h; 0 disables"))
+    ulong incompleteSwitchBackoffSeconds = 300;
 }
 
 enum deployApplyDeferredExitCode = 75;
@@ -141,6 +187,8 @@ struct DeployApplyArgs
         .Placeholder("PATH")
         .Description("Executable recovery-only probe called with DESIRED CURRENT before exact-current convergence"))
     string alreadyCurrentRecoveryHook;
+
+    mixin LifecycleHookPolicyArgs;
 
     @(NamedArgument(["event-log"])
         .Placeholder("events.jsonl")
@@ -217,6 +265,14 @@ struct DeployApplyDependencies
     void delegate() beforeStateLock;
     void delegate() afterDurableValidation;
     void delegate() onAlreadyCurrent;
+    // Called when the selected generation's last switch never completed: the
+    // apply re-runs the switch (or, at an exhausted budget, refuses loudly).
+    void delegate() onIncompleteSwitch;
+    // Called when an incomplete-switch retry is deferred by its backoff.
+    void delegate() onIncompleteSwitchBackoff;
+    // Test seams; null uses the wall clock and the kernel boot id.
+    long delegate() now;
+    string delegate() bootId;
 }
 
 export int deploy_apply(DeployApplyArgs args)
@@ -441,10 +497,19 @@ ProcessResult shell(ProcessRunner runner, string command)
 // propagates the switch exit code back to the agent, --pipe forwards stdout/stderr
 // so events keep their diagnostics, and --collect garbage-collects the transient
 // unit even if it fails.
-ProcessResult detachedSwitch(ProcessRunner runner, string command, bool detach)
+//
+// `onSuccess`, when given, is a shell command the transient unit runs after the
+// switch exits 0. It lets the switch confirm its own completion even when the
+// switch itself restarts (and so kills) the launching agent before the agent
+// can record the outcome. The switch's own exit status is preserved.
+ProcessResult detachedSwitch(ProcessRunner runner, string command, bool detach,
+    string onSuccess = "")
 {
     if (!detach)
         return shell(runner, command);
+
+    if (onSuccess != "")
+        command = "(" ~ command ~ ") && { " ~ onSuccess ~ " || :; }";
 
     import std.uuid : randomUUID;
 
@@ -487,12 +552,16 @@ ProcessResult currentGeneration(
     }
 }
 
+// Grace period between the timeout's SIGTERM and its SIGKILL.
+enum lifecycleHookKillAfterSeconds = 30;
+
 ProcessResult runLifecycleHook(
     ProcessRunner runner,
     string hook,
     string desired,
     string previous,
     string outcome = "",
+    ulong timeoutSeconds = 0,
 )
 {
     if (hook == "")
@@ -501,7 +570,22 @@ ProcessResult runLifecycleHook(
     auto command = [hook, desired, previous];
     if (outcome != "")
         command ~= outcome;
+    // coreutils timeout signals the hook's whole process group, so a hook's
+    // children (an sqlite copy, an rsync) die with it rather than outliving
+    // the deployment that started them.
+    if (timeoutSeconds > 0)
+        command = [
+            "timeout",
+            "--kill-after=" ~ lifecycleHookKillAfterSeconds.to!string,
+            timeoutSeconds.to!string,
+        ] ~ command;
     return runner(command);
+}
+
+// coreutils timeout exits 124 when it sent the TERM, 137 when it had to KILL.
+bool lifecycleHookTimedOut(ProcessResult result, ulong timeoutSeconds)
+{
+    return timeoutSeconds > 0 && (result.exitCode == 124 || result.exitCode == 137);
 }
 
 // The production NixOS activation: register the generation in the system
@@ -779,6 +863,87 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
         return 1;
     }
 
+    // NixOS only: was the last switch into the selected generation started and
+    // never confirmed? Then `previous == desired` does not mean "converged" --
+    // activation selected the generation, but switch-to-configuration stopped
+    // before it restarted and started units. See IncompleteSwitchMarker.
+    long nowSeconds()
+    {
+        import std.datetime.systime : Clock;
+
+        return deps.now !is null ? deps.now() : Clock.currTime.toUnixTime;
+    }
+    auto bootId = deps.bootId !is null ? deps.bootId() : currentBootId();
+    auto tracksIncompleteSwitch = args.activationMode == DeploymentActivationMode.nixos;
+    auto switchMarker = tracksIncompleteSwitch
+        ? loadIncompleteSwitchMarker(args.stateDir, args.target)
+        : Nullable!IncompleteSwitchMarker.init;
+    if (!switchMarker.isNull && switchMarker.get.bootId != "" && bootId != ""
+        && switchMarker.get.bootId != bootId)
+    {
+        // The host rebooted since: boot activation starts every unit of the
+        // generation it boots, so whatever the interrupted switch left undone
+        // is done. Keeping the marker would only force a redundant switch.
+        removeIncompleteSwitchMarker(args.stateDir, args.target);
+        switchMarker = Nullable!IncompleteSwitchMarker.init;
+    }
+    auto incompleteSwitch = previousResult.succeeded && previous == desired
+        && incompleteSwitchMatches(switchMarker, previous);
+
+    if (incompleteSwitch)
+    {
+        auto marker = switchMarker.get;
+        if (deps.onIncompleteSwitch !is null)
+            deps.onIncompleteSwitch();
+        JSONValue[string] markerMetadata = [
+            "previousGeneration": JSONValue(previous),
+            "newGeneration": JSONValue(previous),
+            "markerDeploymentId": JSONValue(marker.deploymentId),
+            "markerPreviousGeneration": JSONValue(marker.previousGeneration),
+            "switchStartedAt": JSONValue(marker.startedAt),
+            "switchFailures": JSONValue(marker.failures),
+        ];
+        // Loud by construction: a half-applied host is a failure signal on
+        // every run that observes it (mcl_deployment_phase_failures_total
+        // {phase="switch",error_code="switch_incomplete"}), until a switch
+        // completes.
+        emit("switch", "detect incomplete switch", ["mcl-devops", "deploy-apply"], "failed", 1,
+            "The selected generation's last switch-to-configuration did not complete",
+            "switch_incomplete", "", markerMetadata, true);
+
+        if (deps.requireAlreadyCurrent)
+        {
+            markDeploymentState(args.stateDir, manifest, "failed",
+                "Retry budget exhausted while the selected generation's switch is incomplete.");
+            markerMetadata["outcome"] = JSONValue("switch-incomplete");
+            emit("complete", "mcl-devops deploy-apply", ["mcl-devops", "deploy-apply"],
+                "failed", 1,
+                "Retry budget exhausted; the host is half-applied and needs a completed switch",
+                "switch_incomplete", "", markerMetadata);
+            return 1;
+        }
+
+        auto retryAt = marker.lastFailureAt + incompleteSwitchRetryDelaySeconds(
+            args.incompleteSwitchBackoffSeconds.to!long, marker.failures);
+        if (nowSeconds() < retryAt)
+        {
+            if (deps.onIncompleteSwitchBackoff !is null)
+                deps.onIncompleteSwitchBackoff();
+            markDeploymentState(args.stateDir, manifest, "deferred",
+                "Incomplete switch retry is backing off.");
+            markerMetadata["outcome"] = JSONValue("switch-incomplete-backoff");
+            markerMetadata["retryAt"] = JSONValue(retryAt);
+            emit("complete", "mcl-devops deploy-apply", ["mcl-devops", "deploy-apply"],
+                "skipped", deployApplyDeferredExitCode,
+                "Incomplete switch retry is backing off",
+                "switch_incomplete_backoff", "", markerMetadata, true);
+            return deployApplyDeferredExitCode;
+        }
+        // Otherwise fall through to a full transaction for the same
+        // generation: restore (cheap, the closure is present), the pre-switch
+        // hook, and a fresh switch-to-configuration.
+    }
+
     // A newer signed manifest identity can legitimately name the generation
     // that is already selected (for example, an infra-only revision whose m3
     // closure did not change). Authentication and monotonic durable acceptance
@@ -787,7 +952,7 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
     // and every lifecycle hook: those surfaces may stop workloads in
     // preparation for a switch and are not harmless merely because activation
     // would eventually select the same store path.
-    if (previousResult.succeeded && previous == desired)
+    if (previousResult.succeeded && previous == desired && !incompleteSwitch)
     {
         // Tell the pull agent that this path did not start a new generation
         // transaction even when lifecycle recovery below fails. Retry budget
@@ -909,30 +1074,42 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
         return 1;
     }
 
-    auto preHook = runLifecycleHook(runner, args.preSwitchHook, desired, previous);
+    // The pre-switch hook runs after the closure is restored and before any
+    // activation, while the previous generation's services still serve. It
+    // gets DESIRED PREVIOUS; on an incomplete-switch retry the two are equal
+    // because the generation is already selected.
+    auto preHook = runLifecycleHook(runner, args.preSwitchHook, desired, previous, "",
+        args.preSwitchHookTimeoutSeconds);
+    auto preDeferred = preHook.exitCode == deployApplyDeferredExitCode;
+    auto preTimedOut = lifecycleHookTimedOut(preHook, args.preSwitchHookTimeoutSeconds);
+    auto preContinues = !preHook.succeeded && !preDeferred
+        && args.preSwitchHookFailure == HookFailurePolicy.continue_;
     if (args.preSwitchHook != "")
         emit("switch", "deployment readiness hook",
             [args.preSwitchHook, desired, previous],
-            preHook.succeeded ? "succeeded"
-                : preHook.exitCode == deployApplyDeferredExitCode ? "skipped" : "failed",
+            preHook.succeeded ? "succeeded" : preDeferred ? "skipped" : "failed",
             preHook.exitCode,
             preHook.succeeded ? ""
-                : preHook.exitCode == deployApplyDeferredExitCode
-                    ? "Deployment readiness hook deferred activation"
-                    : "Deployment readiness hook failed",
+                : preDeferred ? "Deployment readiness hook deferred activation"
+                : preTimedOut ? "Deployment readiness hook timed out after "
+                    ~ args.preSwitchHookTimeoutSeconds.to!string ~ "s"
+                : "Deployment readiness hook failed",
             preHook.succeeded ? "command_failed"
-                : preHook.exitCode == deployApplyDeferredExitCode
-                    ? "deployment_deferred" : "pre_switch_hook_failed",
+                : preDeferred ? "deployment_deferred"
+                : preTimedOut ? "pre_switch_hook_timeout" : "pre_switch_hook_failed",
             preHook.succeeded ? "" : preHook.stderr.stderrSummary,
             [
                 "lifecycleStage": JSONValue("pre-switch"),
                 "desiredGeneration": JSONValue(desired),
                 "previousGeneration": JSONValue(previous),
+                "timeoutSeconds": JSONValue(cast(long) args.preSwitchHookTimeoutSeconds),
+                "failurePolicy": JSONValue(hookFailurePolicyName(args.preSwitchHookFailure)),
+                "continuedAfterFailure": JSONValue(preContinues),
             ],
-            preHook.exitCode == deployApplyDeferredExitCode);
-    if (!preHook.succeeded)
+            preDeferred);
+    if (!preHook.succeeded && !preContinues)
     {
-        auto deferred = preHook.exitCode == deployApplyDeferredExitCode;
+        auto deferred = preDeferred;
         // The terminal event and the durable state name WHICH readiness
         // condition failed: the hook reports it on stderr. Without this the
         // outcome an operator reads said only "conditions are not met"
@@ -947,8 +1124,11 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
             deferred ? "skipped" : "failed",
             deferred ? deployApplyDeferredExitCode : 1,
             deferred ? "Deployment readiness conditions are not met."
+                : preTimedOut ? "Deployment readiness hook timed out."
                 : "Deployment readiness hook failed.",
-            deferred ? "deployment_deferred" : "pre_switch_hook_failed", hookReason, [
+            deferred ? "deployment_deferred"
+                : preTimedOut ? "pre_switch_hook_timeout" : "pre_switch_hook_failed",
+            hookReason, [
                 "lifecycleStage": JSONValue("pre-switch"),
                 "outcome": JSONValue(deferred ? "deferred" : "failed"),
             ], deferred);
@@ -967,24 +1147,64 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
         auto switchCommand = args.switchCommand == ""
             ? nixosSwitchCommand(args.systemProfile, desired)
             : args.switchCommand;
-        auto switched = detachedSwitch(runner, switchCommand, !args.noDetachSwitch);
+        // Record the switch as started BEFORE running it, carrying the failure
+        // count of an earlier attempt at the same generation for the backoff.
+        auto carried = !switchMarker.isNull && switchMarker.get.generation == desired;
+        writeIncompleteSwitchMarker(args.stateDir, IncompleteSwitchMarker(
+            target: args.target,
+            generation: desired,
+            previousGeneration: carried && switchMarker.get.previousGeneration != ""
+                ? switchMarker.get.previousGeneration : previous,
+            bootId: bootId,
+            deploymentId: manifestDeploymentId(manifest),
+            sequence: cast(long) manifestSequence(manifest),
+            startedAt: nowSeconds(),
+            failures: carried ? switchMarker.get.failures : 0,
+            lastFailureAt: carried ? switchMarker.get.lastFailureAt : 0,
+        ));
+        import std.process : escapeShellFileName;
+
+        auto switched = detachedSwitch(runner, switchCommand, !args.noDetachSwitch,
+            "rm -f " ~ escapeShellFileName(incompleteSwitchMarkerPath(args.stateDir, args.target)));
         auto currentResult = currentGeneration(args, queryRunner);
         current = currentResult.stdout.strip;
         switchOk = switched.succeeded;
         // A refusal that only a reboot can resolve is not a failed switch.
         auto rebootOnly = !switched.succeeded && args.switchCommand == ""
             && refusedOnlyBySwitchInhibitors(switched.stderr);
+        // A failed switch that nevertheless selected the generation left the
+        // host half-applied; the marker makes the next run finish it.
+        auto leftIncomplete = !switched.succeeded && !rebootOnly
+            && currentResult.succeeded && current == desired;
+        if (switched.succeeded || rebootOnly)
+            // rebootOnly: the pre-switch checks refused before activating.
+            removeIncompleteSwitchMarker(args.stateDir, args.target);
+        else
+        {
+            auto failed = loadIncompleteSwitchMarker(args.stateDir, args.target);
+            if (!failed.isNull && failed.get.generation == desired)
+            {
+                auto marker = failed.get;
+                marker.failures += 1;
+                marker.lastFailureAt = nowSeconds();
+                writeIncompleteSwitchMarker(args.stateDir, marker);
+            }
+        }
         emit("switch", "switch-to-configuration", ["sh", "-c", switchCommand],
             switched.succeeded ? "succeeded" : "failed",
             switched.exitCode,
             switched.succeeded ? ""
                 : rebootOnly ? "System switch refused: a switch inhibitor changed and needs a reboot"
+                : leftIncomplete ? "System switch failed after activation selected the generation; "
+                    ~ "the next run re-runs the switch"
                 : "System switch failed",
             rebootOnly ? "switch_inhibited" : "switch_failed",
             switched.succeeded ? "" : switched.stderr.stderrSummary,
             [
                 "previousGeneration": JSONValue(previous),
                 "newGeneration": JSONValue(current),
+                "switchIncomplete": JSONValue(leftIncomplete),
+                "incompleteSwitchRetry": JSONValue(incompleteSwitch),
             ]);
 
         // Install the generation as the boot default instead, so the next
@@ -1158,14 +1378,19 @@ int deployApplyImpl(DeployApplyArgs args, DeployApplyDependencies deps)
         stateMessage = "Deployment converged.";
     }
 
-    auto postHook = runLifecycleHook(runner, args.postSwitchHook, desired, previous, outcome);
+    auto postHook = runLifecycleHook(runner, args.postSwitchHook, desired, previous, outcome,
+        args.postSwitchHookTimeoutSeconds);
+    auto postTimedOut = lifecycleHookTimedOut(postHook, args.postSwitchHookTimeoutSeconds);
     if (args.postSwitchHook != "")
         emit("switch", "deployment cleanup hook",
             [args.postSwitchHook, desired, previous, outcome],
             postHook.succeeded ? "succeeded" : "failed",
             postHook.exitCode,
-            postHook.succeeded ? "" : "Deployment cleanup hook failed",
-            "post_switch_hook_failed",
+            postHook.succeeded ? ""
+                : postTimedOut ? "Deployment cleanup hook timed out after "
+                    ~ args.postSwitchHookTimeoutSeconds.to!string ~ "s"
+                : "Deployment cleanup hook failed",
+            postTimedOut ? "post_switch_hook_timeout" : "post_switch_hook_failed",
             postHook.succeeded ? "" : postHook.stderr.stderrSummary,
             [
                 "lifecycleStage": JSONValue("post-switch"),
