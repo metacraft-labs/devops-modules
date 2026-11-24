@@ -14,9 +14,9 @@
   # in reprobuild.
   #
   # Direction of the dependency: reprobuild owns, nixos-modules re-exports. It
-  # is the only direction the input graph allows — this flake already pins
-  # `reprobuild` as an input, so reprobuild cannot in turn need nixos-modules
-  # for its modules. (reprobuild keeps a `nixos-modules` input for
+  # is the only direction the dependency graph allows — this flake already
+  # depends on the pinned reprobuild, so reprobuild cannot in turn need
+  # nixos-modules for its modules. (reprobuild keeps a `nixos-modules` input for
   # `nixpkgs.follows` only; that is a lock-time pin, not an import, and each
   # flake resolves its own inputs, so there is no cycle.)
   #
@@ -28,8 +28,10 @@
   # drift). Fleet configuration that says `programs.reprobuild.* = …` keeps
   # working unchanged.
   #
-  # REQUIRES a `reprobuild` input revision that carries `nix/modules/`. Bump
-  # `inputs.reprobuild.url` in flake.nix together with this file.
+  # REQUIRES a pinned reprobuild revision that carries `nix/modules/`.
+  # `inputs.reprobuild` is not a flake input: flake.nix reaches it from the
+  # organisation's pin (metacraft-github-actions `pins/reprobuild.json`), so a
+  # bump that changes these module names moves the pin and this file together.
   flake.modules.nixos.mcl-reprobuild = {
     imports = [
       inputs.reprobuild.nixosModules.reprobuild

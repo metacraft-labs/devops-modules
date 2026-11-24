@@ -14,12 +14,12 @@ top@{ ... }:
     {
       pkgs,
       lib,
-      inputs',
+      system,
       ...
     }:
     let
       flake = top.config.flake;
-      reproBinaryCache = inputs'.reprobuild.packages.repro-binary-cache;
+      reproBinaryCache = top.inputs.reprobuild.packages.${system}.repro-binary-cache;
     in
     {
       checks = lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {

@@ -30,17 +30,17 @@ top@{ ... }:
     {
       pkgs,
       lib,
-      inputs',
+      system,
       ...
     }:
     let
       flake = top.config.flake;
-      reproBinaryCache = inputs'.reprobuild.packages.repro-binary-cache;
+      reproBinaryCache = top.inputs.reprobuild.packages.${system}.repro-binary-cache;
       # Binary-Caches.md §"Client CLI Surface (`repro cache`)": the standalone
       # `repro-binary-cache-client` package was retired; its toolset is now the
       # `repro cache <subcommand>` group shipped by the full `reprobuild`
       # package (`bin/repro`).
-      repro = inputs'.reprobuild.packages.reprobuild;
+      repro = top.inputs.reprobuild.packages.${system}.reprobuild;
 
       # --- Fixture provenance -------------------------------------------------
       # Minted with:

@@ -20,12 +20,12 @@ top@{ inputs, ... }:
     {
       pkgs,
       lib,
-      inputs',
+      system,
       ...
     }:
     let
       flake = top.config.flake;
-      reproPkg = inputs'.reprobuild.packages.reprobuild;
+      reproPkg = inputs.reprobuild.packages.${system}.reprobuild;
 
       # ---- Evaluate the NixOS class (system reaper) via lib.nixosSystem (the
       # same idiom the netbird-with-agenix eval gate uses). ----

@@ -36,7 +36,7 @@ top@{ ... }:
     {
       pkgs,
       lib,
-      inputs',
+      system,
       ...
     }:
     let
@@ -44,7 +44,7 @@ top@{ ... }:
       # Pass the reprobuild package explicitly (like the sibling cross-host gate
       # passes the daemon), keeping the check self-contained. This is the full
       # toolset — `repro`, whose `cache` subcommand bundles the client.
-      reproPkg = inputs'.reprobuild.packages.reprobuild;
+      reproPkg = top.inputs.reprobuild.packages.${system}.reprobuild;
 
       # The concrete fleet cache (from R3's managed signing key). The pubkey is
       # the exact 130-hex string committed at
