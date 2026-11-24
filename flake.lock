@@ -4506,17 +4506,17 @@
         "test-certificates-tools-src": "test-certificates-tools-src"
       },
       "locked": {
-        "lastModified": 1795299905,
-        "narHash": "sha256-UH5Y9ANUW9XbuAsxyhDKfjZ1ZblnOq/4lF0vvKzPFas=",
+        "lastModified": 1795426006,
+        "narHash": "sha256-wSLwfXhh8jE1+zohBjR1+oFKK56PRFX3VByUoS0RpDo=",
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "2f7cb5db5289fa1e9e060281ebe8c095bf9669e9",
+        "rev": "c6c3f9c0c2995edb28d968a240e8406f9ff46671",
         "type": "github"
       },
       "original": {
         "owner": "metacraft-labs",
         "repo": "reprobuild",
-        "rev": "2f7cb5db5289fa1e9e060281ebe8c095bf9669e9",
+        "rev": "c6c3f9c0c2995edb28d968a240e8406f9ff46671",
         "type": "github"
       }
     },

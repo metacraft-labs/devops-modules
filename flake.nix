@@ -68,7 +68,11 @@
     # older than that makes `modules/` fail to evaluate, not merely ship a stale
     # `repro`.
     reprobuild = {
-      url = "github:metacraft-labs/reprobuild/2f7cb5db5289fa1e9e060281ebe8c095bf9669e9";
+      # c6c3f9c0 is agents 2f7cb5db5 (0.2.31, interface envelope 35, the rev
+      # codetracer's dev shell pins) plus a cherry-pick of the managed-hook fix
+      # c7daf6781. It lives on reprobuild's `fleet/0.2.31-gate-fix` branch, not on
+      # agents, so that branch must not be deleted while this pin names it.
+      url = "github:metacraft-labs/reprobuild/c6c3f9c0c2995edb28d968a240e8406f9ff46671";
       # reprobuild's own pin of this repo reaches microvm too, so the same
       # spectrum-os.org input sits one level down. Drop it for the same reason
       # as in `microvm` below.
