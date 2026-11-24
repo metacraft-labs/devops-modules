@@ -10,7 +10,14 @@ This exists because microvm.nix locks `spectrum` from spectrum-os.org. That
 host stopped answering on 2026-11-19 and every consumer fetching the whole
 lock failed with it, although nothing evaluates the input.
 
-Usage: check_flake_lock_sources.py [--allowlist FILE] FLAKE_LOCK...
+A lock may also carry a named exception, `--exception LOCK:NODE:HOST`: that
+one node of that one lock may fetch from that host, denied or not. Every other
+node, host and lock is checked as usual, and an exception that matches nothing
+is itself a problem, so it is deleted when the input it excuses goes away
+instead of quietly outliving it.
+
+Usage: check_flake_lock_sources.py [--allowlist FILE]
+                                   [--exception LOCK:NODE:HOST]... FLAKE_LOCK...
 Exit 0 when every lock is clean, 1 when one is not, 2 on a usage error.
 """
 
@@ -60,7 +67,18 @@ def load_allowlist(path):
     return hosts
 
 
-def check(lock_path, allowed):
+def parse_exception(text):
+    """`LOCK:NODE:HOST` -> (LOCK, NODE, HOST). LOCK may itself contain colons."""
+    parts = text.rsplit(":", 2)
+    if len(parts) != 3 or not all(parts):
+        raise argparse.ArgumentTypeError(f"expected LOCK:NODE:HOST, got {text!r}")
+    lock, node, host = parts
+    return lock, node, host.lower()
+
+
+def check(lock_path, allowed, excepted=frozenset(), used=None):
+    """Problems in one lock. `excepted` holds the (node, host) pairs this lock
+    may fetch regardless; each one that matches is added to `used`."""
     nodes = json.loads(lock_path.read_text())["nodes"]
     problems = []
     for name, node in sorted(nodes.items()):
@@ -70,6 +88,10 @@ def check(lock_path, allowed):
                 continue
             host = source_host(ref)
             if host is None:
+                continue
+            if (name, host) in excepted:
+                if used is not None:
+                    used.add((name, host))
                 continue
             if host in DENIED:
                 problems.append(
@@ -85,23 +107,56 @@ def check(lock_path, allowed):
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--allowlist", type=Path, default=DEFAULT_ALLOWLIST)
+    ap.add_argument(
+        "--exception",
+        type=parse_exception,
+        action="append",
+        default=[],
+        metavar="LOCK:NODE:HOST",
+        help="let NODE in LOCK (exactly as given among the locks) fetch from HOST",
+    )
     ap.add_argument("locks", type=Path, nargs="+")
     args = ap.parse_args(argv)
     allowed = load_allowlist(args.allowlist)
+    lock_names = {str(lock) for lock in args.locks}
+    exceptions = {}
+    for lock, node, host in args.exception:
+        if lock not in lock_names:
+            ap.error(f"--exception names {lock}, which is not one of the locks checked")
+        exceptions.setdefault(lock, set()).add((node, host))
+    # Source problems and stale exceptions have different remedies, so they
+    # are kept apart and each gets its own closing hint.
     problems = []
+    stale = []
     for lock in args.locks:
-        problems += check(lock, allowed)
-    if problems:
-        print("\n".join(problems), file=sys.stderr)
-        print(
-            f"{len(problems)} problem(s). Pin the input to GitHub/GitLab, drop it with "
-            '`inputs.<x>.inputs.<y>.follows = ""`, or, for a host that is genuinely '
-            f"needed and reliable, add it to {args.allowlist.name} with a reason.",
-            file=sys.stderr,
-        )
+        excepted = exceptions.get(str(lock), set())
+        used = set()
+        problems += check(lock, allowed, excepted, used)
+        for node, host in sorted(excepted - used):
+            stale.append(
+                f"{lock}: exception for node '{node}' from {host} is stale: no such "
+                "node fetches from that host any more, so delete the exception"
+            )
+    if problems or stale:
+        print("\n".join(problems + stale), file=sys.stderr)
+        if problems:
+            print(
+                f"{len(problems)} problem(s). Pin the input to GitHub/GitLab, drop it with "
+                '`inputs.<x>.inputs.<y>.follows = ""`, or, for a host that is genuinely '
+                f"needed and reliable, add it to {args.allowlist.name} with a reason.",
+                file=sys.stderr,
+            )
+        if stale:
+            print(
+                f"{len(stale)} stale exception(s). Remove the matching --exception "
+                "argument(s) and the comment that justifies them.",
+                file=sys.stderr,
+            )
         return 1
+    excused = sum(len(pairs) for pairs in exceptions.values())
     print(
         f"ok: {len(args.locks)} lock(s), every input from GitHub/GitLab or an allowlisted host"
+        + (f", apart from {excused} named exception(s)" if excused else "")
     )
     return 0
 

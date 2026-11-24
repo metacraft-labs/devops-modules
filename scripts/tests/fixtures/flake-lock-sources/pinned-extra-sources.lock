@@ -1,0 +1,27 @@
+{
+  "nodes": {
+    "microvm": {
+      "inputs": { "spectrum": "spectrum" },
+      "locked": { "owner": "astro", "repo": "microvm.nix", "rev": "9ddb425679d44e6e1e5cd5df9db0c42ed99df4a4", "type": "github" },
+      "original": { "owner": "astro", "repo": "microvm.nix", "type": "github" }
+    },
+    "root": { "inputs": { "microvm": "microvm", "spectrum-mirror": "spectrum-mirror", "elsewhere": "elsewhere" } },
+    "spectrum": {
+      "flake": false,
+      "locked": { "rev": "fe39e122d898f66e89ffa17d4f4209989ccb5358", "type": "git", "url": "https://spectrum-os.org/git/spectrum" },
+      "original": { "type": "git", "url": "https://spectrum-os.org/git/spectrum" }
+    },
+    "spectrum-mirror": {
+      "flake": false,
+      "locked": { "rev": "fe39e122d898f66e89ffa17d4f4209989ccb5358", "type": "git", "url": "https://spectrum-os.org/git/spectrum" },
+      "original": { "type": "git", "url": "https://spectrum-os.org/git/spectrum" }
+    },
+    "elsewhere": {
+      "flake": false,
+      "locked": { "narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "type": "tarball", "url": "https://example.org/src.tar.gz" },
+      "original": { "type": "tarball", "url": "https://example.org/src.tar.gz" }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
