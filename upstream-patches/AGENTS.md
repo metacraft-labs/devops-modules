@@ -56,6 +56,7 @@ submitted or approved.
 | `garm-job-cache-stale-lock`                     | aa830b59 | ✓       | ✓       | ready for review                                                   |
 | `garm-deleting-instances-hold-capacity`         | aa830b59 | ✓       | ✓       | ready for review                                                   |
 | `garm-instance-lifecycle-leaks`                 | 33ec0921 | ✓       | ✓       | re-cut 2026-10-27; ready for review                                |
+| `garm-scaleset-worker-start-race`               | 030a3915 | ✓       | ✓       | added 2026-11-18; ready for review                                 |
 | `garm-allow-macos-pools` (`bundle-common.toml`) | ec82f622 | ✓       | ✓       | ready for review; submit first                                     |
 | `garm-allow-macos-pools` (`bundle.toml`)        | 0a9a939c | ✓       | ✓       | ready for review; needs the provider-common PR merged and vendored |
 | `garm-listinstances-inverted-error-check`       | 0a9a939c | ✓       | ❌      | **landed**: fixed upstream in 488cf98b; local patch dropped        |

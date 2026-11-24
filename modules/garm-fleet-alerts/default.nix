@@ -48,6 +48,8 @@
         inherit (cfg)
           garmJob
           mode
+          instanceLifecycle
+          overProvision
           externalChecks
           webhookChecks
           webhookProbeJobRegex
@@ -84,6 +86,23 @@
           '';
         };
 
+        instanceLifecycle = mkOption {
+          type = types.bool;
+          default = true;
+          description = ''
+            Emit the `garm-fleet-instance-lifecycle` group: DeleteInstance storms,
+            instances absent from the provider's ListInstances, and the gosti
+            orphan/inventory alerts (which need the gosti-serve inventory
+            exporter on each provider host).
+          '';
+        };
+
+        overProvision = mkOption {
+          type = types.bool;
+          default = true;
+          description = "Emit the RC5 `garm-fleet-overprovision` group (runners created / jobs served thundering-herd watch).";
+        };
+
         externalChecks = mkOption {
           type = types.bool;
           default = true;
@@ -115,13 +134,13 @@
         thresholds = {
           providerCreateFailCount = mkOption {
             type = types.int;
-            default = 3;
-            description = "CreateInstance failures within 15m that trip GarmProviderCreateFailures.";
+            default = 10;
+            description = "CreateInstance failures within 1h, per (controller, provider), that trip GarmProviderCreateFailures while most creates still succeed.";
           };
           providerErrorRatioCrit = mkOption {
             type = types.str;
-            default = "0.2";
-            description = "Provider error/operation ratio (over 15m) that trips GarmProviderHighErrorRatio.";
+            default = "0.5";
+            description = "CreateInstance/Start error/operation ratio (over 1h, per controller and provider) that trips GarmProviderHighErrorRatio.";
           };
           rateLimitWarn = mkOption {
             type = types.int;

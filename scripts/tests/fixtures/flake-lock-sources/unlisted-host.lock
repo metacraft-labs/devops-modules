@@ -1,0 +1,16 @@
+{
+  "nodes": {
+    "elsewhere": {
+      "flake": false,
+      "locked": { "narHash": "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "type": "tarball", "url": "https://example.org/src.tar.gz" },
+      "original": { "type": "tarball", "url": "https://example.org/src.tar.gz" }
+    },
+    "selfhosted-gitlab": {
+      "locked": { "host": "gitlab.example.org", "owner": "o", "repo": "r", "rev": "0000000000000000000000000000000000000000", "type": "gitlab" },
+      "original": { "host": "gitlab.example.org", "owner": "o", "repo": "r", "type": "gitlab" }
+    },
+    "root": { "inputs": { "elsewhere": "elsewhere", "selfhosted-gitlab": "selfhosted-gitlab" } }
+  },
+  "root": "root",
+  "version": 7
+}

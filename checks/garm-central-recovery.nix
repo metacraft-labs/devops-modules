@@ -54,8 +54,12 @@ top@{ ... }:
       alertRules = config.packages.garm-fleet-alert-rules;
 
       # promtool test: replay a killed controller's down signal and assert the two
-      # RE1 controller alerts fire. Default thresholds: GarmControllerDown for=2m,
-      # GarmControllerUnhealthy for=5m.
+      # RE1 controller alerts fire. Default thresholds: GarmControllerDown fires
+      # once the controller is down NOW and has been down for at least 10 of the
+      # last 60 minutes (for: 1m); GarmControllerUnhealthy for=5m. An hour of
+      # healthy history first, so the 1h fraction is the real one; then the
+      # central controller is killed at t=60m and stays down. A sibling that
+      # blips for 3 minutes (a restart during a deploy) must NOT page.
       recoveryAlertTest = pkgs.writeText "central-recovery-alerts.test.yml" ''
         rule_files:
           - garm-fleet-alerts.yml
@@ -64,22 +68,27 @@ top@{ ... }:
 
         tests:
           - interval: 1m
-            name: 'a killed central GARM fires GarmControllerDown + GarmControllerUnhealthy'
+            name: 'a killed central GARM fires GarmControllerDown + GarmControllerUnhealthy; a restart blip does not'
             input_series:
               - series: 'up{job="garm", instance="central"}'
-                values: '0x10'
+                values: '1x59 0x20'
               - series: 'garm_health{controller_id="central"}'
-                values: '0x10'
+                values: '1x59 0x20'
+              - series: 'up{job="garm", instance="blip"}'
+                values: '1x59 0x3 1x17'
             alert_rule_test:
-              # for: windows not yet elapsed -> silent.
-              - eval_time: 1m
+              # Killed 5m ago: 6 of the last 60 minutes down, under the 10-minute
+              # budget -> GarmControllerDown silent (the blip too); the 5m
+              # Unhealthy window has not elapsed either.
+              - eval_time: 65m
                 alertname: GarmControllerDown
                 exp_alerts: []
-              - eval_time: 3m
+              - eval_time: 63m
                 alertname: GarmControllerUnhealthy
                 exp_alerts: []
-              # sustained down past both windows -> both page.
-              - eval_time: 6m
+              # Sustained down past both windows -> both page; the blip, up
+              # again since t=63m, stays silent.
+              - eval_time: 72m
                 alertname: GarmControllerDown
                 exp_alerts:
                   - exp_labels:
@@ -89,8 +98,8 @@ top@{ ... }:
                       instance: central
                     exp_annotations:
                       summary: 'GARM controller unreachable (central)'
-                      description: 'Prometheus cannot scrape GARM at central (job garm) for 2m. No runners can be created or reaped while the controller is down — check the garm.service unit and the host.'
-              - eval_time: 6m
+                      description: 'Prometheus cannot scrape GARM at central (job garm), and it has been down for at least 10 of the last 60 minutes. No runners can be created or reaped while the controller is down — check the garm.service unit and the host.'
+              - eval_time: 72m
                 alertname: GarmControllerUnhealthy
                 exp_alerts:
                   - exp_labels:

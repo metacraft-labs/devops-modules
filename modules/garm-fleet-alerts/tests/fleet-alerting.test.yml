@@ -14,18 +14,27 @@ evaluation_interval: 1m
 
 tests:
   # ── GarmControllerDown ─────────────────────────────────────────────────────
+  # An hour of history first, so the 1h fraction is real. Then: high-mem-server
+  # down for 20m pages ~10m in; a 7-minute restart blip of m3's controller —
+  # the shape of 25 of the 37 down runs measured 2026-11-02..16 — does not;
+  # gpu-server-001 dropping for 4 minutes in every 10 (m3's median down run is
+  # 4m) pages too, which an unbroken `for: 10m` never would.
   - interval: 1m
-    name: 'a down controller pages; a healthy sibling stays silent'
+    name: 'a GARM host down for 10m pages, so does one flapping; a restart blip and a healthy sibling are silent'
     input_series:
       - series: 'up{job="garm", instance="high-mem-server"}'
-        values: '0x10'
+        values: '1x59 0x20 1x30'
+      - series: 'up{job="garm", instance="m3:9997"}'
+        values: '1x60 0x6 1x13'
       - series: 'up{job="garm", instance="gpu-server-001"}'
-        values: '1x10'
+        values: '1x59 0x3 1x5 0x3 1x5 0x3 1x5 0x3 1x5 0x3 1x5 0x3 1x5'
+      - series: 'up{job="garm", instance="ncb-healthy"}'
+        values: '1x109'
     alert_rule_test:
-      - eval_time: 1m # for: 2m not elapsed
+      - eval_time: 65m
         alertname: GarmControllerDown
         exp_alerts: []
-      - eval_time: 5m
+      - eval_time: 72m
         alertname: GarmControllerDown
         exp_alerts:
           - exp_labels:
@@ -35,7 +44,21 @@ tests:
               instance: high-mem-server
             exp_annotations:
               summary: 'GARM controller unreachable (high-mem-server)'
-              description: 'Prometheus cannot scrape GARM at high-mem-server (job garm) for 2m. No runners can be created or reaped while the controller is down — check the garm.service unit and the host.'
+              description: 'Prometheus cannot scrape GARM at high-mem-server (job garm), and it has been down for at least 10 of the last 60 minutes. No runners can be created or reaped while the controller is down — check the garm.service unit and the host.'
+      # The flapping controller, in its fifth 4-minute drop (t=100-103m): 18
+      # down minutes in the hour. high-mem-server answered again at t=80m and
+      # its hold has run out.
+      - eval_time: 101m
+        alertname: GarmControllerDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: garm-fleet
+              job: garm
+              instance: gpu-server-001
+            exp_annotations:
+              summary: 'GARM controller unreachable (gpu-server-001)'
+              description: 'Prometheus cannot scrape GARM at gpu-server-001 (job garm), and it has been down for at least 10 of the last 60 minutes. No runners can be created or reaped while the controller is down — check the garm.service unit and the host.'
 
   # ── GarmControllerUnhealthy ────────────────────────────────────────────────
   - interval: 1m
@@ -86,30 +109,63 @@ tests:
               description: 'The pool manager for org agent-harbor has been stopped for 5m. That org gets no new runners even though the controller is up — restart / check the org credentials.'
 
   # ── GarmProviderCreateFailures ─────────────────────────────────────────────
+  # A BUSY provider losing a share of its creates: gpu001-incus's shape on
+  # 2026-11-05/06/08 (25-65% of 40-110 creates an hour). Here 60 of 300 an hour
+  # fail (20%). The controls: a one-off failure on `win`, and a provider failing
+  # EVERY create, which is GarmProviderHighErrorRatio's and must not fire here
+  # too (it is asserted in that test).
   - interval: 1m
-    name: 'repeated CreateInstance failures page; one transient does not'
+    name: 'a busy provider losing 20% of its creates warns; a one-off failure does not'
     input_series:
-      # Broken backend: CreateInstance errors accrue steadily (4/min).
-      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="gosti"}'
-        values: '0+4x20'
-      # Healthy: a single lifetime CreateInstance failure, then flat.
-      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="win"}'
-        values: '0 1+0x19'
+      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="gpu001-incus", instance="high-mem-server:9997", job="garm"}'
+        values: '0+1x90'
+      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="gpu001-incus", instance="high-mem-server:9997", job="garm"}'
+        values: '0+5x90'
+      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="win", instance="high-mem-server:9997", job="garm"}'
+        values: '0 1+0x89'
+      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="win", instance="high-mem-server:9997", job="garm"}'
+        values: '0+5x90'
     alert_rule_test:
-      - eval_time: 2m # for: 5m not elapsed
+      # 10 failures reached at ~10m; the 15m `for` has not elapsed.
+      - eval_time: 20m
         alertname: GarmProviderCreateFailures
         exp_alerts: []
-      - eval_time: 8m
+      - eval_time: 80m
         alertname: GarmProviderCreateFailures
         exp_alerts:
           - exp_labels:
               severity: warning
               component: garm-fleet
-              operation: CreateInstance
-              provider: gosti
+              instance: 'high-mem-server:9997'
+              provider: gpu001-incus
             exp_annotations:
-              summary: 'GARM provider failing to create runners (gosti)'
-              description: 'Provider gosti has had at least 3 CreateInstance failures in the last 15m. The backend (incus/libvirt/tart/EC2) is likely broken — check the provider host.'
+              summary: 'GARM provider losing creates (gpu001-incus)'
+              description: 'Provider gpu001-incus on high-mem-server:9997 has failed 60 CreateInstance calls in the last hour while most of its creates still succeed. The backend (incus/libvirt/tart/EC2) is degraded rather than down — check the provider host. When most creates fail, GarmProviderHighErrorRatio fires instead.'
+      - eval_time: 80m
+        alertname: GarmProviderHighErrorRatio
+        exp_alerts: []
+
+  # The OLD sawtooth: three failures in a burst, then nothing for 20 minutes,
+  # repeated — the old `increase[15m] >= 3` fired on every burst. Nine an hour
+  # is below the busy-provider threshold, and 9 of 120 creates is not a
+  # provider that is down, so neither alert fires.
+  - interval: 1m
+    name: 'a provider retrying a few failed creates every 20 minutes is not an incident'
+    input_series:
+      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="hms-incus", instance="high-mem-server:9997", job="garm"}'
+        values: '0x9 1 2 3x18 4 5 6x18 7 8 9x18 10 11 12x18'
+      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="hms-incus", instance="high-mem-server:9997", job="garm"}'
+        values: '0+2x90'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: GarmProviderCreateFailures
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: GarmProviderCreateFailures
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: GarmProviderHighErrorRatio
+        exp_alerts: []
 
   # ── GarmProviderDeleteFailures ─────────────────────────────────────────────
   - interval: 1m
@@ -237,34 +293,61 @@ tests:
               description: "`gosti ephemeral-list --backend incus` has failed on gpu-server-002 for 15m. GARM's ListInstances for this host fails closed while this persists, so runners there are neither confirmed nor reconciled — fix the hypervisor/daemon access."
 
   # ── GarmProviderHighErrorRatio ─────────────────────────────────────────────
+  # hms-incus-terraform during the 2026-11-12/13 ZFS write-latency incident:
+  # every create fails, one a minute, for 90 minutes. It fires after an hour
+  # and the 2h hold carries it past the last failure. The controls: a busy
+  # healthy provider at 0.1% (6 failures an hour), and DeleteInstance failing 100% — the H7 teardown
+  # retry, which is GarmInstanceStuckDeleting's to judge, not this alert's.
   - interval: 1m
-    name: 'a backend failing 40% of ops pages; a busy healthy one does not'
+    name: 'a provider failing every create warns after an hour and holds; deletes and a healthy provider do not'
     input_series:
-      # Broken: 2 errors/min against 5 ops/min = 40% failure ratio.
-      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="gosti"}'
-        values: '0+2x20'
-      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="gosti"}'
-        values: '0+5x20'
-      # Healthy high-volume: 1 error/min against 100 ops/min = 1%.
-      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="win"}'
-        values: '0+1x20'
-      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="win"}'
-        values: '0+100x20'
+      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="hms-incus-terraform", instance="high-mem-server:9997", job="garm"}'
+        values: '0+1x90'
+      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="hms-incus-terraform", instance="high-mem-server:9997", job="garm"}'
+        values: '0+1x90'
+      - series: 'garm_runner_errors_total{operation="CreateInstance", provider="win", instance="high-mem-server:9997", job="garm"}'
+        values: '0+0.1x90'
+      - series: 'garm_runner_operations_total{operation="CreateInstance", provider="win", instance="high-mem-server:9997", job="garm"}'
+        values: '0+100x90'
+      - series: 'garm_runner_errors_total{operation="DeleteInstance", provider="hms-incus", instance="high-mem-server:9997", job="garm"}'
+        values: '0+3x90'
+      - series: 'garm_runner_operations_total{operation="DeleteInstance", provider="hms-incus", instance="high-mem-server:9997", job="garm"}'
+        values: '0+3x90'
     alert_rule_test:
-      - eval_time: 5m # for: 10m not elapsed
+      - eval_time: 45m
         alertname: GarmProviderHighErrorRatio
         exp_alerts: []
-      - eval_time: 13m
+      - eval_time: 70m
         alertname: GarmProviderHighErrorRatio
         exp_alerts:
           - exp_labels:
-              severity: critical
+              severity: warning
               component: garm-fleet
-              operation: CreateInstance
-              provider: gosti
+              instance: 'high-mem-server:9997'
+              provider: hms-incus-terraform
             exp_annotations:
-              summary: 'GARM provider failing >0.2 of operations (gosti)'
-              description: 'Provider gosti is failing more than 0.2 of its runner operations over 15m (40%). The backend is broken (incus/libvirt/tart down, or AWS quota/subnet/AMI errors) — runners are not being provisioned.'
+              summary: 'GARM provider failing most of its creates (hms-incus-terraform)'
+              description: 'Provider hms-incus-terraform on high-mem-server:9997 has failed more than half of its CreateInstance/Start calls over the last hour (100%), for an hour. Its pools are not producing runners — the backend is broken (incus/libvirt/tart down, or AWS quota/subnet/AMI errors). If jobs are waiting on it, GarmFleetStarvation or GarmCapabilityPoolStarvation pages as well.'
+      # Most creates fail, so the busy-provider warning stays out of it.
+      - eval_time: 70m
+        alertname: GarmProviderCreateFailures
+        exp_alerts: []
+      # The failures stop at 90m. The 1h window still holds them until ~150m,
+      # and the 2h hold keeps the alert to ~4h30m.
+      - eval_time: 200m
+        alertname: GarmProviderHighErrorRatio
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              component: garm-fleet
+              instance: 'high-mem-server:9997'
+              provider: hms-incus-terraform
+            exp_annotations:
+              summary: 'GARM provider failing most of its creates (hms-incus-terraform)'
+              description: 'Provider hms-incus-terraform on high-mem-server:9997 has failed more than half of its CreateInstance/Start calls over the last hour (100%), for an hour. Its pools are not producing runners — the backend is broken (incus/libvirt/tart down, or AWS quota/subnet/AMI errors). If jobs are waiting on it, GarmFleetStarvation or GarmCapabilityPoolStarvation pages as well.'
+      - eval_time: 300m
+        alertname: GarmProviderHighErrorRatio
+        exp_alerts: []
 
   # ── GarmGithubRateLimit{Low,Critical} ──────────────────────────────────────
   - interval: 1m
@@ -326,41 +409,55 @@ tests:
               description: 'Credential mcl-app has 120 GitHub API requests remaining (< 200) for 5m. Approaching a throttle that will stall runner provisioning.'
 
   # ── GarmFleetStarvation (the priority page) ────────────────────────────────
+  # Exactly the live 2026-09-08 shape: eph-linux-x64 (metacraft-labs, scaleset
+  # id=5) at desired==max==6 with an eph-linux-x64 job queued.
   - interval: 1m
-    name: 'queued jobs + saturated class pages; saturated-only and queued-only do not'
+    name: 'a saturated class running none of its queued jobs pages; a working queue, saturated-only and queued-only do not'
     input_series:
-      # metacraft-labs/eph-linux-x64: desired == max (saturated) AND jobs queued
-      # -> the real starvation. (Exactly the live 2026-09-08 shape.)
       - series: 'garm_scaleset_desired_runner_count{id="5"}'
-        values: '6x15'
+        values: '6x60'
       - series: 'garm_scaleset_max_runners{id="5"}'
-        values: '6x15'
+        values: '6x60'
       - series: 'garm_scaleset_info{id="5", scaleset_owner="metacraft-labs", name="eph-linux-x64"}'
-        values: '1x15'
+        values: '1x60'
       - series: 'garm_job_status{job_id="36620", owner="metacraft-labs", requested_labels="eph-linux-x64", status="queued"}'
-        values: '1x15'
-      # NEGATIVE 1 — saturated but NO queued jobs (metacraft eph-win-x64).
+        values: '1x60'
+      # saturated but no queued jobs (eph-win-x64, id=9)
       - series: 'garm_scaleset_desired_runner_count{id="9"}'
-        values: '6x15'
+        values: '6x60'
       - series: 'garm_scaleset_max_runners{id="9"}'
-        values: '6x15'
+        values: '6x60'
       - series: 'garm_scaleset_info{id="9", scaleset_owner="metacraft-labs", name="eph-win-x64"}'
-        values: '1x15'
-      # NEGATIVE 2 — queued jobs but NOT saturated (agent-harbor eph-linux-x64,
-      # desired 2 < max 6).
+        values: '1x60'
+      # queued jobs but NOT saturated (agent-harbor eph-linux-x64, id=6, desired 2<max 4)
       - series: 'garm_scaleset_desired_runner_count{id="6"}'
-        values: '2x15'
+        values: '2x60'
       - series: 'garm_scaleset_max_runners{id="6"}'
-        values: '6x15'
+        values: '4x60'
       - series: 'garm_scaleset_info{id="6", scaleset_owner="agent-harbor", name="eph-linux-x64"}'
-        values: '1x15'
+        values: '1x60'
       - series: 'garm_job_status{job_id="40001", owner="agent-harbor", requested_labels="eph-linux-x64", status="queued"}'
-        values: '1x15'
+        values: '1x60'
+      # THE TERRAFORM-LANE SHAPE that was 117 of the 303 episodes in 14 days:
+      # at its ceiling, a job queued behind one that is RUNNING. That is a
+      # capacity queue, not starvation, and it must stay silent.
+      - series: 'garm_scaleset_desired_runner_count{id="21"}'
+        values: '6x60'
+      - series: 'garm_scaleset_max_runners{id="21"}'
+        values: '6x60'
+      - series: 'garm_scaleset_info{id="21", scaleset_owner="metacraft-labs", name="eph-linux-x64-terraform"}'
+        values: '1x60'
+      - series: 'garm_job_status{job_id="50001", owner="metacraft-labs", requested_labels="eph-linux-x64-terraform", status="queued"}'
+        values: '1x60'
+      - series: 'garm_job_status{job_id="50000", owner="metacraft-labs", requested_labels="eph-linux-x64-terraform", status="in_progress"}'
+        values: '1x60'
     alert_rule_test:
-      - eval_time: 5m # for: 10m not elapsed
+      # 30m in: the old 10m rule had paged; this one needs 30 starved minutes
+      # in the hour plus a 5m `for:`.
+      - eval_time: 30m
         alertname: GarmFleetStarvation
         exp_alerts: []
-      - eval_time: 12m
+      - eval_time: 50m
         alertname: GarmFleetStarvation
         exp_alerts:
           - exp_labels:
@@ -369,8 +466,38 @@ tests:
               garm_owner: metacraft-labs
               garm_class: eph-linux-x64
             exp_annotations:
-              summary: 'Runner STARVATION: metacraft-labs/eph-linux-x64 saturated with jobs queued'
-              description: '1 job(s) have been queued for 10m for class eph-linux-x64 (owner metacraft-labs) while that class is at its runner ceiling. Jobs are starving — raise max-runners, add a qualifying host, or check that the AWS burst spill is firing.'
+              summary: 'Runner STARVATION: metacraft-labs/eph-linux-x64 saturated, jobs queued, none running'
+              description: 'Class eph-linux-x64 (owner metacraft-labs) has had jobs queued while at its runner ceiling and running NONE of them for 51 of the last 60 minutes — every slot is held by a runner that takes no work. Check GarmListenerSessionShortfall and GarmProviderHighErrorRatio for the controller that serves the class, then the runners themselves (booting, offline on GitHub, or wedged in teardown).'
+
+  # m3's eph-linux-arm64 in W47: starved for hours, but a job got a runner
+  # for a minute now and then, so the condition's median unbroken stretch was
+  # 31 minutes. Here a job is in progress for one minute in every five. A long `for:`
+  # would never complete; 30-of-60 does.
+  - interval: 1m
+    name: 'a class starved with brief breaks still pages'
+    input_series:
+      - series: 'garm_scaleset_desired_runner_count{id="13"}'
+        values: '2x60'
+      - series: 'garm_scaleset_max_runners{id="13"}'
+        values: '2x60'
+      - series: 'garm_scaleset_info{id="13", scaleset_owner="metacraft-labs", name="eph-linux-arm64"}'
+        values: '1x60'
+      - series: 'garm_job_status{job_id="70001", owner="metacraft-labs", requested_labels="eph-linux-arm64", status="queued"}'
+        values: '1x60'
+      - series: 'garm_job_status{job_id="70000", owner="metacraft-labs", requested_labels="eph-linux-arm64", status="in_progress"}'
+        values: '_x2 1 stale _x2 1 stale _x2 1 stale _x2 1 stale _x2 1 stale _x2 1 stale _x2 1 stale _x2 1 stale _x2 1 stale _x2 1 stale _x2 1 stale _x2 1 stale'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: GarmFleetStarvation
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: garm-fleet
+              garm_owner: metacraft-labs
+              garm_class: eph-linux-arm64
+            exp_annotations:
+              summary: 'Runner STARVATION: metacraft-labs/eph-linux-arm64 saturated, jobs queued, none running'
+              description: 'Class eph-linux-arm64 (owner metacraft-labs) has had jobs queued while at its runner ceiling and running NONE of them for 48 of the last 60 minutes — every slot is held by a runner that takes no work. Check GarmListenerSessionShortfall and GarmProviderHighErrorRatio for the controller that serves the class, then the runners themselves (booting, offline on GitHub, or wedged in teardown).'
 
   # ── GithubAppTokenMintFailing (external check) ─────────────────────────────
   - interval: 1m
@@ -601,6 +728,69 @@ tests:
               summary: 'GARM listeners MISSING on high-mem-server (1 message session(s) short)'
               description: 'Controller high-mem-server has had 1 fewer live GitHub message session(s) (CreateMessageSession minus DeleteMessageSession) than it has declared scale sets/pools, for 15m. Those scale sets are no longer claiming jobs and GARM will not say so — it logs no error, no warning and no backoff for a dead listener, which is how this went unnoticed for four days on 2026-09-02. Corroborate with garm:message_session_poll_interval_seconds (healthy is roughly 45-50s per session), then restart GARM on that host and confirm every scale set logs starting consumer.'
 
+  # ── GarmListenerSessionShortfall: a shortfall that SURVIVES a restart ─────
+  # m3:9997 as measured 2026-11-12..16: 6 scale sets declared, 4 sessions live,
+  # and the controller restarted (here: five minutes with no scrape at
+  # t=30-34m) without the missing two coming back. Without the hold the alert
+  # resolved during the gap and paged again 15m after the restart — 5
+  # episodes for one fault in a week. With `keep_firing_for: 30m` it is one.
+  - interval: 1m
+    name: 'a shortfall that survives a controller restart stays ONE alert'
+    input_series:
+      - series: 'garm_scaleset_info{instance="m3:9997", id="13", name="eph-linux-arm64", scaleset_owner="metacraft-labs", scaleset_type="organization"}'
+        values: '1x29 _x5 1x30'
+      - series: 'garm_scaleset_info{instance="m3:9997", id="15", name="eph-win-arm64", scaleset_owner="metacraft-labs", scaleset_type="organization"}'
+        values: '1x29 _x5 1x30'
+      - series: 'garm_scaleset_info{instance="m3:9997", id="19", name="eph-macos-arm64", scaleset_owner="metacraft-labs", scaleset_type="organization"}'
+        values: '1x29 _x5 1x30'
+      - series: 'garm_scaleset_info{instance="m3:9997", id="16", name="eph-linux-arm64", scaleset_owner="schelling-point-labs", scaleset_type="enterprise"}'
+        values: '1x29 _x5 1x30'
+      - series: 'garm_scaleset_info{instance="m3:9997", id="17", name="eph-macos-arm64", scaleset_owner="schelling-point-labs", scaleset_type="enterprise"}'
+        values: '1x29 _x5 1x30'
+      - series: 'garm_scaleset_info{instance="m3:9997", id="18", name="eph-win-arm64", scaleset_owner="schelling-point-labs", scaleset_type="enterprise"}'
+        values: '1x29 _x5 1x30'
+      - series: 'garm_github_operations_total{instance="m3:9997", operation="CreateMessageSession", scope="Organization"}'
+        values: '3x29 _x5 2x30'
+      - series: 'garm_github_operations_total{instance="m3:9997", operation="CreateMessageSession", scope="Enterprise"}'
+        values: '3x29 _x5 2x30'
+      - series: 'garm_github_operations_total{instance="m3:9997", operation="DeleteMessageSession", scope="Organization"}'
+        values: '1x29 _x5 0x30'
+      - series: 'garm_github_operations_total{instance="m3:9997", operation="DeleteMessageSession", scope="Enterprise"}'
+        values: '1x29 _x5 0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GarmListenerSessionShortfall
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: garm-fleet
+              instance: m3:9997
+            exp_annotations:
+              summary: 'GARM listeners MISSING on m3:9997 (2 message session(s) short)'
+              description: 'Controller m3:9997 has had 2 fewer live GitHub message session(s) (CreateMessageSession minus DeleteMessageSession) than it has declared scale sets/pools, for 15m. Those scale sets are no longer claiming jobs and GARM will not say so — it logs no error, no warning and no backoff for a dead listener, which is how this went unnoticed for four days on 2026-09-02. Corroborate with garm:message_session_poll_interval_seconds (healthy is roughly 45-50s per session), then restart GARM on that host and confirm every scale set logs starting consumer.'
+      # During the scrape gap the expression is empty; the hold keeps it.
+      - eval_time: 36m
+        alertname: GarmListenerSessionShortfall
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: garm-fleet
+              instance: m3:9997
+            exp_annotations:
+              summary: 'GARM listeners MISSING on m3:9997 (2 message session(s) short)'
+              description: 'Controller m3:9997 has had 2 fewer live GitHub message session(s) (CreateMessageSession minus DeleteMessageSession) than it has declared scale sets/pools, for 15m. Those scale sets are no longer claiming jobs and GARM will not say so — it logs no error, no warning and no backoff for a dead listener, which is how this went unnoticed for four days on 2026-09-02. Corroborate with garm:message_session_poll_interval_seconds (healthy is roughly 45-50s per session), then restart GARM on that host and confirm every scale set logs starting consumer.'
+      # 10m after the restart: without the hold this would only be pending.
+      - eval_time: 45m
+        alertname: GarmListenerSessionShortfall
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: garm-fleet
+              instance: m3:9997
+            exp_annotations:
+              summary: 'GARM listeners MISSING on m3:9997 (2 message session(s) short)'
+              description: 'Controller m3:9997 has had 2 fewer live GitHub message session(s) (CreateMessageSession minus DeleteMessageSession) than it has declared scale sets/pools, for 15m. Those scale sets are no longer claiming jobs and GARM will not say so — it logs no error, no warning and no backoff for a dead listener, which is how this went unnoticed for four days on 2026-09-02. Corroborate with garm:message_session_poll_interval_seconds (healthy is roughly 45-50s per session), then restart GARM on that host and confirm every scale set logs starting consumer.'
+
   - interval: 1m
     name: 'a controlled restart drops every session in one scrape and does NOT page'
     input_series:
@@ -744,3 +934,345 @@ tests:
             exp_annotations:
               summary: 'Alerting pipeline heartbeat (always firing)'
               description: "This alert is always firing. It is routed to an off-host dead-man's switch that alarms if these notifications STOP arriving — i.e. if Prometheus, Alertmanager, this host, or the network has died. If YOU are reading this as a page, the routing is misconfigured (the Watchdog must go only to the dead-man receiver)."
+
+  # ── GarmCapabilityPoolStarvation ───────────────────────────────────────────
+  # Replays the 2026-10-17 incident with its real label values: agent-harbor
+  # with 22 instance records against 22 declared pool slots, of which 10 are
+  # dead (6 pending_delete + 4 deleting), and jobs queued on a CAPABILITY class
+  # (`self-hosted linux x64`) that `garm:class_saturated` cannot see.
+  #
+  # The control arm is the part that matters: the SAME shaped incident where
+  # the corpses are absent leaves a free slot, and must stay silent — the alert
+  # has to mean "no slot available", not "lots of jobs queued".
+  - interval: 1m
+    name: 'a fully-allocated capability-pool owner with queued jobs pages; a free slot is silent'
+    input_series:
+      # Two pools, 1 slot each => 2 declared slots for agent-harbor.
+      - series: 'garm_pool_max_runners{id="pool-a", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_pool_max_runners{id="pool-b", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_pool_info{id="pool-a", pool_owner="agent-harbor", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_pool_info{id="pool-b", pool_owner="agent-harbor", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      # Both slots allocated: one live, one a pending_delete corpse.
+      - series: 'garm_runner_status{name="garm-live", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="running", runner_status="active", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_runner_status{name="garm-corpse", pool_id="pool-b", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      # Demand on a CAPABILITY class — the shape garm:class_saturated misses.
+      - series: 'garm_job_status{status="queued", owner="agent-harbor", requested_labels="self-hosted linux x64", job_id="1", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_job_status{status="queued", owner="agent-harbor", requested_labels="self-hosted linux x64", job_id="2", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+    promql_expr_test:
+      # The arithmetic the incident turned on: allocation counts the corpse.
+      - expr: garm:pool_slots_allocated
+        eval_time: 20m
+        exp_samples:
+          - labels: '{__name__="garm:pool_slots_allocated", pool_owner="agent-harbor"}'
+            value: 2
+      - expr: garm:pool_slots_free
+        eval_time: 20m
+        exp_samples:
+          - labels: '{__name__="garm:pool_slots_free", pool_owner="agent-harbor"}'
+            value: 0
+      # And the proof of the gap: the scale-set-only rule sees nothing here.
+      - expr: garm:class_saturated
+        eval_time: 20m
+        exp_samples: []
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GarmCapabilityPoolStarvation
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: GarmCapabilityPoolStarvation
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: garm-fleet
+              garm_owner: agent-harbor
+            exp_annotations:
+              summary: 'Runner STARVATION (capability pools): agent-harbor has 2 job(s) queued and ZERO free pool slots'
+              description: '2 job(s) have been queued for 15m for owner agent-harbor while every declared capability-pool slot it owns is allocated. This is the pool-side counterpart of GarmFleetStarvation, which only covers scale-set classes and cannot see this. Allocation counts instances in `pending_delete`/`deleting` too, because GARM charges those against maxRunners until the record disappears — so check GarmInstanceStuckDeleting FIRST: if corpses are holding the slots, the fix is teardown, not more capacity. Raising maxRunners on a host that cannot tear down makes it worse.'
+
+  - interval: 1m
+    name: 'queued jobs with a FREE pool slot stay silent (the alert means no capacity, not busy)'
+    input_series:
+      - series: 'garm_pool_max_runners{id="pool-a", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_pool_max_runners{id="pool-b", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_pool_info{id="pool-a", pool_owner="agent-harbor", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_pool_info{id="pool-b", pool_owner="agent-harbor", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      # Only one of the two slots is taken — pool-b is free.
+      - series: 'garm_runner_status{name="garm-live", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="running", runner_status="active", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_job_status{status="queued", owner="agent-harbor", requested_labels="self-hosted linux x64", job_id="1", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+    promql_expr_test:
+      - expr: garm:pool_slots_free
+        eval_time: 20m
+        exp_samples:
+          - labels: '{__name__="garm:pool_slots_free", pool_owner="agent-harbor"}'
+            value: 1
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: GarmCapabilityPoolStarvation
+        exp_alerts: []
+
+  # ── GarmInstanceStuckDeleting ──────────────────────────────────────────────
+  # The 2026-10-17 signal: eleven instances wedged in pending_delete for a
+  # median of 169 minutes. Since 2026-11-16 the alert counts wedged instances
+  # per controller and fires at five, because a page per corpse was 544
+  # episodes in 14 days. Asserted both ways: five corpses past 30m page (one
+  # of them flipping pending_delete -> deleting, which must not reset its
+  # age), and the documented H7 drain — instances that clear inside 20m, or
+  # four long-lived corpses — does not.
+  - interval: 1m
+    name: 'five instances wedged in teardown page; normal 20m drains and four corpses are silent'
+    input_series:
+      - series: 'garm_runner_status{name="garm-w1", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus-terraform", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1x60'
+      - series: 'garm_runner_status{name="garm-w2", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus-terraform", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1x60'
+      - series: 'garm_runner_status{name="garm-w3", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1x60'
+      - series: 'garm_runner_status{name="garm-w4", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1x60'
+      - series: 'garm_runner_status{name="garm-w5", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1x14 _x46'
+      - series: 'garm_runner_status{name="garm-w5", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="deleting", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '_x15 1x45'
+      - series: 'garm_runner_status{name="garm-drain1", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1x20'
+      - series: 'garm_runner_status{name="garm-drain2", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '_x20 1x20'
+      - series: 'garm_runner_status{name="garm-drain3", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '_x40 1x20'
+    alert_rule_test:
+      # 20m: nobody has been in teardown for 30m yet.
+      - eval_time: 20m
+        alertname: GarmInstanceStuckDeleting
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: GarmInstanceStuckDeleting
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: garm-fleet
+              instance: 'high-mem-server:9997'
+            exp_annotations:
+              summary: 'GARM high-mem-server:9997 has 5 instances in teardown for 30m+'
+              description: '5 instances on controller high-mem-server:9997 have been in pending_delete/deleting for over 30m. A healthy teardown clears in 10-25m even with the H7 `dataset is busy` retry defect, so this is teardown that has stopped converging — and every one of them still occupies a slot against its pool maxRunners until the record is gone. List them with `count_over_time(garm:instance_deleting{instance="high-mem-server:9997"}[30m]) >= 28` (labels name, provider, pool_owner), identify the mount-namespace holders with `scripts/incus-busy-dataset-holders.sh` on the provider host, and check that host load: the H7 unmount race drains far slower under CPU starvation.'
+
+  - interval: 1m
+    name: 'four long-lived corpses and a stream of 20m drains do not page'
+    input_series:
+      - series: 'garm_runner_status{name="garm-w1", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus-terraform", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1x90'
+      - series: 'garm_runner_status{name="garm-w2", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus-terraform", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1x90'
+      - series: 'garm_runner_status{name="garm-w3", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1x90'
+      - series: 'garm_runner_status{name="garm-w4", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1x90'
+      - series: 'garm_runner_status{name="garm-drain1", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1x20 _x70'
+      - series: 'garm_runner_status{name="garm-drain2", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '_x15 1x20 _x55'
+      - series: 'garm_runner_status{name="garm-drain3", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '_x30 1x20 _x40'
+      - series: 'garm_runner_status{name="garm-drain4", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '_x45 1x20 _x25'
+      - series: 'garm_runner_status{name="garm-drain5", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '_x60 1x20 _x10'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: GarmInstanceStuckDeleting
+        exp_alerts: []
+      - eval_time: 85m
+        alertname: GarmInstanceStuckDeleting
+        exp_alerts: []
+
+  # Edge case for `garm:pool_slots_free`: an owner whose pools hold NO
+  # instances at all has no `garm_runner_status` series, so the subtraction
+  # would yield an empty vector rather than "all slots free". The `or
+  # (… * 0)` arm in the recording rule is what keeps the series present, and
+  # this asserts it — without it a fully-idle owner silently disappears from
+  # the capacity view, which is exactly the kind of blind spot this family of
+  # rules exists to remove.
+  - interval: 1m
+    name: 'an owner with pools and zero instances reports all slots free, not an empty vector'
+    input_series:
+      - series: 'garm_pool_max_runners{id="pool-z", instance="high-mem-server:9997", job="garm"}'
+        values: '3x20'
+      - series: 'garm_pool_info{id="pool-z", pool_owner="blocksense-network", instance="high-mem-server:9997", job="garm"}'
+        values: '1x20'
+    promql_expr_test:
+      - expr: garm:pool_slots_allocated
+        eval_time: 10m
+        exp_samples: []
+      - expr: garm:pool_slots_free
+        eval_time: 10m
+        exp_samples:
+          - labels: '{__name__="garm:pool_slots_free", pool_owner="blocksense-network"}'
+            value: 3
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GarmCapabilityPoolStarvation
+        exp_alerts: []
+
+  # ── GarmLiveRunnerCollapse ─────────────────────────────────────────────────
+  # The 2026-10-31 reading: hms GARM exported no `garm_runner_status` series in
+  # some scrapes while its runners kept running. Here 12 runners blink out of
+  # every third scrape together, against a min-idle floor of 10, and the alert
+  # must stay silent. Two real collapses must page: 2 runners left, and none.
+  # The disabled scale set's min-idle must not count towards the floor.
+  - interval: 1m
+    name: 'runners collapsing below the min-idle floor page; a blinking runner family is silent'
+    input_series:
+      - series: 'up{job="garm", instance="high-mem-server:9997"}'
+        values: '1x40'
+      - series: 'garm_pool_min_idle_runners{id="pool-a", instance="high-mem-server:9997", job="garm"}'
+        values: '10x40'
+      - series: 'garm_pool_status{id="pool-a", enabled="true", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_scaleset_min_idle_runners{id="1", instance="high-mem-server:9997", job="garm"}'
+        values: '3x40'
+      - series: 'garm_scaleset_status{id="1", enabled="false", state="active", instance="high-mem-server:9997", job="garm"}'
+        values: '0x40'
+      - series: 'garm_runner_status{name="garm-r0", pool_id="pool-a", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'garm_runner_status{name="garm-r1", pool_id="pool-a", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'garm_runner_status{name="garm-r2", pool_id="pool-a", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'garm_runner_status{name="garm-r3", pool_id="pool-a", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'garm_runner_status{name="garm-r4", pool_id="pool-a", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'garm_runner_status{name="garm-r5", pool_id="pool-a", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'garm_runner_status{name="garm-r6", pool_id="pool-a", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'garm_runner_status{name="garm-r7", pool_id="pool-a", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'garm_runner_status{name="garm-r8", pool_id="pool-a", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'garm_runner_status{name="garm-r9", pool_id="pool-a", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'garm_runner_status{name="garm-r10", pool_id="pool-a", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'garm_runner_status{name="garm-r11", pool_id="pool-a", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'up{job="garm", instance="collapsed:9997"}'
+        values: '1x40'
+      - series: 'garm_pool_min_idle_runners{id="pool-c", instance="collapsed:9997", job="garm"}'
+        values: '10x40'
+      - series: 'garm_pool_status{id="pool-c", enabled="true", instance="collapsed:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_scaleset_min_idle_runners{id="1", instance="collapsed:9997", job="garm"}'
+        values: '3x40'
+      - series: 'garm_scaleset_status{id="1", enabled="false", state="active", instance="collapsed:9997", job="garm"}'
+        values: '0x40'
+      - series: 'garm_runner_status{name="garm-r100", pool_id="pool-c", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="collapsed:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_runner_status{name="garm-r101", pool_id="pool-c", pool_owner="metacraft-labs", provider="hms-incus", status="running", runner_status="idle", instance="collapsed:9997", job="garm"}'
+        values: '1x40'
+      - series: 'up{job="garm", instance="empty:9997"}'
+        values: '1x40'
+      - series: 'garm_pool_min_idle_runners{id="pool-e", instance="empty:9997", job="garm"}'
+        values: '10x40'
+      - series: 'garm_pool_status{id="pool-e", enabled="true", instance="empty:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_scaleset_min_idle_runners{id="1", instance="empty:9997", job="garm"}'
+        values: '3x40'
+      - series: 'garm_scaleset_status{id="1", enabled="false", state="active", instance="empty:9997", job="garm"}'
+        values: '0x40'
+      - series: 'up{job="garm", instance="m3:9997"}'
+        values: '1x40'
+      - series: 'garm_pool_min_idle_runners{id="pool-m", instance="m3:9997", job="garm"}'
+        values: '0x40'
+      - series: 'garm_pool_status{id="pool-m", enabled="true", instance="m3:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_scaleset_min_idle_runners{id="1", instance="m3:9997", job="garm"}'
+        values: '3x40'
+      - series: 'garm_scaleset_status{id="1", enabled="false", state="active", instance="m3:9997", job="garm"}'
+        values: '0x40'
+    promql_expr_test:
+      - expr: garm:min_idle_floor{instance="high-mem-server:9997"}
+        eval_time: 20m
+        exp_samples:
+          - labels: 'garm:min_idle_floor{instance="high-mem-server:9997"}'
+            value: 10
+      - expr: garm:live_runners{instance="high-mem-server:9997"}
+        eval_time: 20m
+        exp_samples:
+          - labels: 'garm:live_runners{instance="high-mem-server:9997"}'
+            value: 0
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GarmLiveRunnerCollapse
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: GarmLiveRunnerCollapse
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: garm-fleet
+              instance: collapsed:9997
+            exp_annotations:
+              summary: 'GARM collapsed:9997 has fewer live runners than its min-idle floor'
+              description: 'GARM at collapsed:9997 has had at most 2 runner(s) in state `running` for 15m+, fewer than the min-idle runners its enabled pools and scale sets declare. The controller is up, so runners are failing to be created or are dying. Check GarmProviderCreateFailures, the provider serve units (gosti-serve) and incus on the runner hosts, and the garm.service journal for `failed to create instance in provider`.'
+          - exp_labels:
+              severity: critical
+              component: garm-fleet
+              instance: empty:9997
+            exp_annotations:
+              summary: 'GARM empty:9997 has fewer live runners than its min-idle floor'
+              description: 'GARM at empty:9997 has had at most 0 runner(s) in state `running` for 15m+, fewer than the min-idle runners its enabled pools and scale sets declare. The controller is up, so runners are failing to be created or are dying. Check GarmProviderCreateFailures, the provider serve units (gosti-serve) and incus on the runner hosts, and the garm.service journal for `failed to create instance in provider`.'
+
+  # The same incident read through the 2026-10-31 artifact: both instance
+  # records are missing from every third scrape. Read raw, allocation fell to
+  # nothing on those scrapes, free rose to 2 and the 15m `for` restarted, so
+  # this never paged. garm:pool_slots_free takes the max over 3m.
+  - interval: 1m
+    name: 'capability-pool starvation still pages when the runner family blinks out of some scrapes'
+    input_series:
+      # Two pools, 1 slot each => 2 declared slots for agent-harbor.
+      - series: 'garm_pool_max_runners{id="pool-a", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_pool_max_runners{id="pool-b", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_pool_info{id="pool-a", pool_owner="agent-harbor", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_pool_info{id="pool-b", pool_owner="agent-harbor", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      # Both slots allocated: one live, one a pending_delete corpse.
+      - series: 'garm_runner_status{name="garm-live", pool_id="pool-a", pool_owner="agent-harbor", provider="hms-incus", status="running", runner_status="active", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      - series: 'garm_runner_status{name="garm-corpse", pool_id="pool-b", pool_owner="agent-harbor", provider="hms-incus", status="pending_delete", runner_status="terminated", instance="high-mem-server:9997", job="garm"}'
+        values: '1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1 stale 1 1'
+      # Demand on a CAPABILITY class — the shape garm:class_saturated misses.
+      - series: 'garm_job_status{status="queued", owner="agent-harbor", requested_labels="self-hosted linux x64", job_id="1", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+      - series: 'garm_job_status{status="queued", owner="agent-harbor", requested_labels="self-hosted linux x64", job_id="2", instance="high-mem-server:9997", job="garm"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GarmCapabilityPoolStarvation
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: GarmCapabilityPoolStarvation
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              component: garm-fleet
+              garm_owner: agent-harbor
+            exp_annotations:
+              summary: 'Runner STARVATION (capability pools): agent-harbor has 2 job(s) queued and ZERO free pool slots'
+              description: '2 job(s) have been queued for 15m for owner agent-harbor while every declared capability-pool slot it owns is allocated. This is the pool-side counterpart of GarmFleetStarvation, which only covers scale-set classes and cannot see this. Allocation counts instances in `pending_delete`/`deleting` too, because GARM charges those against maxRunners until the record disappears — so check GarmInstanceStuckDeleting FIRST: if corpses are holding the slots, the fix is teardown, not more capacity. Raising maxRunners on a host that cannot tear down makes it worse.'
