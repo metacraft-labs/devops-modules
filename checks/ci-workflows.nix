@@ -141,6 +141,29 @@
               || { echo "jobs.build.timeout-minutes is '$timeout', not the build-timeout-minutes input" >&2; exit 1; }
             touch "$out"
           '';
+      # `eval-fail-fast` is opt-out: its default keeps GitHub's fail-fast for
+      # every caller that does not pass it, and the input really drives the
+      # eval matrix. The `build` matrix never cancels its siblings, and
+      # neither setting may decide a result: `Merge matrices` needs every
+      # shard to succeed.
+      checks.reusable-flake-checks-eval-fail-fast =
+        pkgs.runCommand "reusable-flake-checks-eval-fail-fast" { nativeBuildInputs = [ pkgs.yq-go ]; }
+          ''
+            workflow=${flakeChecksWorkflow}
+            input_type="$(yq -r '.on.workflow_call.inputs."eval-fail-fast".type' "$workflow")"
+            default="$(yq -r '.on.workflow_call.inputs."eval-fail-fast".default' "$workflow")"
+            eval_ff="$(yq -r '.jobs.eval-matrix.strategy.fail-fast' "$workflow")"
+            build_ff="$(yq -r '.jobs.build.strategy.fail-fast' "$workflow")"
+            merge_if="$(yq -r '.jobs.merge-matrices.if' "$workflow")"
+            test "$input_type" = boolean || { echo "eval-fail-fast must be a boolean input, got $input_type" >&2; exit 1; }
+            test "$default" = true || { echo "eval-fail-fast must default to true (GitHub's default), got $default" >&2; exit 1; }
+            test "$eval_ff" = "\''${{ inputs.eval-fail-fast }}" \
+              || { echo "jobs.eval-matrix.strategy.fail-fast is '$eval_ff', not the eval-fail-fast input" >&2; exit 1; }
+            test "$build_ff" = false || { echo "jobs.build.strategy.fail-fast is '$build_ff', expected false" >&2; exit 1; }
+            [[ "$merge_if" == *"needs.eval-matrix.result == 'success'"* ]] \
+              || { echo "Merge matrices no longer requires every eval shard to succeed: $merge_if" >&2; exit 1; }
+            touch "$out"
+          '';
       checks.reusable-flake-checks-mcl-ref =
         pkgs.runCommand "reusable-flake-checks-mcl-ref"
           {

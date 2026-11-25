@@ -96,6 +96,27 @@ on:
         default: 270
         required: false
         type: number
+      eval-fail-fast:
+        # GitHub's default for a matrix: the first failing `eval-matrix` shard
+        # cancels every other shard. That suits a real evaluation error, which
+        # the other shards cannot fix, but most shard failures on the shared
+        # runner pools are environmental, and then fail-fast turns one lost
+        # shard into a whole re-run: infra #2480 (2026-11-25) lost shard 05 to
+        # a DNS failure in the Nix installer and fail-fast cancelled 22
+        # running and queued shards; #2455 (2026-11-24, run 45255223639) lost
+        # one memory-killed shard and 24 more were cancelled, then 3 more on
+        # attempt 2. `gh run rerun --failed` re-runs cancelled jobs too, so
+        # every cancelled shard queued again on the scarce pool. With 'false'
+        # the healthy shards finish, and a re-run repeats only the failed one.
+        #
+        # This changes no result. `Merge matrices` runs only when every shard
+        # succeeded (`needs.eval-matrix.result == 'success'`), and a failed
+        # shard fails the run, and with it the caller's `needs.<call>.result`,
+        # either way. The `build` matrix is already `fail-fast: false`.
+        description: 'Cancel the remaining eval-matrix shards when one fails (GitHub default); false lets them finish'
+        default: true
+        required: false
+        type: boolean
       push-deployment-caches:
         description: 'Push deployment target closures to configured deployment cache backends'
         default: false
@@ -306,6 +327,8 @@ jobs:
     runs-on: ${{ fromJSON(inputs.non-nix-runner) }}
     if: needs.shard-matrix.outputs.eval_matrix
     strategy:
+      # See the `eval-fail-fast` input.
+      fail-fast: ${{ inputs.eval-fail-fast }}
       matrix: ${{fromJSON(needs.shard-matrix.outputs.eval_matrix)}}
     steps:
       - name: Setup Nix
