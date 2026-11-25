@@ -31,16 +31,17 @@
       lock = ../flake.lock;
       reprobuildLock = "${inputs.reprobuild}/flake.lock";
 
-      # The pinned reprobuild (d1bf1f065ac) predates reprobuild PR #526, "fix(flake):
-      # drop microvm's spectrum input from the devops-modules closure" (merge
-      # commit df1df9e276a8f6b916efaa29552c6f27a9c26e6c on `agents`), so its
-      # lock still names microvm's `spectrum` input from spectrum-os.org. Nothing
+      # The reprobuild revision `pins/reprobuild.json` names does not contain
+      # reprobuild PR #526, "fix(flake): drop microvm's spectrum input from the
+      # devops-modules closure" (merge commit
+      # df1df9e276a8f6b916efaa29552c6f27a9c26e6c on `agents`), so its lock
+      # still names microvm's `spectrum` input from spectrum-os.org. Nothing
       # evaluates that input, and `getFlake` fetches inputs lazily, so it is
       # fetched only by a whole-closure `nix flake archive` of reprobuild.
       #
-      # REMOVE this exception when `pins/reprobuild.json` moves to a revision
-      # that contains df1df9e. The checker reports it as stale once the pinned
-      # lock no longer has the node, so this check fails until it is deleted.
+      # REMOVE this exception when the pin first contains reprobuild df1df9e
+      # (PR #526). The checker reports it as stale once the pinned lock no
+      # longer has the node, so this check fails until it is deleted.
       pinnedLockException = "${reprobuildLock}:spectrum:spectrum-os.org";
     in
     {

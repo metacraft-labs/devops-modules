@@ -1065,11 +1065,11 @@
     },
     "metacraft-github-actions": {
       "locked": {
-        "lastModified": 1795525879,
-        "narHash": "sha256-M8TObJQ+lNSyoFZPIAKZsvN1PTmKtFyACUOh/SZLZe8=",
+        "lastModified": 1795635657,
+        "narHash": "sha256-sU2YUNKEwnNhFe7+PKWC11HuOXay7muGnQfxRautXeo=",
         "owner": "metacraft-labs",
         "repo": "metacraft-github-actions",
-        "rev": "8f5cd8e3fa969b0f863b305184086ac2a1365994",
+        "rev": "186926e295d5aa74020e547ec9b9062d6ce9f5fb",
         "type": "github"
       },
       "original": {
