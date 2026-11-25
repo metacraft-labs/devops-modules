@@ -221,6 +221,17 @@ buildGo126Module rec {
     # before LockJob. Tests in runner/pool (testing tag), run by
     # t_garm_skip_queued_jobs_when_pools_full.
     ./patches/skip-queued-jobs-when-pools-full.patch
+    # Queued jobs that can never run were retried forever (central GARM,
+    # high-mem-server, 2026-11-25): 165 queued pool jobs from runs that had
+    # ended up to eight weeks earlier (77 completed on GitHub with the
+    # completed event missed, 88 left queued by GitHub inside finished runs)
+    # took about half of all runner-create attempts. Upstream deletes only
+    # non-queued jobs (DeleteInactionableJobs). Now consumeQueuedJobs drops a
+    # pool job queued for longer than GitHub's own 24-hour limit, from the
+    # store and the cache. Scale-set jobs are untouched
+    # (fix-stale-scaleset-job-reaper.patch handles those). Cut against the tree with every patch above applied; keep it
+    # LAST. Gate: t_garm_stale_queued_job_dropped (with negative control).
+    ./patches/expire-stale-queued-jobs.patch
   ];
 
   # go-sqlite3 is a cgo module; the daemon needs cgo to link SQLite.

@@ -1,0 +1,59 @@
+diff --git a/runner/pool/pool.go b/runner/pool/pool.go
+index ba1ed17..45c77c9 100644
+--- a/runner/pool/pool.go
++++ b/runner/pool/pool.go
+@@ -2291,6 +2291,45 @@ func (r *basePoolManager) reconcileStaleJobs() error {
+ // as they do so, new idle runners will be spun up in their stead. New jobs will record in the DB as they come in,
+ // so those will trigger the creation of a runner. The jobs we don't know about will be dealt with by the idle runners.
+ // Once jobs are consumed, you can set min-idle-runners to 0 again.
++// maxQueuedJobAge is how long a job may stay queued before the pool manager
++// stops trying to serve it. It is GitHub's own limit: a job that no
++// self-hosted runner has started within 24 hours is terminated by the forge.
++const maxQueuedJobAge = 24 * time.Hour
++
++// dropStaleQueuedJobs deletes, from the store and the cache, every pool job
++// that has been queued for longer than maxQueuedJobAge, and returns the rest.
++//
++// The forge will never hand such a job to a runner. Either a runner did take
++// it and the completed event never reached us, or the run ended and left the
++// job queued on GitHub's side. Upstream never deletes a queued job
++// (DeleteInactionableJobs skips them), so without this it is retried against
++// every matching pool on every pass, forever. Scale-set jobs
++// (WorkflowJobID 0) are not pool jobs and are left alone.
++func (r *basePoolManager) dropStaleQueuedJobs(queued []params.Job) []params.Job {
++	live := make([]params.Job, 0, len(queued))
++	for _, job := range queued {
++		if job.WorkflowJobID == 0 || time.Since(job.CreatedAt) <= maxQueuedJobAge {
++			live = append(live, job)
++			continue
++		}
++		slog.InfoContext(
++			r.ctx, "dropping a queued job older than the forge's queue limit",
++			"job_id", job.WorkflowJobID,
++			"queued_since", job.CreatedAt)
++		if err := r.store.DeleteJob(r.ctx, job.WorkflowJobID); err != nil {
++			slog.With(slog.Any("error", err)).ErrorContext(
++				r.ctx, "failed to delete stale queued job",
++				"job_id", job.WorkflowJobID)
++			live = append(live, job)
++			continue
++		}
++		r.mux.Lock()
++		delete(r.jobs, job.ID)
++		r.mux.Unlock()
++	}
++	return live
++}
++
+ func (r *basePoolManager) consumeQueuedJobs() error {
+ 	defer func() {
+ 		// Always try to clean inactionable jobs. Otherwise, if any condition
+@@ -2301,7 +2340,7 @@ func (r *basePoolManager) consumeQueuedJobs() error {
+ 				r.ctx, "failed to delete completed jobs")
+ 		}
+ 	}()
+-	queued := r.getQueuedJobs()
++	queued := r.dropStaleQueuedJobs(r.getQueuedJobs())
+ 
+ 	fullThisPass := fullPools{}
+ 
