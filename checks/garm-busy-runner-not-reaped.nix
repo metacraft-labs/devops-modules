@@ -19,7 +19,8 @@ top@{ ... }:
   # THE NEGATIVE CONTROL
   #
   #   The same test file runs against the tree we ship and against one that
-  #   is identical except that `fix-busy-runner-reap.patch` is left out. The
+  #   is identical except that `fix-busy-runner-reap.patch` (and the
+  #   overlapping `fix-reap-skips-job-started-runners.patch`) is left out. The
   #   three defect tests must FAIL there, and the two controls (an idle
   #   timed-out runner is still reaped; an active runner the forge no longer
   #   has is still retired) must PASS on BOTH trees.
@@ -44,14 +45,23 @@ top@{ ... }:
             patches = garm.patches;
           };
 
-          # The control: the same tree with ONLY the patch under test removed.
-          # If that list ever stops containing the patch, `builtins.filter`
-          # silently yields the same tree and the control stops controlling —
-          # so assert the removal actually removed something.
-          controlPatches = builtins.filter (p: p != patchUnderTest) garm.patches;
+          # fix-reap-skips-job-started-runners.patch also keeps the reaper
+          # off a runner GARM recorded RunnerActive, which covers this gate's
+          # first defect case (a busy runner that started a job) by a second
+          # route. Left in, it would mask that defect in the control, so the
+          # control drops it as well: the control is the tree without either
+          # reaper protection.
+          overlappingPatch = ../packages/garm/patches/fix-reap-skips-job-started-runners.patch;
+
+          # The control: the same tree with the patch under test (and the
+          # overlapping one above) removed. If that list ever stops
+          # containing them, `builtins.filter` silently yields the same tree
+          # and the control stops controlling — so assert the removal
+          # actually removed both.
+          controlPatches = builtins.filter (p: p != patchUnderTest && p != overlappingPatch) garm.patches;
           unpatchedSrc =
-            assert lib.assertMsg (builtins.length controlPatches == builtins.length garm.patches - 1)
-              "garm-busy-runner-not-reaped: fix-busy-runner-reap.patch is not in packages/garm/default.nix `patches`, so the negative control would be identical to the patched tree";
+            assert lib.assertMsg (builtins.length controlPatches == builtins.length garm.patches - 2)
+              "garm-busy-runner-not-reaped: fix-busy-runner-reap.patch or fix-reap-skips-job-started-runners.patch is not in packages/garm/default.nix `patches`, so the negative control would not be the tree without the reaper protections";
             pkgs.applyPatches {
               name = "garm-src-unpatched";
               inherit (garm) src;

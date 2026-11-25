@@ -221,6 +221,19 @@ buildGo126Module rec {
     # before LockJob. Tests in runner/pool (testing tag), run by
     # t_garm_skip_queued_jobs_when_pools_full.
     ./patches/skip-queued-jobs-when-pools-full.patch
+    # The timeout reaper still asked GitHub to remove runners that were in
+    # the middle of a job (central GARM, high-mem-server, 2026-11-25): two
+    # agent-harbor runners hours into a 1080-minute job were listed offline
+    # AND not busy for a moment, so fix-busy-runner-reap.patch's busy check
+    # did not hold, and only GitHub's 422 kept the jobs alive. Now
+    # reapTimedOutRunners also skips any instance GARM recorded as
+    # RunnerActive (set on the job's in_progress event): every case the
+    # reaper exists for is a runner that never reached a job. Such a runner
+    # is retired by the job's completed event or, if that is missed, by
+    # cleanupOrphanedProviderRunners once the forge no longer lists it.
+    # Cut against the tree with every patch above applied; keep it LAST.
+    # Gate: t_garm_job_started_runner_not_reaped (with negative control).
+    ./patches/fix-reap-skips-job-started-runners.patch
   ];
 
   # go-sqlite3 is a cgo module; the daemon needs cgo to link SQLite.

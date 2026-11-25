@@ -1,0 +1,28 @@
+diff --git a/runner/pool/pool.go b/runner/pool/pool.go
+index ba1ed17..1001704 100644
+--- a/runner/pool/pool.go
++++ b/runner/pool/pool.go
+@@ -720,6 +720,23 @@ func (r *basePoolManager) reapTimedOutRunners(runners []forgeRunner) error {
+ 			continue
+ 		}
+ 
++		if instance.RunnerStatus == params.RunnerActive {
++			// GARM itself recorded this runner picking up a job (the
++			// in_progress workflow_job event). None of the timeout cases
++			// below can be true of it: each is a runner that never got as
++			// far as a job. UpdatedAt is not refreshed while a job runs, and
++			// the forge's own view is not enough: while a job runs on a
++			// starved host the forge can list the runner offline AND not
++			// busy for a moment, yet still refuse to remove it (422) because
++			// the job is assigned to it. Leave it to the job's completed
++			// event, or to cleanupOrphanedProviderRunners once the forge no
++			// longer has the runner.
++			slog.DebugContext(
++				r.ctx, "not reaping runner: it started a job",
++				"runner_name", instance.Name)
++			continue
++		}
++
+ 		// There are 3 cases (currently) where we consider a runner as timed out:
+ 		//   * The runner never joined github within the pool timeout
+ 		//   * The runner managed to join github, but the setup process failed later and the runner

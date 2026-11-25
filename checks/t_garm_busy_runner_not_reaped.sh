@@ -15,7 +15,8 @@
 # file, twice:
 #
 #   PATCHED   — the tree this repo ships. All five sub-tests must PASS.
-#   UNPATCHED — identical except that patches/fix-busy-runner-reap.patch is
+#   UNPATCHED — identical except that patches/fix-busy-runner-reap.patch (and
+#               the overlapping fix-reap-skips-job-started-runners.patch) is
 #               left out. The three defect sub-tests must FAIL; the two
 #               controls must still PASS (so the control is not simply broken).
 #
