@@ -102,7 +102,10 @@ case "${1:-}" in
   *) exit 0 ;;
 esac
 verb="$1"
-{ printf 'nix-%s W=%s' "$verb" "${RUNQUOTA_RUN_WIDTH:-unset}"; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'; } >>"$NIX_STUB_LOG"
+# One write per line: six sessions append at once, and a line written in pieces interleaves with
+# another session's, which then no longer starts with `nix-` and drops out of the count.
+line="$(printf 'nix-%s W=%s' "$verb" "${RUNQUOTA_RUN_WIDTH:-unset}"; for a in "$@"; do printf ' [%s]' "$a"; done)"
+printf '%s\n' "$line" >>"$NIX_STUB_LOG"
 echo "nix-stub-output"
 [ -n "${NIX_STUB_FAIL:-}" ] && exit 7
 [ "$verb" = run ] && exit 0
