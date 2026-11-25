@@ -190,6 +190,13 @@ jobs:
         shell: bash
         run: bash .github/setup-nix/tests/verify-nix-config-test.sh
 
+      # The DNS wait and revert-then-retry around the Nix install, on both
+      # platforms: the macOS leg runs it under that runner's bash and BSD
+      # userland (no `timeout`), which the Nix sandbox check cannot reach.
+      - name: Run the install-resilience contract test
+        shell: bash
+        run: bash .github/setup-nix/tests/install-nix-resilience-test.sh
+
       # The credential path that makes a `type = "git"` private flake input
       # fetchable. `access-tokens` does not cover it — Nix shells out to git,
       # which reads ~/.netrc and not Nix's own netrc. See write-netrc.sh.
