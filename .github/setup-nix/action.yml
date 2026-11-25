@@ -331,9 +331,37 @@ runs:
           echo "Nix is not installed, will install it"
         fi
 
+    # A transient DNS failure used to fail the whole job here: infra #2480's
+    # eval shard 05 (2026-11-25, runner garm-s6s02y3sz2ix) could not resolve
+    # releases.nixos.org ("dns error ... Try again") seconds after other names
+    # had resolved. So: wait, bounded, for the names before installing; on a
+    # failed install, revert it and install once more. Linux and macOS only,
+    # like the installer. See install-nix-resilience.sh, which also explains
+    # why the retry must revert first (the action reads a failed install's
+    # /nix/receipt.json as "already installed").
+    - name: Wait for the Nix download hosts to resolve
+      if: steps.check-nix.outputs.has_nix != 'true'
+      shell: bash
+      run: bash "${{ github.action_path }}/install-nix-resilience.sh" wait
+
     - name: Install Nix
+      id: install-nix
       uses: DeterminateSystems/nix-installer-action@v22
       if: steps.check-nix.outputs.has_nix != 'true'
+      # The retry below decides; a second failure still fails the job.
+      continue-on-error: true
+      with:
+        determinate: false
+        extra-conf: ${{ steps.check-nix.outputs.symlinked_store == 'true' && 'allow-symlinked-store = true' || '' }}
+
+    - name: Revert the failed Nix install before retrying
+      if: steps.check-nix.outputs.has_nix != 'true' && steps.install-nix.outcome == 'failure'
+      shell: bash
+      run: bash "${{ github.action_path }}/install-nix-resilience.sh" recover
+
+    - name: Install Nix (second attempt)
+      uses: DeterminateSystems/nix-installer-action@v22
+      if: steps.check-nix.outputs.has_nix != 'true' && steps.install-nix.outcome == 'failure'
       with:
         determinate: false
         extra-conf: ${{ steps.check-nix.outputs.symlinked_store == 'true' && 'allow-symlinked-store = true' || '' }}

@@ -90,8 +90,35 @@ runs:
           echo "preinstalled=false" >> "$GITHUB_OUTPUT"
         fi
 
-    - name: Install Nix
+    # A transient DNS failure used to fail the whole job here: infra #2480's
+    # eval shard 05 (2026-11-25, runner garm-s6s02y3sz2ix) could not resolve
+    # releases.nixos.org ("dns error ... Try again") seconds after other names
+    # had resolved. So: wait, bounded, for the names before installing; on a
+    # failed install, revert it and install once more. See
+    # install-nix-resilience.sh, which also explains why the retry must revert
+    # first (the action reads a failed install's /nix/receipt.json as "already
+    # installed"). Same steps as devops-modules `.github/setup-nix`.
+    - name: Wait for the Nix download hosts to resolve
       if: steps.nix_check.outputs.preinstalled != 'true'
+      shell: bash
+      run: bash "${{ github.action_path }}/install-nix-resilience.sh" wait
+
+    - name: Install Nix
+      id: install-nix
+      if: steps.nix_check.outputs.preinstalled != 'true'
+      uses: DeterminateSystems/nix-installer-action@v22
+      # The retry below decides; a second failure still fails the job.
+      continue-on-error: true
+      with:
+        determinate: false
+
+    - name: Revert the failed Nix install before retrying
+      if: steps.nix_check.outputs.preinstalled != 'true' && steps.install-nix.outcome == 'failure'
+      shell: bash
+      run: bash "${{ github.action_path }}/install-nix-resilience.sh" recover
+
+    - name: Install Nix (second attempt)
+      if: steps.nix_check.outputs.preinstalled != 'true' && steps.install-nix.outcome == 'failure'
       uses: DeterminateSystems/nix-installer-action@v22
       with:
         determinate: false

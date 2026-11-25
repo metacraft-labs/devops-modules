@@ -4,7 +4,9 @@
 The fixture `fixtures/setup-nix-alignment/metacraft-github-actions-setup-nix-action.yml`
 is metacraft-labs/metacraft-github-actions `setup-nix/action.yml` at a515a0a,
 refreshed after both actions moved the job credentials out of HOME and began
-appending to the host's caches (this repository's 0c51dda, its aaea729).
+appending to the host's caches (this repository's 0c51dda, its aaea729), with
+its Nix install steps then replaced by the DNS wait and the revert-then-retry
+that both actions gained together (2026-11-25).
 
 It is compared against THIS repository's real action, so the first test also
 works as an offline drift guard from this side: change a nix.conf setting or
@@ -37,6 +39,8 @@ def make_mga(root: Path) -> Path:
     shutil.copyfile(FIXTURE, setup_nix / "action.yml")
     shutil.copyfile(DEVOPS_SETUP_NIX / "probe-substituters.sh", setup_nix / "probe-substituters.sh")
     shutil.copyfile(DEVOPS_SETUP_NIX / "tests/probe-substituters-test.sh", setup_nix / "tests/probe-substituters-test.sh")
+    shutil.copyfile(DEVOPS_SETUP_NIX / "install-nix-resilience.sh", setup_nix / "install-nix-resilience.sh")
+    shutil.copyfile(DEVOPS_SETUP_NIX / "tests/install-nix-resilience-test.sh", setup_nix / "tests/install-nix-resilience-test.sh")
     return setup_nix
 
 
@@ -94,6 +98,45 @@ def main() -> int:
         "probe-substituters.sh differs",
     )
     expect_drift("probe suite missing", lambda d: (d / "tests/probe-substituters-test.sh").unlink(), "missing setup-nix/tests/probe-substituters-test.sh")
+
+    # The Nix install retry.
+    retry_if = "    - name: Install Nix (second attempt)\n      if: steps.nix_check.outputs.preinstalled != 'true' && steps.install-nix.outcome == 'failure'\n"
+    expect_drift(
+        "install retry removed",
+        lambda d: edit(d / "action.yml", retry_if + "      uses: DeterminateSystems/nix-installer-action@v22\n", retry_if + "      uses: ./no-installer\n"),
+        "expected two nix-installer-action steps",
+    )
+    expect_drift(
+        "retry runs on the wrong condition",
+        lambda d: edit(d / "action.yml", retry_if, retry_if.replace("== 'failure'", "== 'success'")),
+        "the retry step does not run only when the first install failed",
+    )
+    expect_drift(
+        "first install fails the job",
+        lambda d: edit(d / "action.yml", "      continue-on-error: true\n", ""),
+        "lacks continue-on-error: true",
+    )
+    expect_drift(
+        "no revert before the retry",
+        lambda d: edit(d / "action.yml", 'install-nix-resilience.sh" recover', 'true" recover'),
+        "no install-nix-resilience.sh recover step",
+    )
+    expect_drift(
+        "no DNS wait before the install",
+        lambda d: edit(d / "action.yml", 'install-nix-resilience.sh" wait', 'true" wait'),
+        "no install-nix-resilience.sh wait step before the Nix install",
+    )
+    expect_drift(
+        "installer version differs",
+        lambda d: (d / "action.yml").write_text((d / "action.yml").read_text().replace("nix-installer-action@v22", "nix-installer-action@v99")),
+        "installer action differs",
+    )
+    expect_drift(
+        "install script diverged",
+        lambda d: (d / "install-nix-resilience.sh").write_text((d / "install-nix-resilience.sh").read_text() + "# local tweak\n"),
+        "install-nix-resilience.sh differs",
+    )
+    expect_drift("install suite missing", lambda d: (d / "tests/install-nix-resilience-test.sh").unlink(), "missing setup-nix/tests/install-nix-resilience-test.sh")
 
     # Caller-supplied extras are interpolated differently on each side
     # (`${{ inputs.substituters }}` vs `$EXTRA_SUBSTITUTERS`); that alone is

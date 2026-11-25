@@ -23,6 +23,10 @@ had connect-timeout = 3 with one download attempt while the other had 20 and
      same default, both run probe-substituters.sh from a step named
      "Probe binary caches" after the netrc is written, and the script and its
      contract suite are byte-identical in the two repositories.
+  3. The Nix install retry: both wait for the download hosts before the
+     installer, run it with continue-on-error, revert a failed attempt with
+     install-nix-resilience.sh recover and install once more, with the same
+     installer-action version; the script and its suite are byte-identical.
 
 Usage:
   check-setup-nix-alignment.py --devops-root DIR --mga-root DIR
@@ -42,11 +46,15 @@ DEVOPS_FILES = {
     "action": ".github/setup-nix/action.yml",
     "probe": ".github/setup-nix/probe-substituters.sh",
     "probe-test": ".github/setup-nix/tests/probe-substituters-test.sh",
+    "install": ".github/setup-nix/install-nix-resilience.sh",
+    "install-test": ".github/setup-nix/tests/install-nix-resilience-test.sh",
 }
 MGA_FILES = {
     "action": "setup-nix/action.yml",
     "probe": "setup-nix/probe-substituters.sh",
     "probe-test": "setup-nix/tests/probe-substituters-test.sh",
+    "install": "setup-nix/install-nix-resilience.sh",
+    "install-test": "setup-nix/tests/install-nix-resilience-test.sh",
 }
 
 # Keys the two actions set differently on purpose. Each needs a reason; adding
@@ -156,6 +164,46 @@ def preflight(action: str, label: str, problems: list[str]) -> str | None:
     return default
 
 
+INSTALLER_USES = re.compile(r"^      uses: (DeterminateSystems/nix-installer-action@\S+)\s*$", re.M)
+
+
+def steps(action: str) -> list[str]:
+    return ["    - name: " + s for s in action.split("\n    - name: ")[1:]]
+
+
+def install_retry(action: str, label: str, problems: list[str]) -> str | None:
+    """Check the wait / install / recover / install sequence; return the installer ref."""
+    installs = [i for i, s in enumerate(steps(action)) if INSTALLER_USES.search(s)]
+    all_steps = steps(action)
+    if len(installs) != 2:
+        problems.append(f"{label}: expected two nix-installer-action steps (an install and its one retry), found {len(installs)}")
+        return None
+    first, second = (all_steps[i] for i in installs)
+    refs = {INSTALLER_USES.search(s).group(1) for s in (first, second)}
+    if len(refs) != 1:
+        problems.append(f"{label}: the install and its retry use different installer actions: {sorted(refs)}")
+    if "continue-on-error: true" not in first:
+        problems.append(f"{label}: the first install step lacks continue-on-error: true, so its retry never runs")
+    id_match = re.search(r"^      id: (\S+)$", first, re.M)
+    before = all_steps[: installs[0]]
+    between = all_steps[installs[0] + 1 : installs[1]]
+    if not any('install-nix-resilience.sh" wait' in s for s in before):
+        problems.append(f"{label}: no install-nix-resilience.sh wait step before the Nix install")
+    recover = [s for s in between if 'install-nix-resilience.sh" recover' in s]
+    if not recover:
+        problems.append(f"{label}: no install-nix-resilience.sh recover step between the install and its retry")
+    if not id_match:
+        problems.append(f"{label}: the first install step has no id for the retry to test")
+    else:
+        outcome = f"steps.{id_match.group(1)}.outcome == 'failure'"
+        for name, step in (("recover", recover[0] if recover else ""), ("retry", second)):
+            if outcome not in step:
+                problems.append(f"{label}: the {name} step does not run only when the first install failed ({outcome})")
+        if "continue-on-error" in second:
+            problems.append(f"{label}: the retry must not continue-on-error: a second failure fails the job")
+    return min(refs)
+
+
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -196,7 +244,12 @@ def compare(devops_root: Path, mga_root: Path) -> list[str]:
     if devops_mode is not None and mga_mode is not None and devops_mode != mga_mode:
         problems.append(f"substituter-preflight default differs: devops-modules {devops_mode!r}, metacraft-github-actions {mga_mode!r}")
 
-    for kind in ("probe", "probe-test"):
+    devops_installer = install_retry(devops_action, "devops-modules", problems)
+    mga_installer = install_retry(mga_action, "metacraft-github-actions", problems)
+    if devops_installer and mga_installer and devops_installer != mga_installer:
+        problems.append(f"installer action differs: devops-modules {devops_installer}, metacraft-github-actions {mga_installer}")
+
+    for kind in ("probe", "probe-test", "install", "install-test"):
         left, right = paths[("devops-modules", kind)], paths[("metacraft-github-actions", kind)]
         if not (left.is_file() and right.is_file()):
             continue

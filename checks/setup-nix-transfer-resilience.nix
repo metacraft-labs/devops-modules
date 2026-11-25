@@ -81,6 +81,26 @@
             touch "$out"
           '';
 
+      # Contract suite for install-nix-resilience.sh: the DNS wait before the
+      # Nix install and the revert before its one retry (stubbed resolver,
+      # sleep, sudo and installer; see the test's header).
+      checks.setup-nix-install-resilience =
+        pkgs.runCommand "setup-nix-install-resilience"
+          {
+            nativeBuildInputs = [
+              pkgs.bash
+              pkgs.coreutils
+              pkgs.gnugrep
+              pkgs.gnused
+            ];
+          }
+          ''
+            cp -r ${../.github/setup-nix} setup-nix
+            chmod -R u+w setup-nix
+            bash setup-nix/tests/install-nix-resilience-test.sh
+            touch "$out"
+          '';
+
       # The two setup-nix actions (this repo's and metacraft-github-actions')
       # must write the same transfer settings and run the same preflight.
       # Offline half: this repo's action against a fixture of the other's.
