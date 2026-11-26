@@ -370,7 +370,16 @@ jobs:
         with:
           name: ${{ matrix.filename }}
           path: matrix-pre.json
-          retention-days: 1
+          # `merge-matrices` reads these, and a re-run of only that job (e.g.
+          # `gh run rerun --failed` after a build failure) reuses the shards
+          # an EARLIER attempt uploaded. At 1 day they had expired before such
+          # re-runs started: infra#2455's merge ran ~31 h after its first and
+          # ~7 h after its last shard, found 0 of 26 and could not succeed.
+          # The shards are a few hundred bytes to ~1 KiB each (26 of them were
+          # 31 KiB), so a week costs nothing against the artifact quota that
+          # 1fa3eec shortened retention for. GitHub caps this at the
+          # repository's own retention limit.
+          retention-days: 7
     outputs:
       matrix: ${{ steps.generate-matrix.outputs.matrix }}
 
@@ -451,6 +460,17 @@ jobs:
           # Merge matrices step below).
           ATTIC_SUBSTITUTER: ${{ vars.ATTIC_SUBSTITUTER }}
           ATTIC_TOKEN: ${{ secrets.ATTIC_PULL_TOKEN || secrets.ATTIC_TOKEN }}
+          # How many missing shards this job may evaluate itself. The upload
+          # step is `continue-on-error` so one artifact-quota refusal does not
+          # fail an eval that succeeded (f63bb2e); re-evaluating that ONE shard
+          # here costs what the eval-matrix job that produced it cost. More
+          # than this, or every shard, means the shards are gone wholesale
+          # (expired, or the quota refused them all) and re-evaluating them
+          # one after another on this non-nix runner is a whole eval-matrix
+          # fan-out on a single host: infra#2455's attempt did that for 26
+          # shards until nixos-ci-bare-003's swap guard killed it after 16
+          # minutes. Those cases fail fast instead.
+          MAX_REGENERATED_SHARDS: '1'
         run: |
           set -euo pipefail
 
@@ -462,37 +482,47 @@ jobs:
             fi
           }
 
-          expected="$(
-            printf '%s' "$EVAL_MATRIX" |
-              run_python -c 'import json, sys; print(len(json.load(sys.stdin).get("include", [])))'
-          )"
-          actual="$(find . -mindepth 2 -maxdepth 2 -type f -name matrix-pre.json | wc -l)"
-          actual="${actual//[[:space:]]/}"
-
-          if [[ "$actual" == "$expected" ]]; then
-            echo "Found all $actual CI matrix shard artifact(s)."
-            exit 0
-          fi
-
-          echo "::warning title=Regenerating CI matrix shards::found $actual of $expected shard artifacts; regenerating locally"
-          read -r -a mcl_cmd <<< "$MCL_FLAKE_CMD"
-
+          # download-artifact puts each shard at <artifact name>/matrix-pre.json,
+          # and the artifact name is the shard's `filename`.
+          shards=()
+          missing=()
+          missing_attrs=()
           while IFS=$'\t' read -r filename flake_attr_path; do
             [[ -n "$filename" && -n "$flake_attr_path" ]] || continue
-
-            artifact_dir="${filename%.json}"
-            rm -rf -- "$artifact_dir" matrix-pre.json
-
-            "${mcl_cmd[@]}" -- ci-matrix \
-              --flake-attribute-path "$flake_attr_path" \
-              --is-initial
-
-            mkdir -p "$artifact_dir"
-            mv matrix-pre.json "$artifact_dir/matrix-pre.json"
+            shards+=("$filename")
+            if [[ ! -f "$filename/matrix-pre.json" ]]; then
+              missing+=("$filename")
+              missing_attrs+=("$flake_attr_path")
+            fi
           done < <(
             printf '%s' "$EVAL_MATRIX" |
               run_python -c 'import json, sys; [print("{}\t{}".format(shard.get("filename", ""), shard.get("flakeAttrPath", ""))) for shard in json.load(sys.stdin).get("include", [])]'
           )
+
+          if (( ${#missing[@]} == 0 )); then
+            echo "Found all ${#shards[@]} CI matrix shard artifact(s)."
+            exit 0
+          fi
+
+          if (( ${#missing[@]} > MAX_REGENERATED_SHARDS || ${#missing[@]} >= ${#shards[@]} )); then
+            echo "::error title=CI matrix shards missing::found $(( ${#shards[@]} - ${#missing[@]} )) of ${#shards[@]} shard artifacts; missing: ${missing[*]}. Shard artifacts are kept for the upload step's retention-days, so a re-run of only this job after they expire (or after their uploads failed) cannot get them. Re-run the shard/eval-matrix jobs (or the whole workflow): \`gh run rerun --failed\` does not re-run eval-matrix jobs that already passed. This job will not re-evaluate more than ${MAX_REGENERATED_SHARDS} shard(s) itself."
+            exit 1
+          fi
+
+          echo "::warning title=Regenerating CI matrix shards::found $(( ${#shards[@]} - ${#missing[@]} )) of ${#shards[@]} shard artifacts; re-evaluating ${missing[*]} locally"
+          read -r -a mcl_cmd <<< "$MCL_FLAKE_CMD"
+
+          for index in "${!missing[@]}"; do
+            artifact_dir="${missing[$index]}"
+            rm -f -- matrix-pre.json
+
+            "${mcl_cmd[@]}" -- ci-matrix \
+              --flake-attribute-path "${missing_attrs[$index]}" \
+              --is-initial
+
+            mkdir -p -- "$artifact_dir"
+            mv -- matrix-pre.json "$artifact_dir/matrix-pre.json"
+          done
 
       - name: Merge matrices
         if: needs.eval-matrix.result == 'success'
