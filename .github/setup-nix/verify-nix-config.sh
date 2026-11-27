@@ -199,7 +199,7 @@ fi
 #
 # A zero-input flake in a temp dir: no network, no substituter, no registry.
 # ---------------------------------------------------------------------------
-if printf '%s' "$required_features" | grep -qw flakes; then
+if grep -qw flakes <<<"$required_features"; then
   probe_dir="$(mktemp -d)"
   # On Darwin, mktemp commonly returns /var/folders/... even though /var is a
   # symlink to /private/var. Nix 2.31 rejects local path-flake references that
@@ -256,9 +256,22 @@ fi
 echo "setup-nix: requested experimental-features: $required_features"
 echo "setup-nix: effective experimental-features: $effective"
 
+# One effective feature per line, for `grep -x`. Word splitting takes any run
+# of whitespace as one separator, so the line match stays exact.
+#
+# grep reads a here-string, never a pipe. Under pipefail, `producer | grep -q`
+# made the verdict depend on scheduling: `grep -q` exits at its first match, a
+# producer that writes again gets EPIPE and exits non-zero, and the pipeline
+# then reported a feature that matched as missing. The Rust uutils `tr` on
+# ubuntu-26.04 did exactly that to `nix-command`, a non-final token.
+effective_lines=""
+for token in $effective; do
+  effective_lines="$effective_lines$token"$'\n'
+done
+
 missing=""
 for feature in $required_features; do
-  if ! printf '%s' "$effective" | tr ' ' '\n' | grep -qxF "$feature"; then
+  if ! grep -qxF -- "$feature" <<<"$effective_lines"; then
     missing="$missing $feature"
   fi
 done

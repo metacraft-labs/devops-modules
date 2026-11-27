@@ -253,8 +253,8 @@ vulnerable_exit_code=$?
 set -e
 
 if [ "$vulnerable_exit_code" -ne 0 ] &&
-  printf '%s' "$vulnerable_output" | grep -q 'grep: command not found' &&
-  printf '%s' "$vulnerable_output" | grep -q 'requested experimental features are not in effect'; then
+  case "$vulnerable_output" in *'grep: command not found'*) true ;; *) false ;; esac &&
+  case "$vulnerable_output" in *'requested experimental features are not in effect'*) true ;; *) false ;; esac; then
   pass "fixture reproduces the old grep failure and false missing-feature report"
 else
   fail "FIXTURE BROKEN: guard without the PATH bootstrap did not reproduce the old failure: $vulnerable_output"
@@ -346,8 +346,8 @@ for missing_portable_utility in $portable_utility_names; do
   set -e
 
   if [ "$missing_utility_exit_code" -ne 0 ] &&
-    printf '%s' "$missing_utility_output" | grep -qF "required verification utilities are not on PATH: $missing_portable_utility" &&
-    ! printf '%s' "$missing_utility_output" | grep -qF 'requested experimental features are not in effect'; then
+    case "$missing_utility_output" in *"required verification utilities are not on PATH: $missing_portable_utility"*) true ;; *) false ;; esac &&
+    case "$missing_utility_output" in *'requested experimental features are not in effect'*) false ;; *) true ;; esac; then
     pass "missing $missing_portable_utility is diagnosed as a utility failure"
   else
     fail "missing $missing_portable_utility was not diagnosed precisely: $missing_utility_output"
@@ -423,7 +423,13 @@ fi
 # ---------------------------------------------------------------------------
 partial_probe=""
 partial_probe="$(NIX_CONFIG="experimental-features = nix-command flakes" nix config show experimental-features 2>&1 || true)"
-if printf '%s' "$partial_probe" | tr ' ' '\n' | grep -qxF 'pipe-operators'; then
+# grep reads a here-string, not a pipe, for the reason given in 4a: under
+# pipefail, `producer | grep -q` can report a present word as absent.
+partial_lines=""
+for partial_word in $partial_probe; do
+  partial_lines="$partial_lines$partial_word"$'\n'
+done
+if grep -qxF 'pipe-operators' <<<"$partial_lines"; then
   fail "FIXTURE BROKEN: pipe-operators is still in effect under the partial fixture, so this case proves nothing"
 else
   pass "fixture reproduces a partially applied feature set (pipe-operators absent)"
@@ -438,6 +444,55 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 4a. A requested feature that is NOT the last effective token.
+#
+# The guard used to test each feature with
+# `printf '%s' "$effective" | tr ' ' '\n' | grep -qxF "$feature"` under
+# `set -euo pipefail`. `grep -q` exits at its first match; a `tr` that writes
+# again afterwards gets EPIPE, and pipefail made a feature that matched read as
+# missing. GNU `tr` writes this input in one go, so the race needs a `tr` that
+# writes per line and exits 1 on a broken pipe, as the Rust uutils `tr` on
+# ubuntu-26.04 did ("tr: write error: Broken pipe", a false
+# "not in effect: nix-command"). The fixture below is such a `tr`, with a pause
+# between lines so the losing order is the only order.
+# ---------------------------------------------------------------------------
+sigpipe_fixture_bin="$portable_fixture_root/per-line-tr-bin"
+mkdir "$sigpipe_fixture_bin"
+{
+  printf '#!%s\n' "$BASH"
+  printf 'real_tr=%q\n' "$(command -v tr)"
+  printf 'real_sleep=%q\n' "$(command -v sleep)"
+  cat <<'EOF'
+trap '' PIPE
+"$real_tr" "$@" | while IFS= read -r line || [ -n "$line" ]; do
+  printf '%s\n' "$line" || exit 1
+  "$real_sleep" 0.2
+done
+EOF
+} >"$sigpipe_fixture_bin/tr"
+chmod +x "$sigpipe_fixture_bin/tr"
+
+sigpipe_features="nix-command flakes pipe-operators"
+sigpipe_effective="fetch-tree flakes nix-command pipe-operators"
+if PATH="$sigpipe_fixture_bin:$PATH" SIGPIPE_EFFECTIVE="$sigpipe_effective" "$BASH" -c '
+  set -euo pipefail
+  printf "%s" "$SIGPIPE_EFFECTIVE" | tr " " "\n" | grep -qxF nix-command
+' 2>/dev/null; then
+  fail "FIXTURE BROKEN: the per-line tr did not make the old pipeline miss a present, non-final feature, so this case proves nothing"
+else
+  pass "fixture makes the old tr | grep -q pipeline report a present, non-final feature as missing"
+fi
+
+if PATH="$sigpipe_fixture_bin:$PATH" \
+  NIX_CONFIG="experimental-features = $sigpipe_features" \
+  SETUP_NIX_REQUIRED_EXPERIMENTAL_FEATURES="$sigpipe_features" \
+  bash "$guard" >/dev/null 2>&1; then
+  pass "guard verifies features that are not the last effective token, whatever tr does on a broken pipe"
+else
+  fail "guard reported a present experimental feature as missing when tr wrote per line and failed on a broken pipe"
+fi
+
+# ---------------------------------------------------------------------------
 # 5. The guard must not leak credentials.
 #
 # nix.conf carries `access-tokens`, so the failure diagnostics must report the
@@ -448,7 +503,7 @@ guard_output="$(NIX_CONFIG="experimental-features =
 access-tokens = github.com=$secret" \
   SETUP_NIX_REQUIRED_EXPERIMENTAL_FEATURES="nix-command" \
   bash "$guard" 2>&1 || true)"
-if printf '%s' "$guard_output" | grep -qF "$secret"; then
+if case "$guard_output" in *"$secret"*) true ;; *) false ;; esac; then
   fail "guard printed a credential from NIX_CONFIG into its diagnostics"
 else
   pass "guard diagnostics do not echo credentials from NIX_CONFIG"
@@ -457,7 +512,7 @@ fi
 # ---------------------------------------------------------------------------
 # Pin the reviewed count so deleting a whole assertion block cannot leave a
 # shorter, apparently green contract suite.
-expected_assertions=26
+expected_assertions=28
 if [ "$assertions" -ne "$expected_assertions" ]; then
   echo "FAIL — expected $expected_assertions assertions, but ran $assertions" >&2
   echo "       contract coverage changed without updating the reviewed count" >&2
