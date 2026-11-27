@@ -19,9 +19,9 @@
   # Negative controls: a lock carrying the spectrum node, the same lock with
   # spectrum-os.org added to the allowlist (the deny list must still win), a
   # lock with an unlisted tarball host and a self-hosted GitLab, and, for the
-  # pinned-lock exception below, another node and another host in the excepted
-  # lock, the spectrum node in a lock the exception does not name, and a stale
-  # exception.
+  # checker's `--exception` mechanism (no lock here needs one today), another
+  # node and another host in an excepted lock, the spectrum node in a lock the
+  # exception does not name, and a stale exception.
   perSystem =
     { pkgs, ... }:
     let
@@ -30,19 +30,6 @@
       fixtures = ../scripts/tests/fixtures/flake-lock-sources;
       lock = ../flake.lock;
       reprobuildLock = "${inputs.reprobuild}/flake.lock";
-
-      # The reprobuild revision `pins/reprobuild.json` names does not contain
-      # reprobuild PR #526, "fix(flake): drop microvm's spectrum input from the
-      # devops-modules closure" (merge commit
-      # df1df9e276a8f6b916efaa29552c6f27a9c26e6c on `agents`), so its lock
-      # still names microvm's `spectrum` input from spectrum-os.org. Nothing
-      # evaluates that input, and `getFlake` fetches inputs lazily, so it is
-      # fetched only by a whole-closure `nix flake archive` of reprobuild.
-      #
-      # REMOVE this exception when the pin first contains reprobuild df1df9e
-      # (PR #526). The checker reports it as stale once the pinned lock no
-      # longer has the node, so this check fails until it is deleted.
-      pinnedLockException = "${reprobuildLock}:spectrum:spectrum-os.org";
     in
     {
       checks.flake-lock-sources =
@@ -52,8 +39,7 @@
             fail() { echo "[flake-lock-sources][FAIL] $1" >&2; exit 1; }
 
             echo "[flake-lock-sources] this repo's flake.lock and the pinned reprobuild's"
-            python3 ${checker} --allowlist ${allowlist} \
-              --exception ${pinnedLockException} ${lock} ${reprobuildLock}
+            python3 ${checker} --allowlist ${allowlist} ${lock} ${reprobuildLock}
 
             echo "[flake-lock-sources] negative control: spectrum-os.org is refused"
             if python3 ${checker} --allowlist ${allowlist} ${fixtures}/spectrum.lock 2>err; then
