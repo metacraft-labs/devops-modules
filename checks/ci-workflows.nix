@@ -45,6 +45,22 @@
             touch "$out"
           '';
 
+      # merge-matrices re-evaluates at most MAX_REGENERATED_SHARDS missing
+      # shards and fails fast, naming them, when more (or all) are missing.
+      checks.reusable-flake-checks-shard-fallback =
+        pkgs.runCommand "reusable-flake-checks-shard-fallback"
+          {
+            nativeBuildInputs = [
+              pkgs.bash
+              pkgs.coreutils
+              (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
+            ];
+          }
+          ''
+            BASH_BIN=${pkgs.bash}/bin/bash python3 ${../scripts/tests/test_reusable_flake_shard_fallback.py} ${flakeChecksWorkflow}
+            touch "$out"
+          '';
+
       # Selector input fixtures exercise the committed workflow expressions.
       # No network client or authentication response is mocked: GitHub evaluates
       # these same expressions in the live reusable workflow.
