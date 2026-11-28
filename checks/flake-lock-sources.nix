@@ -1,4 +1,4 @@
-{ ... }:
+{ inputs, ... }:
 {
   # Every input this flake locks is fetched from GitHub/GitLab or from a host
   # in scripts/ci/flake-lock-allowed-hosts.txt, and never from spectrum-os.org.
@@ -9,9 +9,19 @@
   # evaluates the input. flake.nix drops it with `follows = ""`; this keeps a
   # lock update from bringing it, or another single-point host, back.
   #
+  # It also checks the lock of the pinned Reprobuild. flake.nix reaches that
+  # flake with `builtins.getFlake` (metacraft-github-actions
+  # `pins/reprobuild.json`), so it resolves under reprobuild's own lock and no
+  # `follows` from here can prune it: whatever that lock names is part of our
+  # closure. The lock is read from the pinned source in the store, so the check
+  # needs no network.
+  #
   # Negative controls: a lock carrying the spectrum node, the same lock with
-  # spectrum-os.org added to the allowlist (the deny list must still win), and
-  # a lock with an unlisted tarball host and a self-hosted GitLab.
+  # spectrum-os.org added to the allowlist (the deny list must still win), a
+  # lock with an unlisted tarball host and a self-hosted GitLab, and, for the
+  # checker's `--exception` mechanism (no lock here needs one today), another
+  # node and another host in an excepted lock, the spectrum node in a lock the
+  # exception does not name, and a stale exception.
   perSystem =
     { pkgs, ... }:
     let
@@ -19,6 +29,7 @@
       allowlist = ../scripts/ci/flake-lock-allowed-hosts.txt;
       fixtures = ../scripts/tests/fixtures/flake-lock-sources;
       lock = ../flake.lock;
+      reprobuildLock = "${inputs.reprobuild}/flake.lock";
     in
     {
       checks.flake-lock-sources =
@@ -27,8 +38,8 @@
             set -euo pipefail
             fail() { echo "[flake-lock-sources][FAIL] $1" >&2; exit 1; }
 
-            echo "[flake-lock-sources] this repo's flake.lock"
-            python3 ${checker} --allowlist ${allowlist} ${lock}
+            echo "[flake-lock-sources] this repo's flake.lock and the pinned reprobuild's"
+            python3 ${checker} --allowlist ${allowlist} ${lock} ${reprobuildLock}
 
             echo "[flake-lock-sources] negative control: spectrum-os.org is refused"
             if python3 ${checker} --allowlist ${allowlist} ${fixtures}/spectrum.lock 2>err; then
@@ -54,6 +65,44 @@
             { cat ${allowlist}; echo example.org; echo gitlab.example.org; } > widened.txt
             python3 ${checker} --allowlist widened.txt ${fixtures}/unlisted-host.lock \
               || fail "allowlisted hosts were refused"
+
+            echo "[flake-lock-sources] negative control: the exception admits one node from one host"
+            cp ${fixtures}/pinned-extra-sources.lock pinned.lock
+            if python3 ${checker} --allowlist ${allowlist} \
+                --exception pinned.lock:spectrum:spectrum-os.org pinned.lock 2>err; then
+              fail "an excepted lock with another denied node and an unlisted host passed"
+            fi
+            grep -q "node 'spectrum-mirror' (locked) fetches from spectrum-os.org, which is denied" err \
+              || { cat err >&2; fail "a second spectrum-os.org node was admitted by the exception"; }
+            grep -q "example.org, which is not allowlisted" err \
+              || { cat err >&2; fail "an unlisted host in the excepted lock was admitted"; }
+            if grep -q "node 'spectrum' " err; then
+              cat err >&2; fail "the excepted node was reported"
+            fi
+
+            echo "[flake-lock-sources] negative control: the exception does not reach another lock"
+            cp ${fixtures}/spectrum.lock pinned-spectrum-only.lock
+            if python3 ${checker} --allowlist ${allowlist} \
+                --exception pinned-spectrum-only.lock:spectrum:spectrum-os.org \
+                pinned-spectrum-only.lock ${fixtures}/spectrum.lock 2>err; then
+              fail "spectrum in a lock the exception does not name passed"
+            fi
+            grep -q "^${fixtures}/spectrum.lock: node 'spectrum' (locked) fetches from spectrum-os.org, which is denied" err \
+              || { cat err >&2; fail "spectrum in this repo's lock was admitted"; }
+            if grep -q "^pinned-spectrum-only.lock:" err; then
+              cat err >&2; fail "the excepted lock was reported"
+            fi
+
+            echo "[flake-lock-sources] negative control: an unused exception is stale"
+            if python3 ${checker} --allowlist ${allowlist} \
+                --exception ${lock}:spectrum:spectrum-os.org ${lock} 2>err; then
+              fail "an exception matching nothing passed"
+            fi
+            grep -q "exception for node 'spectrum' from spectrum-os.org is stale" err \
+              || { cat err >&2; fail "the stale exception was not named"; }
+            if grep -q "Pin the input to GitHub/GitLab" err; then
+              cat err >&2; fail "a stale exception alone printed the remedy for a bad source"
+            fi
 
             echo "[flake-lock-sources][PASS]"
             touch $out

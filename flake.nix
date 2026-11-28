@@ -16,64 +16,29 @@
     nixos-2505.url = "github:NixOS/nixpkgs/nixos-25.05";
     nixos-2605.url = "github:NixOS/nixpkgs/nixos-26.05";
 
-    # Windows-Runner-Binary-Cache-Deploy M1 — the reprobuild flake provides the
-    # `repro-binary-cache` package (the binary-cache HTTP daemon) that the
-    # `services.mcl-repro-binary-cache` NixOS module packages into a systemd
-    # unit, mirroring how `mcl.attic-cache-host` packages atticd. reprobuild
-    # already pins `nixpkgs.follows = "nixos-modules/nixpkgs-unstable"`, so it is
-    # built against the same unstable package set as this repo. (There is no
-    # lock cycle: reprobuild's `nixos-modules` input keeps its own pinned
-    # revision; Nix resolves each flake's inputs independently.)
+    # The organisation's tool pins (metacraft-github-actions `pins/`). This
+    # repository keeps NO reprobuild revision of its own: Reprobuild is the
+    # revision `pins/reprobuild.json` names, reached in `outputs` below with
+    # `builtins.getFlake pins.reprobuild.flakeRef` (pure: the reference carries
+    # `rev` and `narHash`). A flake input's URL cannot be computed from another
+    # input's file, so a `reprobuild` input here would be a second record of
+    # the revision; there is deliberately none, and `flake.lock` has no
+    # `reprobuild` node. See metacraft-pm
+    # how-to-distribute-new-reprobuild-versions-internally.md, "One pin set in
+    # the CI actions repository".
     #
-    # PINNED to a specific rev (not a bare branch): we deploy reprobuild to
-    # servers through this input, so an explicit pin keeps the installed
-    # `repro` reproducible. Bump this SHA to roll forward.
+    # This flake has no inputs, so it adds one node and nothing transitive. A
+    # consumer that declares its own `metacraft-github-actions` input sets
+    # `nixos-modules.inputs.metacraft-github-actions.follows =
+    # "metacraft-github-actions"`, so a pin bump reaches it by updating that
+    # input alone (the transitive-duplicate rule, applied to the pin).
     #
-    # THE SHA MAY BE ON `agents`, and need not wait for `dev`. The earlier
-    # wording here required `dev` or a published release tag; that was wrong and
-    # cost real time. `agents` is the agent landing branch for product repos, so
-    # requiring `dev` coupled every pin bump to the separate agents-to-dev
-    # promotion campaign — a fix could be landed, tested and unusable for days.
-    # What the pin actually needs is a revision that EXISTS on a pushed ref and
-    # satisfies the three checks below; which branch carries it is not one of
-    # them. (A release tag's commit remains fine, and a release branch reaches
-    # `dev` later.)
-    #
-    # This SHA is the single source of truth
-    # for the reprobuild revision: nearly every consumer reaches `repro` through
-    # this input with `follows` rather than declaring a pin of its own, so a
-    # machine cannot end up running a `repro` other than the one its closure was
-    # built against.
-    #
-    # `codetracer` is a documented exception — it consumes the prebuilt package
-    # and overrides reprobuild's inputs to get a `repro` built with
-    # `ct_interpose`, which a bare `follows` cannot express. It independently
-    # tracks published `agents`; when rolling out a fix here, verify that its
-    # locked revision already carries the fix. Do not "tidy" that input into a
-    # `follows`.
-    # See metacraft-pm/how-to-distribute-new-reprobuild-versions-internally.md.
-    # Before bumping, check the candidate against a real workspace — it must
-    # still parse the current manifests (`repro workspace status`) and still
-    # satisfy the installed managed-hook contract
-    # (`repro hooks protocol --require=2 --hook-contract=...`).
-    #
-    # THIS INPUT NOW ALSO SUPPLIES THE MODULES, not just the packages.
-    # Distribution-And-Packaging M4 moved `mcl-reprobuild` and
-    # `mcl-repro-binary-cache` into reprobuild's own flake
-    # (`nixosModules.reprobuild`, `darwinModules.reprobuild`,
-    # `homeManagerModules.reprobuild`, `nixosModules.repro-binary-cache`);
-    # `modules/mcl-reprobuild` and `modules/mcl-repro-binary-cache` here are
-    # thin re-exports of them and hold no schema of their own. So this pin must
-    # name a revision that carries reprobuild's `nix/modules/` directory — a pin
-    # older than that makes `modules/` fail to evaluate, not merely ship a stale
-    # `repro`.
-    reprobuild = {
-      url = "github:metacraft-labs/reprobuild/ed186bfecd29f6e95c8673dbd5d8af3b61710815";
-      # reprobuild's own pin of this repo reaches microvm too, so the same
-      # spectrum-os.org input sits one level down. Drop it for the same reason
-      # as in `microvm` below.
-      inputs.nixos-modules.inputs.microvm.inputs.spectrum.follows = "";
-    };
+    # Reprobuild supplies modules as well as packages: `modules/mcl-reprobuild`
+    # and `modules/mcl-repro-binary-cache` re-export its `nixosModules`,
+    # `darwinModules` and `homeManagerModules`, whose default package is the
+    # pinned flake's own. So the pin must name a revision that carries
+    # reprobuild's `nix/modules/` directory.
+    metacraft-github-actions.url = "github:metacraft-labs/metacraft-github-actions/dev";
 
     nixpkgs.follows = "nixos-2605";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -331,12 +296,27 @@
       self,
       nixpkgs,
       flake-parts,
+      metacraft-github-actions,
       ...
     }:
     let
       inherit (nixpkgs) lib;
+
+      # Reprobuild at the organisation's pin. Evaluated once, here, and handed
+      # to every module as `inputs.reprobuild`. It is reprobuild's own flake
+      # under its own lock, so its packages are the derivations
+      # `nix build github:metacraft-labs/reprobuild/<rev>` produces, the same
+      # ones the pin's gate builds. flake-parts builds `inputs'` from
+      # `self.inputs`, which this cannot extend, so per-system code reads
+      # `inputs.reprobuild.packages.${system}`; `inputs'.reprobuild` does not
+      # exist.
+      reprobuildPin = metacraft-github-actions.pins.reprobuild;
+      reprobuild = builtins.getFlake reprobuildPin.flakeRef;
+      inputsWithPin = inputs // {
+        inherit reprobuild;
+      };
     in
-    flake-parts.lib.mkFlake { inherit inputs; } {
+    flake-parts.lib.mkFlake { inputs = inputsWithPin; } {
       imports = [
         inputs.flake-parts.flakeModules.modules
         ./checks
@@ -358,6 +338,14 @@
             config.allowUnfree = true;
           };
         };
+
+      # The pinned Reprobuild for consumers. They used to reach it as
+      # `nixos-modules.inputs.reprobuild`; there is no such input any more, so
+      # it is published here: `nixos-modules.reprobuild` is the pinned flake
+      # (`.packages.<system>.default`, `.inputs.runquota-src`, ...) and
+      # `nixos-modules.pins` the parsed pin set it came from.
+      flake.reprobuild = reprobuild;
+      flake.pins = metacraft-github-actions.pins;
 
       flake.mcl.shard-matrix.systemsToBuild = [
         "x86_64-linux"

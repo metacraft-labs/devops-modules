@@ -40,7 +40,7 @@
       # That binary carries the `deploy-agent` verb (M5) and, since M7 prereq
       # (a), is compiled `-d:ssl` so its cache-consumer paths can speak https://.
       defaultPackage = withSystem pkgs.stdenv.hostPlatform.system (
-        { inputs', ... }: inputs'.reprobuild.packages.reprobuild
+        { system, ... }: inputs.reprobuild.packages.${system}.reprobuild
       );
 
       # The apply path shells out to `repro __repro-compile-profile`, which
@@ -50,9 +50,9 @@
       # supplying it is the consumer's job. Take the same Nim reprobuild builds
       # itself with, plus the C toolchain Nim drives to link the profile.
       defaultProfileCompilerPath = withSystem pkgs.stdenv.hostPlatform.system (
-        { inputs', ... }:
+        { system, ... }:
         [
-          inputs'.reprobuild.packages.nim-fork
+          inputs.reprobuild.packages.${system}.nim-fork
           pkgs.gcc
           pkgs.binutils
         ]
@@ -108,7 +108,7 @@
         repoRoot = mkOption {
           type = types.str;
           default = "${inputs.reprobuild}";
-          defaultText = lib.literalMD "the reprobuild flake input's source tree";
+          defaultText = lib.literalMD "the pinned reprobuild flake's source tree";
           description = ''
             Value for `$REPROBUILD_REPO_ROOT`. `repro`'s profile compiler
             resolves reprobuild's Nim library sources beneath this path and

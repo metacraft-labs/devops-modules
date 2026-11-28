@@ -17,7 +17,8 @@
   # hosts, infra configuration, and the three VM checks in `checks/` that wait
   # on the unit by name all keep working verbatim.
   #
-  # REQUIRES a `reprobuild` input revision that carries `nix/modules/`. Bump
-  # `inputs.reprobuild.url` in flake.nix together with this file.
+  # REQUIRES a pinned reprobuild revision that carries `nix/modules/`.
+  # `inputs.reprobuild` is not a flake input: flake.nix reaches it from the
+  # organisation's pin (metacraft-github-actions `pins/reprobuild.json`).
   flake.modules.nixos.mcl-repro-binary-cache = inputs.reprobuild.nixosModules.repro-binary-cache;
 }

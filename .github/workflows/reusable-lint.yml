@@ -277,9 +277,12 @@ jobs:
           LINT_DEVELOP_SET: ${{ inputs.develop-set }}
           LINT_SUBMODULES: ${{ inputs.submodules }}
           LINT_GIT_TOKEN: ${{ secrets.NIX_GITHUB_TOKEN || secrets.GH_READ_METACRAFT_PRIVATE_REPOS || steps.app-token.outputs.token }}
-          # The org's single reprobuild pin lives in devops-modules' flake
-          # (`inputs.reprobuild`); reading it from there keeps this `repro`
-          # the one the fleet runs, with no second pin to drift.
+          # The org's single reprobuild pin is metacraft-github-actions
+          # `pins/reprobuild.json`; devops-modules publishes the flake it names
+          # as its `reprobuild` output, so this `repro` is the one the fleet
+          # runs, with no second pin to drift. `inputs.reprobuild` is the
+          # fallback for a devops-modules `dev` that predates the output
+          # (Single-Tool-Pins STP2); drop it once `dev` carries the output.
           LINT_REPRO_FLAKE: github:metacraft-labs/devops-modules/dev
         run: |
           # Actions runs this with `bash -e`; every failure below is handled
@@ -340,7 +343,7 @@ jobs:
             echo "reusable-lint: + nix build (the reprobuild pinned by $LINT_REPRO_FLAKE)"
             # shellcheck disable=SC2016
             outs=$(nix build --no-link --print-out-paths --impure --accept-flake-config --expr \
-              '(builtins.getFlake (builtins.getEnv "LINT_REPRO_FLAKE")).inputs.reprobuild.packages.${builtins.currentSystem}.reprobuild') ||
+              'let f = builtins.getFlake (builtins.getEnv "LINT_REPRO_FLAKE"); in (f.reprobuild or f.inputs.reprobuild).packages.${builtins.currentSystem}.reprobuild') ||
               die "could not build the pinned repro CLI from $LINT_REPRO_FLAKE"
             repro=""
             while IFS= read -r o; do

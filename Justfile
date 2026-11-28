@@ -7,14 +7,31 @@ copy-to-docker := if is-podman-available == "true" { "copyToPodman" } else { "co
 docker-socket := if is-podman-available == "true" { "unix://${XDG_RUNTIME_DIR}/podman/podman.sock" } else { "unix:///var/run/docker.sock" }
 do-offline-nix-build := if env("CI", "false") == "false" { "--offline" } else { "" }
 
+# RunQuota bridge (RQE-M6b): prefix for a heavy, finite `nix build` so it takes a
+# lease from the host's shared budget and runs at the granted width. Where
+# `runquota` is absent it runs the command unchanged; `RQ=` turns it off. See
+# scripts/runquota-bridge.sh and tests/test_runquota_bridge.sh
+# (`just test-runquota-bridge`).
+rq := '"' + justfile_directory() + '/scripts/runquota-bridge.sh" run --'
+
 show:
   @echo image: {{image}}
   @echo docker-socket: {{docker-socket}}
   @echo copy-to-docker: {{copy-to-docker}}
   @echo container engine: `docker --version 2>&1 | grep -v 'Switching default driver'`
 
+# The RunQuota `nix` adapter bounds `nix build` but not `nix run`, so the heavy
+# part (building the image closure) is a bridged `nix build`; the `nix run` that
+# follows then finds the closure already built and only runs the copy script.
 image:
+  {{rq}} nix build --no-link --accept-flake-config {{do-offline-nix-build}} .#ci-image.{{copy-to-docker}}
   nix run --accept-flake-config {{do-offline-nix-build}} .#ci-image.{{copy-to-docker}}
+
+# RunQuota bridge check: runs the real `image` recipe against a private runquotad
+# with a stub `nix` and asserts the lease bounds concurrency. `--mutate` deletes
+# the bridge from a copy of this Justfile and expects the bound to fail.
+test-runquota-bridge *args:
+  bash tests/test_runquota_bridge.sh {{args}}
 
 exec: image
   docker run -it {{image}}
